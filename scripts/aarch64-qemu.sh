@@ -134,7 +134,7 @@ chmod +x "$WORKDIR/init"
 # busybox + symlinks
 cp "$BUSYBOX_DIR/busybox" "$WORKDIR/bin/busybox"
 chmod +x "$WORKDIR/bin/busybox"
-for cmd in sh ls cat echo mount mkdir mknod sleep ps dmesg kill; do
+for cmd in sh ls cat echo mount mkdir mknod sleep ps dmesg kill getty; do
     ln -sf busybox "$WORKDIR/bin/$cmd"
 done
 
@@ -152,6 +152,10 @@ echo "Dropping to shell. Run /init to try rinit again."
 exec /bin/sh
 INIT_FALLBACK_EOF
 chmod +x "$WORKDIR/bin/init-fallback"
+
+# copy unit files into initramfs
+cp config/getty.service.toml "$WORKDIR/etc/rinit/units/"
+cp config/default.target.toml "$WORKDIR/etc/rinit/units/"
 
 # package
 mkdir -p "$(dirname "$INITRAMFS")"

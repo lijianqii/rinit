@@ -1,0 +1,10 @@
+name = "getty.service"
+
+[unit]
+description = "Serial console login on ttyAMA0"
+
+[service]
+exec_start = ["/sbin/getty", "115200", "ttyAMA0"]
+type = "simple"
+restart = "always"
+restart_sec = 1

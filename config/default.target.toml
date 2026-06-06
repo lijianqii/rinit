@@ -1,7 +1,5 @@
-name = 'default.target'
+name = "default.target"
 
 [unit]
-description = 'Default boot target — brings up the base system'
-requires = []
-wants = ['test.service']
-after = []
+description = "Default boot target"
+wants = ["getty.service"]
