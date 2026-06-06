@@ -102,11 +102,14 @@ if [ ! -f "$BUSYBOX_DIR/.built" ]; then
     cd "$BUSYBOX_DIR"
     export ARCH=arm64
     export CROSS_COMPILE="$CROSS_PREFIX"
-    make defconfig >/dev/null 2>&1
+    make defconfig >/dev/null || die "busybox defconfig failed"
     sed -i 's/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/' .config
     sed -i "s|^CONFIG_CROSS_COMPILER_PREFIX=.*|CONFIG_CROSS_COMPILER_PREFIX=\"${CROSS_PREFIX}\"|" .config
     echo "  Compiling busybox (this takes ~30s)..."
-    make -j"$(nproc)" 2>&1 | tail -3
+    if ! make -j"$(nproc)"; then
+        cd ../..
+        die "busybox compilation failed — see output above"
+    fi
     touch .built
     cd ../..
     ok "busybox compiled"
