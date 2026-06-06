@@ -2,9 +2,9 @@
 
 use crate::SignalFd;
 use anyhow::{Context, Result};
-use nix::sys::signalfd::SignalFd as NixSignalFd;
-use nix::sys::signalfd::SfdFlags;
 use nix::sys::signal::SigSet;
+use nix::sys::signalfd::SfdFlags;
+use nix::sys::signalfd::SignalFd as NixSignalFd;
 use std::os::unix::io::{AsRawFd, RawFd};
 use tracing::debug;
 
@@ -38,8 +38,9 @@ pub fn create_signal_fd(signals: &[i32]) -> Result<SignalFd> {
     let sfd = NixSignalFd::with_flags(&sigset, SfdFlags::SFD_NONBLOCK | SfdFlags::SFD_CLOEXEC)
         .context("failed to create signalfd")?;
 
-    let fd = sfd.as_raw_fd();
-    std::mem::forget(sfd);
+    // Prevent NixSignalFd's Drop from closing the fd — ownership transfers to SignalFd.
+    let sfd = std::mem::ManuallyDrop::new(sfd);
+    let fd = nix::sys::signalfd::SignalFd::as_raw_fd(&*sfd);
 
     debug!(fd, "signalfd created");
     Ok(SignalFd { fd })
@@ -52,9 +53,7 @@ pub fn read_signals_from_fd(fd: &RawFd) -> Result<Vec<i32>> {
     let mut buf = [0u8; 128]; // sizeof(signalfd_siginfo) = 128
 
     loop {
-        let n = unsafe {
-            libc::read(*fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
-        };
+        let n = unsafe { libc::read(*fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
 
         if n < 0 {
             let err = std::io::Error::last_os_error();
@@ -71,10 +70,7 @@ pub fn read_signals_from_fd(fd: &RawFd) -> Result<Vec<i32>> {
         // Parse siginfo structures
         let count = n as usize / std::mem::size_of::<libc::signalfd_siginfo>();
         let siginfos = unsafe {
-            std::slice::from_raw_parts(
-                buf.as_ptr() as *const libc::signalfd_siginfo,
-                count,
-            )
+            std::slice::from_raw_parts(buf.as_ptr() as *const libc::signalfd_siginfo, count)
         };
 
         for siginfo in siginfos {

@@ -65,6 +65,7 @@ pub fn reap_children() -> Result<Vec<ChildExit>> {
                 exited.push(ChildExit {
                     pid: pid.as_raw(),
                     status,
+                    was_signaled: false,
                 });
             }
             Ok(WaitStatus::Signaled(pid, signal, _)) => {
@@ -72,6 +73,7 @@ pub fn reap_children() -> Result<Vec<ChildExit>> {
                 exited.push(ChildExit {
                     pid: pid.as_raw(),
                     status: 128 + signal as i32,
+                    was_signaled: true,
                 });
             }
             Ok(_) => continue,

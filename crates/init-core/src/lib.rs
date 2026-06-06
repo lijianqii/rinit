@@ -27,9 +27,16 @@ pub struct ChildInfo {
 pub struct ChildExit {
     pub pid: libc::pid_t,
     pub status: i32,
+    /// True if the child was killed by a signal (as opposed to normal exit).
+    pub was_signaled: bool,
 }
 
 /// File descriptor for signalfd.
+///
+/// This is a lightweight wrapper around a raw fd. The fd is NOT closed
+/// when `SignalFd` is dropped — ownership of the fd is transferred to
+/// the caller (typically `Runtime` in init-event), which is responsible
+/// for closing it.
 pub struct SignalFd {
     pub fd: std::os::unix::io::RawFd,
 }

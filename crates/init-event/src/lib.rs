@@ -7,7 +7,7 @@
 use anyhow::{Context, Result};
 use init_core::signal::{self, REQUIRED_SIGNALS};
 use init_unit::UnitRegistry;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tokio::io::unix::AsyncFd;
 use tracing::{debug, info, warn};
 
@@ -16,6 +16,15 @@ pub struct Runtime {
     signal_fd: AsyncFd<std::os::unix::io::RawFd>,
     running: bool,
     pids: HashMap<libc::pid_t, String>,
+}
+
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        // Close the signalfd owned by this Runtime.
+        unsafe {
+            libc::close(*self.signal_fd.get_ref());
+        }
+    }
 }
 
 impl Runtime {
@@ -33,7 +42,9 @@ impl Runtime {
     }
 
     pub fn start_default_target(&mut self) -> Result<()> {
-        let default = self.unit_registry.get("default.target")
+        let default = self
+            .unit_registry
+            .get("default.target")
             .with_context(|| "default.target not found")?;
 
         let wanted: Vec<String> = default.unit.wants.clone();
@@ -47,19 +58,20 @@ impl Runtime {
 
         let mut to_start = HashMap::new();
         let mut queue: Vec<String> = wanted;
+        let mut seen: HashSet<String> = HashSet::new();
 
         while let Some(name) = queue.pop() {
-            if to_start.contains_key(&name) {
+            if !seen.insert(name.clone()) {
                 continue;
             }
             if let Some(unit) = self.unit_registry.get(&name) {
                 for dep in &unit.unit.requires {
-                    if !to_start.contains_key(dep) {
+                    if !seen.contains(dep) {
                         queue.push(dep.clone());
                     }
                 }
                 for dep in &unit.unit.wants {
-                    if !to_start.contains_key(dep) {
+                    if !seen.contains(dep) {
                         queue.push(dep.clone());
                     }
                 }
@@ -90,6 +102,9 @@ impl Runtime {
         name: &str,
         svc: &init_unit::types::ServiceSection,
     ) -> Result<()> {
+        if svc.exec_start.is_empty() {
+            anyhow::bail!("service '{}' has empty exec_start", name);
+        }
         let path = &svc.exec_start[0];
         let args: Vec<String> = if svc.exec_start.len() > 1 {
             svc.exec_start[1..].to_vec()
@@ -178,37 +193,33 @@ impl Runtime {
 
             if let Some(ref name) = unit_name {
                 // Clone service config to avoid borrow conflict with start_service_unit
-                let svc_clone = self.unit_registry.get(name)
-                    .and_then(|u| u.service.clone());
+                let svc_clone = self.unit_registry.get(name).and_then(|u| u.service.clone());
                 let name_clone = name.clone();
 
                 if let Some(svc) = svc_clone {
-                        let should_restart = match svc.restart {
-                            init_unit::types::RestartPolicy::Always => true,
-                            init_unit::types::RestartPolicy::OnFailure => child.status != 0,
-                            init_unit::types::RestartPolicy::OnAbnormal => {
-                                child.status != 0 && child.status != libc::EXIT_SUCCESS
-                            }
-                            init_unit::types::RestartPolicy::No => false,
-                        };
+                    let should_restart = match svc.restart {
+                        init_unit::types::RestartPolicy::Always => true,
+                        init_unit::types::RestartPolicy::OnFailure => child.status != 0,
+                        init_unit::types::RestartPolicy::OnAbnormal => child.was_signaled,
+                        init_unit::types::RestartPolicy::No => false,
+                    };
 
-                        if should_restart {
-                            info!(
-                                unit = %name_clone,
-                                pid = child.pid,
-                                status = child.status,
-                                restart_sec = svc.restart_sec,
-                                "restarting service"
-                            );
+                    if should_restart {
+                        info!(
+                            unit = %name_clone,
+                            pid = child.pid,
+                            status = child.status,
+                            restart_sec = svc.restart_sec,
+                            "restarting service"
+                        );
 
-                            tokio::time::sleep(
-                                std::time::Duration::from_secs(svc.restart_sec as u64)
-                            ).await;
+                        tokio::time::sleep(std::time::Duration::from_secs(svc.restart_sec as u64))
+                            .await;
 
-                            if let Err(e) = self.start_service_unit(&name_clone, &svc) {
-                                warn!(unit = %name_clone, error = %e, "failed to restart service");
-                            }
+                        if let Err(e) = self.start_service_unit(&name_clone, &svc) {
+                            warn!(unit = %name_clone, error = %e, "failed to restart service");
                         }
+                    }
                 }
             }
         }

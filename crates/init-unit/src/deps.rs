@@ -18,6 +18,28 @@ pub fn build_dep_graph(units: &HashMap<String, Unit>) -> HashMap<String, Vec<Str
         graph.entry(name.clone()).or_default();
     }
 
+    // Validate that all referenced dependencies exist in the registry.
+    for (name, unit) in units {
+        for dep in &unit.unit.requires {
+            if !units.contains_key(dep) {
+                tracing::error!(
+                    unit = %name,
+                    missing_dep = %dep,
+                    "hard dependency (Requires) not found in registry"
+                );
+            }
+        }
+        for dep in &unit.unit.wants {
+            if !units.contains_key(dep) {
+                tracing::warn!(
+                    unit = %name,
+                    missing_dep = %dep,
+                    "soft dependency (Wants) not found in registry"
+                );
+            }
+        }
+    }
+
     graph
 }
 
