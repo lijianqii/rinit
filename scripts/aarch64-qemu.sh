@@ -26,7 +26,7 @@ INITRAMFS="target/initramfs-aarch64/initramfs.cpio.gz"
 CROSS_PREFIX="aarch64-linux-gnu-"
 QEMU_MACHINE="virt"
 QEMU_CPU="cortex-a57"
-QEMU_MEM="512M"
+QEMU_MEM="128M"
 
 banner() { echo "=== [$1]"; }
 ok()    { echo "[OK] $1"; }
