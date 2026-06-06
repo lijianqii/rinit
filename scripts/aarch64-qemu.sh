@@ -16,7 +16,6 @@
 # =============================================================================
 set -euo pipefail
 cd "$(dirname "$0")/.."
-export PATH="$HOME/.cargo/bin:$PATH"
 
 # -- constants --
 BUSYBOX_VERSION="1.36.1"
@@ -101,6 +100,8 @@ if [ ! -f "$BUSYBOX_DIR/.built" ]; then
 
     echo "  Configuring (static, minimal)..."
     cd "$BUSYBOX_DIR"
+    export ARCH=arm64
+    export CROSS_COMPILE="$CROSS_PREFIX"
     make defconfig >/dev/null 2>&1
     sed -i 's/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/' .config
     sed -i "s|^CONFIG_CROSS_COMPILER_PREFIX=.*|CONFIG_CROSS_COMPILER_PREFIX=\"${CROSS_PREFIX}\"|" .config
