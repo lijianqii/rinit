@@ -1,0 +1,21 @@
+# === Rust build artifacts ===
+/target/
+
+# === Editor & IDE ===
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# === OS junk ===
+Thumbs.db
+*.tmp
+
+# === Initramfs output (generated, not source) ===
+/target/initramfs/
+
+# === Environment ===
+.env
+.env.local

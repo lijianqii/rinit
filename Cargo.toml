@@ -1,0 +1,33 @@
+[workspace]
+resolver = '2'
+members = ['crates/*']
+
+[workspace.package]
+version = '0.1.0'
+edition = '2021'
+license = 'MIT'
+repository = 'https://github.com/example/rinit'
+
+[package]
+name = 'rinit'
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = 'rinit'
+path = 'src/main.rs'
+
+[dependencies]
+init-core = { path = 'crates/init-core' }
+init-event = { path = 'crates/init-event' }
+init-unit = { path = 'crates/init-unit' }
+tokio = { version = '1', features = ['full'] }
+anyhow = '1'
+tracing = '0.1'
+tracing-subscriber = '0.3'
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

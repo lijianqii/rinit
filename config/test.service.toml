@@ -1,0 +1,16 @@
+name = 'test.service'
+
+[unit]
+description = 'Test service — a simple echo daemon for development'
+after = []
+
+[service]
+exec_start = ['/bin/sh', '-c', 'while true; do echo rinit-test: Sat Jun  6 10:12:25     2026; sleep 5; done']
+type = 'simple'
+restart = 'always'
+restart_sec = 3
+
+[service.limits]
+memory_max = '64M'
+cpu_weight = 50
+tasks_max = 8

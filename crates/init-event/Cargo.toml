@@ -1,0 +1,13 @@
+[package]
+name = "init-event"
+version.workspace = true
+edition.workspace = true
+description = "Event-driven supervision loop for PID 1"
+
+[dependencies]
+init-core = { path = "../init-core" }
+init-unit = { path = "../init-unit" }
+tokio = { version = "1", features = ["full"] }
+libc = "0.2"
+anyhow = "1"
+tracing = "0.1"

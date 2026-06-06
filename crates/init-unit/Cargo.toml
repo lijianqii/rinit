@@ -1,0 +1,12 @@
+[package]
+name = "init-unit"
+version.workspace = true
+edition.workspace = true
+description = "Unit file definitions, TOML parser, and dependency resolver"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+anyhow = "1"
+tracing = "0.1"
+thiserror = "2"
