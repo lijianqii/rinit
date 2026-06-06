@@ -135,7 +135,7 @@ chmod +x "$WORKDIR/init"
 cp "$BUSYBOX_DIR/busybox" "$WORKDIR/bin/busybox"
 chmod +x "$WORKDIR/bin/busybox"
 for cmd in sh ls cat echo mount mkdir mknod sleep ps dmesg kill; do
-    ln -sf /bin/busybox "$WORKDIR/bin/$cmd"
+    ln -sf busybox "$WORKDIR/bin/$cmd"
 done
 
 # rescue shell

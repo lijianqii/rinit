@@ -22,7 +22,7 @@ echo "[3/5] Copying busybox for debugging..."
 cp /usr/bin/busybox "$WORKDIR/bin/busybox"
 chmod +x "$WORKDIR/bin/busybox"
 for cmd in sh ls cat echo mount mkdir mknod sleep ps dmesg kill; do
-    ln -sf /bin/busybox "$WORKDIR/bin/$cmd"
+    ln -sf busybox "$WORKDIR/bin/$cmd"
 done
 
 echo "[4/5] Creating /bin/init-fallback (busybox rescue shell)..."
