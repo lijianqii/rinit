@@ -179,7 +179,7 @@ qemu-system-aarch64 \
     -m "$QEMU_MEM" \
     -kernel "$KERNEL" \
     -initrd "$INITRAMFS" \
-    -append "console=ttyAMA0 quiet rinit.log_level=debug" \
+    -append "console=ttyAMA0 earlycon rinit.log_level=debug" \
     -nographic \
     -no-reboot \
     "$@"
