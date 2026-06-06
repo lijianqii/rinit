@@ -1,0 +1,10 @@
+# Cross-compilation linkers
+# The host "cc" is x86_64 and cannot link aarch64 objects.
+# Point the musl target at the gnu cross-linker — it handles the ELF
+# linking just fine since Rust provides its own musl crt*.o and libc.a.
+
+[target.aarch64-unknown-linux-musl]
+linker = "aarch64-linux-gnu-gcc"
+
+[target.x86_64-unknown-linux-musl]
+linker = "x86_64-linux-gnu-gcc"

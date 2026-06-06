@@ -1,6 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
+export PATH="$HOME/.cargo/bin:$PATH"
 
 echo "[1/3] Installing musl target..."
 rustup target add x86_64-unknown-linux-musl

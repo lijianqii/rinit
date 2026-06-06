@@ -1,6 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
+export PATH="$HOME/.cargo/bin:$PATH"
 
 RINIT_BIN="target/x86_64-unknown-linux-musl/release/rinit"
 if [ ! -f "$RINIT_BIN" ]; then

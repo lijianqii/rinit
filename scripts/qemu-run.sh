@@ -1,6 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
+export PATH="$HOME/.cargo/bin:$PATH"
 
 INITRAMFS="target/initramfs/initramfs.cpio.gz"
 KERNEL="/boot/vmlinuz-$(uname -r)"

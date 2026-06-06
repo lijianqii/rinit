@@ -23,3 +23,5 @@ Thumbs.db
 # === Busybox cross-build artifacts ===
 /target/busybox-*/
 /target/initramfs-aarch64/
+# === Rust cross-compilation config (must be tracked) ===
+# .cargo/config.toml is tracked intentionally — do not ignore

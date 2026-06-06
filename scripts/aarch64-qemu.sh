@@ -16,6 +16,7 @@
 # =============================================================================
 set -euo pipefail
 cd "$(dirname "$0")/.."
+export PATH="$HOME/.cargo/bin:$PATH"
 
 # -- constants --
 BUSYBOX_VERSION="1.36.1"
