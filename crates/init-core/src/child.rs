@@ -98,19 +98,12 @@ fn reset_signals_child() {
 }
 
 fn close_extra_fds() {
-    if let Ok(entries) = std::fs::read_dir("/proc/self/fd") {
-        for entry in entries.flatten() {
-            if let Ok(name) = entry.file_name().into_string() {
-                if let Ok(fd) = name.parse::<i32>() {
-                    if fd > 2 {
-                        unsafe { libc::close(fd) };
-                    }
-                }
-            }
-        }
-    } else {
-        for fd in 3..256 {
-            unsafe { libc::close(fd) };
-        }
+    // Iterate up to sysconf(_SC_OPEN_MAX), ignoring EBADF.
+    // Do NOT read /proc/self/fd: read_dir itself uses an fd,
+    // and closing it mid-iteration causes "Bad file descriptor" panics.
+    let maxfd = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+    let maxfd = if maxfd > 0 { maxfd as i32 } else { 1024 };
+    for fd in 3..maxfd {
+        unsafe { libc::close(fd) };
     }
 }
