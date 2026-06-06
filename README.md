@@ -38,6 +38,8 @@ Subsystems       (future:  socket activation, D-Bus IPC, journal, udev, CLI clie
 rinit/
 ├── Cargo.toml                    # Workspace root
 ├── README.md
+├── .cargo/
+│   └── config.toml               # Cross-compilation linkers (aarch64, x86_64 musl)
 ├── src/
 │   ├── main.rs                   # PID 1 entry point
 │   └── bootstrap.rs              # Early init (mount /proc, /sys, /dev, block signals)
@@ -64,9 +66,10 @@ rinit/
 │   ├── default.target.toml       # Example: default boot target
 │   └── test.service.toml         # Example: a simple echo test service
 └── scripts/
-    ├── build-static.sh           # Static musl build
+    ├── build-static.sh           # Static musl build (x86_64)
     ├── mkinitramfs.sh            # Build minimal initramfs with rinit + busybox
-    └── qemu-run.sh               # Boot rinit in QEMU
+    ├── qemu-run.sh               # Boot rinit in QEMU (x86_64, uses host kernel)
+    └── aarch64-qemu.sh           # Cross-build + QEMU boot for aarch64 (ARM64)
 ```
 
 ---
@@ -111,6 +114,48 @@ You should see kernel messages followed by rinit taking over as PID 1:
 ```
 
 Press `Ctrl+A` then `X` to quit.
+
+### 5. Cross-compile and boot on aarch64 (ARM64)
+
+```bash
+# One-time: install aarch64 cross-compilation toolchain
+sudo apt install -y gcc-aarch64-linux-gnu qemu-system-arm
+
+# Build rinit + busybox for aarch64, then boot in QEMU.
+# Provide your own aarch64 kernel Image as the argument.
+./scripts/aarch64-qemu.sh /path/to/aarch64-kernel-Image
+```
+
+The script handles everything: `rustup target add`, `cargo build --release` for `aarch64-unknown-linux-musl`, downloads and cross-compiles busybox from source, and packages the initramfs. The linker is configured in `.cargo/config.toml`.
+
+---
+
+## Cross-compilation
+
+The project uses `.cargo/config.toml` to map each target to the correct linker since the host `cc` is x86_64 and cannot link aarch64 objects (`EM: 183`):
+
+| Target | Linker | Notes |
+|:---|:---|:---|
+| `x86_64-unknown-linux-musl` | `x86_64-linux-gnu-gcc` | Static binary for initramfs |
+| `aarch64-unknown-linux-musl` | `aarch64-linux-gnu-gcc` | ARM64 / QEMU `virt` machine |
+
+Rust provides its own musl `crt*.o` and `libc.a`, so the gnu linker only needs to perform the final ELF linking.
+
+### Required packages for aarch64
+
+```bash
+sudo apt install -y gcc-aarch64-linux-gnu qemu-system-arm
+```
+
+### Manual cross-compilation
+
+```bash
+# x86_64
+cargo build --release --target x86_64-unknown-linux-musl
+
+# aarch64
+cargo build --release --target aarch64-unknown-linux-musl
+```
 
 ---
 
