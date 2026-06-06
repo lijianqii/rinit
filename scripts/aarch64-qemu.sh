@@ -105,6 +105,10 @@ if [ ! -f "$BUSYBOX_DIR/.built" ]; then
     make defconfig >/dev/null || die "busybox defconfig failed"
     sed -i 's/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/' .config
     sed -i "s|^CONFIG_CROSS_COMPILER_PREFIX=.*|CONFIG_CROSS_COMPILER_PREFIX=\"${CROSS_PREFIX}\"|" .config
+    # Disable tc (traffic control) — TCA_CBQ_* removed from kernel 6.12+ uapi headers
+    sed -i 's/^CONFIG_TC=y$/# CONFIG_TC is not set/' .config
+    # Re-sync dependencies after config changes
+    make oldconfig >/dev/null 2>&1 || true
     echo "  Compiling busybox (this takes ~30s)..."
     if ! make -j"$(nproc)"; then
         cd ../..
