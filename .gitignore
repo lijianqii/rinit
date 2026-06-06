@@ -19,3 +19,7 @@ Thumbs.db
 # === Environment ===
 .env
 .env.local
+
+# === Busybox cross-build artifacts ===
+/target/busybox-*/
+/target/initramfs-aarch64/
