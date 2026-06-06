@@ -134,7 +134,7 @@ chmod +x "$WORKDIR/init"
 # busybox + symlinks
 cp "$BUSYBOX_DIR/busybox" "$WORKDIR/bin/busybox"
 chmod +x "$WORKDIR/bin/busybox"
-for cmd in sh ls cat echo mount mkdir mknod sleep ps dmesg kill getty; do
+for cmd in sh ls cat echo mount mkdir mknod sleep ps dmesg kill getty login; do
     ln -sf busybox "$WORKDIR/bin/$cmd"
 done
 
