@@ -5,6 +5,7 @@
 //! the user environment before exec'ing the shell.
 
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::io::IntoRawFd;
 use std::os::unix::io::FromRawFd;
 use tracing::info;
 
@@ -90,6 +91,10 @@ pub fn do_login(fd: libc::c_int) -> Result<LoginResult, String> {
         libc::setgid(user.gid);
         libc::setuid(user.uid);
     }
+
+    // Prevent File Drop from closing fd 0 (stdin).
+    let _ = writer.into_raw_fd();
+    std::mem::forget(reader);
 
     Ok(LoginResult {
         username,
