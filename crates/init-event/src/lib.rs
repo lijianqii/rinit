@@ -19,6 +19,7 @@ pub struct Runtime {
     signal_fd: AsyncFd<std::os::unix::io::RawFd>,
     running: bool,
     pids: HashMap<libc::pid_t, String>,
+    restart_history: HashMap<String, Vec<std::time::Instant>>,
     uevent_socket: AsyncFd<std::os::unix::io::RawFd>,
 }
 
@@ -48,6 +49,7 @@ impl Runtime {
             signal_fd: async_fd,
             running: true,
             pids: HashMap::new(),
+            restart_history: HashMap::new(),
             uevent_socket: uevent_async,
         })
     }
@@ -316,6 +318,25 @@ impl Runtime {
                     };
 
                     if should_restart {
+                        // Rate limiting: check restart count within time window
+                        let now = std::time::Instant::now();
+                        let window = std::time::Duration::from_secs(10);
+                        let max_burst = 5;
+
+                        let timestamps = self.restart_history.entry(name_clone.clone()).or_default();
+                        timestamps.retain(|t| now - *t < window);
+                        timestamps.push(now);
+
+                        if timestamps.len() > max_burst {
+                            warn!(
+                                unit = %name_clone,
+                                burst = timestamps.len(),
+                                max_burst,
+                                "restart rate limit exceeded, not restarting"
+                            );
+                            continue;
+                        }
+
                         info!(
                             unit = %name_clone,
                             pid = child.pid,

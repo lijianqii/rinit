@@ -2,7 +2,7 @@
 
 ## 🔴 Critical
 
-- [ ] **Implement `shutdown()` and `emergency_shutdown()`** (`init-event/src/lib.rs:230-238`)
+- [x] **Implement `shutdown()` and `emergency_shutdown()`** (`init-event/src/lib.rs:230-238`)
   - Send SIGTERM to all child processes
   - Wait for children to exit (with configurable timeout)
   - Send SIGKILL to any remaining children
@@ -10,17 +10,17 @@
   - Remount filesystems as read-only
   - Call `reboot(RB_POWER_OFF)` / `reboot(RB_AUTOBOOT)` / `reboot(RB_HALT_SYSTEM)`
 
-- [ ] **Set `PR_SET_CHILD_SUBREAPER`** so PID 1 reaps orphaned grandchildren
+- [x] **Set `PR_SET_CHILD_SUBREAPER`** so PID 1 reaps orphaned grandchildren
   - Without this, orphaned grandchildren become zombies if their immediate parent dies
 
-- [ ] **Open `/dev/console` as fd 0, 1, 2** early in bootstrap
+- [x] **Open `/dev/console` as fd 0, 1, 2** early in bootstrap
   - PID 1 should own stdin/stdout/stderr on the console device
   - Prevents kernel messages from being lost
 
-- [ ] **Redirect child stdin/stdout/stderr** in `spawn_service()`
+- [x] **Redirect child stdin/stdout/stderr** in `spawn_service()`
   - Redirect to `/dev/null` (or future journal socket) to prevent terminal hijacking
 
-- [ ] **Add restart rate limiting** (`StartLimitBurst` / `StartLimitInterval`)
+- [x] **Add restart rate limiting** (`StartLimitBurst` / `StartLimitInterval`)
   - Prevent tight restart loops when a service crashes immediately with `restart=always` and `restart_sec=0`
 
 ---
