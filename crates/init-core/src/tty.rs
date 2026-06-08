@@ -53,12 +53,7 @@ pub fn spawn_terminal(
         std::process::exit(1);
     }
 
-            // Close extra fds (but keep 0/1/2 which now point to TTY)
-            let maxfd = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
-            let limit = if maxfd > 0 { maxfd as i32 } else { 1024 };
-            for fd in 3..limit {
-                unsafe { libc::close(fd) };
-            }
+            crate::child::close_extra_fds();
 
             unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
 
