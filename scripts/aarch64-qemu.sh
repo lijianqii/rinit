@@ -132,6 +132,26 @@ banner "Creating initramfs"
 
 mkdir -p "$WORKDIR"/{bin,sbin,dev,proc,sys,run,etc/rinit/units}
 
+# udhcpc default.script for DHCP lease configuration
+mkdir -p "$WORKDIR/usr/share/udhcpc"
+cat > "$WORKDIR/usr/share/udhcpc/default.script" << 'UDHCPCSCRIPT'
+#!/bin/sh
+exec 1>&2
+case "$1" in
+    bound|renew)
+        echo "udhcpc: setting $interface to $ip/$subnet"
+        ifconfig $interface $ip netmask $subnet
+        [ -n "$router" ] && route add default gw $router
+        [ -n "$dns" ] && echo "nameserver $dns" > /etc/resolv.conf
+        ;;
+    deconfig)
+        echo "udhcpc: removing $interface config"
+        ifconfig $interface 0.0.0.0
+        ;;
+esac
+UDHCPCSCRIPT
+chmod +x "$WORKDIR/usr/share/udhcpc/default.script"
+
 # rinit as /init
 cp "$RINIT_BIN" "$WORKDIR/init"
 chmod +x "$WORKDIR/init"
@@ -156,6 +176,8 @@ chmod +x "$WORKDIR/bin/init-fallback"
 # copy unit files into initramfs
 cp config/getty.service.toml "$WORKDIR/etc/rinit/units/"
 cp config/default.target.toml "$WORKDIR/etc/rinit/units/"
+cp config/network.target.toml "$WORKDIR/etc/rinit/units/"
+cp config/eth0.network.toml "$WORKDIR/etc/rinit/units/"
 
 # package
 mkdir -p "$(dirname "$INITRAMFS")"
@@ -181,6 +203,7 @@ qemu-system-aarch64 \
     -M "$QEMU_MACHINE" \
     -cpu "$QEMU_CPU" \
     -m "$QEMU_MEM" \
+    -netdev user,id=n0 -device virtio-net-device,netdev=n0 \
     -kernel "$KERNEL" \
     -initrd "$INITRAMFS" \
     -append "console=ttyAMA0 earlycon rinit.log_level=debug" \

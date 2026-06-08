@@ -7,6 +7,7 @@
 use anyhow::{Context, Result};
 use init_core::signal::{self, REQUIRED_SIGNALS};
 use init_core::uevent::UeventSocket;
+use init_core::net;
 use init_unit::UnitRegistry;
 use std::collections::{HashMap, HashSet};
 use tokio::io::unix::AsyncFd;
@@ -100,6 +101,61 @@ impl Runtime {
                         self.start_service_unit(name, svc)?;
                     }
                 }
+            }
+        }
+
+        // Configure .network units
+        self.configure_networks()?;
+
+        Ok(())
+    }
+
+    /// Process .network units: configure static IP or start DHCP clients.
+    fn configure_networks(&mut self) -> Result<()> {
+        let networks: Vec<_> = self.unit_registry.values()
+            .filter(|u| u.is_network())
+            .cloned()
+            .collect();
+
+        if networks.is_empty() {
+            return Ok(());
+        }
+
+        info!(count = networks.len(), "configuring network interfaces");
+
+        for unit in &networks {
+            let net = match &unit.network {
+                Some(n) => n,
+                None => continue,
+            };
+
+            if net.dhcp {
+                info!(ifname = %net.name, "running DHCP client");
+                match net::run_dhcp(&net.name) {
+                    Ok(lease) => {
+                        info!(
+                            unit = %unit.name,
+                            _ip = ?lease.ip,
+                            "DHCP lease obtained and applied"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(unit = %unit.name, error = %e, "DHCP failed");
+                    }
+                }
+            } else if let Some(ref addr) = net.address {
+                let dns = net.dns.clone().unwrap_or_default();
+                info!(ifname = %net.name, addr = %addr, "configuring static IP");
+                if let Err(e) = net::configure_static(
+                    &net.name,
+                    addr,
+                    net.gateway.as_deref(),
+                    &dns,
+                ) {
+                    warn!(unit = %unit.name, error = %e, "failed to configure static IP");
+                }
+            } else {
+                warn!(unit = %unit.name, "network unit has no dhcp or address");
             }
         }
 

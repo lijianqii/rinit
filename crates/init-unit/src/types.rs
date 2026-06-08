@@ -22,6 +22,25 @@ pub struct Unit {
     /// Only set for .mount units.
     #[serde(default)]
     pub mount: Option<MountSection>,
+
+    /// Only set for .network units.
+    #[serde(default)]
+    pub network: Option<NetworkSection>,
+}
+
+impl Unit {
+    pub fn is_service(&self) -> bool {
+        self.service.is_some()
+    }
+    pub fn is_network(&self) -> bool {
+        self.network.is_some()
+    }
+    pub fn hard_deps(&self) -> &[String] {
+        &self.unit.requires
+    }
+    pub fn soft_deps(&self) -> &[String] {
+        &self.unit.wants
+    }
 }
 
 /// [unit] section — common to all unit types.
@@ -157,19 +176,26 @@ fn default_service_type() -> ServiceType {
     ServiceType::Simple
 }
 
-impl Unit {
-    /// Helper to check if this is a service-type unit.
-    pub fn is_service(&self) -> bool {
-        self.service.is_some()
-    }
+/// [network] section — static IP or DHCP configuration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct NetworkSection {
+    /// Interface name (e.g. "eth0").
+    pub name: String,
 
-    /// Get all hard dependencies (Requires).
-    pub fn hard_deps(&self) -> &[String] {
-        &self.unit.requires
-    }
+    /// Use DHCP to obtain IP configuration.
+    #[serde(default)]
+    pub dhcp: bool,
 
-    /// Get all soft dependencies (Wants).
-    pub fn soft_deps(&self) -> &[String] {
-        &self.unit.wants
-    }
+    /// Static IP address in CIDR notation (e.g. "192.168.1.100/24").
+    #[serde(default)]
+    pub address: Option<String>,
+
+    /// Default gateway (e.g. "192.168.1.1").
+    #[serde(default)]
+    pub gateway: Option<String>,
+
+    /// DNS servers.
+    #[serde(default)]
+    pub dns: Option<Vec<String>>,
 }
+

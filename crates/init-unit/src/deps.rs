@@ -135,6 +135,7 @@ mod tests {
             service: None,
             socket: None,
             mount: None,
+            network: None,
         }
     }
 

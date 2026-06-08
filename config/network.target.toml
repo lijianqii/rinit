@@ -1,0 +1,5 @@
+name = "network.target"
+
+[unit]
+description = "Network is available"
+wants = ["eth0.network"]

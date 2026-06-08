@@ -2,4 +2,4 @@ name = "default.target"
 
 [unit]
 description = "Default boot target"
-wants = ["getty.service"]
+wants = ["getty.service", "network.target"]

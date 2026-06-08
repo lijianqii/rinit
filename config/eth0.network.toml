@@ -1,0 +1,8 @@
+name = "eth0.network"
+
+[unit]
+description = "QEMU virtio-net interface"
+
+[network]
+name = "eth0"
+dhcp = true

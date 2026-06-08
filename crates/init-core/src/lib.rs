@@ -13,6 +13,7 @@ pub mod child;
 pub mod fs;
 pub mod signal;
 pub mod uevent;
+pub mod net;
 
 use anyhow::Result;
 
