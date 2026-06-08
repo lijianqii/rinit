@@ -43,6 +43,16 @@ pub fn spawn_terminal(
                 std::process::exit(1);
             }
 
+            // Run login prompt
+    if let Err(e) = crate::login::do_login(0) {
+        let _ = std::io::Write::write_fmt(
+            &mut std::io::stderr(),
+            format_args!("rinit: login failed: {}
+", e),
+        );
+        std::process::exit(1);
+    }
+
             // Close extra fds (but keep 0/1/2 which now point to TTY)
             let maxfd = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
             let limit = if maxfd > 0 { maxfd as i32 } else { 1024 };

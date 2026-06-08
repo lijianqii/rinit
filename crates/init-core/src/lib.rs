@@ -14,6 +14,7 @@ pub mod fs;
 pub mod signal;
 pub mod uevent;
 pub mod tty;
+pub mod login;
 pub mod net;
 
 use anyhow::Result;
