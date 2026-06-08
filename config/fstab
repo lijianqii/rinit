@@ -1,0 +1,7 @@
+# /etc/fstab — rinit initramfs example
+# device   mountpoint  fstype  options   dump  pass
+none       /proc       proc    defaults   0     0
+none       /sys        sysfs   defaults   0     0
+none       /dev        devtmpfs defaults  0     0
+none       /run        tmpfs   defaults   0     0
+none       /dev/pts    devpts  defaults   0     0
