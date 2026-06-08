@@ -12,6 +12,7 @@ pub mod cgroup;
 pub mod child;
 pub mod fs;
 pub mod signal;
+pub mod uevent;
 
 use anyhow::Result;
 

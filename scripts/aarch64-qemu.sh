@@ -121,6 +121,11 @@ else
     ok "busybox already built (cached)"
 fi
 
+# Install busybox applets into workdir (always run, fast for cached builds)
+echo "  Installing busybox applets..."
+( cd "$BUSYBOX_DIR" && make install CONFIG_PREFIX="$WORKDIR" >/dev/null ) || die "busybox install failed"
+ok "busybox applets installed"
+
 # =========================== BUILD INITRAMFS ================================
 
 banner "Creating initramfs"
@@ -131,12 +136,7 @@ mkdir -p "$WORKDIR"/{bin,sbin,dev,proc,sys,run,etc/rinit/units}
 cp "$RINIT_BIN" "$WORKDIR/init"
 chmod +x "$WORKDIR/init"
 
-# busybox + symlinks
-cp "$BUSYBOX_DIR/busybox" "$WORKDIR/bin/busybox"
-chmod +x "$WORKDIR/bin/busybox"
-for cmd in sh ls cat echo mount mkdir mknod sleep ps dmesg kill getty login; do
-    ln -sf busybox "$WORKDIR/bin/$cmd"
-done
+# busybox applets already installed by 'make install' during build
 
 # rescue shell
 cat > "$WORKDIR/bin/init-fallback" << 'INIT_FALLBACK_EOF'

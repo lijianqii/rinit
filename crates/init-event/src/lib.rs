@@ -6,6 +6,7 @@
 
 use anyhow::{Context, Result};
 use init_core::signal::{self, REQUIRED_SIGNALS};
+use init_core::uevent::UeventSocket;
 use init_unit::UnitRegistry;
 use std::collections::{HashMap, HashSet};
 use tokio::io::unix::AsyncFd;
@@ -16,13 +17,14 @@ pub struct Runtime {
     signal_fd: AsyncFd<std::os::unix::io::RawFd>,
     running: bool,
     pids: HashMap<libc::pid_t, String>,
+    uevent_socket: AsyncFd<std::os::unix::io::RawFd>,
 }
 
 impl Drop for Runtime {
     fn drop(&mut self) {
-        // Close the signalfd owned by this Runtime.
         unsafe {
             libc::close(*self.signal_fd.get_ref());
+            libc::close(*self.uevent_socket.get_ref());
         }
     }
 }
@@ -33,11 +35,18 @@ impl Runtime {
         let fd = sfd.fd;
         let async_fd = AsyncFd::new(fd)?;
 
+        let uevent_sock = UeventSocket::new()?;
+        let uevent_fd = uevent_sock.raw_fd();
+        // Prevent Drop from closing the fd — AsyncFd owns it now
+        std::mem::forget(uevent_sock);
+        let uevent_async = AsyncFd::new(uevent_fd)?;
+
         Ok(Runtime {
             unit_registry,
             signal_fd: async_fd,
             running: true,
             pids: HashMap::new(),
+            uevent_socket: uevent_async,
         })
     }
 
@@ -140,6 +149,17 @@ impl Runtime {
                         }
                     }
                 }
+                uevent_ready = self.uevent_socket.readable() => {
+                    match uevent_ready {
+                        Ok(mut guard) => {
+                            self.handle_uevent().await?;
+                            guard.clear_ready();
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "uevent socket error");
+                        }
+                    }
+                }
                 _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
                     self.reap_and_restart().await?;
                 }
@@ -174,6 +194,34 @@ impl Runtime {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Handle incoming kernel uevents — create /dev nodes for device add events.
+    async fn handle_uevent(&self) -> Result<()> {
+        let fd = self.uevent_socket.get_ref();
+        let sock = UeventSocket::from_raw_fd(*fd);
+
+        while let Some(uevent) = sock.recv()? {
+            if uevent.action == "add" {
+                if let (Some(ref devname), Some(devtype), Some(major), Some(minor)) =
+                    (&uevent.devname, &uevent.devtype, uevent.major, uevent.minor)
+                {
+                    let dt = devtype.chars().next().unwrap_or('c');
+                    init_core::fs::create_device_node(devname, dt, major, minor)
+                        .unwrap_or_else(|e| {
+                            tracing::warn!(
+                                devname = %devname,
+                                error = %e,
+                                "failed to create device node"
+                            );
+                        });
+                }
+            }
+        }
+
+        // Prevent Drop from closing the fd
+        std::mem::forget(sock);
         Ok(())
     }
 
@@ -229,11 +277,58 @@ impl Runtime {
 
     async fn shutdown(&mut self) -> Result<()> {
         info!("initiating graceful shutdown");
+
+        // Phase 1: Send SIGTERM to all services
+        let pids: Vec<i32> = self.pids.keys().copied().collect();
+        for &pid in &pids {
+            unsafe { libc::kill(pid, libc::SIGTERM) };
+            debug!(pid, "sent SIGTERM");
+        }
+
+        // Phase 2: Wait up to 10 seconds for children to exit
+        for _ in 0..100 {
+            self.reap_and_restart().await?;
+            if self.pids.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        // Phase 3: SIGKILL any remaining processes
+        if !self.pids.is_empty() {
+            warn!(remaining = self.pids.len(), "sending SIGKILL to remaining services");
+            let remaining: Vec<i32> = self.pids.keys().copied().collect();
+            for &pid in &remaining {
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+            // Brief wait for SIGKILL to be delivered
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            self.reap_and_restart().await?;
+        }
+
+        // Phase 4: Sync filesystems and power off
+        info!("syncing filesystems and powering off");
+        unsafe { libc::sync() };
+        unsafe { libc::reboot(libc::LINUX_REBOOT_CMD_POWER_OFF) };
+
         Ok(())
     }
 
     async fn emergency_shutdown(&mut self) -> Result<()> {
-        warn!("emergency shutdown - killing all services immediately");
+        warn!("emergency shutdown - sending SIGKILL to all services");
+
+        // Skip SIGTERM, go straight to SIGKILL
+        let pids: Vec<i32> = self.pids.keys().copied().collect();
+        for &pid in &pids {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        self.reap_and_restart().await?;
+
+        info!("syncing filesystems and powering off");
+        unsafe { libc::sync() };
+        unsafe { libc::reboot(libc::LINUX_REBOOT_CMD_POWER_OFF) };
+
         Ok(())
     }
 

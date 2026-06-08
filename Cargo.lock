@@ -233,6 +233,7 @@ dependencies = [
  "init-core",
  "init-event",
  "init-unit",
+ "libc",
  "tokio",
  "tracing",
  "tracing-subscriber",

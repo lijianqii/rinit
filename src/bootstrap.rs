@@ -25,6 +25,13 @@ pub fn early_init() -> Result<()> {
     info!("early bootstrap: blocking PID 1 signals");
     init_core::signal::block_default_signals()?;
 
+    info!("early bootstrap: setting PR_SET_CHILD_SUBREAPER");
+    // PID 1 must be a subreaper so orphan grandchildren are
+    // reaped by init instead of becoming zombies.
+    if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) } != 0 {
+        anyhow::bail!("prctl(PR_SET_CHILD_SUBREAPER) failed: {}", std::io::Error::last_os_error());
+    }
+
     info!("early bootstrap complete");
     Ok(())
 }

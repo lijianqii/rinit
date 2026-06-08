@@ -60,3 +60,38 @@ pub fn create_run_dirs() -> Result<()> {
     }
     Ok(())
 }
+
+/// Create a device node via mknod(2).
+///
+/// Used by the uevent handler to create /dev entries when the kernel
+/// reports a new device (ACTION=add with MAJOR/MINOR).
+pub fn create_device_node(name: &str, devtype: char, major: u32, minor: u32) -> Result<()> {
+    use anyhow::Context;
+    let path = format!("/dev/{}", name);
+
+    let mode = match devtype {
+        'c' => libc::S_IFCHR,
+        'b' => libc::S_IFBLK,
+        _ => libc::S_IFCHR,
+    } | 0o600;
+
+    let dev = libc::makedev(major, minor);
+    let ret = unsafe {
+        libc::mknod(
+            path.as_ptr() as *const libc::c_char,
+            mode,
+            dev,
+        )
+    };
+    if ret < 0 {
+        let err = std::io::Error::last_os_error();
+        // EEXIST is fine — the node may have been created by devtmpfs
+        if err.raw_os_error() != Some(libc::EEXIST) {
+            return Err(err).with_context(|| format!("mknod({}) failed", path));
+        }
+    }
+
+    tracing::debug!(path = %path, devtype = %devtype, major, minor, "device node created");
+    Ok(())
+}
+
