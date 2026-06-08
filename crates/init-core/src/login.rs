@@ -9,6 +9,10 @@ use std::os::unix::io::IntoRawFd;
 use std::os::unix::io::FromRawFd;
 use tracing::info;
 
+extern "C" {
+    fn crypt(key: *const libc::c_char, salt: *const libc::c_char) -> *mut libc::c_char;
+}
+
 /// Result of a successful login.
 pub struct LoginResult {
     pub username: String,
@@ -105,34 +109,31 @@ pub fn do_login(fd: libc::c_int) -> Result<LoginResult, String> {
     })
 }
 
-fn validate(username: &str, _password: &str) -> bool {
-    // Development mode: root always accepted
-    if username == "root" {
-        return true;
-    }
+fn validate(username: &str, password: &str) -> bool {
+    let shadow = match std::fs::read_to_string("/etc/shadow") {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
 
-    // Try reading /etc/passwd
-    if let Ok(content) = std::fs::read_to_string("/etc/passwd") {
-        for line in content.lines() {
-            let fields: Vec<&str> = line.splitn(2, ':').collect();
-            if fields.len() >= 2 && fields[0] == username {
-                // Check password hash (simplified: empty = no password)
-                let rest: Vec<&str> = fields[1].split(':').collect();
-                if rest.len() >= 1 {
-                    // Field 1 is password hash; empty means no password
-                    if rest[0].is_empty() {
-                        return true;
-                    }
-                    // Field 1 is "x" means shadow file — accept for dev
-                    if rest[0] == "x" {
-                        return true;
-                    }
-                }
+    for line in shadow.lines() {
+        let fields: Vec<&str> = line.splitn(3, ':').collect();
+        if fields.len() >= 2 && fields[0] == username {
+            let stored_hash = fields[1];
+            if stored_hash.is_empty() {
+                return true;
             }
+            let entered = unsafe {
+                let pw = std::ffi::CString::new(password).unwrap();
+                let salt = std::ffi::CString::new(stored_hash).unwrap();
+                let result = crypt(pw.as_ptr(), salt.as_ptr());
+                if result.is_null() {
+                    return false;
+                }
+                std::ffi::CStr::from_ptr(result).to_string_lossy().into_owned()
+            };
+            return entered == stored_hash;
         }
     }
-
-    // If no passwd file, only root is accepted
     false
 }
 
