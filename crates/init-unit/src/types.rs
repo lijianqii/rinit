@@ -105,6 +105,14 @@ pub struct ServiceSection {
     #[serde(default)]
     pub environment: HashMap<String, String>,
 
+    /// Terminal device for native getty (e.g. "ttyAMA0").
+    #[serde(default)]
+    pub tty: Option<String>,
+
+    /// Baud rate for the terminal device.
+    #[serde(default)]
+    pub tty_baud: Option<u32>,
+
     /// OOM score adjustment (-1000..1000).
     #[serde(default)]
     pub oom_score_adj: i32,

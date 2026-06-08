@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use init_core::signal::{self, REQUIRED_SIGNALS};
 use init_core::uevent::UeventSocket;
 use init_core::net;
+use init_core::tty;
 use init_unit::UnitRegistry;
 use std::collections::{HashMap, HashSet};
 use tokio::io::unix::AsyncFd;
@@ -179,10 +180,16 @@ impl Runtime {
 
         info!(unit = %name, path = %path, args = ?args, "starting service");
 
-        let child = init_core::child::spawn_service(path, &args)?;
-        self.pids.insert(child.pid, name.to_string());
+        let child_pid = if let Some(ref tty_device) = svc.tty {
+            let baud = svc.tty_baud.unwrap_or(115200);
+            info!(unit = %name, tty = %tty_device, baud, "starting terminal session");
+            tty::spawn_terminal(path, &args, tty_device, baud)?
+        } else {
+            init_core::child::spawn_service(path, &args)?.pid
+        };
+        self.pids.insert(child_pid, name.to_string());
 
-        info!(unit = %name, pid = child.pid, "service started");
+        info!(unit = %name, pid = child_pid, "service started");
         Ok(())
     }
 

@@ -1,10 +1,12 @@
 name = "getty.service"
 
 [unit]
-description = "Serial console shell on ttyAMA0"
+description = "Native serial console shell on ttyAMA0"
 
 [service]
-exec_start = ["/sbin/getty", "-n", "-l", "/bin/sh", "115200", "ttyAMA0"]
+exec_start = ["/bin/sh"]
 type = "simple"
+tty = "ttyAMA0"
+tty_baud = 115200
 restart = "always"
 restart_sec = 1
