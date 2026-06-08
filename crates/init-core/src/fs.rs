@@ -95,3 +95,90 @@ pub fn create_device_node(name: &str, devtype: char, major: u32, minor: u32) -> 
     Ok(())
 }
 
+// ---- /etc/fstab parsing and mounting ----
+
+/// A single mount entry from /etc/fstab.
+#[derive(Debug, Clone)]
+pub struct FstabEntry {
+    pub device: String,
+    pub mountpoint: String,
+    pub fstype: String,
+    pub options: String,
+    pub dump: i32,
+    pub pass: i32,
+}
+
+/// Parse /etc/fstab and return all mountable entries.
+pub fn parse_fstab() -> Vec<FstabEntry> {
+    let content = match std::fs::read_to_string("/etc/fstab") {
+        Ok(c) => c,
+        Err(_) => return vec![],
+    };
+
+    let virtual_fs: &[&str] = &["proc", "sysfs", "devtmpfs", "tmpfs", "devpts"];
+    let mut entries = Vec::new();
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("#") {
+            continue;
+        }
+        let fields: Vec<&str> = trimmed.split_whitespace().collect();
+        if fields.len() < 4 {
+            continue;
+        }
+        let fstype = fields[2];
+        if virtual_fs.contains(&fstype) {
+            continue;
+        }
+        entries.push(FstabEntry {
+            device: fields[0].to_string(),
+            mountpoint: fields[1].to_string(),
+            fstype: fstype.to_string(),
+            options: fields[3].to_string(),
+            dump: fields.get(4).and_then(|s| s.parse().ok()).unwrap_or(0),
+            pass: fields.get(5).and_then(|s| s.parse().ok()).unwrap_or(0),
+        });
+    }
+    entries
+}
+
+/// Mount all entries from /etc/fstab.
+pub fn mount_fstab() -> Result<()> {
+    let entries = parse_fstab();
+    if entries.is_empty() {
+        tracing::debug!("no fstab entries to mount");
+        return Ok(());
+    }
+    tracing::info!(count = entries.len(), "mounting filesystems from /etc/fstab");
+    for entry in &entries {
+        let flags = parse_mount_options(&entry.options);
+        let source = if entry.device == "none" { None } else { Some(entry.device.as_str()) };
+        match mount_fs(source, &entry.mountpoint, &entry.fstype, flags, None) {
+            Ok(()) => tracing::info!(target = %entry.mountpoint, fstype = %entry.fstype, "mounted"),
+            Err(e) => tracing::warn!(target = %entry.mountpoint, error = %e, "failed to mount fstab entry"),
+        }
+    }
+    Ok(())
+}
+
+fn parse_mount_options(options: &str) -> MsFlags {
+    let mut flags = MsFlags::empty();
+    for opt in options.split(",") {
+        match opt.trim() {
+            "defaults" => flags |= MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC | MsFlags::MS_RELATIME,
+            "ro" => flags |= MsFlags::MS_RDONLY,
+            "noexec" => flags |= MsFlags::MS_NOEXEC,
+            "nosuid" => flags |= MsFlags::MS_NOSUID,
+            "nodev" => flags |= MsFlags::MS_NODEV,
+            "noatime" => flags |= MsFlags::MS_NOATIME,
+            "relatime" => flags |= MsFlags::MS_RELATIME,
+            "sync" => flags |= MsFlags::MS_SYNCHRONOUS,
+            "dirsync" => flags |= MsFlags::MS_DIRSYNC,
+            "mand" => flags |= MsFlags::MS_MANDLOCK,
+            _ => {}
+        }
+    }
+    flags
+}
+

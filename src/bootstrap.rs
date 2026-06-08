@@ -17,6 +17,11 @@ pub fn early_init() -> Result<()> {
     info!("early bootstrap: opening /dev/console");
     claim_console();
 
+    info!("early bootstrap: mounting /etc/fstab entries");
+    init_core::fs::mount_fstab().unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "fstab mount failed, continuing");
+    });
+
     info!("early bootstrap: creating runtime directories");
     init_core::fs::create_run_dirs().context("create_run_dirs")?;
 
