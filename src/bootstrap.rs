@@ -14,6 +14,9 @@ pub fn early_init() -> Result<()> {
     info!("early bootstrap: mounting virtual filesystems");
     init_core::fs::mount_virtual_fs().context("mount_virtual_fs")?;
 
+    info!("early bootstrap: opening /dev/console");
+    claim_console();
+
     info!("early bootstrap: creating runtime directories");
     init_core::fs::create_run_dirs().context("create_run_dirs")?;
 
@@ -35,3 +38,26 @@ pub fn early_init() -> Result<()> {
     info!("early bootstrap complete");
     Ok(())
 }
+
+/// Open /dev/console for stdin/stdout/stderr.
+/// Called after devtmpfs mount so /dev/console exists.
+fn claim_console() {
+    let fd = unsafe {
+        libc::open(
+            b"/dev/console\0".as_ptr() as *const libc::c_char,
+            libc::O_RDWR | libc::O_NOCTTY,
+        )
+    };
+    if fd < 0 {
+        return;
+    }
+    for target in 0..=2 {
+        if fd != target {
+            unsafe { libc::dup2(fd, target) };
+        }
+    }
+    if fd > 2 {
+        unsafe { libc::close(fd) };
+    }
+}
+
