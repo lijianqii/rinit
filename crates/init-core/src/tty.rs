@@ -64,8 +64,14 @@ pub fn spawn_terminal(
 
 fn setup_terminal_child(tty: &str, baud: u32) -> Result<()> {
     // Open the TTY device
+    let tty_path = if tty.starts_with('/') {
+        tty.to_string()
+    } else {
+        format!("/dev/{}", tty)
+    };
+
     let fd = unsafe {
-        let tty_c = std::ffi::CString::new(tty)
+        let tty_c = std::ffi::CString::new(tty_path.as_str())
             .context("invalid tty path")?;
         let flags = libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC;
         libc::open(tty_c.as_ptr(), flags)
