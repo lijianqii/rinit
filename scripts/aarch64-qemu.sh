@@ -174,6 +174,7 @@ INIT_FALLBACK_EOF
 chmod +x "$WORKDIR/bin/init-fallback"
 
 # copy unit files into initramfs
+cp config/shadow "$WORKDIR/etc/shadow"
 cp config/passwd "$WORKDIR/etc/passwd"
 cp config/group "$WORKDIR/etc/group"
 cp config/fstab "$WORKDIR/etc/fstab"
