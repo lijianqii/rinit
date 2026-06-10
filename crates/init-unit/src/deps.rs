@@ -45,9 +45,7 @@ pub fn build_dep_graph(units: &HashMap<String, Unit>) -> HashMap<String, Vec<Str
 
 /// Resolve startup order using Kahn algorithm.
 /// Returns layers — units within the same layer can start in parallel.
-pub fn resolve_startup_order(
-    units: &HashMap<String, Unit>,
-) -> Result<Vec<Vec<String>>, DepError> {
+pub fn resolve_startup_order(units: &HashMap<String, Unit>) -> Result<Vec<Vec<String>>, DepError> {
     let graph = build_dep_graph(units);
 
     let mut in_degree: HashMap<String, usize> = HashMap::new();
@@ -155,7 +153,10 @@ mod tests {
         let mut units = HashMap::new();
         units.insert("a.service".into(), make_unit("a.service", &[]));
         units.insert("b.service".into(), make_unit("b.service", &[]));
-        units.insert("c.service".into(), make_unit("c.service", &["a.service", "b.service"]));
+        units.insert(
+            "c.service".into(),
+            make_unit("c.service", &["a.service", "b.service"]),
+        );
 
         let layers = resolve_startup_order(&units).unwrap();
         assert_eq!(layers.len(), 2);

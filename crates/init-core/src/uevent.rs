@@ -88,9 +88,7 @@ impl UeventSocket {
     pub fn recv(&self) -> Result<Option<Uevent>> {
         let mut buf = [0u8; 4096];
 
-        let n = unsafe {
-            libc::recv(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0)
-        };
+        let n = unsafe { libc::recv(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
 
         if n < 0 {
             let err = std::io::Error::last_os_error();

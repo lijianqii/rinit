@@ -206,4 +206,3 @@ pub struct NetworkSection {
     #[serde(default)]
     pub dns: Option<Vec<String>>,
 }
-

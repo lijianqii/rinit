@@ -13,11 +13,11 @@
 pub mod cgroup;
 pub mod child;
 pub mod fs;
-pub mod signal;
-pub mod uevent;
-pub mod tty;
 pub mod login;
 pub mod net;
+pub mod signal;
+pub mod tty;
+pub mod uevent;
 
 /// Spawned child process tracking info.
 #[derive(Debug, Clone)]

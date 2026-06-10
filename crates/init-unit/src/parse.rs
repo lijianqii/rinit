@@ -6,8 +6,7 @@ use tracing::debug;
 
 /// Parse a raw TOML string into a Unit.
 pub fn parse_unit_file(content: &str) -> Result<Unit> {
-    let unit: Unit = toml::from_str(content)
-        .context("failed to parse TOML unit file")?;
+    let unit: Unit = toml::from_str(content).context("failed to parse TOML unit file")?;
 
     debug!(
         name = %unit.name,

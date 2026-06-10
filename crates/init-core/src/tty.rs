@@ -15,12 +15,7 @@ use tracing::{debug, warn};
 ///
 /// Returns the child PID. The child becomes a session leader with
 /// stdin/stdout/stderr connected to the TTY.
-pub fn spawn_terminal(
-    path: &str,
-    args: &[String],
-    tty: &str,
-    baud: u32,
-) -> Result<libc::pid_t> {
+pub fn spawn_terminal(path: &str, args: &[String], tty: &str, baud: u32) -> Result<libc::pid_t> {
     match unsafe { nix::unistd::fork() }.context("fork for terminal failed")? {
         nix::unistd::ForkResult::Parent { child } => {
             let pid = child.as_raw();
@@ -42,14 +37,13 @@ pub fn spawn_terminal(
             }
 
             // Run login prompt
-    if let Err(e) = crate::login::do_login(0) {
-        let _ = std::io::Write::write_fmt(
-            &mut std::io::stderr(),
-            format_args!("rinit: login failed: {}
-", e),
-        );
-        std::process::exit(1);
-    }
+            if let Err(e) = crate::login::do_login(0) {
+                let _ = std::io::Write::write_fmt(
+                    &mut std::io::stderr(),
+                    format_args!("rinit: login failed: {}", e),
+                );
+                std::process::exit(1);
+            }
 
             crate::child::close_extra_fds();
 
@@ -70,7 +64,9 @@ pub fn spawn_terminal(
                 .chain(std::iter::once(std::ptr::null()))
                 .collect();
 
-            unsafe { libc::execv(c_path.as_ptr(), c_args.as_ptr()); }
+            unsafe {
+                libc::execv(c_path.as_ptr(), c_args.as_ptr());
+            }
             let err = std::io::Error::last_os_error();
             let _ = std::io::Write::write_fmt(
                 &mut std::io::stderr(),
@@ -90,15 +86,13 @@ fn setup_terminal_child(tty: &str, baud: u32) -> Result<()> {
     };
 
     let fd = unsafe {
-        let tty_c = std::ffi::CString::new(tty_path.as_str())
-            .context("invalid tty path")?;
+        let tty_c = std::ffi::CString::new(tty_path.as_str()).context("invalid tty path")?;
         let flags = libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC;
         libc::open(tty_c.as_ptr(), flags)
     };
 
     if fd < 0 {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("open({})", tty));
+        return Err(std::io::Error::last_os_error()).with_context(|| format!("open({})", tty));
     }
 
     // Set terminal attributes

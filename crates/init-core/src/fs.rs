@@ -9,13 +9,43 @@ use tracing::debug;
 ///
 /// Called only once during early init, before any services start.
 pub fn mount_virtual_fs() -> Result<()> {
-    mount_fs(Some("proc"), "/proc", "proc", MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC, None)?;
-    mount_fs(Some("sysfs"), "/sys", "sysfs", MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC, None)?;
-    mount_fs(Some("devtmpfs"), "/dev", "devtmpfs", MsFlags::MS_NOSUID, Some("mode=0755"))?;
-    mount_fs(Some("tmpfs"), "/run", "tmpfs", MsFlags::MS_NOSUID | MsFlags::MS_NODEV, Some("mode=0755,size=10%"))?;
+    mount_fs(
+        Some("proc"),
+        "/proc",
+        "proc",
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
+        None,
+    )?;
+    mount_fs(
+        Some("sysfs"),
+        "/sys",
+        "sysfs",
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
+        None,
+    )?;
+    mount_fs(
+        Some("devtmpfs"),
+        "/dev",
+        "devtmpfs",
+        MsFlags::MS_NOSUID,
+        Some("mode=0755"),
+    )?;
+    mount_fs(
+        Some("tmpfs"),
+        "/run",
+        "tmpfs",
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
+        Some("mode=0755,size=10%"),
+    )?;
 
     std::fs::create_dir_all("/dev/pts").ok();
-    mount_fs(Some("devpts"), "/dev/pts", "devpts", MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC, Some("gid=5,mode=0620"))?;
+    mount_fs(
+        Some("devpts"),
+        "/dev/pts",
+        "devpts",
+        MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC,
+        Some("gid=5,mode=0620"),
+    )?;
 
     debug!("virtual filesystems mounted");
     Ok(())
@@ -41,22 +71,16 @@ pub fn mount_fs(
 
 /// Set the system hostname.
 pub fn set_hostname(name: &str) -> Result<()> {
-    nix::unistd::sethostname(name)
-        .context("failed to set hostname")?;
+    nix::unistd::sethostname(name).context("failed to set hostname")?;
     debug!(hostname = %name, "hostname set");
     Ok(())
 }
 
 /// Create essential directories under /run/rinit.
 pub fn create_run_dirs() -> Result<()> {
-    let dirs = [
-        "/run/rinit",
-        "/run/rinit/lock",
-        "/run/rinit/units",
-    ];
+    let dirs = ["/run/rinit", "/run/rinit/lock", "/run/rinit/units"];
     for dir in &dirs {
-        std::fs::create_dir_all(dir)
-            .with_context(|| format!("failed to create {}", dir))?;
+        std::fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir))?;
     }
     Ok(())
 }
@@ -76,13 +100,7 @@ pub fn create_device_node(name: &str, devtype: char, major: u32, minor: u32) -> 
     } | 0o600;
 
     let dev = libc::makedev(major, minor);
-    let ret = unsafe {
-        libc::mknod(
-            path.as_ptr() as *const libc::c_char,
-            mode,
-            dev,
-        )
-    };
+    let ret = unsafe { libc::mknod(path.as_ptr() as *const libc::c_char, mode, dev) };
     if ret < 0 {
         let err = std::io::Error::last_os_error();
         // EEXIST is fine — the node may have been created by devtmpfs
@@ -150,13 +168,22 @@ pub fn mount_fstab() -> Result<()> {
         tracing::debug!("no fstab entries to mount");
         return Ok(());
     }
-    debug!(count = entries.len(), "mounting filesystems from /etc/fstab");
+    debug!(
+        count = entries.len(),
+        "mounting filesystems from /etc/fstab"
+    );
     for entry in &entries {
         let flags = parse_mount_options(&entry.options);
-        let source = if entry.device == "none" { None } else { Some(entry.device.as_str()) };
+        let source = if entry.device == "none" {
+            None
+        } else {
+            Some(entry.device.as_str())
+        };
         match mount_fs(source, &entry.mountpoint, &entry.fstype, flags, None) {
             Ok(()) => tracing::info!(target = %entry.mountpoint, fstype = %entry.fstype, "mounted"),
-            Err(e) => tracing::warn!(target = %entry.mountpoint, error = %e, "failed to mount fstab entry"),
+            Err(e) => {
+                tracing::warn!(target = %entry.mountpoint, error = %e, "failed to mount fstab entry")
+            }
         }
     }
     Ok(())
@@ -166,7 +193,12 @@ fn parse_mount_options(options: &str) -> MsFlags {
     let mut flags = MsFlags::empty();
     for opt in options.split(",") {
         match opt.trim() {
-            "defaults" => flags |= MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC | MsFlags::MS_RELATIME,
+            "defaults" => {
+                flags |= MsFlags::MS_NOSUID
+                    | MsFlags::MS_NODEV
+                    | MsFlags::MS_NOEXEC
+                    | MsFlags::MS_RELATIME
+            }
             "ro" => flags |= MsFlags::MS_RDONLY,
             "noexec" => flags |= MsFlags::MS_NOEXEC,
             "nosuid" => flags |= MsFlags::MS_NOSUID,
@@ -181,4 +213,3 @@ fn parse_mount_options(options: &str) -> MsFlags {
     }
     flags
 }
-

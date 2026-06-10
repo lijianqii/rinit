@@ -5,8 +5,8 @@
 //! the user environment before exec'ing the shell.
 
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::io::IntoRawFd;
 use std::os::unix::io::FromRawFd;
+use std::os::unix::io::IntoRawFd;
 use tracing::info;
 
 extern "C" {
@@ -136,7 +136,9 @@ fn validate(username: &str, password: &str) -> bool {
                 if result.is_null() {
                     return false;
                 }
-                std::ffi::CStr::from_ptr(result).to_string_lossy().into_owned()
+                std::ffi::CStr::from_ptr(result)
+                    .to_string_lossy()
+                    .into_owned()
             };
             return entered == stored_hash;
         }

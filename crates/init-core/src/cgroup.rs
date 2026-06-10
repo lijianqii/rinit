@@ -31,8 +31,14 @@ impl CgroupHandle {
     /// Write a value to a cgroup controller file.
     pub fn write_control(&self, controller: &str, value: &str) -> Result<()> {
         let ctl_path = self.path.join(controller);
-        std::fs::write(&ctl_path, value)
-            .with_context(|| format!("failed to write {} = {} to {}", controller, value, ctl_path.display()))
+        std::fs::write(&ctl_path, value).with_context(|| {
+            format!(
+                "failed to write {} = {} to {}",
+                controller,
+                value,
+                ctl_path.display()
+            )
+        })
     }
 
     /// Add a process to this cgroup by writing its PID to cgroup.procs.

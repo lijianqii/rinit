@@ -5,8 +5,8 @@
 //! - DHCP: native UDP-based DHCP client (no external udhcpc needed)
 
 use anyhow::{Context, Result};
-use std::os::unix::io::AsRawFd;
 use std::net::UdpSocket;
+use std::os::unix::io::AsRawFd;
 use tracing::{debug, warn};
 
 /// DHCP lease information returned by a successful negotiation.
@@ -50,14 +50,19 @@ fn ifup(ifname: &str) -> Result<libc::c_int> {
 
 /// Configure static IP on an interface.
 pub fn configure_static(
-    ifname: &str, address: &str, gateway: Option<&str>, dns: &[String],
+    ifname: &str,
+    address: &str,
+    gateway: Option<&str>,
+    dns: &[String],
 ) -> Result<()> {
     let (addr_str, prefix_len) = parse_cidr(address)?;
     let sock = ifup(ifname)?;
     let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
     let b = ifname.as_bytes();
     let n = b.len().min(libc::IFNAMSIZ - 1);
-    for (i, &c) in b[..n].iter().enumerate() { ifr.ifr_name[i] = c as libc::c_char; }
+    for (i, &c) in b[..n].iter().enumerate() {
+        ifr.ifr_name[i] = c as libc::c_char;
+    }
     let addr = parse_ipv4(addr_str)?;
     unsafe { set_sin(&mut ifr.ifr_ifru.ifru_addr, addr, 0) };
     unsafe { ioctl(sock, libc::SIOCSIFADDR, &mut ifr) };
@@ -66,8 +71,12 @@ pub fn configure_static(
     unsafe { ioctl(sock, libc::SIOCSIFNETMASK, &mut ifr) };
     unsafe { libc::close(sock) };
     debug!(ifname, addr=%addr_str, "static IP");
-    if let Some(gw) = gateway { add_default_route(gw)?; }
-    if !dns.is_empty() { write_resolv_conf_str(dns)?; }
+    if let Some(gw) = gateway {
+        add_default_route(gw)?;
+    }
+    if !dns.is_empty() {
+        write_resolv_conf_str(dns)?;
+    }
     Ok(())
 }
 
@@ -96,13 +105,19 @@ pub fn run_dhcp(ifname: &str) -> Result<DhcpLease> {
         return Err(std::io::Error::last_os_error()).context("SO_BINDTODEVICE");
     }
 
-    socket.set_read_timeout(Some(std::time::Duration::from_secs(3))).ok();
-    socket.set_write_timeout(Some(std::time::Duration::from_secs(1))).ok();
+    socket
+        .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+        .ok();
+    socket
+        .set_write_timeout(Some(std::time::Duration::from_secs(1)))
+        .ok();
 
     // Generate transaction ID from PID + time
-    let xid: u32 = (unsafe { libc::getpid() } as u32) ^
-        (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-            .unwrap().as_secs() as u32);
+    let xid: u32 = (unsafe { libc::getpid() } as u32)
+        ^ (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as u32);
 
     // Build and send DHCPDISCOVER
     debug!(ifname, xid, "DHCP DISCOVER");
@@ -114,7 +129,8 @@ pub fn run_dhcp(ifname: &str) -> Result<DhcpLease> {
     let mut buf = [0u8; 1500];
     let (len, _) = socket.recv_from(&mut buf)?;
     let offer = parse_dhcp_packet(&buf[..len])?;
-    let server_id = offer.server_id
+    let server_id = offer
+        .server_id
         .with_context(|| "DHCPOFFER missing server-id")?;
     let yiaddr = u32::from_be_bytes([buf[16], buf[17], buf[18], buf[19]]);
     debug!(ifname, addr=%fmt_ip(yiaddr), "DHCP OFFER");
@@ -137,18 +153,27 @@ pub fn run_dhcp(ifname: &str) -> Result<DhcpLease> {
     // Apply configuration to interface
     apply_lease(ifname, ip, netmask, gateway, &dns)?;
 
-    Ok(DhcpLease { ip, netmask, gateway, dns })
+    Ok(DhcpLease {
+        ip,
+        netmask,
+        gateway,
+        dns,
+    })
 }
 
 // ---- DHCP packet building ----
 
 fn build_dhcp_packet(
-    op: u8, xid: u32, chaddr: &[u8; 6], msg_type: u8, server_id: Option<&[u8; 4]>,
+    op: u8,
+    xid: u32,
+    chaddr: &[u8; 6],
+    msg_type: u8,
+    server_id: Option<&[u8; 4]>,
 ) -> Vec<u8> {
     let mut pkt = vec![0u8; 240];
-    pkt[0] = op;              // op
-    pkt[1] = 1;               // htype: Ethernet
-    pkt[2] = 6;               // hlen
+    pkt[0] = op; // op
+    pkt[1] = 1; // htype: Ethernet
+    pkt[2] = 6; // hlen
     pkt[4..8].copy_from_slice(&xid.to_be_bytes());
     pkt[10..12].copy_from_slice(&0x8000u16.to_be_bytes()); // flags: broadcast
     pkt[28..34].copy_from_slice(chaddr);
@@ -157,11 +182,16 @@ fn build_dhcp_packet(
     pkt[236..240].copy_from_slice(&DHCP_MAGIC);
 
     // Options
-    let mut opt = vec![
-        DHCP_OPT_MSG_TYPE, 1, msg_type,
-    ];
+    let mut opt = vec![DHCP_OPT_MSG_TYPE, 1, msg_type];
     // Parameter request list
-    opt.extend_from_slice(&[DHCP_OPT_REQ_LIST, 4, DHCP_OPT_SUBNET, DHCP_OPT_ROUTER, DHCP_OPT_DNS, 6]);
+    opt.extend_from_slice(&[
+        DHCP_OPT_REQ_LIST,
+        4,
+        DHCP_OPT_SUBNET,
+        DHCP_OPT_ROUTER,
+        DHCP_OPT_DNS,
+        6,
+    ]);
     // Server identifier for REQUEST
     if let Some(sid) = server_id {
         opt.extend_from_slice(&[DHCP_OPT_SERVER_ID, 4]);
@@ -182,17 +212,30 @@ struct ParsedDhcp {
 }
 
 fn parse_dhcp_packet(data: &[u8]) -> Result<ParsedDhcp> {
-    if data.len() < 240 { anyhow::bail!("DHCP packet too short"); }
-    let mut r = ParsedDhcp { server_id: None, subnet_mask: None, router: None, dns: vec![] };
+    if data.len() < 240 {
+        anyhow::bail!("DHCP packet too short");
+    }
+    let mut r = ParsedDhcp {
+        server_id: None,
+        subnet_mask: None,
+        router: None,
+        dns: vec![],
+    };
     let opts_start = data.iter().position(|&b| b == 0x63).unwrap_or(240);
     let opts = &data[opts_start + 4..]; // skip magic
     let mut i = 0;
     while i < opts.len() {
         let code = opts[i];
-        if code == 255 { break; }
-        if i + 1 >= opts.len() { break; }
+        if code == 255 {
+            break;
+        }
+        if i + 1 >= opts.len() {
+            break;
+        }
         let len = opts[i + 1] as usize;
-        if i + 2 + len > opts.len() { break; }
+        if i + 2 + len > opts.len() {
+            break;
+        }
         let val = &opts[i + 2..i + 2 + len];
         match code {
             DHCP_OPT_SERVER_ID if len == 4 => {
@@ -207,7 +250,8 @@ fn parse_dhcp_packet(data: &[u8]) -> Result<ParsedDhcp> {
             DHCP_OPT_DNS => {
                 for chunk in val.chunks(4) {
                     if chunk.len() == 4 {
-                        r.dns.push(u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+                        r.dns
+                            .push(u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
                     }
                 }
             }
@@ -222,7 +266,8 @@ fn get_iface_mac(ifname: &str) -> Result<[u8; 6]> {
     let path = format!("/sys/class/net/{}/address", ifname);
     let addr = std::fs::read_to_string(&path)
         .with_context(|| format!("read {}", path))?
-        .trim().to_string();
+        .trim()
+        .to_string();
     let parts: Vec<&str> = addr.split(':').collect();
     anyhow::ensure!(parts.len() == 6, "invalid MAC");
     let mut mac = [0u8; 6];
@@ -233,15 +278,23 @@ fn get_iface_mac(ifname: &str) -> Result<[u8; 6]> {
 }
 
 fn apply_lease(
-    ifname: &str, ip: u32, netmask: u32, gateway: Option<u32>, dns: &[u32],
+    ifname: &str,
+    ip: u32,
+    netmask: u32,
+    gateway: Option<u32>,
+    dns: &[u32],
 ) -> Result<()> {
     let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
-    if sock < 0 { return Err(std::io::Error::last_os_error()).context("socket"); }
+    if sock < 0 {
+        return Err(std::io::Error::last_os_error()).context("socket");
+    }
 
     let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
     let b = ifname.as_bytes();
     let n = b.len().min(libc::IFNAMSIZ - 1);
-    for (i, &c) in b[..n].iter().enumerate() { ifr.ifr_name[i] = c as libc::c_char; }
+    for (i, &c) in b[..n].iter().enumerate() {
+        ifr.ifr_name[i] = c as libc::c_char;
+    }
 
     unsafe { set_sin(&mut ifr.ifr_ifru.ifru_addr, ip, 0) };
     unsafe { ioctl(sock, libc::SIOCSIFADDR, &mut ifr) };
@@ -280,12 +333,24 @@ fn parse_cidr(input: &str) -> Result<(&str, u8)> {
 }
 
 fn parse_ipv4(s: &str) -> Result<u32> {
-    let octets: Vec<u32> = s.split('.').map(|o| o.parse::<u32>()).collect::<Result<_, _>>()?;
-    anyhow::ensure!(octets.len() == 4 && octets.iter().all(|&o| o <= 255), "bad IPv4");
+    let octets: Vec<u32> = s
+        .split('.')
+        .map(|o| o.parse::<u32>())
+        .collect::<Result<_, _>>()?;
+    anyhow::ensure!(
+        octets.len() == 4 && octets.iter().all(|&o| o <= 255),
+        "bad IPv4"
+    );
     Ok((octets[0] << 24) | (octets[1] << 16) | (octets[2] << 8) | octets[3])
 }
 
-fn prefix_to_netmask(p: u8) -> u32 { if p == 0 { 0 } else { !0u32 << (32 - p) } }
+fn prefix_to_netmask(p: u8) -> u32 {
+    if p == 0 {
+        0
+    } else {
+        !0u32 << (32 - p)
+    }
+}
 
 unsafe fn set_sin(sa: &mut libc::sockaddr, addr: u32, port: u16) {
     let sin = sa as *mut _ as *mut libc::sockaddr_in;
@@ -296,7 +361,9 @@ unsafe fn set_sin(sa: &mut libc::sockaddr, addr: u32, port: u16) {
 
 unsafe fn ioctl(fd: libc::c_int, req: libc::c_ulong, ifr: &mut libc::ifreq) {
     let ret = libc::ioctl(fd, req as _, ifr as *mut _);
-    if ret < 0 { warn!("ioctl err: {}", std::io::Error::last_os_error()); }
+    if ret < 0 {
+        warn!("ioctl err: {}", std::io::Error::last_os_error());
+    }
 }
 
 fn add_default_route(gw: &str) -> Result<()> {
@@ -317,8 +384,7 @@ fn add_default_route(gw: &str) -> Result<()> {
 }
 
 fn write_resolv_conf_str(servers: &[String]) -> Result<()> {
-    let mut f = std::fs::File::create("/etc/resolv.conf")
-        .context("resolv.conf")?;
+    let mut f = std::fs::File::create("/etc/resolv.conf").context("resolv.conf")?;
     for ns in servers {
         use std::io::Write;
         writeln!(f, "nameserver {}", ns)?;

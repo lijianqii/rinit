@@ -5,10 +5,10 @@
 //! - child process monitoring -> reap + restart
 
 use anyhow::{Context, Result};
-use init_core::signal::{self, REQUIRED_SIGNALS};
-use init_core::uevent::UeventSocket;
 use init_core::net;
+use init_core::signal::{self, REQUIRED_SIGNALS};
 use init_core::tty;
+use init_core::uevent::UeventSocket;
 use init_unit::UnitRegistry;
 use std::collections::{HashMap, HashSet};
 use tokio::io::unix::AsyncFd;
@@ -115,7 +115,9 @@ impl Runtime {
 
     /// Process .network units: configure static IP or start DHCP clients.
     fn configure_networks(&mut self) -> Result<()> {
-        let networks: Vec<_> = self.unit_registry.values()
+        let networks: Vec<_> = self
+            .unit_registry
+            .values()
             .filter(|u| u.is_network())
             .cloned()
             .collect();
@@ -149,12 +151,8 @@ impl Runtime {
             } else if let Some(ref addr) = net.address {
                 let dns = net.dns.clone().unwrap_or_default();
                 debug!(ifname = %net.name, addr = %addr, "configuring static IP");
-                if let Err(e) = net::configure_static(
-                    &net.name,
-                    addr,
-                    net.gateway.as_deref(),
-                    &dns,
-                ) {
+                if let Err(e) = net::configure_static(&net.name, addr, net.gateway.as_deref(), &dns)
+                {
                     warn!(unit = %unit.name, error = %e, "failed to configure static IP");
                 }
             } else {
@@ -273,14 +271,15 @@ impl Runtime {
                     (&uevent.devname, &uevent.devtype, uevent.major, uevent.minor)
                 {
                     let dt = devtype.chars().next().unwrap_or('c');
-                    init_core::fs::create_device_node(devname, dt, major, minor)
-                        .unwrap_or_else(|e| {
+                    init_core::fs::create_device_node(devname, dt, major, minor).unwrap_or_else(
+                        |e| {
                             tracing::warn!(
                                 devname = %devname,
                                 error = %e,
                                 "failed to create device node"
                             );
-                        });
+                        },
+                    );
                 }
             }
         }
@@ -323,7 +322,8 @@ impl Runtime {
                         let window = std::time::Duration::from_secs(10);
                         let max_burst = 5;
 
-                        let timestamps = self.restart_history.entry(name_clone.clone()).or_default();
+                        let timestamps =
+                            self.restart_history.entry(name_clone.clone()).or_default();
                         timestamps.retain(|t| now - *t < window);
                         timestamps.push(now);
 
@@ -380,7 +380,10 @@ impl Runtime {
 
         // Phase 3: SIGKILL any remaining processes
         if !self.pids.is_empty() {
-            warn!(remaining = self.pids.len(), "sending SIGKILL to remaining services");
+            warn!(
+                remaining = self.pids.len(),
+                "sending SIGKILL to remaining services"
+            );
             let remaining: Vec<i32> = self.pids.keys().copied().collect();
             for &pid in &remaining {
                 unsafe { libc::kill(pid, libc::SIGKILL) };
