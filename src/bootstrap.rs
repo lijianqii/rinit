@@ -26,7 +26,10 @@ pub fn early_init() -> Result<()> {
     init_core::fs::create_run_dirs().context("create_run_dirs")?;
 
     info!("early bootstrap: setting hostname");
-    init_core::fs::set_hostname("localhost").context("set_hostname")?;
+    let hostname = std::fs::read_to_string("/etc/hostname")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "localhost".to_string());
+    init_core::fs::set_hostname(&hostname).context("set_hostname")?;
 
     init_core::cgroup::ensure_cgroup_root().ok();
 

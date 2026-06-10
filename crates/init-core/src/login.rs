@@ -73,12 +73,18 @@ pub fn do_login(fd: libc::c_int) -> Result<LoginResult, String> {
     }
 
     // Get user info
-    let user = get_user_info(&username).unwrap_or_else(|| UserInfo {
+    let mut user = get_user_info(&username).unwrap_or_else(|| UserInfo {
         uid: 0,
         gid: 0,
         home: "/root".into(),
-        shell: "/bin/sh".into(),
+        shell: std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()),
     });
+    if user.shell.is_empty() {
+        user.shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    }
+    if user.home.is_empty() {
+        user.home = "/root".to_string();
+    }
 
     info!(user = %username, uid = user.uid, "login successful");
 
