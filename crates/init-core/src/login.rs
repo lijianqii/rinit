@@ -89,6 +89,7 @@ pub fn do_login(fd: libc::c_int) -> Result<LoginResult, String> {
     std::env::set_var("SHELL", &user.shell);
     std::env::set_var("PATH", "/bin:/sbin:/usr/bin:/usr/sbin");
     std::env::set_var("TERM", "vt102");
+    std::env::set_var("HOSTNAME", "rinit");
 
     // Try to set UID/GID (only works as root)
     unsafe {
