@@ -138,6 +138,7 @@ cat > "$WORKDIR/etc/profile" << 'PROFILEEOF'
 export PATH=/bin:/sbin:/usr/bin:/usr/sbin
 export PS1='\u@\h:\w\$ '
 export ENV=/etc/profile
+hostname rinit 2>/dev/null
 cd "$HOME"
 alias ll='ls -la'
 PROFILEEOF

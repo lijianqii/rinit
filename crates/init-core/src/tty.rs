@@ -9,8 +9,6 @@
 //!   - exec the target command
 
 use anyhow::{Context, Result};
-use std::os::unix::process::CommandExt;
-use std::process::Command;
 use tracing::{debug, info, warn};
 
 /// Fork and exec a command attached to a terminal device.
@@ -57,7 +55,23 @@ pub fn spawn_terminal(
 
             unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
 
-            let err = Command::new(path).args(args).exec();
+            // Set argv[0] to -/bin/sh so busybox ash runs as a login shell
+            let shell_name = std::path::Path::new(path)
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.to_string());
+            let prog = std::ffi::CString::new(format!("-{}", shell_name)).unwrap();
+            let c_path = std::ffi::CString::new(path).unwrap();
+            let c_args: Vec<_> = std::iter::once(prog.as_ptr())
+                .chain(args.iter().map(|a| {
+                    let cs = std::ffi::CString::new(a.as_str()).unwrap();
+                    cs.into_raw() as *const libc::c_char
+                }))
+                .chain(std::iter::once(std::ptr::null()))
+                .collect();
+
+            unsafe { libc::execv(c_path.as_ptr(), c_args.as_ptr()); }
+            let err = std::io::Error::last_os_error();
             let _ = std::io::Write::write_fmt(
                 &mut std::io::stderr(),
                 format_args!("rinit: exec {} failed: {}\n", path, err),
