@@ -7,7 +7,7 @@
 use anyhow::{Context, Result};
 use std::os::unix::io::AsRawFd;
 use std::net::UdpSocket;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 /// DHCP lease information returned by a successful negotiation.
 #[derive(Debug, Clone)]
