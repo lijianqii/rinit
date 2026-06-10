@@ -90,7 +90,7 @@ pub fn resolve_startup_order(units: &HashMap<String, Unit>) -> Result<Vec<Vec<St
     if visited != units.len() {
         let unvisited: Vec<_> = units
             .keys()
-            .filter(|k| in_degree.get(*k).map_or(true, |&d| d > 0))
+            .filter(|k| in_degree.get(*k).is_none_or(|&d| d > 0))
             .cloned()
             .collect();
         return Err(DepError::Cycle(unvisited));

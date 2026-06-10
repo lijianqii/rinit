@@ -31,7 +31,7 @@ pub fn load_all_units() -> anyhow::Result<UnitRegistry> {
                 let entry = entry?;
                 let path = entry.path();
 
-                if path.extension().map_or(true, |ext| ext != "toml") {
+                if path.extension().is_none_or(|ext| ext != "toml") {
                     continue;
                 }
 

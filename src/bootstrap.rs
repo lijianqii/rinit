@@ -55,7 +55,7 @@ pub fn early_init() -> Result<()> {
 fn claim_console() {
     let fd = unsafe {
         libc::open(
-            b"/dev/console\0".as_ptr() as *const libc::c_char,
+            c"/dev/console".as_ptr(),
             libc::O_RDWR | libc::O_NOCTTY,
         )
     };

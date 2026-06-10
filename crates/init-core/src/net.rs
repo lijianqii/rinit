@@ -372,7 +372,7 @@ fn add_default_route(gw: &str) -> Result<()> {
     unsafe { set_sin(&mut rt.rt_dst, 0, 0) };
     unsafe { set_sin(&mut rt.rt_gateway, gw, 0) };
     unsafe { set_sin(&mut rt.rt_genmask, 0, 0) };
-    rt.rt_flags = (libc::RTF_UP | libc::RTF_GATEWAY) as u16;
+    rt.rt_flags = libc::RTF_UP | libc::RTF_GATEWAY;
     let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
     anyhow::ensure!(sock >= 0, "socket failed");
     let ret = unsafe { libc::ioctl(sock, libc::SIOCADDRT as _, &rt as *const _) };
