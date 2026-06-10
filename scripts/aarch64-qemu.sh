@@ -134,12 +134,12 @@ mkdir -p "$WORKDIR"/{bin,sbin,dev,proc,sys,run,etc/rinit/units}
 mkdir -p "$WORKDIR/root"
 
 # Minimal /etc/profile for shell environment
-cat > "$WORKDIR/etc/profile" << '"'"'PROFILEEOF'"'"'
+cat > "$WORKDIR/etc/profile" << 'PROFILEEOF'
 export PATH=/bin:/sbin:/usr/bin:/usr/sbin
-export PS1='"'"'\u@\h:\w\$ '"'"'
+export PS1='\u@\h:\w\$ '
 export ENV=/etc/profile
 cd "$HOME"
-alias ll='"'"'ls -la'"'"'
+alias ll='ls -la'
 PROFILEEOF
 
 # udhcpc default.script for DHCP lease configuration
