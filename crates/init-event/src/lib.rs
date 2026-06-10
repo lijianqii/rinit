@@ -124,7 +124,7 @@ impl Runtime {
             return Ok(());
         }
 
-        info!(count = networks.len(), "configuring network interfaces");
+        debug!(count = networks.len(), "configuring network interfaces");
 
         for unit in &networks {
             let net = match &unit.network {
@@ -133,7 +133,7 @@ impl Runtime {
             };
 
             if net.dhcp {
-                info!(ifname = %net.name, "running DHCP client");
+                debug!(ifname = %net.name, "running DHCP client");
                 match net::run_dhcp(&net.name) {
                     Ok(lease) => {
                         info!(
@@ -148,7 +148,7 @@ impl Runtime {
                 }
             } else if let Some(ref addr) = net.address {
                 let dns = net.dns.clone().unwrap_or_default();
-                info!(ifname = %net.name, addr = %addr, "configuring static IP");
+                debug!(ifname = %net.name, addr = %addr, "configuring static IP");
                 if let Err(e) = net::configure_static(
                     &net.name,
                     addr,
@@ -180,18 +180,18 @@ impl Runtime {
             vec![]
         };
 
-        info!(unit = %name, path = %path, args = ?args, "starting service");
+        debug!(unit = %name, path = %path, args = ?args, "starting service");
 
         let child_pid = if let Some(ref tty_device) = svc.tty {
             let baud = svc.tty_baud.unwrap_or(115200);
-            info!(unit = %name, tty = %tty_device, baud, "starting terminal session");
+            debug!(unit = %name, tty = %tty_device, baud, "starting terminal session");
             tty::spawn_terminal(path, &args, tty_device, baud)?
         } else {
             init_core::child::spawn_service(path, &args)?.pid
         };
         self.pids.insert(child_pid, name.to_string());
 
-        info!(unit = %name, pid = child_pid, "service started");
+        debug!(unit = %name, pid = child_pid, "service started");
         Ok(())
     }
 
@@ -246,7 +246,7 @@ impl Runtime {
                     self.running = false;
                 }
                 libc::SIGHUP => {
-                    info!("SIGHUP received - reloading unit configuration");
+                    debug!("SIGHUP received - reloading unit configuration");
                     self.reload_units().await?;
                 }
                 libc::SIGPWR => {
@@ -391,7 +391,7 @@ impl Runtime {
         }
 
         // Phase 4: Sync filesystems and power off
-        info!("syncing filesystems and powering off");
+        debug!("syncing filesystems and powering off");
         unsafe { libc::sync() };
         unsafe { libc::reboot(libc::LINUX_REBOOT_CMD_POWER_OFF) };
 
@@ -409,7 +409,7 @@ impl Runtime {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         self.reap_and_restart().await?;
 
-        info!("syncing filesystems and powering off");
+        debug!("syncing filesystems and powering off");
         unsafe { libc::sync() };
         unsafe { libc::reboot(libc::LINUX_REBOOT_CMD_POWER_OFF) };
 
@@ -418,7 +418,7 @@ impl Runtime {
 
     async fn reload_units(&mut self) -> Result<()> {
         self.unit_registry = init_unit::load_all_units()?;
-        info!(units = self.unit_registry.len(), "units reloaded");
+        debug!(units = self.unit_registry.len(), "units reloaded");
         Ok(())
     }
 }

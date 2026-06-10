@@ -9,7 +9,7 @@
 //!   - exec the target command
 
 use anyhow::{Context, Result};
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 /// Fork and exec a command attached to a terminal device.
 ///
@@ -24,7 +24,7 @@ pub fn spawn_terminal(
     match unsafe { nix::unistd::fork() }.context("fork for terminal failed")? {
         nix::unistd::ForkResult::Parent { child } => {
             let pid = child.as_raw();
-            info!(pid, path = %path, tty = %tty, "terminal session spawned");
+            debug!(pid, path = %path, tty = %tty, "terminal session spawned");
             Ok(pid)
         }
         nix::unistd::ForkResult::Child => {

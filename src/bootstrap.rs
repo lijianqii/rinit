@@ -7,25 +7,25 @@
 //!   4. Set up default signal dispositions
 
 use anyhow::{Context, Result};
-use tracing::info;
+use tracing::{debug, info};
 
 /// Run all early initialisation steps.
 pub fn early_init() -> Result<()> {
-    info!("early bootstrap: mounting virtual filesystems");
+    debug!("early bootstrap: mounting virtual filesystems");
     init_core::fs::mount_virtual_fs().context("mount_virtual_fs")?;
 
-    info!("early bootstrap: opening /dev/console");
+    debug!("early bootstrap: opening /dev/console");
     claim_console();
 
-    info!("early bootstrap: mounting /etc/fstab entries");
+    debug!("early bootstrap: mounting /etc/fstab entries");
     init_core::fs::mount_fstab().unwrap_or_else(|e| {
         tracing::warn!(error = %e, "fstab mount failed, continuing");
     });
 
-    info!("early bootstrap: creating runtime directories");
+    debug!("early bootstrap: creating runtime directories");
     init_core::fs::create_run_dirs().context("create_run_dirs")?;
 
-    info!("early bootstrap: setting hostname");
+    debug!("early bootstrap: setting hostname");
     let hostname = std::fs::read_to_string("/etc/hostname")
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|_| "localhost".to_string());
@@ -33,10 +33,10 @@ pub fn early_init() -> Result<()> {
 
     init_core::cgroup::ensure_cgroup_root().ok();
 
-    info!("early bootstrap: blocking PID 1 signals");
+    debug!("early bootstrap: blocking PID 1 signals");
     init_core::signal::block_default_signals()?;
 
-    info!("early bootstrap: setting PR_SET_CHILD_SUBREAPER");
+    debug!("early bootstrap: setting PR_SET_CHILD_SUBREAPER");
     // PID 1 must be a subreaper so orphan grandchildren are
     // reaped by init instead of becoming zombies.
     if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) } != 0 {

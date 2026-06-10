@@ -7,7 +7,7 @@
 use anyhow::{Context, Result};
 use std::os::unix::io::AsRawFd;
 use std::net::UdpSocket;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// DHCP lease information returned by a successful negotiation.
 #[derive(Debug, Clone)]
@@ -44,7 +44,7 @@ fn ifup(ifname: &str) -> Result<libc::c_int> {
     let flags = unsafe { ifr.ifr_ifru.ifru_flags } as i16;
     ifr.ifr_ifru.ifru_flags = flags | libc::IFF_UP as i16 | libc::IFF_RUNNING as i16;
     unsafe { ioctl(sock, libc::SIOCSIFFLAGS, &mut ifr) };
-    info!(ifname, "interface brought up");
+    debug!(ifname, "interface brought up");
     Ok(sock)
 }
 
@@ -65,7 +65,7 @@ pub fn configure_static(
     unsafe { set_sin(&mut ifr.ifr_ifru.ifru_addr, mask, 0) };
     unsafe { ioctl(sock, libc::SIOCSIFNETMASK, &mut ifr) };
     unsafe { libc::close(sock) };
-    info!(ifname, addr=%addr_str, "static IP");
+    debug!(ifname, addr=%addr_str, "static IP");
     if let Some(gw) = gateway { add_default_route(gw)?; }
     if !dns.is_empty() { write_resolv_conf_str(dns)?; }
     Ok(())
@@ -105,7 +105,7 @@ pub fn run_dhcp(ifname: &str) -> Result<DhcpLease> {
             .unwrap().as_secs() as u32);
 
     // Build and send DHCPDISCOVER
-    info!(ifname, xid, "DHCP DISCOVER");
+    debug!(ifname, xid, "DHCP DISCOVER");
     let mac = get_iface_mac(ifname).unwrap_or([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
     let discover = build_dhcp_packet(1, xid, &mac, DHCP_OPT_DISCOVER, None);
     socket.send_to(&discover, "255.255.255.255:67")?;
@@ -117,7 +117,7 @@ pub fn run_dhcp(ifname: &str) -> Result<DhcpLease> {
     let server_id = offer.server_id
         .with_context(|| "DHCPOFFER missing server-id")?;
     let yiaddr = u32::from_be_bytes([buf[16], buf[17], buf[18], buf[19]]);
-    info!(ifname, addr=%fmt_ip(yiaddr), "DHCP OFFER");
+    debug!(ifname, addr=%fmt_ip(yiaddr), "DHCP OFFER");
 
     // Send DHCPREQUEST
     let request = build_dhcp_packet(1, xid, &mac, DHCP_OPT_REQUEST, Some(&server_id));
@@ -126,7 +126,7 @@ pub fn run_dhcp(ifname: &str) -> Result<DhcpLease> {
     // Receive DHCPACK
     let (len, _) = socket.recv_from(&mut buf)?;
     let ack = parse_dhcp_packet(&buf[..len])?;
-    info!(ifname, "DHCP ACK");
+    debug!(ifname, "DHCP ACK");
 
     // Extract lease
     let ip = u32::from_be_bytes([buf[16], buf[17], buf[18], buf[19]]);
@@ -249,7 +249,7 @@ fn apply_lease(
     unsafe { ioctl(sock, libc::SIOCSIFNETMASK, &mut ifr) };
     unsafe { libc::close(sock) };
 
-    info!(ifname, addr=%fmt_ip(ip), mask=%fmt_ip(netmask), "DHCP lease applied");
+    debug!(ifname, addr=%fmt_ip(ip), mask=%fmt_ip(netmask), "DHCP lease applied");
 
     if let Some(gw) = gateway {
         add_default_route(&fmt_ip(gw))?;

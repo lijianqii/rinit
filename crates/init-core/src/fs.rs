@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use nix::mount::{mount, MsFlags};
 use std::path::Path;
-use tracing::info;
+use tracing::debug;
 
 /// Mount the essential virtual filesystems.
 ///
@@ -17,7 +17,7 @@ pub fn mount_virtual_fs() -> Result<()> {
     std::fs::create_dir_all("/dev/pts").ok();
     mount_fs(Some("devpts"), "/dev/pts", "devpts", MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC, Some("gid=5,mode=0620"))?;
 
-    info!("virtual filesystems mounted");
+    debug!("virtual filesystems mounted");
     Ok(())
 }
 
@@ -43,7 +43,7 @@ pub fn mount_fs(
 pub fn set_hostname(name: &str) -> Result<()> {
     nix::unistd::sethostname(name)
         .context("failed to set hostname")?;
-    info!(hostname = %name, "hostname set");
+    debug!(hostname = %name, "hostname set");
     Ok(())
 }
 
@@ -150,7 +150,7 @@ pub fn mount_fstab() -> Result<()> {
         tracing::debug!("no fstab entries to mount");
         return Ok(());
     }
-    tracing::info!(count = entries.len(), "mounting filesystems from /etc/fstab");
+    debug!(count = entries.len(), "mounting filesystems from /etc/fstab");
     for entry in &entries {
         let flags = parse_mount_options(&entry.options);
         let source = if entry.device == "none" { None } else { Some(entry.device.as_str()) };

@@ -11,7 +11,7 @@
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::os::unix::io::RawFd;
-use tracing::{debug, info};
+use tracing::debug;
 
 /// Parsed kernel uevent.
 #[derive(Debug, Clone, Default)]
@@ -107,7 +107,7 @@ impl UeventSocket {
         let data = &buf[..n as usize];
         let uevent = parse_uevent(data)?;
 
-        info!(
+        debug!(
             action = %uevent.action,
             devpath = %uevent.devpath,
             devname = ?uevent.devname,
