@@ -111,7 +111,7 @@ async fn supervise(signals: &mut SignalSet, manager: &mut UnitManager, notify: &
             rlog!("error: {unit} did not signal readiness in time; stopping it");
         }
         for unit in manager.due_kills() {
-            rlog!("error: {unit} ignored SIGTERM; killed");
+            rlog!("error: {unit} did not stop in time; killed");
         }
         for unit in manager.due_health_probes() {
             rlog!("probing {unit}");
@@ -191,7 +191,7 @@ async fn stop_and_reap(manager: &mut UnitManager) {
         let killed = manager.due_kills();
         let just_killed = !killed.is_empty();
         for unit in killed {
-            rlog!("error: {unit} ignored SIGTERM; killed");
+            rlog!("error: {unit} did not stop in time; killed");
         }
 
         match manager.next_kill_in() {

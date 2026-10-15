@@ -91,6 +91,8 @@ pub struct UnitRuntime {
     /// Set when a stop was requested *to restart*, not to end the unit: a health
     /// failure that asks for a restart. The next reaped exit honours it.
     pub restart_after_stop: bool,
+    /// The running `ExecStop=` command's pid, if one is in flight (plan §1.1).
+    pub exec_stop_pid: Option<libc::pid_t>,
     /// The last `STATUS=` text, for `rctl status`.
     pub status: Option<String>,
     /// The last outcome, kept for logging and `rctl status`.
@@ -122,6 +124,7 @@ impl UnitRuntime {
             probe_deadline: None,
             healthy: None,
             restart_after_stop: false,
+            exec_stop_pid: None,
             status: None,
             last_outcome: None,
         }
@@ -457,6 +460,7 @@ impl UnitManager {
         rt.state = UnitState::Starting;
         rt.restart_at = None;
         rt.kill_at = None;
+        rt.exec_stop_pid = None;
 
         match kind {
             // `simple` is live the moment it is exec'd.
@@ -545,7 +549,9 @@ impl UnitManager {
 
     /// Units that ignored the start-timeout `SIGTERM` and must be `SIGKILL`ed.
     ///
-    /// Returns the units whose process group was signalled, in name order.
+    /// Returns the units whose process group was signalled, in name order. An
+    /// in-flight `ExecStop=` command is killed too: a stuck stop command must
+    /// not keep the unit alive past its timeout.
     pub fn due_kills(&mut self) -> Vec<UnitName> {
         let now = Instant::now();
         let mut due = Vec::new();
@@ -554,6 +560,9 @@ impl UnitManager {
                 && at <= now
             {
                 rt.kill_at = None;
+                if let Some(stop_pid) = rt.exec_stop_pid.take() {
+                    let _ = process::kill_process_group(stop_pid, libc::SIGKILL);
+                }
                 if let Some(pid) = rt.pid {
                     match process::kill_process_group(pid, libc::SIGKILL) {
                         Ok(()) => due.push(name.clone()),
@@ -681,6 +690,14 @@ impl UnitManager {
             .map(|(name, _)| name.clone())
     }
 
+    /// The unit whose `ExecStop=` command `pid` belongs to, if any.
+    fn exec_stop_owner(&self, pid: libc::pid_t) -> Option<UnitName> {
+        self.units
+            .iter()
+            .find(|(_, rt)| rt.exec_stop_pid == Some(pid))
+            .map(|(name, _)| name.clone())
+    }
+
     /// Record a finished probe and act on the verdict (plan §1.3(5)).
     ///
     /// A health failure is not a crash: it is marked, and only restarts when
@@ -729,15 +746,16 @@ impl UnitManager {
         }
     }
 
-    /// Signal a unit's process group to stop.
+    /// Stop a running unit.
     ///
     /// A pending restart is cancelled: an explicit stop beats an automatic one
     /// (plan §1.3(13)).
     ///
-    /// The stop is two-stage (plan §1.1, §1.3(12)): `SIGTERM` now, and a
-    /// `SIGKILL` deadline `TimeoutStopSec` later - immediately, when it is `0`.
-    /// [`due_kills`](Self::due_kills) fires that deadline. Without it, a service
-    /// that ignores `SIGTERM` would never be killed, on shutdown or otherwise.
+    /// `ExecStop=`, when set, *is* the stop action; otherwise `SIGTERM` goes to
+    /// the process group (plan §1.1). Either way the stop is two-stage: the
+    /// `SIGKILL` deadline is armed at `TimeoutStopSec` (immediately, when it is
+    /// `0`) and [`due_kills`](Self::due_kills) fires it. Without that, a service
+    /// that ignores the stop would never be killed.
     pub fn stop_unit(&mut self, unit: &UnitName) {
         let Some(rt) = self.units.get_mut(unit) else {
             return;
@@ -756,17 +774,21 @@ impl UnitManager {
             let _ = process::kill_process_group(pid, libc::SIGKILL);
         }
 
-        match rt.pid {
-            Some(pid) => match process::kill_process_group(pid, libc::SIGTERM) {
+        let Some(pid) = rt.pid else {
+            // No process: an `Active(Exited)` oneshot and anything already down
+            // both land straight in Inactive (plan §1.3(3) skips Deactivating
+            // when there is nothing to signal).
+            rt.state = UnitState::Inactive;
+            return;
+        };
+
+        let mut stopping = false;
+        let stop_cmd = rt.config.exec_stop.argv().to_vec();
+        if stop_cmd.is_empty() {
+            match process::kill_process_group(pid, libc::SIGTERM) {
                 Ok(()) => {
                     rt.state = UnitState::Deactivating;
-                    if rt.config.timeout_stop_sec == 0 {
-                        // Plan §1.1: `TimeoutStopSec=0` means SIGKILL at once.
-                        let _ = process::kill_process_group(pid, libc::SIGKILL);
-                    } else {
-                        rt.kill_at =
-                            Some(Instant::now() + Duration::from_secs(rt.config.timeout_stop_sec));
-                    }
+                    stopping = true;
                     rlog!("stopping {unit} (pgid {pid})");
                 }
                 Err(e) if e.errno() == libc::ESRCH => {
@@ -777,12 +799,42 @@ impl UnitManager {
                     rt.state = UnitState::Inactive;
                 }
                 Err(e) => rlog!("warning: SIGTERM to {unit} failed: {e}"),
-            },
-            // No process: an `Active(Exited)` oneshot and anything already
-            // down both land straight in Inactive (plan §1.3(3) skips
-            // Deactivating when there is nothing to signal).
-            None => {
-                rt.state = UnitState::Inactive;
+            }
+        } else {
+            let env = build_service_env(&rt.config, &[]);
+            let cwd = rt.config.working_directory.clone();
+            match spawn_service_in_group(&stop_cmd, &env, Some(&cwd)) {
+                Ok(stop_pid) => {
+                    rt.exec_stop_pid = Some(stop_pid);
+                    rt.state = UnitState::Deactivating;
+                    stopping = true;
+                    rlog!("stopping {unit} (ExecStop pid {stop_pid})");
+                }
+                Err(e) => {
+                    // A stop command that cannot run must not strand the unit:
+                    // fall back to the signal.
+                    rlog!("warning: {unit}: cannot start ExecStop: {e}; sending SIGTERM");
+                    match process::kill_process_group(pid, libc::SIGTERM) {
+                        Ok(()) => {
+                            rt.state = UnitState::Deactivating;
+                            stopping = true;
+                        }
+                        Err(e) if e.errno() == libc::ESRCH => {
+                            rt.pid = None;
+                            rt.state = UnitState::Inactive;
+                        }
+                        Err(e) => rlog!("warning: SIGTERM to {unit} failed: {e}"),
+                    }
+                }
+            }
+        }
+
+        if stopping {
+            if rt.config.timeout_stop_sec == 0 {
+                // Plan §1.1: `TimeoutStopSec=0` means SIGKILL at once.
+                let _ = process::kill_process_group(pid, libc::SIGKILL);
+            } else {
+                rt.kill_at = Some(Instant::now() + Duration::from_secs(rt.config.timeout_stop_sec));
             }
         }
     }
@@ -800,6 +852,14 @@ impl UnitManager {
         // death (plan §1.3(5)).
         if let Some(unit) = self.probe_owner(pid) {
             self.finish_probe(&unit, outcome);
+            return None;
+        }
+        // So is an `ExecStop=` command: its exit is not the service exiting.
+        if let Some(unit) = self.exec_stop_owner(pid) {
+            if let Some(rt) = self.units.get_mut(&unit) {
+                rt.exec_stop_pid = None;
+            }
+            rlog!("{unit}: ExecStop finished");
             return None;
         }
 
@@ -1666,6 +1726,26 @@ mod tests {
     }
 
     // --- two-stage stop (plan §1.1) -------------------------------------
+
+    /// `ExecStop=`, when set, is the stop action: the service is asked to stop
+    /// by the command rather than by a signal.
+    #[test]
+    fn exec_stop_is_used_as_the_stop_action() {
+        let mut m = manager_with("a.service", RestartPolicy::No);
+        let unit = UnitName::parse("a.service").unwrap();
+        m.units.get_mut(&unit).unwrap().config.exec_stop =
+            rinit_core::ExecCommand::new(vec!["/bin/true".to_string()]);
+        spawn_pid(&mut m, &unit);
+
+        m.stop_unit(&unit);
+
+        let rt = m.get(&unit).unwrap();
+        assert_eq!(rt.state, UnitState::Deactivating);
+        assert!(rt.exec_stop_pid.is_some(), "ExecStop must be running");
+        assert!(rt.kill_at.is_some(), "the SIGKILL escalation still applies");
+
+        cleanup(&mut m, &unit);
+    }
 
     /// Plan §1.3(13): a unit that fails to start fails everything that
     /// hard-`Requires=` it, so the dependents are not started on a broken

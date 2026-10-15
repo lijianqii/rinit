@@ -238,7 +238,36 @@ fn a_unit_that_cannot_start_fails_its_required_dependents() {
     );
 }
 
-/// Plan §1.1: a two-stage stop. A service that ignores `SIGTERM` must still be
+/// Plan §1.1: `ExecStop=`, when set, is the stop action; the `SIGKILL`
+/// escalation still applies if the service does not actually stop.
+#[test]
+fn exec_stop_runs_as_the_stop_action() {
+    let dir = TempDir::new("execstop");
+    dir.write("all.target", "[Unit]\nType=target\nRequires=app.service\n");
+    // The service itself never exits on its own; `ExecStop` just records that
+    // it ran, so the timeout has to escalate.
+    let app = r#"[Service]
+Type=simple
+ExecStart=/bin/sh -c "while :; do sleep 1; done"
+ExecStop=/bin/sh -c "echo MARK_EXECSTOP"
+TimeoutStopSec=1
+"#;
+    dir.write("app.service", app);
+
+    let log = boot_units(&dir, "all.target", Duration::from_millis(700));
+
+    assert!(
+        log.contains("ExecStop pid"),
+        "ExecStop must be the stop action:\n{log}"
+    );
+    assert!(log.contains("MARK_EXECSTOP"), "ExecStop must run:\n{log}");
+    assert!(
+        log.contains("did not stop in time; killed"),
+        "the timeout must still escalate:\n{log}"
+    );
+}
+
+/// Plan §1.1: a service that ignores `SIGTERM` must still be
 /// `SIGKILL`ed once `TimeoutStopSec` expires - otherwise shutdown would leave
 /// it running forever.
 #[test]
@@ -264,7 +293,7 @@ TimeoutStopSec=1
 
     assert!(log.contains("boot complete"), "boot must finish:\n{log}");
     assert!(
-        log.contains("stubborn.service ignored SIGTERM; killed"),
+        log.contains("stubborn.service did not stop in time; killed"),
         "the stop timeout must escalate to SIGKILL:\n{log}"
     );
     assert!(
