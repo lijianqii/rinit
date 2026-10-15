@@ -115,8 +115,12 @@ $(BUSYBOX_SRC)/.config: $(BUSYBOX_TARBALL)
 	# initramfs: static linking (the cpio has no ld.so/libc, /bin/sh must
 	# be static) and the tc applet (networking/tc.c does not compile against
 	# current kernel UAPI headers: struct tc_cbq_wrropt was removed upstream).
+	# The cross prefix makes every busybox make in the tree (notably the
+	# `install` step in build-initramfs.sh) compile for aarch64 by default.
 	sed -i -e 's/^# CONFIG_STATIC is not set$$/CONFIG_STATIC=y/' \
-	       -e 's/^CONFIG_TC=y$$/# CONFIG_TC is not set/' $(BUSYBOX_SRC)/.config
+	       -e 's/^CONFIG_TC=y$$/# CONFIG_TC is not set/' \
+	       -e 's/^CONFIG_CROSS_COMPILER_PREFIX=""$$/CONFIG_CROSS_COMPILER_PREFIX="aarch64-linux-gnu-"/' \
+	       $(BUSYBOX_SRC)/.config
 
 busybox: $(BUSYBOX_BIN)
 

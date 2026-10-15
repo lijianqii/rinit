@@ -66,7 +66,20 @@ if [[ -n "${busybox_src}" ]]; then
         echo "error: ${busybox_src}/busybox not built" >&2
         exit 1
     fi
-    make -C "${busybox_src}" CONFIG_PREFIX="${work}" install >/dev/null
+    # busybox's Makefile only reads the cross prefix from the command line or
+    # CONFIG_CROSS_COMPILER_PREFIX in .config (defconfig leaves it empty).
+    # Without passing it here the install step silently recompiles busybox with
+    # the HOST compiler and overwrites the cross-built binary.
+    cross=""
+    bbox_arch=""
+    case "${triple}" in
+        aarch64-*) cross="aarch64-linux-gnu-"; bbox_arch="arm64" ;;
+    esac
+    if [[ -n "${cross}" ]]; then
+        make -C "${busybox_src}" CONFIG_PREFIX="${work}" CROSS_COMPILE="${cross}" ARCH="${bbox_arch}" install >/dev/null
+    else
+        make -C "${busybox_src}" CONFIG_PREFIX="${work}" install >/dev/null
+    fi
     printf 'root:x:0:0:root:/root:/bin/sh\n' >"${work}/etc/passwd"
     printf 'root:x:0:\n' >"${work}/etc/group"
 fi
