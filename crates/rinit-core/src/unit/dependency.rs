@@ -108,7 +108,20 @@ pub struct DependencyGraph {
     /// Every known unit, sorted by name for deterministic iteration.
     units: Vec<UnitName>,
     /// For each unit index, the indices it must wait for before starting.
+    ///
+    /// This is the *ordering* relation: `Requires=`, `Wants=`, `After=` and the
+    /// mirror of `Before=`. Used by [`levels`](Self::levels) and
+    /// [`topological_order`](Self::topological_order).
     dependencies: Vec<Vec<usize>>,
+    /// For each unit index, the indices it *activates*: `Requires=`/`Wants=`
+    /// only. Used by [`closure_of`](Self::closure_of).
+    ///
+    /// Kept separate from `dependencies` because plan §1.1 makes `After=`
+    /// ordering-only: an `After=`-referenced unit must be ordered first *if it
+    /// is started anyway*, but must never be started *because of* that
+    /// reference. Folding both into one adjacency (which this used to do) made
+    /// `app.service` with `After=db.service` pull `db.service` into the boot.
+    activations: Vec<Vec<usize>>,
     /// Soft references that could not be resolved, reported as warnings.
     pub warnings: Vec<String>,
 }
@@ -137,6 +150,7 @@ impl DependencyGraph {
 
         let index_of = |name: &UnitName| units.iter().position(|u| u == name);
         let mut dependencies: Vec<Vec<usize>> = vec![Vec::new(); units.len()];
+        let mut activations: Vec<Vec<usize>> = vec![Vec::new(); units.len()];
         let mut warnings = Vec::new();
 
         for cfg in &configs {
@@ -195,12 +209,17 @@ impl DependencyGraph {
                 // silently ignored (plan §4.1 lists self-dependency as a DAG
                 // case).
                 push_unique(&mut dependencies[me], other);
+                // Only `Requires=`/`Wants=` activate (plan §1.1).
+                if matches!(edge, Edge::Requires | Edge::Wants) {
+                    push_unique(&mut activations[me], other);
+                }
             }
         }
 
         let graph = DependencyGraph {
             units,
             dependencies,
+            activations,
             warnings,
         };
         graph.check_acyclic()?;
@@ -372,10 +391,11 @@ impl DependencyGraph {
         self.topological_order().map(|_| ())
     }
 
-    /// Everything `target` transitively pulls in, including itself.
+    /// Everything `target` transitively *activates*, including itself.
     ///
-    /// `Conflicts=` is excluded: a mutual exclusion never *pulls in* a unit.
-    /// The result is sorted for determinism.
+    /// Activation is `Requires=`/`Wants=` only (plan §1.1): `After=`/`Before=`
+    /// are ordering-only, and a `Conflicts=` is an exclusion, so neither pulls
+    /// a unit in. The result is sorted for determinism.
     pub fn closure_of(&self, target: &UnitName) -> Vec<UnitName> {
         let mut out: Vec<UnitName> = Vec::new();
         let mut stack = vec![target.clone()];
@@ -383,9 +403,17 @@ impl DependencyGraph {
             if out.contains(&unit) {
                 continue;
             }
+            let activated: Vec<UnitName> = match self.units.iter().position(|u| u == &unit) {
+                Some(i) => self.activations[i]
+                    .iter()
+                    .filter_map(|&d| self.units.get(d))
+                    .cloned()
+                    .collect(),
+                None => Vec::new(),
+            };
             out.push(unit.clone());
-            for dep in self.dependencies_of(&unit) {
-                stack.push(dep.clone());
+            for dep in activated {
+                stack.push(dep);
             }
         }
         out.sort();
@@ -724,6 +752,50 @@ mod tests {
         assert!(closure.contains(&name("b.service")), "{closure:?}");
         assert!(closure.contains(&name("all.target")), "{closure:?}");
         assert!(!closure.contains(&name("unrelated.service")), "{closure:?}");
+    }
+
+    /// Plan §1.1: `After=` is ordering-only, so it must *not* activate the
+    /// referenced unit. A unit that only says `After=db.service` must not drag
+    /// `db.service` into the boot - it is only ordered after it, if it happens
+    /// to be started for some other reason.
+    #[test]
+    fn after_does_not_activate_the_referenced_unit() {
+        let configs = vec![
+            unit("db.service", &[], &[], UnitType::Service),
+            // Only ordering: no Requires/Wants.
+            unit("app.service", &[], &["db.service"], UnitType::Service),
+        ];
+        let graph = DependencyGraph::build(&configs).unwrap();
+
+        // Ordering is still recorded...
+        assert_eq!(
+            graph.dependencies_of(&name("app.service")),
+            [name("db.service")],
+            "After= still orders app after db"
+        );
+        // ...but app does not activate db.
+        let closure = graph.closure_of(&name("app.service"));
+        assert_eq!(
+            closure,
+            [name("app.service")],
+            "After= must not pull the referenced unit in: {closure:?}"
+        );
+    }
+
+    /// `Wants=` is a weak *activation*, so unlike `After=` it does pull the
+    /// referenced unit in.
+    #[test]
+    fn wants_activates_the_referenced_unit() {
+        let mut app = unit("app.service", &[], &[], UnitType::Service);
+        app.deps.wants = vec![name("metrics.service")];
+        let configs = vec![app, unit("metrics.service", &[], &[], UnitType::Service)];
+        let graph = DependencyGraph::build(&configs).unwrap();
+
+        let closure = graph.closure_of(&name("app.service"));
+        assert!(
+            closure.contains(&name("metrics.service")),
+            "Wants= must activate: {closure:?}"
+        );
     }
 
     #[test]

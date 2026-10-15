@@ -298,6 +298,34 @@ mod tests {
         assert!(config_of(&plan, &UnitName::parse("unrelated.service").unwrap()).is_some());
     }
 
+    /// Plan §1.1: `After=` orders but does not activate, so a unit referenced
+    /// only by `After=` must not be started. Regression guard for the boot plan
+    /// following the ordering relation as if it were an activation one.
+    #[test]
+    fn an_after_only_reference_is_not_started() {
+        let dir = TempDir::new("after-only");
+        dir.write(
+            "multi-user.target",
+            "[Unit]\nType=target\nRequires=app.service\n",
+        );
+        dir.write(
+            "app.service",
+            "[Unit]\nAfter=helper.service\n[Service]\nExecStart=/bin/true\n",
+        );
+        dir.write("helper.service", "[Unit]\n[Service]\nExecStart=/bin/true\n");
+
+        let plan = plan_boot(&dir.0, "multi-user.target").unwrap();
+        let scheduled: Vec<&UnitName> = plan.levels.iter().flatten().collect();
+        assert!(
+            !scheduled.contains(&&UnitName::parse("helper.service").unwrap()),
+            "After= must not schedule helper.service: {scheduled:?}"
+        );
+        assert!(
+            scheduled.contains(&&UnitName::parse("app.service").unwrap()),
+            "the required unit is still scheduled: {scheduled:?}"
+        );
+    }
+
     /// Plan §1.3(1): a broken unit file must stop the boot with a message that
     /// names the file and the line.
     #[test]
