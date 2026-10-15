@@ -169,8 +169,7 @@ fn kill_process_group_reports_esrch_when_gone() {
     .expect("posix_spawn");
     drain_until_reaped(pid);
 
-    let err = process::kill_process_group(pid, libc::SIGTERM)
-        .expect_err("the group is empty");
+    let err = process::kill_process_group(pid, libc::SIGTERM).expect_err("the group is empty");
     assert_eq!(err.errno(), libc::ESRCH);
 }
 
@@ -204,7 +203,9 @@ fn drain_until_reaped(target: libc::pid_t) {
         let mut found = false;
         for ev in wait::reap_children() {
             match ev {
-                ChildExit::Exited { pid, .. } | ChildExit::Signaled { pid, .. } if pid == target => {
+                ChildExit::Exited { pid, .. } | ChildExit::Signaled { pid, .. }
+                    if pid == target =>
+                {
                     found = true;
                 }
                 _ => {}

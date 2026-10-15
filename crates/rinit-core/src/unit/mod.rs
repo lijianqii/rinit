@@ -29,10 +29,10 @@ pub use config::{
     Cap, CpuQuota, Dependencies, ExecCommand, RestartPolicy, ServiceKind, SizeBytes, UnitConfig,
 };
 pub use dependency::{DependencyError, DependencyGraph};
-pub use job::{Job, JobQueue, JobTarget};
+pub use job::{Job, JobQueue, JobTarget, RequestSource};
 pub use parser::{ParseError, parse as parse_unit_file};
 pub use restart::{BackoffState, Jitter};
-pub use state::{ExitOutcome, FailedReason, UnitState};
+pub use state::{Effect, Event, ExitOutcome, FailedReason, TransitionError, UnitState, transition};
 
 /// The kind of a unit (plan §1.1 `[Unit] Type`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

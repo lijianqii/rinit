@@ -21,8 +21,6 @@
 
 use std::time::Duration;
 
-use crate::log::rlog;
-use crate::service::ServiceSet;
 use rinit_core::ServiceKind;
 
 /// How often to poll while waiting for a child to exit.
@@ -82,60 +80,6 @@ pub fn wait_for_exit(pid: libc::pid_t, timeout: Duration) -> Result<Option<i32>,
         }
         std::thread::sleep(POLL_INTERVAL);
     }
-}
-
-/// Wait for a batch of `oneshot` units, then forget them from supervision.
-///
-/// Each entry is `(unit name, pid, TimeoutStartSec)`. A unit that exits
-/// non-zero, dies on a signal, or times out is reported as a failure; the rest
-/// are still allowed to finish, because one broken initializer must not leave
-/// the remaining children unreaped.
-///
-/// # Errors
-/// Returns the names of the units that did not succeed, having already logged
-/// the detail.
-pub fn await_oneshots(
-    services: &mut ServiceSet,
-    batch: &[(String, libc::pid_t, u64)],
-) -> Vec<String> {
-    let mut failed = Vec::new();
-
-    for (name, pid, timeout_sec) in batch {
-        // Plan §1.1: `TimeoutStartSec=0` means wait forever.
-        let timeout = if *timeout_sec == 0 {
-            Duration::from_secs(u32::MAX as u64)
-        } else {
-            Duration::from_secs(*timeout_sec)
-        };
-
-        match wait_for_exit(*pid, timeout) {
-            Ok(Some(0)) => {
-                rlog!("{name} completed (Active(Exited))");
-            }
-            Ok(Some(code)) => {
-                rlog!("error: {name} exited {code}");
-                failed.push(name.clone());
-            }
-            Ok(None) => {
-                rlog!("error: {name} was killed by a signal");
-                failed.push(name.clone());
-            }
-            Err(()) => {
-                // Distinguish "hung" from "vanished" by asking supervision.
-                if services.contains(*pid) {
-                    rlog!("error: {name} timed out after {timeout_sec}s");
-                } else {
-                    rlog!("error: {name} could not be waited for");
-                }
-                failed.push(name.clone());
-            }
-        }
-        // Either way the child is gone (or hopeless), so stop tracking it and
-        // leave shutdown with nothing to signal.
-        services.forget(*pid);
-    }
-
-    failed
 }
 
 #[cfg(test)]
@@ -204,86 +148,34 @@ mod tests {
         let _ = wait_for_exit(pid, Duration::from_secs(5));
     }
 
+    /// Plan §1.1: `TimeoutStartSec=0` means wait forever, not zero seconds, so
+    /// a zero timeout must not report failure the instant it is reached.
     #[test]
-    fn awaiting_oneshots_forgets_them_afterwards() {
-        let mut services = ServiceSet::new();
-        let pid = services
-            .spawn(&[
-                "/bin/sh".to_string(),
-                "-c".to_string(),
-                "exit 0".to_string(),
-            ])
-            .expect("spawn");
+    fn a_zero_timeout_does_not_expire_immediately() {
+        let mut backoff = crate::unit_manager::UnitManager::new();
+        let unit = rinit_core::UnitName::parse("t.service").unwrap();
+        let mut cfg = rinit_core::UnitConfig::new(unit.clone());
+        cfg.exec_start = rinit_core::ExecCommand::new(vec!["/bin/true".to_string()]);
+        cfg.timeout_start_sec = 0;
+        backoff.add(cfg);
 
-        let failed = await_oneshots(&mut services, &[("init.service".to_string(), pid, 10)]);
-        assert!(failed.is_empty(), "{failed:?}");
-        assert!(services.pids().is_empty(), "the child must be forgotten");
+        let pid = spawn_pid(&mut backoff, &unit);
+        // With no timeout the wait is unbounded, so the only way this returns is
+        // the child exiting - which it does immediately.
+        assert_eq!(wait_for_exit(pid, unbounded()), Ok(Some(0)));
     }
 
-    /// A failing initializer must be named, and must not leave the others
-    /// unreaped.
-    #[test]
-    fn awaiting_oneshots_reports_failures_and_keeps_going() {
-        let mut services = ServiceSet::new();
-        let bad = services
-            .spawn(&[
-                "/bin/sh".to_string(),
-                "-c".to_string(),
-                "exit 1".to_string(),
-            ])
-            .expect("spawn");
-        let good = services
-            .spawn(&[
-                "/bin/sh".to_string(),
-                "-c".to_string(),
-                "exit 0".to_string(),
-            ])
-            .expect("spawn");
-
-        let failed = await_oneshots(
-            &mut services,
-            &[
-                ("bad.service".to_string(), bad, 10),
-                ("good.service".to_string(), good, 10),
-            ],
-        );
-        assert_eq!(failed, ["bad.service"]);
-        assert!(services.pids().is_empty(), "both must be reaped");
+    /// The unbounded wait that `TimeoutStartSec=0` maps to.
+    fn unbounded() -> Duration {
+        Duration::from_secs(u32::MAX as u64)
     }
 
-    /// `TimeoutStartSec=0` means wait forever, not wait zero seconds.
-    #[test]
-    fn a_zero_timeout_does_not_fail_immediately() {
-        let mut services = ServiceSet::new();
-        let pid = services.spawn(&["/bin/true".to_string()]).expect("spawn");
-        let failed = await_oneshots(&mut services, &[("t.service".to_string(), pid, 0)]);
-        assert!(failed.is_empty(), "0 must mean 'no timeout': {failed:?}");
-    }
-
-    /// A hung `oneshot` must time out, be named, and be stopped being tracked:
-    /// leaving it in the set would have shutdown try to SIGTERM a dead pid.
-    #[test]
-    fn a_hung_oneshot_times_out_and_is_named() {
-        let mut services = ServiceSet::new();
-        let pid = services
-            .spawn(&[
-                "/bin/sh".to_string(),
-                "-c".to_string(),
-                "sleep 30".to_string(),
-            ])
-            .expect("spawn");
-        assert!(services.contains(pid));
-
-        // TimeoutStartSec=1, so the wait is bounded and the test is quick.
-        let failed = await_oneshots(&mut services, &[("slow.service".to_string(), pid, 1)]);
-        assert_eq!(failed, ["slow.service"], "a hung initializer must fail");
-        assert!(
-            services.pids().is_empty(),
-            "a timed-out child must no longer be supervised"
-        );
-
-        // Clean up the child itself so it does not linger.
-        process::kill(pid, libc::SIGKILL).ok();
-        let _ = wait_for_exit(pid, Duration::from_secs(5));
+    /// Spawn a unit and return the pid the manager tracked for it.
+    fn spawn_pid(
+        m: &mut crate::unit_manager::UnitManager,
+        unit: &rinit_core::UnitName,
+    ) -> libc::pid_t {
+        m.spawn_unit(unit).expect("spawn");
+        m.get(unit).and_then(|rt| rt.pid).expect("a tracked pid")
     }
 }

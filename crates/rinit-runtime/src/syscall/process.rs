@@ -79,9 +79,10 @@ pub fn posix_spawn_with(
             return Err(SyscallError::last_os_error("posix_spawnattr_init"));
         }
         let mut flags: libc::c_short = 0;
-        // SAFETY: `posix_spawnattr_getflags` writes through the pointer it is
-        // given, and we pass a valid local.
-        unsafe { libc::posix_spawnattr_getflags(&mut attrs, &mut flags) };
+        // SAFETY: `posix_spawnattr_getflags` takes the attributes by const
+        // pointer and writes the flags through the pointer it is given; both
+        // are valid locals.
+        unsafe { libc::posix_spawnattr_getflags(&attrs, &mut flags) };
         flags |= libc::POSIX_SPAWN_SETPGROUP as libc::c_short;
         // SAFETY: as above.
         unsafe { libc::posix_spawnattr_setflags(&mut attrs, flags) };

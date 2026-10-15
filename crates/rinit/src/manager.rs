@@ -135,8 +135,6 @@ pub fn describe_plan(plan: &BootPlan) -> Vec<String> {
 pub struct LevelEntry<'a> {
     /// The unit being started.
     pub name: &'a UnitName,
-    /// Its `argv`, with `argv[0]` the program.
-    pub argv: &'a [String],
     /// How startup completion is judged (plan §1.3(3)).
     pub kind: ServiceKind,
     /// `TimeoutStartSec`; `0` means wait forever (plan §1.1).
@@ -153,7 +151,6 @@ pub fn commands_in_level<'a>(plan: &'a BootPlan, level: &'a [UnitName]) -> Vec<L
             let cfg = config_of(plan, name)?;
             spawns_process(cfg).then_some(LevelEntry {
                 name,
-                argv: cfg.exec_start.argv(),
                 kind: cfg.service_kind,
                 timeout_start_sec: cfg.timeout_start_sec,
             })

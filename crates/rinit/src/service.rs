@@ -54,34 +54,60 @@ impl ServiceSet {
     pub fn forget(&mut self, pid: libc::pid_t) {
         self.pids.retain(|&p| p != pid);
     }
-
-    /// Whether `pid` is still being supervised.
-    pub fn contains(&self, pid: libc::pid_t) -> bool {
-        self.pids.contains(&pid)
-    }
 }
 
-/// Launch `argv` with [`SERVICE_ENV`].
+/// Launch `argv` with [`SERVICE_ENV`], in a fresh process group.
+///
+/// Every service goes through this rather than [`spawn_service`], so that
+/// stopping a unit signals its whole process group and reaches children the
+/// service forked itself (plan §1.3(6)).
+///
+/// # Errors
+/// `argv` must be non-empty and contain no interior NUL bytes.
+pub fn spawn_service_in_group(argv: &[String]) -> Result<libc::pid_t, RuntimeError> {
+    let (argv, envp) = prepare(argv)?;
+    let path = argv[0].as_c_str();
+    process::posix_spawn_with(
+        path,
+        &argv,
+        &envp,
+        process::SpawnOptions::with_process_group(),
+    )
+    .map_err(RuntimeError::from)
+}
+
+/// Launch `argv` with [`SERVICE_ENV`] in rinit's own process group.
+///
+/// Kept for bring-up and tests that need the child to share rinit's group.
 ///
 /// # Errors
 /// `argv` must be non-empty and contain no interior NUL bytes.
 pub fn spawn_service(argv: &[String]) -> Result<libc::pid_t, RuntimeError> {
+    let (argv, envp) = prepare(argv)?;
+    let path = argv[0].as_c_str();
+    process::posix_spawn(path, &argv, &envp).map_err(RuntimeError::from)
+}
+
+/// Turn `argv` into the C forms `posix_spawn` needs, plus the resolved path.
+fn prepare(argv: &[String]) -> Result<(Vec<CString>, Vec<CString>), RuntimeError> {
     // `argv[0]` must be included for posix_spawn (it becomes the program name).
     let argv: Vec<CString> = argv
         .iter()
         .map(|a| cstring("service argv", a))
         .collect::<Result<_, _>>()
         .map_err(RuntimeError::from)?;
-    let path = argv.first().ok_or_else(|| RuntimeError::Io {
-        op: "service argv",
-        source: std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty command"),
-    })?;
+    if argv.is_empty() {
+        return Err(RuntimeError::Io {
+            op: "service argv",
+            source: std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty command"),
+        });
+    }
     let envp: Vec<CString> = SERVICE_ENV
         .iter()
         .map(|e| cstring("service env", e))
         .collect::<Result<_, _>>()
         .map_err(RuntimeError::from)?;
-    process::posix_spawn(path.as_c_str(), &argv, &envp).map_err(RuntimeError::from)
+    Ok((argv, envp))
 }
 
 /// Drain every exited child and log it. Returns how many were reaped.

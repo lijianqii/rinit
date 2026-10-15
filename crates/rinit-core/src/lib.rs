@@ -22,7 +22,9 @@ pub mod error;
 pub mod unit;
 
 pub use error::CoreError;
+pub use unit::state::{Effect, Event, ExitOutcome, TransitionError, transition};
 pub use unit::{
-    DependencyError, DependencyGraph, ExecCommand, ParseError, RestartPolicy, ServiceKind,
-    UnitConfig, UnitName, UnitType,
+    DependencyError, DependencyGraph, ExecCommand, FailedReason, Job, JobQueue, JobTarget,
+    ParseError, RequestSource, RestartPolicy, ServiceKind, UnitConfig, UnitName, UnitState,
+    UnitType,
 };

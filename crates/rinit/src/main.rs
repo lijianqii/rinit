@@ -10,6 +10,7 @@ mod log;
 mod manager;
 mod readiness;
 mod service;
+mod unit_manager;
 
 use std::io::Write;
 use std::process::ExitCode;
