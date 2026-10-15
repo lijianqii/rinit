@@ -9,7 +9,7 @@
 //! unit directory, resolves the dependency graph, and starts each *level* of
 //! the schedule in parallel before moving on (plan §3 M1).
 
-use rinit_core::{ServiceKind, UnitName};
+use rinit_core::{Effect, RequestSource, ServiceKind, UnitName};
 use rinit_runtime::syscall::{process, reboot, signal};
 use rinit_runtime::{RuntimeError, Signal, SignalSet};
 
@@ -151,13 +151,19 @@ async fn supervise(signals: &mut SignalSet, manager: &mut UnitManager, notify: &
         }
     }
 
-    // Shutdown is ordered by the Job queue in M4; for now stop every unit and
-    // unlink its notify socket.
+    // Shutdown is a `ShutdownStop` request for everything the queue still
+    // wants running. Going through the queue rather than stopping each unit by
+    // hand is what gives shutdown its precedence (plan §1.3(11)): its source
+    // outranks a dependency start, so a unit cannot be pulled back up while the
+    // system is going down.
     for line in manager.summary() {
         rlog!("shutdown: {line}");
     }
-    for unit in manager.units_to_stop() {
-        manager.stop_unit(&unit);
+    for unit in manager.started_units() {
+        let effect = manager.request_stop(&unit, RequestSource::ShutdownStop);
+        if let Err(e) = apply_effect(manager, notify, &unit, effect) {
+            rlog!("warning: stopping {unit} failed: {e}");
+        }
     }
     notify.disarm_all();
     tokio::time::sleep(STOP_WAIT).await;
@@ -184,6 +190,46 @@ fn start_unit(
         _ => Vec::new(),
     };
     manager.spawn_unit_with_env(unit, &env)
+}
+
+/// Carry out what the Job queue decided for `unit` (plan §1.3(13)).
+///
+/// The manager owns the target, the state and the timers, so most effects are
+/// delegated straight back to it. The one thing it cannot do is `exec`: the
+/// notify socket lives with the async reactor, so the spawn happens here with
+/// the environment that socket needs.
+///
+/// Returns whether a process was spawned, which is what the boot log counts.
+fn apply_effect(
+    manager: &mut UnitManager,
+    notify: &mut NotifyHub,
+    unit: &UnitName,
+    effect: Option<Effect>,
+) -> Result<bool, RuntimeError> {
+    match effect {
+        None | Some(Effect::None) => Ok(false),
+        // `CancelBackoffAndStart` needs no extra step: taking the unit back to
+        // `Starting` clears `restart_at` on its way through.
+        Some(Effect::SpawnProcess | Effect::CancelBackoffAndStart) => {
+            start_unit(manager, notify, unit).map(|()| true)
+        }
+        Some(Effect::ClearStartLimitAndStart) => {
+            manager.clear_start_limit(unit);
+            start_unit(manager, notify, unit).map(|()| true)
+        }
+        // `stop_unit` cancels a pending restart too, so a stop is a stop.
+        Some(Effect::SendStopSignal | Effect::CancelBackoffAndStop) => {
+            manager.stop_unit(unit);
+            Ok(false)
+        }
+        // `JobQueue::reconcile` produces neither: a backoff is armed by the
+        // reaper, and a dependency failure is propagated where the graph
+        // lives. Reaching one here would be a bug worth seeing.
+        Some(Effect::ScheduleBackoff { .. } | Effect::PropagateFailure) => {
+            rlog!("warning: unexpected effect for {unit}; ignoring");
+            Ok(false)
+        }
+    }
 }
 
 /// Report what a reaped exit meant to a unit.
@@ -251,11 +297,17 @@ fn start_units(cfg: &Config, notify: &mut NotifyHub) -> Result<UnitManager, Runt
         let mut oneshots: Vec<(UnitName, libc::pid_t, u64)> = Vec::new();
         for entry in batch {
             let name = entry.name;
-            start_unit(&mut units, notify, name).map_err(|e| RuntimeError::Io {
-                op: "spawn unit",
-                source: std::io::Error::other(format!("{name}: {e}")),
-            })?;
-            started_units += 1;
+            // The boot schedule is a set of `Dependency` start requests, so a
+            // unit pulled in twice is started once (plan §1.3(11)).
+            let effect = units.request_start(name, RequestSource::Dependency);
+            let spawned =
+                apply_effect(&mut units, notify, name, effect).map_err(|e| RuntimeError::Io {
+                    op: "spawn unit",
+                    source: std::io::Error::other(format!("{name}: {e}")),
+                })?;
+            if spawned {
+                started_units += 1;
+            }
 
             // `oneshot` is only ready once it has exited 0. `simple` and the
             // M2 stand-in for `notify` are ready at exec.

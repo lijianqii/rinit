@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 use rinit_core::unit::config::{RestartPolicy, ServiceKind};
 use rinit_core::unit::dependency::spawns_process;
 use rinit_core::unit::restart::BackoffState;
-use rinit_core::{Event, ExitOutcome, FailedReason, NotifyMessage, UnitState, transition};
-use rinit_core::{UnitConfig, UnitName};
+use rinit_core::{Effect, Event, ExitOutcome, FailedReason, NotifyMessage, UnitState, transition};
+use rinit_core::{Job, JobQueue, JobTarget, RequestSource, UnitConfig, UnitName};
 
 use rinit_runtime::RuntimeError;
 use rinit_runtime::syscall::{process, wait};
@@ -172,6 +172,12 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 #[derive(Debug)]
 pub struct UnitManager {
     units: BTreeMap<UnitName, UnitRuntime>,
+    /// What each unit has been asked to become (plan §1.3(11)).
+    ///
+    /// The queue is the source of truth for *target* state; `units[..].state`
+    /// is where the unit actually is. Keeping them apart is what lets two
+    /// sources race without producing two decisions (plan §1.3(13)).
+    jobs: JobQueue,
     /// Monotonic origin for the Job queue's timestamps.
     origin: Instant,
 }
@@ -181,6 +187,7 @@ impl UnitManager {
     pub fn new() -> Self {
         UnitManager {
             units: BTreeMap::new(),
+            jobs: JobQueue::new(),
             origin: Instant::now(),
         }
     }
@@ -201,6 +208,79 @@ impl UnitManager {
         self.units.get(unit)
     }
 
+    /// Ask for `unit` to be started, merging with any request already held.
+    ///
+    /// Returns what the merged target implies *right now* (plan §1.3(13)), or
+    /// `None` when there is nothing to do: either the target is already
+    /// satisfied, or a stop in progress must finish first.
+    ///
+    /// The effect is derived when the request arrives rather than re-derived on
+    /// every loop. That distinction matters: plan §1.3(13) has a *start job*
+    /// against `RestartWait` cancel the backoff, and a unit in `RestartWait`
+    /// keeps the `Started` target its boot request gave it. Re-deriving the
+    /// effect continuously would therefore cancel every automatic restart's
+    /// backoff, which is precisely what the backoff exists to prevent.
+    pub fn request_start(&mut self, unit: &UnitName, source: RequestSource) -> Option<Effect> {
+        self.request(unit, JobTarget::Started, source)
+    }
+
+    /// Ask for `unit` to be stopped. Mirrors [`request_start`](Self::request_start).
+    pub fn request_stop(&mut self, unit: &UnitName, source: RequestSource) -> Option<Effect> {
+        self.request(unit, JobTarget::Stopped, source)
+    }
+
+    /// Submit a request and derive the action it implies.
+    fn request(
+        &mut self,
+        unit: &UnitName,
+        target: JobTarget,
+        source: RequestSource,
+    ) -> Option<Effect> {
+        if !self.units.contains_key(unit) {
+            return None;
+        }
+        let at = self.now_millis();
+        self.jobs.submit(Job::new(unit.clone(), target, source, at));
+        self.effect_for(unit)
+    }
+
+    /// The action the merged target implies for `unit` right now.
+    ///
+    /// `None` means either "nothing was asked" or "the request is waiting": a
+    /// start against a stop in progress is queued rather than raced
+    /// (plan §1.3(13)). M3's `rctl` is the first source that can produce the
+    /// second case, so remembering the queued start belongs with it.
+    pub fn effect_for(&self, unit: &UnitName) -> Option<Effect> {
+        let actual = self.units.get(unit)?.state;
+        self.jobs
+            .reconcile(unit, actual)
+            .map(|(effect, _to)| effect)
+    }
+
+    /// Units the queue still wants running, in name order.
+    ///
+    /// Shutdown stops these (plan §1.3(11)); a unit nobody ever asked for is
+    /// not included, because it has nothing to stop.
+    pub fn started_units(&self) -> Vec<UnitName> {
+        self.jobs
+            .targets()
+            .into_iter()
+            .filter(|(_, target)| target.target == JobTarget::Started)
+            .map(|(name, _)| name)
+            .collect()
+    }
+
+    /// Forget the breaker's failures so the next start is judged fresh.
+    ///
+    /// This is what makes a manual start the escape hatch from
+    /// `Failed(StartLimitHit)` (plan §1.3(13)); `rctl reset-failed` will use
+    /// the same method without starting the unit.
+    pub fn clear_start_limit(&mut self, unit: &UnitName) {
+        if let Some(rt) = self.units.get_mut(unit) {
+            rt.backoff.reset();
+        }
+    }
+
     /// Mark a `oneshot` as having completed successfully.
     ///
     /// The boot sequence waits for these with a direct `waitpid` (it cannot use
@@ -218,15 +298,6 @@ impl UnitManager {
     /// How many units currently have a process.
     pub fn running_count(&self) -> usize {
         self.units.values().filter(|rt| rt.pid.is_some()).count()
-    }
-
-    /// Every unit with a live process, in name order.
-    pub fn units_to_stop(&self) -> Vec<UnitName> {
-        self.units
-            .values()
-            .filter(|rt| rt.pid.is_some())
-            .map(|rt| rt.config.name.clone())
-            .collect()
     }
 
     /// Time until the next restart is due, if any.
@@ -1278,5 +1349,187 @@ mod tests {
         assert_eq!(names, ["a.service", "b.service", "c.service"]);
         assert!(m.get(&UnitName::parse("a.service").unwrap()).is_some());
         assert!(m.get(&UnitName::parse("z.service").unwrap()).is_none());
+    }
+
+    // --- Job queue interaction (plan §1.3(13)) --------------------------
+
+    /// A start request against a unit that is down asks for a process.
+    #[test]
+    fn a_start_request_spawns_an_inactive_unit() {
+        let mut m = manager_with("a.service", RestartPolicy::No);
+        let unit = UnitName::parse("a.service").unwrap();
+        assert_eq!(
+            m.request_start(&unit, RequestSource::Dependency),
+            Some(Effect::SpawnProcess)
+        );
+    }
+
+    /// The request is remembered even when it produces no action, so a later
+    /// reconcile still knows what was asked for.
+    #[test]
+    fn a_start_request_against_a_running_unit_is_satisfied() {
+        let mut m = manager_with("a.service", RestartPolicy::No);
+        let unit = UnitName::parse("a.service").unwrap();
+        m.request_start(&unit, RequestSource::Dependency);
+        spawn_pid(&mut m, &unit);
+
+        assert_eq!(
+            m.request_start(&unit, RequestSource::Dependency),
+            Some(Effect::None),
+            "an already-active unit must not be started twice"
+        );
+        assert_eq!(
+            m.started_units(),
+            std::slice::from_ref(&unit),
+            "and the target is still the one the first request set"
+        );
+
+        cleanup(&mut m, &unit);
+    }
+
+    /// Asking a running unit to stop produces the signal, not a state guess.
+    #[test]
+    fn a_stop_request_signals_a_running_unit() {
+        let mut m = manager_with("a.service", RestartPolicy::No);
+        let unit = UnitName::parse("a.service").unwrap();
+        m.request_start(&unit, RequestSource::Dependency);
+        spawn_pid(&mut m, &unit);
+
+        assert_eq!(
+            m.request_stop(&unit, RequestSource::UserStop),
+            Some(Effect::SendStopSignal)
+        );
+        assert_eq!(
+            m.started_units(),
+            Vec::<UnitName>::new(),
+            "the queue no longer wants it running"
+        );
+
+        cleanup(&mut m, &unit);
+    }
+
+    /// Plan §1.3(13): a manual start is the escape hatch from a tripped breaker,
+    /// and it cancels a pending backoff rather than waiting it out.
+    #[test]
+    fn a_start_request_reaches_past_failure_states() {
+        for (state, expected) in [
+            (
+                UnitState::Failed(FailedReason::StartLimitHit),
+                Effect::ClearStartLimitAndStart,
+            ),
+            (
+                UnitState::Failed(FailedReason::StartFailure),
+                Effect::ClearStartLimitAndStart,
+            ),
+            (UnitState::RestartWait, Effect::CancelBackoffAndStart),
+        ] {
+            let mut m = manager_with("a.service", RestartPolicy::Always);
+            let unit = UnitName::parse("a.service").unwrap();
+            m.units.get_mut(&unit).unwrap().state = state;
+
+            assert_eq!(
+                m.request_start(&unit, RequestSource::UserStart),
+                Some(expected),
+                "{state} must be startable"
+            );
+        }
+    }
+
+    /// Clearing the breaker is what makes the retry a fresh start.
+    #[test]
+    fn clearing_the_start_limit_forgets_the_failures() {
+        let mut m = manager_with("a.service", RestartPolicy::Always);
+        let unit = UnitName::parse("a.service").unwrap();
+        let rt = m.units.get_mut(&unit).unwrap();
+        rt.backoff.on_failure(0);
+        rt.backoff.on_failure(0);
+        assert_eq!(rt.backoff.failures_in_window(), 2);
+
+        m.clear_start_limit(&unit);
+        assert_eq!(
+            m.get(&unit).unwrap().backoff.failures_in_window(),
+            0,
+            "a manual start must not inherit the old failures"
+        );
+    }
+
+    /// Plan §1.3(13): a start that arrives while a stop is in progress waits
+    /// instead of racing it. The stop wins, and the start is not applied to a
+    /// unit that is still tearing down.
+    #[test]
+    fn a_start_against_a_stop_in_progress_is_queued() {
+        let mut m = manager_with("a.service", RestartPolicy::No);
+        let unit = UnitName::parse("a.service").unwrap();
+        m.request_start(&unit, RequestSource::Dependency);
+        spawn_pid(&mut m, &unit);
+
+        // A stop that did not come from a request - a health failure does this
+        // - so the `Started` target is still standing while the unit tears down.
+        m.stop_unit(&unit);
+        assert_eq!(m.get(&unit).unwrap().state, UnitState::Deactivating);
+
+        assert_eq!(
+            m.request_start(&unit, RequestSource::UserStart),
+            None,
+            "the start must wait for the stop to finish"
+        );
+
+        cleanup(&mut m, &unit);
+    }
+
+    /// Plan §1.3(11): a stop outranks a start, so a dependency start that
+    /// arrives after shutdown must not bring the unit back - even though it is
+    /// newer.
+    #[test]
+    fn a_shutdown_stop_outranks_a_later_start() {
+        let mut m = manager_with("a.service", RestartPolicy::Always);
+        let unit = UnitName::parse("a.service").unwrap();
+        m.request_start(&unit, RequestSource::Dependency);
+        spawn_pid(&mut m, &unit);
+
+        m.request_stop(&unit, RequestSource::ShutdownStop);
+        assert_eq!(
+            m.request_start(&unit, RequestSource::Dependency),
+            Some(Effect::SendStopSignal),
+            "the newer start must lose to the shutdown"
+        );
+        assert!(m.started_units().is_empty());
+        assert_eq!(m.get(&unit).unwrap().restart_at, None);
+
+        cleanup(&mut m, &unit);
+    }
+
+    /// The boot target keeps saying "running" while a unit waits out a backoff,
+    /// so nothing short of a fresh request may cancel that backoff. (Deriving
+    /// the effect on every loop iteration would cancel it immediately, which is
+    /// the whole failure mode the backoff exists to avoid.)
+    #[test]
+    fn a_pending_backoff_survives_the_standing_start_target() {
+        let mut m = manager_with("a.service", RestartPolicy::Always);
+        let unit = UnitName::parse("a.service").unwrap();
+        m.request_start(&unit, RequestSource::Dependency);
+        let pid = spawn_pid(&mut m, &unit);
+        let _ = process::kill(pid, libc::SIGKILL);
+        m.on_child_exit(pid, ExitOutcome::Signalled(libc::SIGKILL))
+            .expect("handled");
+
+        let rt = m.get(&unit).unwrap();
+        assert_eq!(rt.state, UnitState::RestartWait);
+        assert!(rt.restart_at.is_some(), "the backoff must still be pending");
+        assert_eq!(
+            m.started_units(),
+            [unit],
+            "the target still says the unit should be running"
+        );
+    }
+
+    /// A request for a unit rinit does not know is a no-op, not a panic.
+    #[test]
+    fn a_request_for_an_unknown_unit_does_nothing() {
+        let mut m = UnitManager::new();
+        let ghost = UnitName::parse("ghost.service").unwrap();
+        assert_eq!(m.request_start(&ghost, RequestSource::UserStart), None);
+        assert_eq!(m.request_stop(&ghost, RequestSource::UserStop), None);
+        assert!(m.started_units().is_empty());
     }
 }
