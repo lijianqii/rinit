@@ -6,11 +6,12 @@
 #                          [--timeout SECONDS] [--log FILE] [--keep-log]
 #
 # What it does:
-#   1. boots the guest with a bounded test service (`--ticks 6`), so the
-#      service exits by itself and rinit must reap it;
-#   2. captures the serial console to a log file;
-#   3. asserts the M0 acceptance list on that log;
-#   4. reports kernel panics / oopses as failures.
+#   1. boots the guest from its unit directory (units/multi-user.target), which
+#      starts shell.service and gives an interactive root shell;
+#   2. types at that shell to prove a login is not required;
+#   3. captures the serial console to a log file;
+#   4. asserts the M0/M1 acceptance list on that log;
+#   5. reports kernel panics / oopses as failures.
 #
 # Exit codes:
 #   0  all assertions passed
@@ -58,7 +59,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 for f in "${kernel}" "${initrd}"; do
     if [[ ! -f "${f}" ]]; then
         echo "error: missing artifact ${f}" >&2
-        echo "hint: run 'make run' (without SKIP_BUILD=1) to build it." >&2
+        echo "hint: run 'make initramfs kernel' to build it." >&2
         exit 2
     fi
 done

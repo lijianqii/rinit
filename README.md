@@ -16,14 +16,14 @@ M0 delivers a working PID 1 skeleton, verified booting in qemu:
 - first-wave mounts (`/run` → `/proc` → `/sys` → `/dev` → `/tmp`), fatal vs
   degradable handling per plan §1.3(9).
 - child reaping via `SIGCHLD` + `waitpid(-1, WNOHANG)`.
-- hardcoded service launch via `posix_spawn` (no config parsing yet).
+- M1: unit files parsed from `/etc/rinit/units`, dependency graph resolved,
+  and units started level by level with each level running in parallel.
 - panic hook that routes to `/dev/kmsg` for serial visibility.
 
-Verified on the **target architecture** (aarch64 qemu, 128M, Linux 6.6.158) via
-`make run SKIP_BUILD=1 SERVICE="/sbin/rinit-testservice --ticks 6"`:
+Verified on the **target architecture** (aarch64 qemu, 128M, Linux 6.6.158)
+with a bare `make run`, which boots the unit directory:
 
 ```
-[    2.076903] Freeing unused kernel memory: 2624K
 [    2.078772] Run /sbin/rinit as init process
 rinit: rinit 0.1.0 starting (pid 1)
 rinit: mounted /run
@@ -31,12 +31,20 @@ rinit: mounted /proc
 rinit: mounted /sys
 rinit: mounted /dev
 rinit: mounted /tmp
-rinit: launched test service '/sbin/rinit-testservice --ticks 6' as pid 48
-rinit-testservice: main started (pid 48)
-rinit-testservice: heartbeat (pid 49)
-...
-rinit-testservice: exiting after 6 ticks
-rinit: reaped child pid 48 (exit 0)
+rinit: boot plan for 'multi-user.target': 4 unit(s) in 3 level(s)
+rinit: plan 0: rinit-init.target (target)
+rinit: plan 1: shell.service (service)
+rinit: plan 2: multi-user.target (target)
+rinit: starting level 0: 0 service(s)
+rinit: level 0 reached: rinit-init.target active
+rinit: starting level 1: 1 service(s)
+rinit: started shell.service as pid 48
+rinit: starting level 2: 0 service(s)
+rinit: level 2 reached: multi-user.target active
+rinit: boot complete: 1 unit(s) started from 'multi-user.target' (1 still running)
+/bin/sh: can't access tty; job control turned off
+~ # uname -m
+aarch64
 ```
 
 That covers the whole M0 acceptance list: boots as PID 1 via `rdinit=`, mounts
@@ -157,24 +165,26 @@ What it does, in order (see [Makefile](Makefile)):
 4. Assemble `build/out/initramfs-<target>.cpio.gz` (busybox + rinit + units).
 5. Boot it in `qemu-system-aarch64 -machine virt -cpu cortex-a57 -m 128M`.
 
-Useful knobs:
+There is nothing to configure: `make run` always builds whatever is out of date
+and boots the unit directory. Re-running it does no downloading and no
+compiling — the file targets below already encode that, which is why there is no
+"skip the build" switch.
 
 ```bash
-make run                        # boot units/ → interactive root shell (default)
-make run SERVICE=/bin/sh        # plain busybox shell, bypassing rinit's units
-make run SERVICE="/sbin/rinit-testservice --ticks 6"   # M0 bring-up check
-make run SKIP_BUILD=1           # boot existing artifacts; never download/compile
-make kernel                     # kernel only
-make busybox                    # busybox only
-make initramfs                  # rinit + initramfs only
-make qemu                       # boot existing artifacts
-make MIRROR=https://... run     # different mirror
+make run            # build if needed, boot → interactive root shell
+make kernel         # kernel only
+make busybox        # busybox only
+make initramfs      # rinit + initramfs only
+make qemu           # alias for `make run`
+make check          # fmt + clippy + host tests (no cross toolchain)
+make test           # check + the qemu system test
+make MIRROR=https://... run   # different source mirror
 make KERNEL_VERSION=6.6.158 BUSYBOX_VERSION=1.36.1 ...   # pin versions
 ```
 
-> `SERVICE=...` puts a command on the kernel cmdline, which **replaces the unit
-> directory entirely**. If rinit logs `launched test service ...` instead of
-> `boot plan for 'multi-user.target'`, that override is set — not a stale image.
+The image is rebuilt whenever `rinit`, `busybox`, a file in `units/`, or one of
+the packing scripts changes — editing `units/shell.service` repacks the
+initramfs, because the unit directory is what the guest boots.
 
 ### Getting a shell in the guest
 
@@ -206,27 +216,22 @@ parses conflicts but does not stop running units, which needs M2.)
 Exiting qemu: `SIGTERM` to PID 1 is not reachable from the qemu monitor, so use
 `Ctrl-A X` (qemu) to quit.
 
-### Skipping downloads and builds
+### How the incremental build works
 
-`make run` is **incremental by default**: every step is a file target, so a step
-whose output already exists (and is newer than its inputs) is skipped. Re-running
-`make run` after a successful build does no downloading and no compiling — it
-just boots. In particular:
+`make run` is incremental by construction: every step is a file target, so a
+step whose output already exists and is newer than its inputs is skipped.
+Re-running it after a successful build does no downloading and no compiling —
+it just boots. In particular:
 
 - a cached tarball in `build/dl/` is reused (no re-download);
 - `linux-6.6.158/arch/arm64/boot/Image` present → kernel is not rebuilt;
 - `busybox-1.36.1/busybox` present → busybox is not rebuilt;
-- `target/aarch64-unknown-linux-gnu/release/rinit{,testservice}` present and
-  newer than the sources → `cargo build` is not re-run;
-- the initramfs is repacked only when the rinit binaries or busybox change.
+- `target/.../release/rinit` newer than the sources → `cargo build` is not
+  re-run;
+- the initramfs is repacked when rinit, busybox, a file in `units/`, or one of
+  the packing scripts changes.
 
-To guarantee that nothing is downloaded or compiled (e.g. on a machine without
-network or the cross toolchain), use `SKIP_BUILD=1`. It fails fast with a clear
-message if a required artifact is missing:
-
-```bash
-make run SKIP_BUILD=1
-```
+Because that already holds, there is no `SKIP_BUILD` knob to forget to pass.
 
 ## Running in qemu (host/x86 verification only)
 
@@ -236,14 +241,13 @@ the Debian host kernel:
 
 ```bash
 cargo build --release --target x86_64-unknown-linux-musl
-scripts/build-initramfs.sh x86_64-unknown-linux-musl --out /tmp/ir.cpio.gz
+scripts/build-initramfs.sh x86_64-unknown-linux-musl --busybox-src build/src/busybox-1.36.1 --out /tmp/ir.cpio.gz
 scripts/run-qemu.sh --arch x86_64 \
     --kernel /boot/vmlinuz-6.12.111+deb13-amd64 \
-    --initrd /tmp/ir.cpio.gz \
-    --service "/sbin/rinit-testservice --ticks 6"
+    --initrd /tmp/ir.cpio.gz
 ```
 
-### rinit CLI (M0)
+### rinit CLI
 
 ```
 rinit [OPTIONS] [-- <SERVICE> [ARGS...]]
@@ -251,9 +255,15 @@ rinit [OPTIONS] [-- <SERVICE> [ARGS...]]
   -h, --help                 Show help
   -V, --version              Show version
       --dev                  Skip mounts; do not reboot (host/smoke testing)
-      --test-service <CMD>   Hardcoded service (whitespace-split)
-      -- <SERVICE> [ARGS]    Hardcoded service argv (kernel-cmdline form)
+      --units <DIR>          Unit directory (default: /etc/rinit/units)
+      --default <TARGET>     Boot target (default: multi-user.target)
+      --test-service <CMD>   Launch this instead of the unit directory
+      -- <SERVICE> [ARGS]    Service as an argv (kernel-cmdline form)
 ```
+
+With no `--test-service`, rinit boots the unit directory. `--test-service` (and
+the `RINIT_TEST_SERVICE` environment variable) is the bring-up escape hatch
+that bypasses it; the guest never sets it.
 
 ## Design decisions in this milestone
 
@@ -279,11 +289,15 @@ they are not mistaken for drift:
 
 Stripped `release` binaries from this machine:
 
-| target                              | binary              | size    |
-| ----------------------------------- | ------------------- | ------- |
-| `aarch64-unknown-linux-gnu` (static)| `rinit`             | 1.19 MB |
-| `aarch64-unknown-linux-gnu` (static)| `rinit-testservice` | 0.99 MB |
-| `x86_64-unknown-linux-musl` (static)| `rinit`             | 0.54 MB |
+| target                              | binary              | size    | in image |
+| ----------------------------------- | ------------------- | ------- | -------- |
+| `aarch64-unknown-linux-gnu` (static)| `rinit`             | 1.19 MB | yes      |
+| `aarch64-unknown-linux-gnu` (static)| `rinit-testservice` | 0.99 MB | no       |
+| `x86_64-unknown-linux-musl` (static)| `rinit`             | 0.54 MB | yes      |
+
+`rinit-testservice` is a host-side bring-up helper (it proves fork/exec/reap
+deterministically), so it is built but not shipped: the guest's services come
+from `units/` and busybox. Dropping it took the initramfs from 2.2 MB to 1.7 MB.
 
 Both are well under the plan's ≤4 MB static budget. RSS-at-boot numbers are not
 measured yet; that requires `/proc/<pid>/status` inside the guest (a later

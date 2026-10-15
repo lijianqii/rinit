@@ -111,7 +111,7 @@ jobs:
         run: make initramfs kernel busybox
 
       - name: Boot and assert
-        run: make test-system SKIP_BUILD=1
+        run: make test-system
 
       - name: Upload the serial log
         if: always()

@@ -3,14 +3,13 @@
 #
 #   make run         download + build kernel & busybox + rinit, pack the
 #                    initramfs, and boot it in qemu (default goal)
-#   make run SKIP_BUILD=1   boot existing artifacts; never download or compile
 #   make kernel      build the Linux kernel Image only
 #   make busybox     build busybox only
 #   make initramfs   build rinit and assemble the initramfs
-#   make qemu        boot artifacts, building them first if missing
+#   make qemu        alias for `make run`
 #   make check       pre-commit gate: fmt + clippy + host tests (no cross toolchain)
 #   make test        check + the qemu system test
-#   make test-system boot the guest and assert the M0 acceptance list
+#   make test-system boot the guest and assert the M0/M1 acceptance list
 #   make help        show this help
 #   make clean       remove build outputs (keeps downloads)
 #   make distclean   remove everything, including downloads
@@ -42,20 +41,6 @@ BUSYBOX_ARCH     ?= arm64
 JOBS             ?= $(shell nproc 2>/dev/null || echo 2)
 QEMU_MEM         ?= 128M
 
-# Service appended to the kernel cmdline, overriding the unit directory.
-#
-# Empty by default: rinit boots units/ (which starts shell.service, so you get a
-# root shell on the console). Setting this is the M0 bring-up path and it
-# *replaces* the unit directory entirely, which is easy to mistake for "the
-# new units did not make it into the image" when they actually did.
-#   - SERVICE=/sbin/rinit-testservice --ticks 6 : prove fork/exec/reap only
-#   - SERVICE=/bin/sh                           : plain busybox shell, no rinit units
-SERVICE          ?=
-
-# `make run SKIP_BUILD=1` boots what is already built and never downloads,
-# extracts or compiles anything (it fails fast if an artifact is missing).
-SKIP_BUILD       ?= 0
-
 BUILD_DIR        := build
 DL_DIR           := $(BUILD_DIR)/dl
 SRC_DIR          := $(BUILD_DIR)/src
@@ -74,7 +59,7 @@ MAKE_KERNEL      := $(MAKE) -C $(KERNEL_SRC) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_
 MAKE_BUSYBOX     := $(MAKE) -C $(BUSYBOX_SRC) ARCH=$(BUSYBOX_ARCH) CROSS_COMPILE=$(CROSS_COMPILE)
 
 .DEFAULT_GOAL    := run
-.PHONY: run kernel busybox rinit initramfs qemu check-artifacts help clean distclean \
+.PHONY: run kernel busybox rinit initramfs qemu help clean distclean \
         check test test-system
 
 help:
@@ -139,40 +124,25 @@ $(BUSYBOX_BIN): $(BUSYBOX_SRC)/.config
 # --- initramfs ------------------------------------------------------------
 initramfs: $(INITRAMFS)
 
-# Repacked only when the rinit binaries or busybox change.
+# Repacked when rinit, busybox, a unit file, or the packing script itself
+# changes - the script decides what goes in the image, so editing it has to
+# invalidate the image just like editing a unit does.
 UNIT_FILES := $(wildcard units/*.service) $(wildcard units/*.target)
+INITRAMFS_SCRIPTS := $(SCRIPTS)/build-initramfs.sh $(SCRIPTS)/mkinitramfs.sh
 
-$(INITRAMFS): $(RINIT_BIN) $(RINIT_TEST_BIN) $(BUSYBOX_BIN) $(UNIT_FILES)
+$(INITRAMFS): $(RINIT_BIN) $(BUSYBOX_BIN) $(UNIT_FILES) $(INITRAMFS_SCRIPTS)
 	$(SCRIPTS)/build-initramfs.sh $(TARGET) --busybox-src $(BUSYBOX_SRC) --out $@
 
-# --- boot -----------------------------------------------------------------
-# `--service` is passed only when SERVICE is set: passing it empty would put an
-# empty token on the kernel cmdline, which rinit would reject as an empty
-# program path.
+# The guest boots units/, so nothing is put on the kernel cmdline: any token
+# there would override the unit directory and the console shell would never
+# start. Everything is rebuilt by the file targets above whenever a source is
+# newer, so there is no "skip the build" switch - running `make run` twice just
+# boots the second time.
 QEMU_CMD = $(SCRIPTS)/run-qemu.sh --arch aarch64 --kernel $(KERNEL_IMAGE) \
-	--initrd $(INITRAMFS) --mem $(QEMU_MEM) \
-	$(if $(strip $(SERVICE)),--service "$(SERVICE)")
+	--initrd $(INITRAMFS) --mem $(QEMU_MEM)
 
-qemu: $(KERNEL_IMAGE) $(INITRAMFS)
+qemu run: $(KERNEL_IMAGE) $(INITRAMFS)
 	$(QEMU_CMD)
-
-ifeq ($(strip $(SKIP_BUILD)),1)
-# Boot only: dependencies are checked, not built.
-run: check-artifacts
-	$(QEMU_CMD)
-else
-run: qemu
-endif
-
-check-artifacts:
-	@missing=0; \
-	for f in $(KERNEL_IMAGE) $(INITRAMFS); do \
-	  if [ ! -e "$$f" ]; then echo "error: missing $$f" >&2; missing=1; fi; \
-	done; \
-	if [ $$missing -ne 0 ]; then \
-	  echo "hint: run 'make run' once (without SKIP_BUILD=1) to build the artifacts." >&2; \
-	  exit 1; \
-	fi
 
 # --- gates ----------------------------------------------------------------
 # `check` is the pre-commit gate (plan §4.1 "每个 commit 必跑"): formatting,
@@ -183,19 +153,14 @@ check:
 	cargo test --offline --workspace
 
 # `test` = `check` plus the qemu system test, which needs the aarch64
-# artifacts. Builds them first unless SKIP_BUILD=1.
+# artifacts.
 test: check
-	$(MAKE) test-system SKIP_BUILD=$(SKIP_BUILD)
+	$(MAKE) test-system
 
-# `test-system` boots the guest and asserts the M0 acceptance list on the
+# `test-system` boots the guest and asserts the M0/M1 acceptance list on the
 # serial console. Logs land in build/logs/.
-test-system:
-ifeq ($(strip $(SKIP_BUILD)),1)
+test-system: $(KERNEL_IMAGE) $(INITRAMFS)
 	$(SCRIPTS)/system-test.sh --kernel $(KERNEL_IMAGE) --initrd $(INITRAMFS)
-else
-	$(KERNEL_IMAGE) $(INITRAMFS)
-	$(SCRIPTS)/system-test.sh --kernel $(KERNEL_IMAGE) --initrd $(INITRAMFS)
-endif
 
 # --- housekeeping ---------------------------------------------------------
 clean:

@@ -38,12 +38,10 @@ done
 [[ -n "${output}" ]] || output="${repo_root}/build/out/initramfs-${triple}.cpio.gz"
 
 bin_dir="${repo_root}/target/${triple}/release"
-for bin in rinit rinit-testservice; do
-    if [[ ! -x "${bin_dir}/${bin}" ]]; then
-        echo "error: ${bin_dir}/${bin} not found; run 'cargo build --release --target ${triple}'" >&2
-        exit 1
-    fi
-done
+if [[ ! -x "${bin_dir}/rinit" ]]; then
+    echo "error: ${bin_dir}/rinit not found; run 'cargo build --release --target ${triple}'" >&2
+    exit 1
+fi
 
 work="$(mktemp -d)"
 trap 'rm -rf "${work}"' EXIT
@@ -52,9 +50,13 @@ trap 'rm -rf "${work}"' EXIT
 install -d "${work}"/{sbin,bin,etc/rinit/units,proc,sys,dev,run,tmp,root}
 
 install -m 0755 "${bin_dir}/rinit" "${work}/sbin/rinit"
-install -m 0755 "${bin_dir}/rinit-testservice" "${work}/sbin/rinit-testservice"
 
-# Example unit files (M0 does not parse them yet; included for layout parity).
+# rinit-testservice is deliberately NOT packed. It is a M0 bring-up helper used
+# to prove fork/exec/reap, and it is still built into target/ for the host
+# smoke test; shipping a ~1 MB binary that no unit refers to would only bloat
+# the image. The guest's services come from units/ and busybox.
+
+# The unit directory, which is what the guest actually boots.
 for glob in "${repo_root}"/units/*.service "${repo_root}"/units/*.target; do
     [[ -e "${glob}" ]] || continue
     install -m 0644 "${glob}" "${work}/etc/rinit/units/"
