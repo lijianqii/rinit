@@ -24,6 +24,13 @@ use crate::log::rlog;
 /// Where the per-unit notify sockets are created (plan §1.3(12)).
 pub const NOTIFY_DIR: &str = "/run/rinit/notify";
 
+/// Environment variable that overrides [`NOTIFY_DIR`].
+///
+/// The same shape as `RINIT_TEST_SERVICE`: a test cannot create
+/// `/run/rinit/notify` without root, so it points rinit at a scratch directory
+/// and exercises the real socket path end to end.
+pub const ENV_NOTIFY_DIR: &str = "RINIT_NOTIFY_DIR";
+
 /// The directory mode: readable/traversable, but only root may create entries.
 const DIR_MODE: u32 = 0o755;
 /// The socket mode: writable only by its owner (the unit's user, or root).
@@ -49,9 +56,12 @@ pub struct NotifyHub {
 }
 
 impl NotifyHub {
-    /// A hub using [`NOTIFY_DIR`].
+    /// A hub using [`NOTIFY_DIR`], or [`ENV_NOTIFY_DIR`] when it is set.
     pub fn new() -> Self {
-        Self::new_at(NOTIFY_DIR)
+        match std::env::var(ENV_NOTIFY_DIR) {
+            Ok(dir) if !dir.is_empty() => Self::new_at(dir),
+            _ => Self::new_at(NOTIFY_DIR),
+        }
     }
 
     /// A hub using a specific directory (tests use a temporary one).

@@ -817,6 +817,48 @@ mod tests {
         );
     }
 
+    /// Plan §1.1: `Wants=` implies ordering too, not just activation.
+    #[test]
+    fn wants_also_orders() {
+        let mut app = unit("app.service", &[], &[], UnitType::Service);
+        app.deps.wants = vec![name("metrics.service")];
+        let configs = vec![app, unit("metrics.service", &[], &[], UnitType::Service)];
+        let graph = DependencyGraph::build(&configs).unwrap();
+
+        assert_eq!(
+            graph.dependencies_of(&name("app.service")),
+            [name("metrics.service")],
+            "Wants= must order app after metrics"
+        );
+    }
+
+    /// Plan §1.1: `Conflicts=` is not transitive - only a directly declared
+    /// pair is mutually exclusive.
+    #[test]
+    fn conflicts_is_not_transitive() {
+        let with_conflict = |me: &str, other: &str| {
+            let mut cfg = unit(me, &[], &[], UnitType::Service);
+            cfg.deps.conflicts = vec![name(other)];
+            cfg
+        };
+        let configs = vec![
+            with_conflict("a.service", "b.service"),
+            with_conflict("b.service", "c.service"),
+            unit("c.service", &[], &[], UnitType::Service),
+        ];
+        let graph = DependencyGraph::build(&configs).unwrap();
+
+        // a and c never mention each other, so they are free to coexist: no
+        // edge of any kind.
+        assert_eq!(
+            graph.closure_of(&name("a.service")),
+            [name("a.service")],
+            "a Conflicts b must not drag c in"
+        );
+        assert!(graph.dependencies_of(&name("a.service")).is_empty());
+        assert!(graph.dependencies_of(&name("c.service")).is_empty());
+    }
+
     #[test]
     fn empty_graph_is_valid() {
         let graph = DependencyGraph::build([]).unwrap();

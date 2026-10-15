@@ -712,3 +712,72 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    //! Plan §4.4 asks for a property test over the Job queue: any sequence of
+    //! requests must converge on one consistent target, with no dependence on
+    //! the order they were submitted in beyond the documented rules.
+
+    use proptest::prelude::*;
+
+    use super::*;
+
+    fn name(s: &str) -> UnitName {
+        UnitName::parse(s).expect("valid name")
+    }
+
+    fn from_code(code: u8) -> RequestSource {
+        match code % 4 {
+            0 => RequestSource::Dependency,
+            1 => RequestSource::UserStart,
+            2 => RequestSource::UserStop,
+            _ => RequestSource::ShutdownStop,
+        }
+    }
+
+    proptest! {
+        /// The merged target is always the highest-priority request, ties going
+        /// to the earlier one - exactly what `Job::supersedes` defines.
+        #[test]
+        fn the_merged_target_is_the_highest_priority_request(
+            requests in proptest::collection::vec((0u8..4, any::<u64>(), any::<bool>()), 0..40)
+        ) {
+            let mut q = JobQueue::new();
+            let mut winner: Option<(RequestSource, u64, JobTarget)> = None;
+
+            for (source, at, started) in requests {
+                let source = from_code(source);
+                let target = if started { JobTarget::Started } else { JobTarget::Stopped };
+                q.submit(Job::new(name("a.service"), target, source, at));
+
+                let candidate = (source, at, target);
+                winner = Some(match winner {
+                    // Strictly greater: an equal (source, at) keeps the earlier
+                    // request, matching `supersedes` returning false on a tie.
+                    Some(best) if best.0 > candidate.0 || (best.0 == candidate.0 && best.1 >= candidate.1) => best,
+                    _ => candidate,
+                });
+            }
+
+            let merged = q.target_of(&name("a.service"));
+            let actual = merged.map(|m| (m.source, m.at, m.target));
+            prop_assert_eq!(actual, winner);
+        }
+
+        /// Submitting a request never leaves the queue without a target, and
+        /// the target is always one of the two values - a convergence check
+        /// that also guards against a panic on any input.
+        #[test]
+        fn a_request_always_yields_a_target(
+            requests in proptest::collection::vec((0u8..4, any::<u64>(), any::<bool>()), 1..20)
+        ) {
+            let mut q = JobQueue::new();
+            for (source, at, started) in requests {
+                let target = if started { JobTarget::Started } else { JobTarget::Stopped };
+                q.submit(Job::new(name("a.service"), target, from_code(source), at));
+            }
+            prop_assert!(q.target_of(&name("a.service")).is_some());
+        }
+    }
+}

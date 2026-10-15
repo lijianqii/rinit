@@ -704,6 +704,35 @@ pub fn reboot_now() -> ! {
 /// error normally in dev mode, so this never strands a test or a developer
 /// shell in an unrecoverable loop.
 pub fn fatal(err: &RuntimeError) -> ! {
+    fatal_with(err, reboot_now)
+}
+
+/// The reset action a fatal early-boot error takes.
+///
+/// A function pointer rather than a direct call to [`reboot_now`] so the policy
+/// (a fatal early error resets the board and never returns) is testable without
+/// rebooting the machine.
+pub type Reboofer = fn() -> !;
+
+/// [`fatal`] with the reset action injected.
+pub fn fatal_with(err: &RuntimeError, reboot: Reboofer) -> ! {
     rlog!("FATAL: {err}");
-    reboot_now()
+    reboot()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Plan §1.3(9): a fatal early-boot error must *reset the machine*, not
+    /// return or hang - the abort path that a failed first-wave mount takes.
+    #[test]
+    #[should_panic(expected = "reboot was invoked")]
+    fn a_fatal_boot_error_resets_the_machine() {
+        let err = RuntimeError::Io {
+            op: "mount",
+            source: std::io::Error::other("mount /proc failed"),
+        };
+        fatal_with(&err, || panic!("reboot was invoked"));
+    }
 }

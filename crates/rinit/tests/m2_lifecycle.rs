@@ -372,6 +372,66 @@ TimeoutStopSec=1
     );
 }
 
+/// Plan §1.3(12): a `Type=notify` unit is not `Active` until it reports
+/// readiness, and the whole path - socket creation, `NOTIFY_SOCKET`, the
+/// datagram, the state transition - has to work for a real child.
+///
+/// The service cannot itself send a datagram from a shell, so the test plays
+/// the service's part: it waits for the socket rinit created and sends exactly
+/// what `sd_notify` would.
+#[test]
+fn a_notify_unit_becomes_active_when_it_reports_ready() {
+    use std::os::unix::net::UnixDatagram;
+
+    let dir = TempDir::new("notify");
+    dir.write("all.target", "[Unit]\nType=target\nRequires=app.service\n");
+    dir.write(
+        "app.service",
+        "[Service]\nType=notify\nExecStart=/bin/sh -c \"sleep 30\"\n",
+    );
+    let notify_dir = dir.0.join("notify");
+
+    let bin = env!("CARGO_BIN_EXE_rinit");
+    let child = Command::new(bin)
+        .arg("--dev")
+        .arg("--units")
+        .arg(&dir.0)
+        .arg("--default")
+        .arg("all.target")
+        .env("RINIT_NOTIFY_DIR", &notify_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn rinit");
+
+    let socket = notify_dir.join("app.service.sock");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !socket.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "rinit must create the notify socket"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // The service reports readiness, exactly as `sd_notify(READY=1)` would.
+    let client = UnixDatagram::unbound().expect("client socket");
+    client.send_to(b"READY=1", &socket).expect("send READY=1");
+    std::thread::sleep(Duration::from_millis(300));
+
+    // SAFETY: signalling our own child.
+    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+    let out = child.wait_with_output().expect("wait for rinit");
+    let mut log = String::from_utf8_lossy(&out.stdout).into_owned();
+    log.push_str(&String::from_utf8_lossy(&out.stderr));
+
+    assert!(
+        log.contains("app.service is ready"),
+        "READY=1 must complete start-up:\n{log}"
+    );
+}
+
 /// Plan §1.1: a service that ignores `SIGTERM` must still be
 /// `SIGKILL`ed once `TimeoutStopSec` expires - otherwise shutdown would leave
 /// it running forever.
