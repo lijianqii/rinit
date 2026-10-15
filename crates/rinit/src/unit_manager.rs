@@ -1089,6 +1089,7 @@ mod tests {
 
     #[test]
     fn a_new_unit_is_inactive_and_untracked() {
+        let _guard = crate::test_support::children_lock();
         let m = manager_with("a.service", RestartPolicy::No);
         let rt = m.get(&UnitName::parse("a.service").unwrap()).unwrap();
         assert_eq!(rt.state, UnitState::Inactive);
@@ -1099,6 +1100,7 @@ mod tests {
     /// Spawning must actually produce a process the manager knows about.
     #[test]
     fn spawning_a_unit_tracks_its_pid_and_becomes_active() {
+        let _guard = crate::test_support::children_lock();
         let mut m = manager_with("a.service", RestartPolicy::No);
         let unit = UnitName::parse("a.service").unwrap();
         m.spawn_unit_with_env(&unit, &[]).expect("spawn");
@@ -1117,6 +1119,7 @@ mod tests {
     /// would wait forever.
     #[test]
     fn starting_a_target_reaches_active_without_a_process() {
+        let _guard = crate::test_support::children_lock();
         let mut cfg = config("t.target", RestartPolicy::No);
         cfg.kind = rinit_core::UnitType::Target;
         cfg.exec_start = rinit_core::ExecCommand::empty();
@@ -1132,6 +1135,7 @@ mod tests {
     /// The core of M2's acceptance: a killed service is restarted.
     #[test]
     fn a_killed_service_schedules_a_restart() {
+        let _guard = crate::test_support::children_lock();
         let mut m = manager_with("a.service", RestartPolicy::Always);
         let unit = UnitName::parse("a.service").unwrap();
         m.spawn_unit_with_env(&unit, &[]).expect("spawn");
@@ -1156,6 +1160,7 @@ mod tests {
     /// supervised service and a run-once task.
     #[test]
     fn without_restart_a_dead_service_stays_down() {
+        let _guard = crate::test_support::children_lock();
         let mut m = manager_with("a.service", RestartPolicy::No);
         let unit = UnitName::parse("a.service").unwrap();
         m.spawn_unit_with_env(&unit, &[]).expect("spawn");
@@ -1178,6 +1183,7 @@ mod tests {
     /// unit instead of restarting forever.
     #[test]
     fn repeated_crashes_trip_the_breaker() {
+        let _guard = crate::test_support::children_lock();
         let mut cfg = config("a.service", RestartPolicy::Always);
         cfg.start_limit_burst = 3;
         cfg.start_limit_interval_sec = 600;
@@ -1223,6 +1229,7 @@ mod tests {
     /// `Restart=always` - otherwise every shutdown would restart everything.
     #[test]
     fn an_exit_during_stop_does_not_restart() {
+        let _guard = crate::test_support::children_lock();
         let mut m = manager_with("a.service", RestartPolicy::Always);
         let unit = UnitName::parse("a.service").unwrap();
         m.spawn_unit_with_env(&unit, &[]).expect("spawn");
@@ -1244,6 +1251,7 @@ mod tests {
     /// A clean `oneshot` is a success, not something to restart.
     #[test]
     fn a_successful_oneshot_becomes_active_exited() {
+        let _guard = crate::test_support::children_lock();
         let mut m = oneshot_manager(RestartPolicy::OnFailure, true);
         let unit = UnitName::parse("once.service").unwrap();
         let pid = spawn_pid(&mut m, &unit);
@@ -1261,6 +1269,7 @@ mod tests {
     /// An `oneshot` that fails *is* subject to `Restart=`.
     #[test]
     fn a_failed_oneshot_follows_the_restart_policy() {
+        let _guard = crate::test_support::children_lock();
         let mut m = oneshot_manager(RestartPolicy::OnFailure, false);
         let unit = UnitName::parse("once.service").unwrap();
         let pid = spawn_pid(&mut m, &unit);
@@ -1307,6 +1316,7 @@ mod tests {
     /// An exit for a pid rinit does not know must be ignored, not crash.
     #[test]
     fn an_unknown_pid_is_ignored() {
+        let _guard = crate::test_support::children_lock();
         let mut m = manager_with("a.service", RestartPolicy::Always);
         assert!(m.on_child_exit(123_456_789, ExitOutcome::Success).is_none());
     }
@@ -1333,6 +1343,7 @@ mod tests {
     /// `notify` stays `Starting` until `READY=1` arrives (plan §1.3(12)).
     #[test]
     fn a_notify_unit_becomes_active_on_ready() {
+        let _guard = crate::test_support::children_lock();
         let (mut m, unit) = notify_running("n.service");
         assert_eq!(m.get(&unit).unwrap().state, UnitState::Starting);
 
@@ -1354,6 +1365,7 @@ mod tests {
     /// own.
     #[test]
     fn status_alone_does_not_make_a_unit_ready() {
+        let _guard = crate::test_support::children_lock();
         let (mut m, unit) = notify_running("n.service");
         let became_active = m.on_notify(
             &unit,
@@ -1374,6 +1386,7 @@ mod tests {
     /// `WATCHDOG=1` is recorded but M2 takes no action on it.
     #[test]
     fn a_watchdog_ping_does_not_complete_start_up() {
+        let _guard = crate::test_support::children_lock();
         let (mut m, unit) = notify_running("n.service");
         let became_active = m.on_notify(
             &unit,
@@ -1393,6 +1406,7 @@ mod tests {
     /// arms the `SIGKILL` follow-up (plan §1.3(12)).
     #[test]
     fn a_silent_notify_unit_is_timed_out() {
+        let _guard = crate::test_support::children_lock();
         let (mut m, unit) = notify_running("n.service");
         // Pretend the deadline already passed instead of waiting for it.
         m.units.get_mut(&unit).unwrap().start_deadline =
@@ -1414,6 +1428,7 @@ mod tests {
     /// The follow-up kill fires when its `TimeoutStopSec` elapses.
     #[test]
     fn a_unit_that_ignores_the_stop_signal_is_killed() {
+        let _guard = crate::test_support::children_lock();
         let (mut m, unit) = notify_running("n.service");
         m.units.get_mut(&unit).unwrap().kill_at = Some(Instant::now() - Duration::from_secs(1));
 
@@ -1451,6 +1466,7 @@ mod tests {
     /// A probe that exits 0 marks the unit healthy and books the next probe.
     #[test]
     fn a_passing_probe_marks_the_unit_healthy() {
+        let _guard = crate::test_support::children_lock();
         let (mut m, unit) = health_service("h.service", "/bin/true", false);
         make_probe_due(&mut m, &unit);
 
@@ -1474,6 +1490,7 @@ mod tests {
     /// but leaves it running.
     #[test]
     fn a_failing_probe_only_marks_without_restart() {
+        let _guard = crate::test_support::children_lock();
         let (mut m, unit) = health_service("h.service", "/bin/false", false);
         make_probe_due(&mut m, &unit);
 
@@ -1493,6 +1510,7 @@ mod tests {
     /// re-enters the restart path (plan §1.3(5)).
     #[test]
     fn a_failing_probe_restarts_when_asked() {
+        let _guard = crate::test_support::children_lock();
         let (mut m, unit) = health_service("h.service", "/bin/false", true);
         make_probe_due(&mut m, &unit);
 
@@ -1519,6 +1537,7 @@ mod tests {
     /// A probe that hangs past `HealthTimeoutSec` is killed.
     #[test]
     fn a_hung_probe_is_killed() {
+        let _guard = crate::test_support::children_lock();
         let (mut m, unit) = health_service("h.service", "/bin/true", false);
         make_probe_due(&mut m, &unit);
         m.due_health_probes();
@@ -1540,6 +1559,7 @@ mod tests {
     /// A unit with no `HealthCheck` is never probed.
     #[test]
     fn a_unit_without_a_health_check_is_not_probed() {
+        let _guard = crate::test_support::children_lock();
         let mut m = manager_with("a.service", RestartPolicy::No);
         let unit = UnitName::parse("a.service").unwrap();
         m.spawn_unit_with_env(&unit, &[]).expect("spawn");
@@ -1552,6 +1572,7 @@ mod tests {
 
     #[test]
     fn different_units_get_different_jitter_seeds() {
+        let _guard = crate::test_support::children_lock();
         let a = fnv1a(b"a.service");
         let b = fnv1a(b"b.service");
         assert_ne!(a, b, "two units must not share a jitter stream");
@@ -1560,6 +1581,7 @@ mod tests {
 
     #[test]
     fn units_are_reported_in_name_order() {
+        let _guard = crate::test_support::children_lock();
         let mut m = UnitManager::new();
         for n in ["c.service", "a.service", "b.service"] {
             m.add(config(n, RestartPolicy::No));
@@ -1579,6 +1601,7 @@ mod tests {
     /// A start request against a unit that is down asks for a process.
     #[test]
     fn a_start_request_spawns_an_inactive_unit() {
+        let _guard = crate::test_support::children_lock();
         let mut m = manager_with("a.service", RestartPolicy::No);
         let unit = UnitName::parse("a.service").unwrap();
         assert_eq!(
@@ -1591,6 +1614,7 @@ mod tests {
     /// reconcile still knows what was asked for.
     #[test]
     fn a_start_request_against_a_running_unit_is_satisfied() {
+        let _guard = crate::test_support::children_lock();
         let mut m = manager_with("a.service", RestartPolicy::No);
         let unit = UnitName::parse("a.service").unwrap();
         m.request_start(&unit, RequestSource::Dependency);
@@ -1613,6 +1637,7 @@ mod tests {
     /// Asking a running unit to stop produces the signal, not a state guess.
     #[test]
     fn a_stop_request_signals_a_running_unit() {
+        let _guard = crate::test_support::children_lock();
         let mut m = manager_with("a.service", RestartPolicy::No);
         let unit = UnitName::parse("a.service").unwrap();
         m.request_start(&unit, RequestSource::Dependency);
@@ -1635,6 +1660,7 @@ mod tests {
     /// and it cancels a pending backoff rather than waiting it out.
     #[test]
     fn a_start_request_reaches_past_failure_states() {
+        let _guard = crate::test_support::children_lock();
         for (state, expected) in [
             (
                 UnitState::Failed(FailedReason::StartLimitHit),
@@ -1661,6 +1687,7 @@ mod tests {
     /// Clearing the breaker is what makes the retry a fresh start.
     #[test]
     fn clearing_the_start_limit_forgets_the_failures() {
+        let _guard = crate::test_support::children_lock();
         let mut m = manager_with("a.service", RestartPolicy::Always);
         let unit = UnitName::parse("a.service").unwrap();
         let rt = m.units.get_mut(&unit).unwrap();
@@ -1681,6 +1708,7 @@ mod tests {
     /// unit that is still tearing down.
     #[test]
     fn a_start_against_a_stop_in_progress_is_queued() {
+        let _guard = crate::test_support::children_lock();
         let mut m = manager_with("a.service", RestartPolicy::No);
         let unit = UnitName::parse("a.service").unwrap();
         m.request_start(&unit, RequestSource::Dependency);
@@ -1705,6 +1733,7 @@ mod tests {
     /// newer.
     #[test]
     fn a_shutdown_stop_outranks_a_later_start() {
+        let _guard = crate::test_support::children_lock();
         let mut m = manager_with("a.service", RestartPolicy::Always);
         let unit = UnitName::parse("a.service").unwrap();
         m.request_start(&unit, RequestSource::Dependency);
@@ -1728,6 +1757,7 @@ mod tests {
     /// the whole failure mode the backoff exists to avoid.)
     #[test]
     fn a_pending_backoff_survives_the_standing_start_target() {
+        let _guard = crate::test_support::children_lock();
         let mut m = manager_with("a.service", RestartPolicy::Always);
         let unit = UnitName::parse("a.service").unwrap();
         m.request_start(&unit, RequestSource::Dependency);
@@ -1749,6 +1779,7 @@ mod tests {
     /// A request for a unit rinit does not know is a no-op, not a panic.
     #[test]
     fn a_request_for_an_unknown_unit_does_nothing() {
+        let _guard = crate::test_support::children_lock();
         let mut m = UnitManager::new();
         let ghost = UnitName::parse("ghost.service").unwrap();
         assert_eq!(m.request_start(&ghost, RequestSource::UserStart), None);
@@ -1759,6 +1790,7 @@ mod tests {
     /// Plan §1.1: power failure compresses every stop timeout to a hard cap.
     #[test]
     fn compress_stop_timeouts_caps_every_unit() {
+        let _guard = crate::test_support::children_lock();
         let mut m = UnitManager::new();
         m.add(config("slow.service", RestartPolicy::No));
         m.add(config("quick.service", RestartPolicy::No));
@@ -1797,6 +1829,7 @@ mod tests {
     /// Plan §1.1: starting a unit stops whatever it conflicts with.
     #[test]
     fn starting_a_unit_stops_its_conflicts() {
+        let _guard = crate::test_support::children_lock();
         let mut m = UnitManager::new();
         m.add(config("alpha.service", RestartPolicy::No));
         let mut beta = config("beta.service", RestartPolicy::No);
@@ -1822,6 +1855,7 @@ mod tests {
     /// by the command rather than by a signal.
     #[test]
     fn exec_stop_is_used_as_the_stop_action() {
+        let _guard = crate::test_support::children_lock();
         let mut m = manager_with("a.service", RestartPolicy::No);
         let unit = UnitName::parse("a.service").unwrap();
         m.units.get_mut(&unit).unwrap().config.exec_stop =
@@ -1843,6 +1877,7 @@ mod tests {
     /// foundation.
     #[test]
     fn a_failed_dependency_fails_its_requires_dependents() {
+        let _guard = crate::test_support::children_lock();
         let mut m = UnitManager::new();
         m.add(config("base.service", RestartPolicy::No));
         let mut dep = config("dep.service", RestartPolicy::No);
@@ -1867,6 +1902,7 @@ mod tests {
     /// could never escalate.
     #[test]
     fn a_stop_arms_the_sigkill_deadline() {
+        let _guard = crate::test_support::children_lock();
         let mut m = manager_with("a.service", RestartPolicy::No);
         let unit = UnitName::parse("a.service").unwrap();
         spawn_pid(&mut m, &unit);
@@ -1888,6 +1924,7 @@ mod tests {
     /// deadline to wait for.
     #[test]
     fn a_zero_stop_timeout_kills_immediately() {
+        let _guard = crate::test_support::children_lock();
         let mut m = manager_with("a.service", RestartPolicy::No);
         let unit = UnitName::parse("a.service").unwrap();
         spawn_pid(&mut m, &unit);

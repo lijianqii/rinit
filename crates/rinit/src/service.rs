@@ -201,6 +201,7 @@ mod tests {
 
     #[test]
     fn empty_argv_is_rejected_before_any_syscall() {
+        let _guard = crate::test_support::children_lock();
         let err = spawn_service(&[]).expect_err("empty argv must not spawn");
         assert!(err.to_string().contains("empty command"), "got: {err}");
     }
@@ -209,6 +210,7 @@ mod tests {
     /// refused rather than turned into a bogus path.
     #[test]
     fn interior_nul_in_argv_is_rejected() {
+        let _guard = crate::test_support::children_lock();
         let err =
             spawn_service(&["/bin/sh\0".to_string()]).expect_err("interior NUL must be rejected");
         assert!(
@@ -219,6 +221,7 @@ mod tests {
 
     #[test]
     fn interior_nul_in_a_later_argv_element_is_rejected() {
+        let _guard = crate::test_support::children_lock();
         let err = spawn_service(&["/bin/sh".to_string(), "-c\0".to_string()])
             .expect_err("interior NUL must be rejected");
         assert!(
@@ -229,6 +232,7 @@ mod tests {
 
     #[test]
     fn spawn_tracks_the_child_and_forget_removes_it() {
+        let _guard = crate::test_support::children_lock();
         let mut services = ServiceSet::new();
         let pid = services
             .spawn(&["/bin/sleep".to_string(), "5".to_string()])
@@ -242,6 +246,7 @@ mod tests {
 
     #[test]
     fn spawning_a_missing_binary_reports_the_errno() {
+        let _guard = crate::test_support::children_lock();
         let mut services = ServiceSet::new();
         let err = services
             .spawn(&["/definitely/not/a/real/binary".to_string()])
@@ -253,6 +258,7 @@ mod tests {
     /// be SIGTERMed again during shutdown.
     #[test]
     fn reaping_untracks_the_child() {
+        let _guard = crate::test_support::children_lock();
         let mut services = ServiceSet::new();
         let pid = services
             .spawn(&[
@@ -283,6 +289,7 @@ mod tests {
     /// developer's machine. The smoke test relies on this.
     #[tokio::test(flavor = "current_thread")]
     async fn shutdown_is_a_noop_on_an_empty_set() {
+        let _guard = crate::test_support::children_lock_async().await;
         let mut services = ServiceSet::new();
         shutdown(&mut services)
             .await

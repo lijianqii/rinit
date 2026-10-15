@@ -525,14 +525,10 @@ fn logical_lines(input: &str) -> Vec<(usize, String)> {
         let line = raw.strip_suffix('\r').unwrap_or(raw);
         let line_no = idx + 1;
 
-        let continuing = !line.trim_start().starts_with('#')
-            && line.trim_end().ends_with('\\')
-            && !line
-                .trim_end()
-                .strip_suffix('\\')
-                .unwrap_or("")
-                .trim()
-                .is_empty();
+        // A comment line never continues, and any other line ending in `\`
+        // does - including a bare `\`, which the EBNF's `continuation` rule
+        // allows.
+        let continuing = !line.trim_start().starts_with('#') && line.trim_end().ends_with('\\');
 
         if current.is_empty() {
             start = line_no;
@@ -570,7 +566,7 @@ fn section_header(line: &str, line_no: usize) -> Result<Option<Section>, ParseEr
             message: format!("unexpected content after section header: {tail:?}"),
         });
     }
-    match name.trim() {
+    match name {
         "Unit" => Ok(Some(Section::Unit)),
         "Service" => Ok(Some(Section::Service)),
         other => Err(ParseError::UnknownSection {
@@ -747,9 +743,12 @@ fn number(line: usize, key: &str, tokens: &[String], zero: Zero) -> Result<u64, 
 
 fn boolean(line: usize, key: &str, tokens: &[String]) -> Result<bool, ParseError> {
     let text = join_tokens(tokens);
+    // Plan §1.1 spells the type as `true`/`false`; the lenient shell-ish
+    // spellings are deliberately not accepted, so a typo is caught here rather
+    // than silently defaulting.
     match text.as_str() {
-        "true" | "yes" | "1" => Ok(true),
-        "false" | "no" | "0" => Ok(false),
+        "true" => Ok(true),
+        "false" => Ok(false),
         _ => Err(invalid(line, key, &text, "expected 'true' or 'false'")),
     }
 }
@@ -1087,6 +1086,16 @@ mod tests {
         assert_eq!(cfg.description, "App");
     }
 
+    /// The EBNF's `continuation` rule allows a line that is only `\`.
+    #[test]
+    fn a_lone_backslash_continues_the_next_line() {
+        let cfg = ok(
+            "app.service",
+            "[Unit]\n\\\nDescription=App\n[Service]\nExecStart=/bin/true\n",
+        );
+        assert_eq!(cfg.description, "App");
+    }
+
     // --- sections and keys ---------------------------------------------
 
     #[test]
@@ -1098,6 +1107,15 @@ mod tests {
                 section: "Servcie".to_string()
             }
         );
+    }
+
+    /// The EBNF spells the section header `[Unit]`, with no interior space.
+    #[test]
+    fn whitespace_inside_a_section_header_is_rejected() {
+        assert!(matches!(
+            err("app.service", "[ Unit ]\nExecStart=/bin/true\n"),
+            ParseError::UnknownSection { line: 1, .. }
+        ));
     }
 
     /// A typo'd key would otherwise be a silent no-op, so it must be loud.
@@ -1435,6 +1453,24 @@ mod tests {
             ),
             ParseError::InvalidValue { line: 3, .. }
         ));
+    }
+
+    /// Plan §1.1 spells the boolean type `true`/`false` only; the shell-ish
+    /// spellings are not silently accepted.
+    #[test]
+    fn shell_style_booleans_are_rejected() {
+        for value in ["yes", "no", "1", "0", "TRUE"] {
+            assert!(
+                matches!(
+                    err(
+                        "app.service",
+                        &format!("[Service]\nExecStart=/bin/true\nNoNewPrivileges={value}\n")
+                    ),
+                    ParseError::InvalidValue { line: 3, .. }
+                ),
+                "{value} must be rejected"
+            );
+        }
     }
 
     /// Plan §1.1: `Option<Vec<Cap>>` must distinguish unset from cleared, or

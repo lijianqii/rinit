@@ -15,7 +15,7 @@
 //! - **A target has no process.** `UnitType::Target` units carry no
 //!   `ExecStart` and are not spawned.
 
-use alloc::string::{String, ToString};
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::time::Duration;
 
@@ -192,16 +192,30 @@ impl CpuQuota {
 pub struct Cap(String);
 
 impl Cap {
-    /// Validate a capability name: lowercase letters, digits and `_`.
+    /// Validate and normalise a capability name.
+    ///
+    /// Accepts the spelling people actually write - `NET_BIND_SERVICE`,
+    /// `CAP_SYS_ADMIN`, or the lower-case form - and stores one canonical
+    /// lower-case name with the `CAP_` prefix stripped, so the runtime's name
+    /// table has a single key per capability (plan §7.4).
     pub fn parse(s: &str) -> Option<Self> {
-        if s.is_empty()
-            || !s
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        let s = s.trim();
+        // `CAP_FOO` and `cap_foo` and `FOO` all mean the same capability.
+        let name = s
+            .strip_prefix("CAP_")
+            .or_else(|| s.strip_prefix("cap_"))
+            .unwrap_or(s);
+        if name.is_empty() {
+            return None;
+        }
+        let normalised = name.to_ascii_lowercase();
+        if !normalised
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
         {
             return None;
         }
-        Some(Cap(s.to_string()))
+        Some(Cap(normalised))
     }
 
     /// The capability name.
@@ -493,13 +507,24 @@ mod tests {
     }
 
     #[test]
-    fn capability_names_are_validated() {
-        assert_eq!(
-            Cap::parse("net_bind_service").unwrap().as_str(),
-            "net_bind_service"
-        );
-        assert_eq!(Cap::parse("CAP_SYS_ADMIN"), None);
+    fn capability_names_are_validated_and_normalised() {
+        // Plan §7.4 writes them upper-case (its `AmbientCapabilities=` example
+        // is `NET_BIND_SERVICE`), so all spellings must land on one canonical
+        // name for the runtime's lookup table.
+        for spelling in [
+            "net_bind_service",
+            "NET_BIND_SERVICE",
+            "CAP_NET_BIND_SERVICE",
+        ] {
+            assert_eq!(
+                Cap::parse(spelling).unwrap().as_str(),
+                "net_bind_service",
+                "{spelling} must normalise"
+            );
+        }
+        assert_eq!(Cap::parse("cap_sys_admin").unwrap().as_str(), "sys_admin");
         assert_eq!(Cap::parse(""), None);
+        assert_eq!(Cap::parse("CAP_"), None);
         assert_eq!(Cap::parse("bad-name"), None);
     }
 

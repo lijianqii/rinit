@@ -47,6 +47,16 @@ pub enum DependencyError {
         /// The requested target.
         target: UnitName,
     },
+    /// Two inputs defined the same unit.
+    ///
+    /// The loader keys a unit by its file name, so a directory cannot produce
+    /// this; the check lives here because the graph is where identity matters,
+    /// and it keeps any other caller (a future reload, `rctl`, a test fixture)
+    /// from silently merging two definitions the way `build` used to.
+    DuplicateUnit {
+        /// The unit that was defined twice.
+        unit: UnitName,
+    },
 }
 
 impl core::fmt::Display for DependencyError {
@@ -72,6 +82,9 @@ impl core::fmt::Display for DependencyError {
             ),
             DependencyError::UnknownDefaultTarget { target } => {
                 write!(f, "boot target {target} not found in the unit directory")
+            }
+            DependencyError::DuplicateUnit { unit } => {
+                write!(f, "{unit} is defined more than once")
             }
         }
     }
@@ -143,10 +156,16 @@ impl DependencyGraph {
 
         let mut units: Vec<UnitName> = Vec::with_capacity(configs.len());
         for cfg in &configs {
+            // Plan §1.1: two definitions of the same unit is an error, never a
+            // silent merge.
+            if units.contains(&cfg.name) {
+                return Err(DependencyError::DuplicateUnit {
+                    unit: cfg.name.clone(),
+                });
+            }
             units.push(cfg.name.clone());
         }
         units.sort();
-        units.dedup();
 
         let index_of = |name: &UnitName| units.iter().position(|u| u == name);
         let mut dependencies: Vec<Vec<usize>> = vec![Vec::new(); units.len()];
@@ -804,6 +823,23 @@ mod tests {
         assert!(graph.units().is_empty());
         assert!(graph.topological_order().unwrap().is_empty());
         assert!(graph.levels().unwrap().is_empty());
+    }
+
+    /// Plan §1.1: two definitions of one unit must be rejected, not merged.
+    #[test]
+    fn a_duplicate_unit_is_an_error() {
+        let configs = vec![
+            unit("dup.service", &[], &[], UnitType::Service),
+            unit("dup.service", &["a.service"], &[], UnitType::Service),
+        ];
+        let err = DependencyGraph::build(&configs).unwrap_err();
+        assert_eq!(
+            err,
+            DependencyError::DuplicateUnit {
+                unit: name("dup.service")
+            }
+        );
+        assert!(format!("{err}").contains("dup.service"), "got: {err}");
     }
 
     #[test]

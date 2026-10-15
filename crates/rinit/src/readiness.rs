@@ -102,6 +102,7 @@ mod tests {
 
     #[test]
     fn oneshot_waits_for_exit_and_simple_does_not() {
+        let _guard = crate::test_support::children_lock();
         assert_eq!(readiness_of(ServiceKind::Oneshot), Readiness::OnExitSuccess);
         assert_eq!(readiness_of(ServiceKind::Simple), Readiness::Immediate);
         assert_eq!(readiness_of(ServiceKind::Notify), Readiness::Immediate);
@@ -109,6 +110,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn waiting_reports_a_successful_exit_code() {
+        let _guard = crate::test_support::children_lock_async().await;
         let pid = crate::service::spawn_service(&[
             "/bin/sh".to_string(),
             "-c".to_string(),
@@ -123,6 +125,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn waiting_reports_a_nonzero_exit_code() {
+        let _guard = crate::test_support::children_lock_async().await;
         let pid = crate::service::spawn_service(&[
             "/bin/sh".to_string(),
             "-c".to_string(),
@@ -139,6 +142,7 @@ mod tests {
     /// successfully, which the caller must treat as a failure.
     #[tokio::test(flavor = "current_thread")]
     async fn waiting_reports_a_signalled_child_as_unsuccessful() {
+        let _guard = crate::test_support::children_lock_async().await;
         let pid = crate::service::spawn_service(&[
             "/bin/sh".to_string(),
             "-c".to_string(),
@@ -153,6 +157,7 @@ mod tests {
     /// A timeout must be reported as such, not mistaken for an exit.
     #[tokio::test(flavor = "current_thread")]
     async fn waiting_times_out_on_a_hung_child() {
+        let _guard = crate::test_support::children_lock_async().await;
         let pid = crate::service::spawn_service(&[
             "/bin/sh".to_string(),
             "-c".to_string(),
@@ -174,6 +179,7 @@ mod tests {
     /// `ECHILD` branch that the `EINTR` retry has to be distinguished from.
     #[tokio::test(flavor = "current_thread")]
     async fn waiting_on_an_already_reaped_child_reports_failure() {
+        let _guard = crate::test_support::children_lock_async().await;
         let pid = crate::service::spawn_service(&[
             "/bin/sh".to_string(),
             "-c".to_string(),
@@ -197,6 +203,7 @@ mod tests {
     /// a zero timeout must not report failure the instant it is reached.
     #[tokio::test(flavor = "current_thread")]
     async fn a_zero_timeout_does_not_expire_immediately() {
+        let _guard = crate::test_support::children_lock_async().await;
         let mut backoff = crate::unit_manager::UnitManager::new();
         let unit = rinit_core::UnitName::parse("t.service").unwrap();
         let mut cfg = rinit_core::UnitConfig::new(unit.clone());

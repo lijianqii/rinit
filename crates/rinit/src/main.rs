@@ -11,6 +11,8 @@ mod manager;
 mod notify;
 mod readiness;
 mod service;
+#[cfg(test)]
+mod test_support;
 mod unit_manager;
 
 use std::io::Write;
