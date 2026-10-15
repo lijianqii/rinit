@@ -238,6 +238,36 @@ fn a_unit_that_cannot_start_fails_its_required_dependents() {
     );
 }
 
+/// Plan §1.1: starting a unit stops whatever it declares `Conflicts=`, before
+/// it starts.
+#[test]
+fn starting_a_unit_stops_what_it_conflicts_with() {
+    let dir = TempDir::new("conflicts");
+    dir.write(
+        "all.target",
+        "[Unit]\nType=target\nRequires=alpha.service beta.service\n",
+    );
+    dir.write(
+        "alpha.service",
+        "[Service]\nType=simple\nExecStart=/bin/sleep 30\n",
+    );
+    dir.write(
+        "beta.service",
+        "[Unit]\nConflicts=alpha.service\n[Service]\nType=simple\nExecStart=/bin/sleep 30\n",
+    );
+
+    let log = boot_units(&dir, "all.target", Duration::from_millis(800));
+
+    assert!(
+        log.contains("stopping alpha.service: it conflicts with beta.service"),
+        "the conflict must be resolved by stopping alpha:\n{log}"
+    );
+    assert!(
+        log.contains("alpha.service stopped; beta.service may start"),
+        "beta must wait for alpha to actually stop:\n{log}"
+    );
+}
+
 /// Plan §1.1: `ExecStop=`, when set, is the stop action; the `SIGKILL`
 /// escalation still applies if the service does not actually stop.
 #[test]

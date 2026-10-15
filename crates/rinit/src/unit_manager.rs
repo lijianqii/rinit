@@ -338,6 +338,27 @@ impl UnitManager {
         }
     }
 
+    /// Stop every unit `unit` mutually excludes, so that it can start.
+    ///
+    /// Plan §1.1: `Conflicts=` means "stop the other one first". This only
+    /// touches units with a live process, and it returns them so the caller can
+    /// wait for them to actually go away before spawning `unit`.
+    pub fn stop_conflicts(&mut self, unit: &UnitName) -> Vec<UnitName> {
+        let conflicts = match self.units.get(unit) {
+            Some(rt) => rt.config.deps.conflicts.clone(),
+            None => return Vec::new(),
+        };
+        let mut stopped = Vec::new();
+        for other in conflicts {
+            // A conflicting unit that is not running is already resolved.
+            if self.units.get(&other).is_some_and(|rt| rt.pid.is_some()) {
+                self.stop_unit(&other);
+                stopped.push(other);
+            }
+        }
+        stopped
+    }
+
     /// Units that hard-`Requires=` `unit`, in name order.
     pub fn requires_dependents(&self, unit: &UnitName) -> Vec<UnitName> {
         self.units
@@ -1726,6 +1747,30 @@ mod tests {
     }
 
     // --- two-stage stop (plan §1.1) -------------------------------------
+
+    /// Plan §1.1: starting a unit stops whatever it conflicts with.
+    #[test]
+    fn starting_a_unit_stops_its_conflicts() {
+        let mut m = UnitManager::new();
+        m.add(config("alpha.service", RestartPolicy::No));
+        let mut beta = config("beta.service", RestartPolicy::No);
+        beta.deps.conflicts = vec![UnitName::parse("alpha.service").unwrap()];
+        m.add(beta);
+
+        let alpha = UnitName::parse("alpha.service").unwrap();
+        let beta = UnitName::parse("beta.service").unwrap();
+        spawn_pid(&mut m, &alpha);
+
+        let stopped = m.stop_conflicts(&beta);
+        assert_eq!(stopped, std::slice::from_ref(&alpha));
+        assert_eq!(
+            m.get(&alpha).unwrap().state,
+            UnitState::Deactivating,
+            "the conflicting unit must be stopping"
+        );
+
+        cleanup(&mut m, &alpha);
+    }
 
     /// `ExecStop=`, when set, is the stop action: the service is asked to stop
     /// by the command rather than by a signal.

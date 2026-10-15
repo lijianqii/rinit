@@ -9,7 +9,7 @@
 //! unit directory, resolves the dependency graph, and starts each *level* of
 //! the schedule in parallel before moving on (plan §3 M1).
 
-use rinit_core::{Effect, RequestSource, ServiceKind, UnitName};
+use rinit_core::{Effect, ExitOutcome, RequestSource, ServiceKind, UnitName};
 use rinit_runtime::syscall::{process, reboot, signal};
 use rinit_runtime::{RuntimeError, Signal, SignalSet};
 
@@ -250,6 +250,10 @@ async fn start_unit(
     notify: &mut NotifyHub,
     unit: &UnitName,
 ) -> Result<bool, RuntimeError> {
+    // `Conflicts=` first: the other unit must be gone before this one starts
+    // (plan §1.1).
+    stop_conflicts(manager, unit).await;
+
     let pre = manager
         .get(unit)
         .map(|rt| rt.config.exec_start_pre.clone())
@@ -343,6 +347,46 @@ async fn run_start_post(manager: &UnitManager, unit: &UnitName) {
 fn fail_unit(manager: &mut UnitManager, unit: &UnitName) {
     for dependent in manager.fail_start(unit) {
         rlog!("error: {dependent} requires {unit}, which failed; not starting it");
+    }
+}
+
+/// Stop everything `unit` conflicts with and wait for it to actually go.
+///
+/// Plan §1.1 makes `Conflicts=` mutual exclusion with "stop the other one
+/// first" semantics, so the conflicting unit is waited for by its own pid -
+/// which keeps the wait from stealing the exit of an unrelated unit that boot
+/// is still going to wait for.
+async fn stop_conflicts(manager: &mut UnitManager, unit: &UnitName) {
+    for other in manager.stop_conflicts(unit) {
+        rlog!("stopping {other}: it conflicts with {unit}");
+        let Some(pid) = manager.get(&other).and_then(|rt| rt.pid) else {
+            continue;
+        };
+        let timeout = manager
+            .get(&other)
+            .map_or(1, |rt| rt.config.timeout_stop_sec.max(1));
+        let outcome =
+            match readiness::wait_for_exit(pid, std::time::Duration::from_secs(timeout)).await {
+                Ok(code) => exit_outcome(code),
+                Err(()) => {
+                    // It did not stop in time: escalate, as the stop path would.
+                    let _ = process::kill_process_group(pid, libc::SIGKILL);
+                    let _ = readiness::wait_for_exit(pid, std::time::Duration::from_secs(5)).await;
+                    ExitOutcome::Signalled(libc::SIGKILL)
+                }
+            };
+        manager.on_child_exit(pid, outcome);
+        rlog!("{other} stopped; {unit} may start");
+    }
+}
+
+/// Turn a `wait_for_exit` result into the outcome the manager records.
+fn exit_outcome(code: Option<i32>) -> ExitOutcome {
+    match code {
+        Some(0) => ExitOutcome::Success,
+        Some(code) => ExitOutcome::Failure(code),
+        // We signalled it, so a missing exit code means it died on a signal.
+        None => ExitOutcome::Signalled(libc::SIGTERM),
     }
 }
 
