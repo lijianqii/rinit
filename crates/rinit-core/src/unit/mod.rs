@@ -7,9 +7,11 @@
 //!
 //! Submodules (plan §1.2):
 //!
-//! - [`config`] — the parsed unit-file data model (M1).
-//! - [`parser`] — the `&str -> Result<UnitConfig, _>` unit-file parser (M1).
-//! - [`dependency`] — dependency DAG, topological sort, cycle detection (M1).
+//! - [`config`] — the parsed unit-file data model (plan §1.1).
+//! - [`parser`] — the `&str -> Result<UnitConfig, _>` unit-file parser
+//!   (plan §1.0 grammar).
+//! - [`dependency`] — dependency DAG, topological order, cycle detection
+//!   (plan §1.3(1)).
 
 pub mod config;
 pub mod dependency;
@@ -19,6 +21,12 @@ use alloc::string::{String, ToString};
 use core::fmt;
 
 use crate::CoreError;
+
+pub use config::{
+    Cap, CpuQuota, Dependencies, ExecCommand, RestartPolicy, ServiceKind, SizeBytes, UnitConfig,
+};
+pub use dependency::{DependencyError, DependencyGraph};
+pub use parser::{ParseError, parse as parse_unit_file};
 
 /// The kind of a unit (plan §1.1 `[Unit] Type`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

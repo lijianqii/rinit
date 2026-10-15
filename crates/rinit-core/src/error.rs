@@ -13,7 +13,23 @@ use core::fmt;
 pub enum CoreError {
     /// A unit name was empty or contained characters outside the permitted set.
     InvalidUnitName(String),
-    // M1+ adds: Parse(ParseError), Dependency(DependencyError), State(StateError).
+    /// A unit file did not satisfy the format or the directive contract.
+    Parse(crate::unit::parser::ParseError),
+    /// The dependency graph could not be built or scheduled.
+    Dependency(crate::unit::dependency::DependencyError),
+    // M2+ adds: State(StateError).
+}
+
+impl From<crate::unit::parser::ParseError> for CoreError {
+    fn from(e: crate::unit::parser::ParseError) -> Self {
+        CoreError::Parse(e)
+    }
+}
+
+impl From<crate::unit::dependency::DependencyError> for CoreError {
+    fn from(e: crate::unit::dependency::DependencyError) -> Self {
+        CoreError::Dependency(e)
+    }
 }
 
 impl fmt::Display for CoreError {
@@ -22,6 +38,8 @@ impl fmt::Display for CoreError {
             CoreError::InvalidUnitName(name) => {
                 write!(f, "invalid unit name: {name:?}")
             }
+            CoreError::Parse(e) => write!(f, "{e}"),
+            CoreError::Dependency(e) => write!(f, "{e}"),
         }
     }
 }

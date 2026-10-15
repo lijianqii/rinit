@@ -6,9 +6,9 @@
 //! binary unchanged. All state is passed explicitly: no `static mut`, no
 //! `lazy_static` (plan §0.2 principle 2).
 //!
-//! M0 scope: error types and unit-name modelling. The unit parser, dependency
-//! DAG, state machine and manager land in M1/M2 (plan §3); the `unit/` module
-//! tree already reserves their homes per plan §1.2.
+//! M0 scope: error types and unit-name modelling. M1 adds the unit-file
+//! parser, the dependency graph and the unit data model; the state machine and
+//! manager land in M2 (plan §3).
 #![no_std]
 #![forbid(unsafe_code)]
 
@@ -22,4 +22,7 @@ pub mod error;
 pub mod unit;
 
 pub use error::CoreError;
-pub use unit::{UnitName, UnitType};
+pub use unit::{
+    DependencyError, DependencyGraph, ExecCommand, ParseError, RestartPolicy, ServiceKind,
+    UnitConfig, UnitName, UnitType,
+};

@@ -1,25 +1,786 @@
-//! Dependency DAG: construction, topological sort, cycle detection (plan §1.3(1));
-//! lands with M1.
+//! Dependency graph: construction, topological order, cycle detection
+//! (plan §1.1, §1.3(1), §7.2).
 //!
-//! M1 will build the directed graph here and drive parallel startup from it.
+//! The graph is what makes M1's parallel startup correct, so its edges encode
+//! the plan's distinctions precisely:
 //!
-//! Semantics to implement (plan §1.1, §1.3(1)):
+//! - `Requires=` and `Wants=` are *activation* dependencies that also imply
+//!   ordering (plan §1.1), so they produce edges like `After=` does.
+//! - `After=` / `Before=` are ordering only and imply no liveness.
+//! - `Conflicts=` is mutual exclusion and deliberately produces **no** start
+//!   edge; it does not propagate transitively either (plan §1.1).
 //!
-//! - `Requires=` — hard dependency; failure of the required unit fails the
-//!   requirer.
-//! - `Wants=` — weak dependency; a missing or failed wanted unit degrades to a
-//!   warning.
-//! - `After=` / `Before=` — ordering only, no liveness implication.
-//! - `Conflicts=` — mutual exclusion.
+//! Scheduling is expressed as *levels*: every unit whose dependencies are all
+//! in earlier levels can be started at the same time, which is what turns a
+//! serial boot into a parallel one.
 //!
-//! Required behaviours:
-//!
-//! - Topological sort (Kahn or DFS) with **cycle detection that names the
-//!   cycle path** (`a -> b -> c -> a`), because a cycle in a unit directory is
-//!   otherwise very hard to spot.
-//! - Deterministic ordering: ties are broken with [`super::UnitName`]'s
-//!   `Ord` so two boots produce the same startup sequence.
-//! - Reference integrity checked at build time, before anything starts: a
-//!   `Requires=`/`After=` pointing at a unit with no file is a
-//!   `MissingDependency` error; the same case in `Wants=` downgrades to a
-//!   warning.
+//! Ordering ties are broken by [`UnitName`]'s `Ord`, so two boots of the same
+//! unit directory produce the same schedule.
+
+use alloc::format;
+use alloc::string::String;
+use alloc::vec;
+use alloc::vec::Vec;
+
+use super::{UnitName, UnitType};
+use crate::unit::config::UnitConfig;
+
+/// Something wrong with the dependency structure of a unit directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DependencyError {
+    /// The dependency cycle, listed as a closed path `a -> b -> a`.
+    Cycle {
+        /// The cycle, starting and ending at the same unit.
+        path: Vec<UnitName>,
+    },
+    /// A `Requires=`/`After=`/`Before=` names a unit with no file.
+    MissingDependency {
+        /// The unit that declared the reference.
+        required_by: UnitName,
+        /// The referenced unit that does not exist.
+        missing: UnitName,
+        /// The directive that referenced it.
+        directive: &'static str,
+    },
+    /// The requested boot target is not in the unit directory.
+    UnknownDefaultTarget {
+        /// The requested target.
+        target: UnitName,
+    },
+}
+
+impl core::fmt::Display for DependencyError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            DependencyError::Cycle { path } => {
+                write!(f, "dependency cycle: ")?;
+                for (i, unit) in path.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, " -> ")?;
+                    }
+                    write!(f, "{unit}")?;
+                }
+                Ok(())
+            }
+            DependencyError::MissingDependency {
+                required_by,
+                missing,
+                directive,
+            } => write!(
+                f,
+                "{required_by}: {directive}={missing} but no such unit file exists"
+            ),
+            DependencyError::UnknownDefaultTarget { target } => {
+                write!(f, "boot target {target} not found in the unit directory")
+            }
+        }
+    }
+}
+
+/// How strongly a reference binds the unit that declared it.
+///
+/// The variants exist so an unresolvable reference can be reported against the
+/// directive that actually wrote it: plan §1.3(1) makes `Requires=` and `After=`
+/// hard failures while `Wants=` is only a warning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Edge {
+    /// `Requires=`: hard activation, and the referenced unit must exist.
+    Requires,
+    /// `Wants=`: soft activation; a missing unit degrades to a warning.
+    Wants,
+    /// `After=`: ordering only, but the reference must still resolve.
+    After,
+}
+
+impl Edge {
+    const fn directive(self) -> &'static str {
+        match self {
+            Edge::Requires => "Requires",
+            Edge::Wants => "Wants",
+            Edge::After => "After",
+        }
+    }
+}
+
+/// A resolved dependency graph over one unit directory.
+#[derive(Debug, Clone, Default)]
+pub struct DependencyGraph {
+    /// Every known unit, sorted by name for deterministic iteration.
+    units: Vec<UnitName>,
+    /// For each unit index, the indices it must wait for before starting.
+    dependencies: Vec<Vec<usize>>,
+    /// Soft references that could not be resolved, reported as warnings.
+    pub warnings: Vec<String>,
+}
+
+impl DependencyGraph {
+    /// Build the graph from a set of parsed units.
+    ///
+    /// # Errors
+    /// Returns [`DependencyError::MissingDependency`] for an unresolvable
+    /// hard reference, and [`DependencyError::Cycle`] if the ordering edges
+    /// form a loop.
+    pub fn build<'a>(
+        configs: impl IntoIterator<Item = &'a UnitConfig>,
+    ) -> Result<Self, DependencyError> {
+        // Collect once, then sort: a deterministic unit order is what makes
+        // every index below (and the whole schedule) reproducible.
+        let mut configs: Vec<&UnitConfig> = configs.into_iter().collect();
+        configs.sort_by(|a, b| a.name.cmp(&b.name));
+
+        let mut units: Vec<UnitName> = Vec::with_capacity(configs.len());
+        for cfg in &configs {
+            units.push(cfg.name.clone());
+        }
+        units.sort();
+        units.dedup();
+
+        let index_of = |name: &UnitName| units.iter().position(|u| u == name);
+        let mut dependencies: Vec<Vec<usize>> = vec![Vec::new(); units.len()];
+        let mut warnings = Vec::new();
+
+        for cfg in &configs {
+            let me = index_of(&cfg.name).expect("every unit is indexed");
+
+            // (referenced unit, strength) pairs. `Requires`/`Wants` imply
+            // ordering (plan §1.1), so they produce edges here too.
+            let mut edges: Vec<(&UnitName, Edge)> = Vec::new();
+            for unit in &cfg.deps.requires {
+                edges.push((unit, Edge::Requires));
+            }
+            for unit in &cfg.deps.wants {
+                edges.push((unit, Edge::Wants));
+            }
+            for unit in &cfg.deps.after {
+                edges.push((unit, Edge::After));
+            }
+            // `Before=` is the mirror image: the referenced unit waits for us.
+            for unit in &cfg.deps.before {
+                match index_of(unit) {
+                    Some(other) => push_unique(&mut dependencies[other], me),
+                    None => {
+                        return Err(DependencyError::MissingDependency {
+                            required_by: cfg.name.clone(),
+                            missing: unit.clone(),
+                            directive: "Before",
+                        });
+                    }
+                }
+            }
+            // `Conflicts=` intentionally contributes no start edge.
+
+            for (unit, edge) in edges {
+                let Some(other) = index_of(unit) else {
+                    match edge {
+                        // Plan §1.3(1): a missing hard reference is reported
+                        // here, at build time, instead of at run time.
+                        Edge::Requires | Edge::After => {
+                            return Err(DependencyError::MissingDependency {
+                                required_by: cfg.name.clone(),
+                                missing: unit.clone(),
+                                directive: edge.directive(),
+                            });
+                        }
+                        Edge::Wants => {
+                            warnings.push(format!(
+                                "{}: Wants={} but no such unit file exists",
+                                cfg.name, unit
+                            ));
+                            continue;
+                        }
+                    }
+                };
+                // A self-reference is deliberately *not* filtered out: it forms
+                // a cycle, which the operator needs to fix rather than have
+                // silently ignored (plan §4.1 lists self-dependency as a DAG
+                // case).
+                push_unique(&mut dependencies[me], other);
+            }
+        }
+
+        let graph = DependencyGraph {
+            units,
+            dependencies,
+            warnings,
+        };
+        graph.check_acyclic()?;
+        Ok(graph)
+    }
+
+    /// Every known unit, in deterministic order.
+    pub fn units(&self) -> &[UnitName] {
+        &self.units
+    }
+
+    /// The units `unit` must wait for before it may start.
+    pub fn dependencies_of(&self, unit: &UnitName) -> Vec<UnitName> {
+        match self.units.iter().position(|u| u == unit) {
+            Some(i) => self.dependencies[i]
+                .iter()
+                .filter_map(|&d| self.units.get(d))
+                .cloned()
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// The units that are waiting on `unit`.
+    pub fn dependents_of(&self, unit: &UnitName) -> Vec<UnitName> {
+        let Some(me) = self.units.iter().position(|u| u == unit) else {
+            return Vec::new();
+        };
+        self.dependencies
+            .iter()
+            .enumerate()
+            .filter(|(_, deps)| deps.contains(&me))
+            .filter_map(|(i, _)| self.units.get(i))
+            .cloned()
+            .collect()
+    }
+
+    /// Assign every unit a startup level.
+    ///
+    /// Level 0 has no dependencies; every other unit sits one level below its
+    /// deepest dependency. All units in a level may start concurrently.
+    ///
+    /// # Errors
+    /// [`DependencyError::Cycle`] if the graph is cyclic. Calling this after
+    /// [`DependencyGraph::build`] cannot fail, since `build` already rejects
+    /// cycles; the signature stays fallible so this can be used standalone.
+    pub fn levels(&self) -> Result<Vec<Vec<UnitName>>, DependencyError> {
+        let order = self.topological_order()?;
+        let mut level_of: Vec<(UnitName, usize)> = Vec::with_capacity(order.len());
+        let mut levels: Vec<Vec<UnitName>> = Vec::new();
+
+        for unit in order {
+            let deepest = self
+                .dependencies_of(&unit)
+                .iter()
+                .map(|dep| {
+                    level_of
+                        .iter()
+                        .find(|(n, _)| n == dep)
+                        .map(|(_, l)| *l)
+                        .unwrap_or(0)
+                })
+                .max()
+                .unwrap_or(0);
+            let level = if deepest == 0 && self.dependencies_of(&unit).is_empty() {
+                0
+            } else {
+                deepest + 1
+            };
+            level_of.push((unit.clone(), level));
+            if levels.len() <= level {
+                levels.resize(level + 1, Vec::new());
+            }
+            levels[level].push(unit);
+        }
+        Ok(levels)
+    }
+
+    /// A deterministic topological order (Kahn's algorithm).
+    ///
+    /// # Errors
+    /// [`DependencyError::Cycle`] with the offending path spelled out.
+    pub fn topological_order(&self) -> Result<Vec<UnitName>, DependencyError> {
+        let n = self.units.len();
+        let mut remaining: Vec<usize> = (0..n).map(|i| self.dependencies[i].len()).collect();
+        let mut ordered: Vec<UnitName> = Vec::with_capacity(n);
+        let mut placed = vec![false; n];
+
+        // Pick the ready unit with the smallest name each round: stable output
+        // without a second sort.
+        while ordered.len() < n {
+            let next = (0..n)
+                .filter(|&i| !placed[i] && remaining[i] == 0)
+                .min_by(|&a, &b| self.units[a].cmp(&self.units[b]));
+            let Some(next) = next else {
+                return Err(self.find_cycle());
+            };
+            placed[next] = true;
+            ordered.push(self.units[next].clone());
+            // Anything that was waiting on `next` is one step closer.
+            for (i, deps) in self.dependencies.iter().enumerate() {
+                if deps.contains(&next) {
+                    remaining[i] -= 1;
+                }
+            }
+        }
+        Ok(ordered)
+    }
+
+    /// Depth-first search for a concrete cycle, to report it.
+    fn find_cycle(&self) -> DependencyError {
+        #[derive(Clone, Copy, PartialEq)]
+        enum Mark {
+            Unseen,
+            OnStack,
+            Done,
+        }
+        let n = self.units.len();
+        let mut marks = vec![Mark::Unseen; n];
+        let mut stack: Vec<usize> = Vec::new();
+
+        // Iterative DFS so a deep graph cannot overflow the stack.
+        for start in 0..n {
+            if marks[start] != Mark::Unseen {
+                continue;
+            }
+            let mut work: Vec<(usize, usize)> = vec![(start, 0)];
+            marks[start] = Mark::OnStack;
+            stack.push(start);
+
+            while let Some((node, cursor)) = work.pop() {
+                let deps = &self.dependencies[node];
+                if cursor < deps.len() {
+                    work.push((node, cursor + 1));
+                    let next = deps[cursor];
+                    match marks[next] {
+                        Mark::Unseen => {
+                            marks[next] = Mark::OnStack;
+                            stack.push(next);
+                            work.push((next, 0));
+                        }
+                        Mark::OnStack => {
+                            // Found it: slice the cycle out of the stack.
+                            let start_at = stack.iter().position(|&i| i == next).unwrap_or(0);
+                            let path: Vec<UnitName> = stack[start_at..]
+                                .iter()
+                                .map(|&i| self.units[i].clone())
+                                .collect();
+                            let mut path = path;
+                            path.push(self.units[next].clone());
+                            return DependencyError::Cycle { path };
+                        }
+                        Mark::Done => {}
+                    }
+                } else {
+                    marks[node] = Mark::Done;
+                    stack.pop();
+                }
+            }
+        }
+        // Unreachable for a graph Kahn could not drain, but keep it total.
+        DependencyError::Cycle {
+            path: self.units.clone(),
+        }
+    }
+
+    /// Verify the graph has no cycle (used by `build`).
+    fn check_acyclic(&self) -> Result<(), DependencyError> {
+        self.topological_order().map(|_| ())
+    }
+
+    /// Everything `target` transitively pulls in, including itself.
+    ///
+    /// `Conflicts=` is excluded: a mutual exclusion never *pulls in* a unit.
+    /// The result is sorted for determinism.
+    pub fn closure_of(&self, target: &UnitName) -> Vec<UnitName> {
+        let mut out: Vec<UnitName> = Vec::new();
+        let mut stack = vec![target.clone()];
+        while let Some(unit) = stack.pop() {
+            if out.contains(&unit) {
+                continue;
+            }
+            out.push(unit.clone());
+            for dep in self.dependencies_of(&unit) {
+                stack.push(dep.clone());
+            }
+        }
+        out.sort();
+        out
+    }
+}
+
+fn push_unique(list: &mut Vec<usize>, value: usize) {
+    if !list.contains(&value) {
+        list.push(value);
+    }
+}
+
+/// Whether a unit spawns a process, i.e. whether it needs launching at all.
+///
+/// Targets are aggregation points (plan §7.2): they reach a terminal state
+/// without ever being exec'd.
+pub fn spawns_process(config: &UnitConfig) -> bool {
+    config.kind == UnitType::Service
+}
+
+/// A convenience wrapper: build, then schedule, in one call.
+///
+/// # Errors
+/// Propagates any [`DependencyError`] from [`DependencyGraph::build`].
+pub fn schedule<'a>(
+    configs: impl IntoIterator<Item = &'a UnitConfig>,
+    default_target: &UnitName,
+) -> Result<Vec<Vec<UnitName>>, DependencyError> {
+    let graph = DependencyGraph::build(configs)?;
+    if !graph.units().contains(default_target) {
+        return Err(DependencyError::UnknownDefaultTarget {
+            target: default_target.clone(),
+        });
+    }
+    graph.levels()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn name(s: &str) -> UnitName {
+        UnitName::parse(s).expect("valid name")
+    }
+
+    fn unit(n: &str, requires: &[&str], after: &[&str], kind: UnitType) -> UnitConfig {
+        let mut cfg = UnitConfig::new(name(n));
+        cfg.kind = kind;
+        cfg.deps.requires = requires.iter().map(|s| name(s)).collect();
+        cfg.deps.after = after.iter().map(|s| name(s)).collect();
+        cfg
+    }
+
+    /// A minimal three-unit graph: `a` and `b` are independent, `c` needs both.
+    fn diamond() -> Vec<UnitConfig> {
+        vec![
+            unit("a.service", &[], &[], UnitType::Service),
+            unit("b.service", &[], &[], UnitType::Service),
+            unit(
+                "c.service",
+                &["a.service", "b.service"],
+                &[],
+                UnitType::Service,
+            ),
+        ]
+    }
+
+    #[test]
+    fn independent_units_share_level_zero() {
+        let configs = diamond();
+        let graph = DependencyGraph::build(&configs).unwrap();
+        let levels = graph.levels().unwrap();
+        assert_eq!(
+            levels[0],
+            [name("a.service"), name("b.service")],
+            "a and b have no dependencies and may start together"
+        );
+        assert_eq!(levels[1], [name("c.service")]);
+        assert_eq!(levels.len(), 2);
+    }
+
+    /// The M1 acceptance criterion: a wide graph must collapse into few
+    /// levels, i.e. most units start in parallel.
+    #[test]
+    fn a_wide_graph_starts_mostly_in_parallel() {
+        let base = unit("base.service", &[], &[], UnitType::Service);
+        let configs: Vec<UnitConfig> = (0..10)
+            .map(|i| {
+                unit(
+                    &format!("svc{i}.service"),
+                    &[],
+                    &["base.service"],
+                    UnitType::Service,
+                )
+            })
+            .collect();
+        let by_ref: Vec<&UnitConfig> = configs.iter().chain([&base]).collect();
+
+        let levels = schedule(by_ref, &name("svc0.service")).unwrap();
+        assert_eq!(
+            levels[0],
+            [name("base.service")],
+            "the single root starts alone"
+        );
+        assert_eq!(
+            levels[1].len(),
+            10,
+            "all ten dependents may start concurrently: {levels:?}"
+        );
+    }
+
+    #[test]
+    fn topological_order_respects_edges() {
+        let configs = diamond();
+        let graph = DependencyGraph::build(&configs).unwrap();
+        let order = graph.topological_order().unwrap();
+        let pos = |n: &str| order.iter().position(|u| u == &name(n)).unwrap();
+        assert!(pos("a.service") < pos("c.service"));
+        assert!(pos("b.service") < pos("c.service"));
+    }
+
+    #[test]
+    fn topological_order_is_deterministic() {
+        let configs: Vec<UnitConfig> = ["e", "d", "c", "b", "a"]
+            .iter()
+            .map(|n| unit(&format!("{n}.service"), &[], &[], UnitType::Service))
+            .collect();
+        let first = DependencyGraph::build(&configs)
+            .unwrap()
+            .topological_order();
+        // Same input, reversed construction order, same schedule.
+        let reversed: Vec<UnitConfig> = configs.iter().rev().cloned().collect();
+        let second = DependencyGraph::build(&reversed)
+            .unwrap()
+            .topological_order();
+        assert_eq!(first, second);
+    }
+
+    /// A cycle must be reported *with its path*, otherwise the operator has no
+    /// idea which units to edit.
+    #[test]
+    fn direct_cycle_names_the_path() {
+        let configs = vec![
+            unit("a.service", &["b.service"], &[], UnitType::Service),
+            unit("b.service", &["a.service"], &[], UnitType::Service),
+        ];
+        let err = DependencyGraph::build(&configs).unwrap_err();
+        let DependencyError::Cycle { path } = err else {
+            panic!("expected a cycle, got {err:?}");
+        };
+        assert!(path.len() >= 3, "a closed path needs a repeat: {path:?}");
+        assert_eq!(path.first(), path.last(), "the path must close: {path:?}");
+        assert!(path.contains(&name("a.service")) && path.contains(&name("b.service")));
+    }
+
+    #[test]
+    fn longer_cycle_names_the_path() {
+        let configs = vec![
+            unit("a.service", &["c.service"], &[], UnitType::Service),
+            unit("b.service", &["a.service"], &[], UnitType::Service),
+            unit("c.service", &["b.service"], &[], UnitType::Service),
+        ];
+        let DependencyError::Cycle { path } = DependencyGraph::build(&configs).unwrap_err() else {
+            panic!("expected a cycle");
+        };
+        assert_eq!(path.len(), 4, "{path:?}");
+        assert_eq!(path[0], path[3]);
+    }
+
+    #[test]
+    fn self_dependency_is_a_cycle() {
+        let configs = vec![unit("a.service", &["a.service"], &[], UnitType::Service)];
+        assert!(matches!(
+            DependencyGraph::build(&configs),
+            Err(DependencyError::Cycle { .. })
+        ));
+    }
+
+    /// A cycle that runs through unrelated units must not be missed.
+    #[test]
+    fn cycle_is_found_even_when_independent_units_interleave() {
+        let configs = vec![
+            unit("a.service", &["b.service"], &[], UnitType::Service),
+            unit("b.service", &["a.service"], &[], UnitType::Service),
+            unit("free.service", &[], &[], UnitType::Service),
+        ];
+        assert!(matches!(
+            DependencyGraph::build(&configs),
+            Err(DependencyError::Cycle { .. })
+        ));
+    }
+
+    /// Plan §1.3(1): hard references must be resolved at build time, not left
+    /// to blow up at runtime.
+    #[test]
+    fn missing_requires_is_an_error() {
+        let configs = vec![unit(
+            "a.service",
+            &["ghost.service"],
+            &[],
+            UnitType::Service,
+        )];
+        let err = DependencyGraph::build(&configs).unwrap_err();
+        assert_eq!(
+            err,
+            DependencyError::MissingDependency {
+                required_by: name("a.service"),
+                missing: name("ghost.service"),
+                directive: "Requires",
+            }
+        );
+    }
+
+    #[test]
+    fn missing_after_is_an_error() {
+        let configs = vec![unit(
+            "a.service",
+            &[],
+            &["ghost.service"],
+            UnitType::Service,
+        )];
+        assert!(matches!(
+            DependencyGraph::build(&configs),
+            Err(DependencyError::MissingDependency {
+                directive: "After",
+                ..
+            })
+        ));
+    }
+
+    /// Plan §1.3(1): a missing `Wants` target degrades to a warning.
+    #[test]
+    fn missing_wants_is_only_a_warning() {
+        let configs = vec![UnitConfig {
+            deps: super::super::config::Dependencies {
+                wants: vec![name("ghost.service")],
+                ..Default::default()
+            },
+            ..unit("a.service", &[], &[], UnitType::Service)
+        }];
+        let graph = DependencyGraph::build(&configs).expect("must not fail");
+        assert_eq!(graph.warnings.len(), 1, "{:?}", graph.warnings);
+        assert!(
+            graph.warnings[0].contains("ghost.service"),
+            "{:?}",
+            graph.warnings
+        );
+    }
+
+    /// `Conflicts=` must not become a start edge, or mutually exclusive units
+    /// would deadlock each other.
+    #[test]
+    fn conflicts_contributes_no_start_edge() {
+        let cfg = UnitConfig {
+            deps: super::super::config::Dependencies {
+                conflicts: vec![name("other.service")],
+                ..Default::default()
+            },
+            ..unit("a.service", &[], &[], UnitType::Service)
+        };
+        let graph =
+            DependencyGraph::build([&cfg, &unit("other.service", &[], &[], UnitType::Service)])
+                .unwrap();
+        assert!(graph.dependencies_of(&name("a.service")).is_empty());
+        assert!(graph.dependencies_of(&name("other.service")).is_empty());
+    }
+
+    /// Plan §1.1: `Before=` is the mirror of `After=`. `late Before=early`
+    /// means late starts first, so *early* is the one that waits.
+    #[test]
+    fn before_makes_the_other_unit_wait() {
+        let configs = vec![
+            unit("early.service", &[], &[], UnitType::Service),
+            UnitConfig {
+                deps: super::super::config::Dependencies {
+                    before: vec![name("early.service")],
+                    ..Default::default()
+                },
+                ..unit("late.service", &[], &[], UnitType::Service)
+            },
+        ];
+        let graph = DependencyGraph::build(&configs).unwrap();
+        assert!(
+            graph.dependencies_of(&name("late.service")).is_empty(),
+            "late waits for nothing"
+        );
+        assert_eq!(
+            graph.dependencies_of(&name("early.service")),
+            [name("late.service")],
+            "early must wait for late"
+        );
+    }
+
+    #[test]
+    fn duplicate_references_produce_one_edge() {
+        let cfg = UnitConfig {
+            deps: super::super::config::Dependencies {
+                requires: vec![name("a.service")],
+                after: vec![name("a.service")],
+                ..Default::default()
+            },
+            ..unit("b.service", &[], &[], UnitType::Service)
+        };
+        let graph = DependencyGraph::build([&cfg, &unit("a.service", &[], &[], UnitType::Service)])
+            .unwrap();
+        assert_eq!(graph.dependencies_of(&name("b.service")).len(), 1);
+    }
+
+    /// Targets take part in the graph exactly like services (plan §7.2).
+    #[test]
+    fn targets_participate_in_ordering() {
+        let configs = vec![
+            unit("net.service", &[], &[], UnitType::Service),
+            unit("net.target", &["net.service"], &[], UnitType::Target),
+            unit("app.service", &["net.target"], &[], UnitType::Service),
+        ];
+        let graph = DependencyGraph::build(&configs).unwrap();
+        let levels = graph.levels().unwrap();
+        assert_eq!(levels[0], [name("net.service")]);
+        assert_eq!(levels[1], [name("net.target")]);
+        assert_eq!(levels[2], [name("app.service")]);
+    }
+
+    #[test]
+    fn closure_includes_transitive_dependencies() {
+        let configs = vec![
+            unit("a.service", &[], &[], UnitType::Service),
+            unit("b.service", &["a.service"], &[], UnitType::Service),
+            unit("all.target", &["b.service"], &[], UnitType::Target),
+            unit("unrelated.service", &[], &[], UnitType::Service),
+        ];
+        let graph = DependencyGraph::build(&configs).unwrap();
+        let closure = graph.closure_of(&name("all.target"));
+        assert!(closure.contains(&name("a.service")), "{closure:?}");
+        assert!(closure.contains(&name("b.service")), "{closure:?}");
+        assert!(closure.contains(&name("all.target")), "{closure:?}");
+        assert!(!closure.contains(&name("unrelated.service")), "{closure:?}");
+    }
+
+    #[test]
+    fn empty_graph_is_valid() {
+        let graph = DependencyGraph::build([]).unwrap();
+        assert!(graph.units().is_empty());
+        assert!(graph.topological_order().unwrap().is_empty());
+        assert!(graph.levels().unwrap().is_empty());
+    }
+
+    #[test]
+    fn schedule_rejects_an_unknown_boot_target() {
+        let configs = diamond();
+        let by_ref: Vec<&UnitConfig> = configs.iter().collect();
+        let err = schedule(by_ref, &name("nope.target")).unwrap_err();
+        assert_eq!(
+            err,
+            DependencyError::UnknownDefaultTarget {
+                target: name("nope.target")
+            }
+        );
+    }
+
+    /// Only services need launching; targets must not be exec'd (plan §7.2).
+    #[test]
+    fn only_services_spawn_a_process() {
+        let target = unit("x.target", &[], &[], UnitType::Target);
+        let service = unit("y.service", &[], &[], UnitType::Service);
+        assert!(!spawns_process(&target));
+        assert!(spawns_process(&service));
+    }
+
+    /// A `Conflicts` pair must be schedulable: mutual exclusion is not a start
+    /// edge, so neither unit may end up waiting for the other.
+    #[test]
+    fn conflicting_units_can_both_be_scheduled() {
+        let configs = vec![
+            UnitConfig {
+                deps: super::super::config::Dependencies {
+                    conflicts: vec![name("b.service")],
+                    ..Default::default()
+                },
+                ..unit("a.service", &[], &[], UnitType::Service)
+            },
+            UnitConfig {
+                deps: super::super::config::Dependencies {
+                    conflicts: vec![name("a.service")],
+                    ..Default::default()
+                },
+                ..unit("b.service", &[], &[], UnitType::Service)
+            },
+        ];
+        let levels = schedule(&configs, &name("a.service")).unwrap();
+        assert_eq!(
+            levels[0].len(),
+            2,
+            "neither may wait for the other: {levels:?}"
+        );
+    }
+}

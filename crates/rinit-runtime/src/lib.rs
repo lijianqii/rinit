@@ -11,7 +11,9 @@ pub mod error;
 pub mod mounts;
 pub mod signals;
 pub mod syscall;
+pub mod units;
 
 pub use error::{RuntimeError, SyscallError};
 pub use mounts::{MountOps, MountReport, RealMounts, first_wave_mounts, first_wave_mounts_with};
 pub use signals::{Signal, SignalSet};
+pub use units::{DEFAULT_TARGET, DEFAULT_UNIT_DIR, UnitFile, load_unit_files};
