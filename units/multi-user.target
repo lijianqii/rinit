@@ -30,3 +30,7 @@ After=rinit-init.target
 Requires=rinit-init.target
 # Requires=shell.service
 Requires=getty.service
+
+# The M2 fault-injection service is `Wants=` (soft), not `Requires=`: it fails
+# on purpose, and a unit designed to fail must not be able to fail the boot.
+Wants=fault.service

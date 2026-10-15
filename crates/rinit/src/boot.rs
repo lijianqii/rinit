@@ -54,6 +54,12 @@ pub async fn run(cfg: Config) -> Result<(), RuntimeError> {
         let mut notify = NotifyHub::new();
         let mut manager = start_units(&cfg, &mut notify)?;
         supervise(&mut signals, &mut manager, &mut notify).await;
+        // A dev-mode boot (`--dev`) is a host smoke test, not PID 1: returning
+        // lets the test process exit instead of spinning in `reboot_now`,
+        // where `reboot(2)` would fail without `CAP_SYS_BOOT`.
+        if !cfg.skip_mounts {
+            reboot_now();
+        }
         return Ok(());
     }
 
@@ -158,7 +164,6 @@ async fn supervise(signals: &mut SignalSet, manager: &mut UnitManager, notify: &
     for outcome in reap_into_manager(manager) {
         log_outcome(&outcome);
     }
-    reboot_now();
 }
 
 /// Spawn `unit`, arming its `notify` socket first when it is `Type=notify`.

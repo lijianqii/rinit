@@ -7,11 +7,12 @@
 #
 # What it does:
 #   1. boots the guest from its unit directory (units/multi-user.target), which
-#      starts shell.service and gives an interactive root shell;
-#   2. types at that shell to prove a login is not required;
-#   3. captures the serial console to a log file;
-#   4. asserts the M0/M1 acceptance list on that log;
-#   5. reports kernel panics / oopses as failures.
+#      starts getty.service and gives an interactive root login;
+#   2. types at that login to prove a passwordless root shell is reachable;
+#   3. kills that console service and checks rinit restarts it (M2);
+#   4. captures the serial console to a log file;
+#   5. asserts the M0-M2 acceptance list on that log;
+#   6. reports kernel panics / oopses as failures.
 #
 # Exit codes:
 #   0  all assertions passed
@@ -108,8 +109,13 @@ trap 'rm -f "${fifo}"' EXIT
     sleep 3
     printf 'id\n' >&3
     sleep 2
-    printf 'exit\n' >&3 # release the console so rinit can reap getty
-    sleep 3
+    # M2: kill the console service and let rinit bring it back. `login` execs
+    # the shell, so `$$` *is* the getty process tree; killing it makes rinit
+    # reap the exit and, because getty is `Restart=always`, start it again -
+    # the "自动重启" half of the milestone's acceptance test. The following
+    # sleep covers the restart backoff.
+    printf 'kill -9 $$\n' >&3
+    sleep 8
     exec 3>&-
 ) &
 feeder_pid=$!
@@ -148,7 +154,7 @@ expect() {
     fi
 }
 
-# The M0/M1 acceptance list: boots as PID 1, mounts the first wave, resolves
+# The M0-M2 acceptance list: boots as PID 1, mounts the first wave, resolves
 # the unit directory into a dependency-ordered schedule, and starts it.
 expect "kernel executed rinit as init" "Run /sbin/rinit as init process"
 expect "rinit started as PID 1" "starting (pid 1)"
@@ -190,10 +196,10 @@ else
     fail "getty.service should have been started"
 fi
 
-if grep -qF "boot complete: 1 unit(s) started" "${log_file}"; then
-    pass "getty is still running after boot"
+if grep -qF "boot complete: 2 unit(s) started" "${log_file}"; then
+    pass "getty and the fault-injection unit were started at boot"
 else
-    fail "getty must survive boot (it is a long-running service)"
+    fail "boot should have started getty.service and fault.service"
 fi
 
 # Logging in must work, and with an empty password field there is nothing to
@@ -201,6 +207,32 @@ fi
 # getty, login, /etc/passwd - actually worked.
 expect "getty presents a login prompt" "login:"
 expect "login succeeded and gave a root shell" "uid=0(root)"
+
+# M2 acceptance (plan §3): kill a service and watch the manager restart it. The
+# console shell *is* the getty process tree, so `kill -9 $$` is a real crash of
+# getty.service; a `Restart=always` unit must come back.
+expect "a crashed service is scheduled for restart" "getty.service will restart in"
+if [[ "$(grep -cF 'started getty.service as pid' "${log_file}")" -ge 2 ]]; then
+    pass "the crashed console service was restarted"
+else
+    fail "getty.service must be restarted after it is killed"
+fi
+# A single crash is a restart, not a meltdown: the breaker must not have tripped.
+if grep -qF "getty.service hit its start limit" "${log_file}"; then
+    fail "a single crash must not trip getty's start limit"
+else
+    pass "one crash did not trip the breaker"
+fi
+
+# M2 acceptance: the breaker does trip when a service fails in a burst. The
+# fault-injection unit fails immediately and twice, which exhausts its burst of
+# two and parks it in Failed(StartLimitHit) instead of restarting forever.
+expect "a repeatedly failing unit is retried at least once" "fault.service will restart in"
+if grep -qE "error: fault.service hit its start limit \(2 failures\)" "${log_file}"; then
+    pass "the breaker tripped on the failing unit"
+else
+    fail "fault.service should have tripped its start limit after two failures"
+fi
 
 # Plan §7.2: a target is an aggregation point with no process, so it must
 # never appear in the "started ... as pid" stream.

@@ -1,0 +1,30 @@
+# M2 fault injection (plan §3 M2 acceptance: "kill 掉服务进程,观察自动重启与熔断").
+#
+# This service is *meant* to fail. `/bin/false` exits 1 immediately and
+# `Restart=always` makes rinit bring it straight back; with a burst limit of
+# two inside a long window, the second failure trips the breaker and rinit
+# stops retrying. That is the "熔断" half of the milestone's acceptance test,
+# and it is visible on the console as:
+#
+#   started fault.service as pid N
+#   fault.service will restart in ...
+#   error: fault.service hit its start limit (2 failures); not restarting
+#
+# `StartLimitIntervalSec` is deliberately longer than the whole test run: a
+# short window would let the two failures slide apart and the breaker would
+# never see a burst.
+#
+# It is pulled in with `Wants=` rather than `Requires=`, and it is not part of
+# the boot-critical path: a unit whose job is to fail must never be able to
+# fail the boot.
+[Unit]
+Description=M2 fault injection (fails on purpose)
+After=rinit-init.target
+
+[Service]
+Type=simple
+ExecStart=/bin/false
+Restart=always
+RestartSec=1
+StartLimitBurst=2
+StartLimitIntervalSec=300
