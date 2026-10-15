@@ -7,6 +7,7 @@
 mod args;
 mod boot;
 mod log;
+mod service;
 
 use std::io::Write;
 use std::process::ExitCode;

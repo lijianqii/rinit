@@ -1,0 +1,11 @@
+# Built-in logical init unit anchor (plan §1.3(9)).
+#
+# In M0 this is a no-op placeholder: the first-wave mounts are hardcoded in the
+# binary and nothing reads this file yet. It exists so the unit directory and
+# the dependency graph have their first node from the start.
+#
+# A target is identified by its `.target` suffix, not by a `Type=` directive:
+# `Type=` belongs to `[Service]` and selects simple | oneshot | notify
+# (plan §1.3(1)). Naming this file `.target` is what makes it a target.
+[Unit]
+Description=rinit system initialization

@@ -8,6 +8,9 @@
 #   make busybox     build busybox only
 #   make initramfs   build rinit and assemble the initramfs
 #   make qemu        boot artifacts, building them first if missing
+#   make check       pre-commit gate: fmt + clippy + host tests (no cross toolchain)
+#   make test        check + the qemu system test
+#   make test-system boot the guest and assert the M0 acceptance list
 #   make help        show this help
 #   make clean       remove build outputs (keeps downloads)
 #   make distclean   remove everything, including downloads
@@ -66,7 +69,8 @@ MAKE_KERNEL      := $(MAKE) -C $(KERNEL_SRC) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_
 MAKE_BUSYBOX     := $(MAKE) -C $(BUSYBOX_SRC) ARCH=$(BUSYBOX_ARCH) CROSS_COMPILE=$(CROSS_COMPILE)
 
 .DEFAULT_GOAL    := run
-.PHONY: run kernel busybox rinit initramfs qemu check-artifacts help clean distclean
+.PHONY: run kernel busybox rinit initramfs qemu check-artifacts help clean distclean \
+        check test test-system
 
 help:
 	@sed -n '2,/^# ====/p' $(MAKEFILE_LIST) | sed '$$d' | sed 's/^# \{0,1\}//'
@@ -158,6 +162,29 @@ check-artifacts:
 	  echo "hint: run 'make run' once (without SKIP_BUILD=1) to build the artifacts." >&2; \
 	  exit 1; \
 	fi
+
+# --- gates ----------------------------------------------------------------
+# `check` is the pre-commit gate (plan §4.1 "每个 commit 必跑"): formatting,
+# lints and the host test suite. It needs no cross toolchain and no network.
+check:
+	cargo fmt --all --check
+	cargo clippy --offline --all-targets -- -D warnings
+	cargo test --offline --workspace
+
+# `test` = `check` plus the qemu system test, which needs the aarch64
+# artifacts. Builds them first unless SKIP_BUILD=1.
+test: check
+	$(MAKE) test-system SKIP_BUILD=$(SKIP_BUILD)
+
+# `test-system` boots the guest and asserts the M0 acceptance list on the
+# serial console. Logs land in build/logs/.
+test-system:
+ifeq ($(strip $(SKIP_BUILD)),1)
+	$(SCRIPTS)/system-test.sh --kernel $(KERNEL_IMAGE) --initrd $(INITRAMFS)
+else
+	$(KERNEL_IMAGE) $(INITRAMFS)
+	$(SCRIPTS)/system-test.sh --kernel $(KERNEL_IMAGE) --initrd $(INITRAMFS)
+endif
 
 # --- housekeeping ---------------------------------------------------------
 clean:

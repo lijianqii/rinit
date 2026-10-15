@@ -1,5 +1,8 @@
-# Default boot target anchor (plan §7.2).
+# Default boot target (plan §7.2): the aggregation point everything else can
+# order itself after.
+#
+# `After=` is ordering only - it implies no liveness requirement, so a missing
+# `rinit-init.target` degrades rather than failing the boot (plan §1.1).
 [Unit]
 Description=Multi-user system
-Type=target
-After=rinit-init.service
+After=rinit-init.target

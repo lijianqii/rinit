@@ -1,5 +1,0 @@
-# Built-in logical init unit anchor (plan §1.3(9)).
-# In M0 this is a no-op placeholder; mounts are hardcoded in the binary.
-[Unit]
-Description=rinit system initialization
-Type=target

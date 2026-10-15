@@ -4,6 +4,7 @@ use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
+use super::cstring;
 use crate::error::SyscallError;
 
 /// Ensure `dir` exists, creating parents as needed.
@@ -11,10 +12,7 @@ pub fn mkdir_p(dir: &Path) -> Result<(), SyscallError> {
     std::fs::create_dir_all(dir).map_err(|e| SyscallError::from_io("create_dir_all", &e))
 }
 
-fn cstring(op: &'static str, s: &str) -> Result<CString, SyscallError> {
-    CString::new(s).map_err(|_| SyscallError::new(op, libc::EINVAL))
-}
-
+/// Like [`cstring`], but for an OS path (which need not be valid UTF-8).
 fn cpath(op: &'static str, path: &Path) -> Result<CString, SyscallError> {
     CString::new(path.as_os_str().as_bytes()).map_err(|_| SyscallError::new(op, libc::EINVAL))
 }
@@ -97,7 +95,10 @@ pub fn mount_devtmpfs(target: &Path) -> Result<(), SyscallError> {
     )
 }
 
-/// Mount the cgroup v2 unified hierarchy at `target` (reserved for M5).
+/// Mount the cgroup v2 unified hierarchy at `target`.
+///
+/// Reserved for M5, where it joins the first-wave sequence. Public API of the
+/// syscall layer, so it is intentionally callable before then.
 pub fn mount_cgroup2(target: &Path) -> Result<(), SyscallError> {
     mkdir_p(target)?;
     mount(

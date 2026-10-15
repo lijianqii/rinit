@@ -1,8 +1,11 @@
-# Serial console login (plan §4.3 example unit).
+# Serial console getty (plan §4.3 example unit).
+#
+# `Type=simple` lives in `[Service]` and means "the process is the service":
+# rinit considers it started as soon as it is exec'd, with no READY= protocol.
+# `Restart=always` brings the console back if getty ever dies.
 [Unit]
 Description=Serial console getty
-Type=service
-After=rinit-init.service
+After=rinit-init.target
 
 [Service]
 Type=simple

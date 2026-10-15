@@ -5,7 +5,7 @@ targeted at resource-constrained embedded Linux (aarch64). See
 [`rinit-开发计划.md`](rinit-开发计划.md) for the full development plan; this
 README tracks implementation status.
 
-## Status: M0 complete (scaffolding + minimal PID 1)
+## Status: M0 complete (scaffolding + minimal PID 1) — verified on aarch64
 
 M0 delivers a working PID 1 skeleton, verified booting in qemu:
 
@@ -19,34 +19,48 @@ M0 delivers a working PID 1 skeleton, verified booting in qemu:
 - hardcoded service launch via `posix_spawn` (no config parsing yet).
 - panic hook that routes to `/dev/kmsg` for serial visibility.
 
-Verified in qemu (x86_64 verification build; the aarch64 build is produced by
-cross-compilation):
+Verified on the **target architecture** (aarch64 qemu, 128M, Linux 6.6.158) via
+`make run SKIP_BUILD=1 SERVICE="/sbin/rinit-testservice --ticks 6"`:
 
 ```
-[    5.411075] Run /sbin/rinit as init process
+[    2.076903] Freeing unused kernel memory: 2624K
+[    2.078772] Run /sbin/rinit as init process
 rinit: rinit 0.1.0 starting (pid 1)
 rinit: mounted /run
 rinit: mounted /proc
 rinit: mounted /sys
 rinit: mounted /dev
 rinit: mounted /tmp
-rinit: launched test service '/sbin/rinit-testservice --ticks 6' as pid 130
-rinit-testservice: main started (pid 130)
+rinit: launched test service '/sbin/rinit-testservice --ticks 6' as pid 48
+rinit-testservice: main started (pid 48)
+rinit-testservice: heartbeat (pid 49)
 ...
 rinit-testservice: exiting after 6 ticks
-rinit: reaped child pid 130 (exit 0)
+rinit: reaped child pid 48 (exit 0)
 ```
+
+That covers the whole M0 acceptance list: boots as PID 1 via `rdinit=`, mounts
+the first wave, `fork`/`exec`s a child, and reaps it on `SIGCHLD`. No
+`Kernel panic` / `BUG:` in the boot log, and rinit keeps running as PID 1 after
+the service is gone. Full logs: `build/logs/qemu-aarch64-m0*.log`.
+
+The same run on the x86_64 host kernel (fast iteration substitute) produces an
+equivalent transcript.
 
 ## Layout
 
 ```
 crates/
-  rinit-core/       # platform-independent engine (no_std + alloc); M0: errors, UnitName
+  rinit-core/       # platform-independent engine (no_std + alloc)
+    src/unit/       # M0: UnitName/UnitType; M1: parser.rs, dependency.rs, config.rs
   rinit-runtime/    # syscall layer + mounts + signals + reaping (std/libc/tokio)
-  rinit/            # PID 1 binary + rinit-testservice helper (M0 hardcoded service)
+  rinit/            # PID 1 binary
+    src/boot.rs     # boot sequence + main loop (orchestration only)
+    src/service.rs  # service supervision: spawn, track, reap, stop
+    src/bin/        # rinit-testservice helper
   rctl/             # CLI stub (real commands land in M3)
 units/              # example unit files
-scripts/            # initramfs / qemu / kernel helpers
+scripts/            # initramfs / qemu / kernel / system-test helpers
 ```
 
 ## Building
@@ -60,6 +74,63 @@ cargo clippy --offline --all-targets
 
 # embedded target (static, default per plan §2 risk mitigation)
 cargo build --offline --release --target aarch64-unknown-linux-gnu
+```
+
+## Testing
+
+Three layers, cheapest first:
+
+```bash
+make check          # fmt + clippy -D warnings + host tests  (no cross toolchain)
+make test-system    # boot aarch64 qemu and assert the M0 acceptance list
+make test           # both
+```
+
+`cargo test --offline` alone runs 92 tests: unit tests next to the code
+(crate `#[cfg(test)]` modules, including `proptest` properties), integration
+tests in `crates/*/tests/`, and an end-to-end smoke test that runs the real
+binary in `--dev` mode.
+
+`scripts/system-test.sh` is the automated form of the manual verification in
+plan §4.3: it boots the guest with a bounded test service, captures the serial
+console, and asserts the whole M0 acceptance list - including that no `Kernel
+panic` / `BUG:` / rinit panic appears. Exit codes are `0` pass, `1` assertion
+failed, `2` missing artifacts, `3` qemu could not start. Logs land in
+`build/logs/`.
+
+Measured with `llvm-cov` (union across all test binaries):
+
+| area                                   | region coverage |
+| -------------------------------------- | --------------- |
+| `rinit-core` unit naming + errors      | 100%            |
+| `rinit/src/args.rs` (CLI parsing)      | 100%            |
+| `rinit/src/service.rs` (supervision)   | ~95%            |
+| `rinit-runtime/src/error.rs`           | 99%             |
+| `rinit-runtime/src/mounts.rs`          | ~90%            |
+| `rinit-runtime/src/signals.rs`         | ~85%            |
+| `rinit-runtime` syscall wrappers       | 94–98%          |
+| `rinit/src/boot.rs` (orchestration)    | ~65%            |
+
+The mount policy (plan §1.3(9)) is covered through the `MountOps` trait, so
+the fatal-vs-degradable rules are tested without `CAP_SYS_ADMIN` - this is the
+"fake runtime" shape plan §4.2 asks for.
+
+**Known gaps**, tracked rather than hidden:
+
+- `boot.rs`'s reboot/halt paths are only exercised in the guest; on the host
+  they must not run (they would reboot the machine).
+- `signals.rs`'s pipe-full path (handler drops a byte) is not forced in a test.
+- `rctl` has no tests yet (its exit-code contract is trivial to pin down).
+
+Reproduce the coverage numbers with:
+
+```bash
+RUSTFLAGS="-C instrument-coverage" CARGO_TARGET_DIR=target-cov \
+    cargo test --offline --workspace
+llvm-profdata merge -sparse $(find . -name '*.profraw') -o target-cov/merged.profdata
+llvm-cov report -instr-profile=target-cov/merged.profdata \
+    --ignore-filename-regex='/\.cargo/|/rustc/' \
+    -object target-cov/debug/deps/<each-test-binary>
 ```
 
 ## Running: `make run` (aarch64, full pipeline)
@@ -152,7 +223,7 @@ rinit [OPTIONS] [-- <SERVICE> [ARGS...]]
 
 ## Design decisions in this milestone
 
-Two points differ from the written plan; both are deliberate and noted here so
+Three points differ from the written plan; all are deliberate and noted here so
 they are not mistaken for drift:
 
 1. **Signals use a self-pipe, not `tokio::signal`.** Plan §2.1④ says to unify
@@ -164,6 +235,11 @@ they are not mistaken for drift:
 2. **`/dev` is `mkdir -p`'d before mounting `devtmpfs`.** Plan §1.3(9) allows
    skipping it, but `mount(2)` requires the target to exist, so creating it is
    strictly more robust.
+3. **The mount sequence is expressed as a `MountOps` trait.** Plan §1.3(9)
+   describes the order and the fatal/degradable split but not how to test it.
+   Coding it against `mount(2)` directly made the whole policy untestable
+   without `CAP_SYS_ADMIN`; behind a trait, `first_wave_mounts_with` runs
+   against a recording fake on the host. Same shape plan §4.2 calls for.
 
 ## Measurements (plan §0.1 calibration point)
 
