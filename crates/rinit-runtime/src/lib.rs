@@ -13,5 +13,5 @@ pub mod signals;
 pub mod syscall;
 
 pub use error::{RuntimeError, SyscallError};
-pub use mounts::{MountReport, first_wave_mounts};
+pub use mounts::{MountOps, MountReport, RealMounts, first_wave_mounts, first_wave_mounts_with};
 pub use signals::{Signal, SignalSet};
