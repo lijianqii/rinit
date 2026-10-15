@@ -25,6 +25,29 @@ use crate::unit_manager::{Outcome, UnitManager, build_service_env, reap_into_man
 /// deadlines. Small enough that a quick exit is noticed promptly.
 const SHUTDOWN_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
+/// Per-unit stop timeout under power failure (plan §7.1): essentially no time
+/// to be graceful, so the budget is capped hard.
+const FAST_STOP_SECS: u64 = 2;
+
+/// Total shutdown budget under power failure (plan §7.1).
+const FAST_SHUTDOWN_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Signals rinit neither acts on nor wants any default action for (plan §7.1).
+///
+/// `SIGCHLD`/`SIGTERM`/`SIGINT`/`SIGPWR` are handled by [`SignalSet`]; every
+/// other signal that could otherwise terminate rinit is explicitly ignored, so
+/// the whole disposition matrix is auditable in one place instead of relying on
+/// the kernel's special treatment of PID 1.
+const IGNORED_SIGNALS: &[libc::c_int] = &[
+    libc::SIGWINCH,
+    // Reserved for `reload` (plan §7.1, §7.6): ignored until it is implemented.
+    libc::SIGHUP,
+    libc::SIGUSR1,
+    libc::SIGUSR2,
+    libc::SIGQUIT,
+    libc::SIGPIPE,
+];
+
 /// Run the boot sequence and main loop. Returns `Ok` on a clean shutdown.
 ///
 /// # Errors
@@ -44,7 +67,11 @@ pub async fn run(cfg: Config) -> Result<(), RuntimeError> {
         report_mounts().await?;
     }
 
-    // Install signal handlers BEFORE starting anything so no SIGCHLD is lost.
+    // Install signal handlers BEFORE starting anything so no SIGCHLD is lost,
+    // and make the ignore set explicit (plan §7.1).
+    for &signal in IGNORED_SIGNALS {
+        signal::ignore(signal);
+    }
     let mut signals = SignalSet::new(&Signal::ALL).map_err(RuntimeError::from)?;
 
     let mut services = ServiceSet::new();
@@ -97,6 +124,9 @@ pub async fn run(cfg: Config) -> Result<(), RuntimeError> {
 /// a plain `recv()` - without them a service scheduled to restart in two
 /// seconds would sit there until some unrelated signal arrived.
 async fn supervise(signals: &mut SignalSet, manager: &mut UnitManager, notify: &mut NotifyHub) {
+    // Set when the shutdown was triggered by power failure, which runs under a
+    // much smaller budget (plan §7.1).
+    let mut fast = false;
     loop {
         // Service anything already due before blocking, so a zero-length timer
         // does not wait for the next unrelated wake-up.
@@ -139,6 +169,7 @@ async fn supervise(signals: &mut SignalSet, manager: &mut UnitManager, notify: &
                 }
                 Signal::Pwr => {
                     rlog!("received SIGPWR (power failure)");
+                    fast = true;
                     break;
                 }
             },
@@ -159,6 +190,9 @@ async fn supervise(signals: &mut SignalSet, manager: &mut UnitManager, notify: &
     // hand is what gives shutdown its precedence (plan §1.3(11)): its source
     // outranks a dependency start, so a unit cannot be pulled back up while the
     // system is going down.
+    if fast {
+        manager.compress_stop_timeouts(FAST_STOP_SECS);
+    }
     for line in manager.summary() {
         rlog!("shutdown: {line}");
     }
@@ -169,17 +203,23 @@ async fn supervise(signals: &mut SignalSet, manager: &mut UnitManager, notify: &
         }
     }
     notify.disarm_all();
-    stop_and_reap(manager).await;
+    let budget = fast.then_some(FAST_SHUTDOWN_BUDGET);
+    stop_and_reap(manager, budget).await;
 }
 
 /// Bring every unit the queue still wants running down, then wait for them.
 ///
 /// The main loop has already broken on the shutdown signal, so this is where the
 /// *second* stage of a two-stage stop happens (plan §1.1, §1.3(8)):
-/// `stop_unit` sent `SIGTERM`, and any unit still alive when its
+/// `stop_unit` sent the stop action, and any unit still alive when its
 /// `TimeoutStopSec` expires is `SIGKILL`ed. Without this loop a service that
-/// ignores `SIGTERM` would never be killed.
-async fn stop_and_reap(manager: &mut UnitManager) {
+/// ignores the stop would never be killed.
+///
+/// `budget` is the total time allowed, used for the power-failure path where
+/// plan §7.1 caps the whole shutdown at a few seconds. `None` means "as long as
+/// the per-unit timeouts take".
+async fn stop_and_reap(manager: &mut UnitManager, budget: Option<std::time::Duration>) {
+    let give_up = budget.map(|b| std::time::Instant::now() + b);
     loop {
         for outcome in reap_into_manager(manager) {
             log_outcome(&outcome);
@@ -192,6 +232,16 @@ async fn stop_and_reap(manager: &mut UnitManager) {
         let just_killed = !killed.is_empty();
         for unit in killed {
             rlog!("error: {unit} did not stop in time; killed");
+        }
+
+        if let Some(deadline) = give_up
+            && std::time::Instant::now() >= deadline
+        {
+            rlog!(
+                "warning: shutdown budget spent with {} unit(s) still running",
+                manager.running_count()
+            );
+            break;
         }
 
         match manager.next_kill_in() {

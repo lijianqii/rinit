@@ -359,6 +359,16 @@ impl UnitManager {
         stopped
     }
 
+    /// Cap every unit's `TimeoutStopSec` at `secs`.
+    ///
+    /// Power failure gets almost no time to stop (plan §7.1), so the shutdown
+    /// path compresses each unit's budget before issuing its stop.
+    pub fn compress_stop_timeouts(&mut self, secs: u64) {
+        for rt in self.units.values_mut() {
+            rt.config.timeout_stop_sec = rt.config.timeout_stop_sec.min(secs);
+        }
+    }
+
     /// Units that hard-`Requires=` `unit`, in name order.
     pub fn requires_dependents(&self, unit: &UnitName) -> Vec<UnitName> {
         self.units
@@ -1744,6 +1754,42 @@ mod tests {
         assert_eq!(m.request_start(&ghost, RequestSource::UserStart), None);
         assert_eq!(m.request_stop(&ghost, RequestSource::UserStop), None);
         assert!(m.started_units().is_empty());
+    }
+
+    /// Plan §1.1: power failure compresses every stop timeout to a hard cap.
+    #[test]
+    fn compress_stop_timeouts_caps_every_unit() {
+        let mut m = UnitManager::new();
+        m.add(config("slow.service", RestartPolicy::No));
+        m.add(config("quick.service", RestartPolicy::No));
+        m.units
+            .get_mut(&UnitName::parse("slow.service").unwrap())
+            .unwrap()
+            .config
+            .timeout_stop_sec = 30;
+        m.units
+            .get_mut(&UnitName::parse("quick.service").unwrap())
+            .unwrap()
+            .config
+            .timeout_stop_sec = 1;
+
+        m.compress_stop_timeouts(2);
+
+        assert_eq!(
+            m.get(&UnitName::parse("slow.service").unwrap())
+                .unwrap()
+                .config
+                .timeout_stop_sec,
+            2
+        );
+        assert_eq!(
+            m.get(&UnitName::parse("quick.service").unwrap())
+                .unwrap()
+                .config
+                .timeout_stop_sec,
+            1,
+            "a shorter timeout is not lengthened"
+        );
     }
 
     // --- two-stage stop (plan §1.1) -------------------------------------

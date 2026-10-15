@@ -40,6 +40,16 @@ impl Drop for TempDir {
 ///
 /// Returns everything rinit logged on stdout and stderr.
 fn boot_units(units: &TempDir, target: &str, settle: Duration) -> String {
+    boot_units_with_signal(units, target, settle, libc::SIGTERM)
+}
+
+/// As [`boot_units`], but shutting down with `signal`.
+fn boot_units_with_signal(
+    units: &TempDir,
+    target: &str,
+    settle: Duration,
+    signal: libc::c_int,
+) -> String {
     let bin = env!("CARGO_BIN_EXE_rinit");
     let child = Command::new(bin)
         .arg("--dev")
@@ -56,14 +66,14 @@ fn boot_units(units: &TempDir, target: &str, settle: Duration) -> String {
     // Let the unit directory boot and any restart/breaker activity happen.
     std::thread::sleep(settle);
     // SAFETY: signalling our own child.
-    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+    unsafe { libc::kill(child.id() as libc::pid_t, signal) };
 
     let out = child.wait_with_output().expect("wait for rinit");
     let mut log = String::from_utf8_lossy(&out.stdout).into_owned();
     log.push_str(&String::from_utf8_lossy(&out.stderr));
     assert!(
         out.status.success(),
-        "rinit should exit cleanly on SIGTERM, got {:?}:\n{log}",
+        "rinit should exit cleanly on the shutdown signal, got {:?}:\n{log}",
         out.status
     );
     log
@@ -265,6 +275,40 @@ fn starting_a_unit_stops_what_it_conflicts_with() {
     assert!(
         log.contains("alpha.service stopped; beta.service may start"),
         "beta must wait for alpha to actually stop:\n{log}"
+    );
+}
+
+/// Plan §7.1: `SIGPWR` is a *fast* shutdown - the per-unit timeout is capped at
+/// 2s and the whole shutdown at 5s, so a service with a 30s timeout is still
+/// killed promptly.
+#[test]
+fn sigpwr_shuts_down_within_the_power_budget() {
+    let dir = TempDir::new("sigpwr");
+    dir.write("all.target", "[Unit]\nType=target\nRequires=app.service\n");
+    // Ignores SIGTERM and has a long stop timeout; only the power-failure
+    // compression gets it killed quickly.
+    let app = r#"[Service]
+Type=simple
+ExecStart=/bin/sh -c "trap '' TERM; while :; do sleep 1; done"
+TimeoutStopSec=30
+"#;
+    dir.write("app.service", app);
+
+    let started = std::time::Instant::now();
+    let log = boot_units_with_signal(&dir, "all.target", Duration::from_millis(700), libc::SIGPWR);
+    let elapsed = started.elapsed();
+
+    assert!(
+        log.contains("received SIGPWR"),
+        "SIGPWR must be handled:\n{log}"
+    );
+    assert!(
+        log.contains("did not stop in time; killed"),
+        "the service must still be killed:\n{log}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "power shutdown must beat the 30s timeout, took {elapsed:?}:\n{log}"
     );
 }
 

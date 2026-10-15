@@ -203,8 +203,7 @@ pub fn kill(pid: libc::pid_t, signal: libc::c_int) -> Result<(), SyscallError> {
     }
 }
 
-/// Send `signal` to every process in `pid`'s process group.
-///
+/// Send `signal` to every process in `pid`'s process group.///
 /// `pid` is expected to lead its own process group, as created by
 /// [`SpawnOptions::with_session`]. This is how a stop reaches services
 /// that fork their own children (plan §1.3(6)): signalling the group delivers
