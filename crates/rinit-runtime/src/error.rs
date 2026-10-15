@@ -110,3 +110,132 @@ impl From<CoreError> for RuntimeError {
         RuntimeError::Core(e)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error as _;
+
+    use super::*;
+
+    #[test]
+    fn syscall_error_keeps_op_and_errno() {
+        let e = SyscallError::new("mount", libc::EPERM);
+        assert_eq!(e.op(), "mount");
+        assert_eq!(e.errno(), libc::EPERM);
+    }
+
+    #[test]
+    fn syscall_error_last_os_error_reads_the_current_errno() {
+        // A failing syscall is the only portable way to set errno.
+        // SAFETY: `close(-1)` cannot succeed, so no descriptor is affected.
+        let failed = unsafe { libc::close(-1) };
+        assert_eq!(failed, -1, "close(-1) must fail");
+
+        let e = SyscallError::last_os_error("close");
+        assert_eq!(e.op(), "close");
+        assert_eq!(e.errno(), libc::EBADF);
+    }
+
+    #[test]
+    fn syscall_error_from_io_preserves_os_errors() {
+        let io = io::Error::from_raw_os_error(libc::ENOENT);
+        let e = SyscallError::from_io("open", &io);
+        assert_eq!(e.errno(), libc::ENOENT);
+        assert_eq!(e.op(), "open");
+    }
+
+    /// A non-OS error carries no errno; the wrapper records 0 rather than
+    /// inventing a value, and the accessors must not panic on it.
+    #[test]
+    fn syscall_error_from_io_handles_non_os_errors() {
+        let io = io::Error::new(io::ErrorKind::InvalidInput, "no errno here");
+        let e = SyscallError::from_io("parse", &io);
+        assert_eq!(e.errno(), 0);
+        assert_eq!(e.op(), "parse");
+    }
+
+    /// The errno survives the round trip so callers can match on it again.
+    #[test]
+    fn syscall_error_round_trips_through_io_error() {
+        let e = SyscallError::new("kill", libc::ESRCH);
+        assert_eq!(e.io_error().raw_os_error(), Some(libc::ESRCH));
+    }
+
+    #[test]
+    fn syscall_error_display_names_op_and_errno() {
+        let msg = SyscallError::new("kill", libc::ESRCH).to_string();
+        assert!(msg.contains("kill"), "got: {msg}");
+        assert!(msg.contains(&libc::ESRCH.to_string()), "got: {msg}");
+    }
+
+    #[test]
+    fn runtime_error_from_syscall_preserves_payload() {
+        let err = RuntimeError::from(SyscallError::new("mount", libc::EPERM));
+        assert!(matches!(err, RuntimeError::Syscall(_)));
+        assert!(err.to_string().contains("mount"), "got: {err}");
+    }
+
+    /// `source()` is what makes error chains useful, so every variant must
+    /// implement it deliberately.
+    #[test]
+    fn runtime_error_sources_are_wired() {
+        let syscall = RuntimeError::Syscall(SyscallError::new("mount", libc::EPERM));
+        assert!(syscall.source().is_some());
+
+        let io = RuntimeError::Io {
+            op: "create_dir_all",
+            source: io::Error::from_raw_os_error(libc::EIO),
+        };
+        assert!(io.source().is_some());
+
+        let core = RuntimeError::Core(CoreError::InvalidUnitName("bad name".to_string()));
+        assert!(core.source().is_some());
+
+        // A join failure has no underlying error object, only a message.
+        let join = RuntimeError::Join {
+            op: "mount",
+            detail: "task panicked".to_string(),
+        };
+        assert!(join.source().is_none());
+    }
+
+    #[test]
+    fn runtime_error_io_display_mentions_op_and_cause() {
+        let err = RuntimeError::Io {
+            op: "create_dir_all",
+            source: io::Error::from_raw_os_error(libc::EACCES),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("create_dir_all"), "got: {msg}");
+        assert!(msg.contains(&libc::EACCES.to_string()), "got: {msg}");
+    }
+
+    #[test]
+    fn runtime_error_join_display_mentions_op_and_detail() {
+        let err = RuntimeError::Join {
+            op: "mount",
+            detail: "task panicked".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("mount"), "got: {msg}");
+        assert!(msg.contains("task panicked"), "got: {msg}");
+    }
+
+    #[test]
+    fn runtime_error_from_core_preserves_payload() {
+        let err = RuntimeError::from(CoreError::InvalidUnitName("bad name".to_string()));
+        assert!(matches!(err, RuntimeError::Core(_)));
+        assert!(err.to_string().contains("bad name"), "got: {err}");
+    }
+
+    /// A runtime error must stay usable as a boxed `dyn Error`; the binaries
+    /// return these from `main`, so this is on the real path.
+    #[test]
+    fn runtime_error_is_a_usable_std_error() {
+        let err: Box<dyn std::error::Error> = Box::new(RuntimeError::Syscall(SyscallError::new(
+            "kill",
+            libc::ESRCH,
+        )));
+        assert!(err.to_string().contains("kill"));
+    }
+}

@@ -1,0 +1,18 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+#
+# --- rinit note ---------------------------------------------------------
+# The seed below is retained deliberately, not as a still-failing case. It
+# recorded the moment `forbidden_characters_are_always_rejected` caught an
+# over-strong claim: `"a "` is a *valid* unit name, because `parse` trims
+# surrounding whitespace before validating. The property was corrected to use
+# only characters that trimming cannot remove, and whitespace is covered by
+# `surrounding_whitespace_is_irrelevant`.
+#
+# Keeping the seed means the trimming path is re-checked on every run: if the
+# trim behaviour ever changes, this case is the first to notice.
+cc f49ff352973d6074d594d681cc1de16de6faad87bcbf3f8821f9f89311da155e # shrinks to stem = "a", bad = ' '

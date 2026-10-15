@@ -7,7 +7,8 @@
 //! `lazy_static` (plan §0.2 principle 2).
 //!
 //! M0 scope: error types and unit-name modelling. The unit parser, dependency
-//! DAG, state machine and manager land in M1/M2 (plan §3).
+//! DAG, state machine and manager land in M1/M2 (plan §3); the `unit/` module
+//! tree already reserves their homes per plan §1.2.
 #![no_std]
 #![forbid(unsafe_code)]
 

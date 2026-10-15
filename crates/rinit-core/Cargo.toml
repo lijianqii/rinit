@@ -10,5 +10,10 @@ license.workspace = true
 # Intentionally empty: rinit-core depends only on `core` and `alloc`
 # (plan §2 "no_std + alloc 落地方式").
 
+[dev-dependencies]
+# Property tests for the unit-name invariants (plan §4.1/§4.4). Dev-only, so
+# the `no_std + alloc` production dependency set is unchanged.
+proptest = "1.11"
+
 [lints.rust]
 unsafe_code = "forbid"
