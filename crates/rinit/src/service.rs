@@ -73,13 +73,8 @@ pub fn spawn_service_in_group(
 ) -> Result<libc::pid_t, RuntimeError> {
     let (argv, envp) = prepare(argv, extra_env)?;
     let path = argv[0].as_c_str();
-    process::posix_spawn_with(
-        path,
-        &argv,
-        &envp,
-        process::SpawnOptions::with_process_group(),
-    )
-    .map_err(RuntimeError::from)
+    process::posix_spawn_with(path, &argv, &envp, process::SpawnOptions::with_session())
+        .map_err(RuntimeError::from)
 }
 
 /// Launch `argv` with [`SERVICE_ENV`] in rinit's own process group.

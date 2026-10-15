@@ -92,19 +92,22 @@ fn cstr_roundtrip_sanity() {
     assert_eq!(c"/bin/sh".to_bytes(), b"/bin/sh");
 }
 
-/// A spawned service must become a process-group leader (plan §1.3(6)).
+/// A spawned service must become a session leader (plan §1.3(6)).
 ///
-/// This is not cosmetic: a stop signals the *group*, and without a distinct
-/// group the signal would also hit rinit itself.
+/// This is not cosmetic. Services like `getty` call `setsid()` themselves and
+/// die if they are already a process-group leader but not a session leader, so
+/// rinit has to give them the session *first*. A session leader is also its
+/// process group's leader, which is what makes a stop signal the whole tree
+/// rather than rinit itself.
 #[test]
-fn spawn_with_process_group_makes_the_child_a_group_leader() {
+fn spawn_with_session_makes_the_child_a_session_leader() {
     let _guard = REAP_LOCK.lock().unwrap();
     let argv = [cs("sh"), cs("-c"), cs("sleep 30")];
     let pid = process::posix_spawn_with(
         c"/bin/sh",
         &argv,
         &[],
-        process::SpawnOptions::with_process_group(),
+        process::SpawnOptions::with_session(),
     )
     .expect("posix_spawn");
 
@@ -117,6 +120,12 @@ fn spawn_with_process_group_makes_the_child_a_group_leader() {
         pgid,
         process::getpid(),
         "the group must not be rinit's own group"
+    );
+    // SAFETY: `getsid` takes a scalar pid and cannot fault.
+    assert_eq!(
+        unsafe { libc::getsid(pid) },
+        pid,
+        "the child must be a session leader, or getty would die on its own setsid"
     );
 
     process::kill(pid, libc::SIGKILL).expect("kill");
@@ -136,7 +145,7 @@ fn kill_process_group_reaches_grandchildren() {
         c"/bin/sh",
         &argv,
         &[],
-        process::SpawnOptions::with_process_group(),
+        process::SpawnOptions::with_session(),
     )
     .expect("posix_spawn");
 
@@ -164,7 +173,7 @@ fn kill_process_group_reports_esrch_when_gone() {
         c"/bin/sh",
         &argv,
         &[],
-        process::SpawnOptions::with_process_group(),
+        process::SpawnOptions::with_session(),
     )
     .expect("posix_spawn");
     drain_until_reaped(pid);

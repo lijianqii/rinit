@@ -11,22 +11,29 @@ use crate::error::SyscallError;
 /// The attributes a spawned service gets.
 ///
 /// Kept as a struct rather than a bare `posix_spawn` call because plan §1.3(6)
-/// requires each service to become a *process-group leader*: stopping it then
+/// requires each service to be signalable as a whole tree: stopping it then
 /// signals `kill(-pgid, ...)`, which reaches children the service forked
 /// itself. Signalling only the direct child would leave those grandchildren
 /// running and holding the port the next start wants.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SpawnOptions {
-    /// Create a new process group with the child as leader.
-    pub new_process_group: bool,
+    /// Start the child in a new *session* (`setsid`).
+    pub new_session: bool,
 }
 
 impl SpawnOptions {
-    /// Spawn into a fresh process group, so the whole tree can be signalled.
-    pub const fn with_process_group() -> Self {
-        SpawnOptions {
-            new_process_group: true,
-        }
+    /// Spawn into a fresh session, so the whole tree can be signalled.
+    ///
+    /// A new session also gives a new process group with `pgid == pid`, so
+    /// `kill(-pgid, ...)` behaves exactly as it would for a plain process-group
+    /// leader - but `setsid` is what services actually expect. `getty` is the
+    /// reason this is not merely `setpgid`: it calls `setsid()` itself and
+    /// *dies* if it is already a process-group leader (`setsid` fails with
+    /// `EPERM` unless the caller is not a group leader), which is exactly what
+    /// a bare `setpgid` would make it. As a session leader, `getty`'s own
+    /// `setsid()` fails harmlessly and it carries on.
+    pub const fn with_session() -> Self {
+        SpawnOptions { new_session: true }
     }
 }
 
@@ -65,13 +72,12 @@ pub fn posix_spawn_with(
         .collect();
     env_ptrs.push(std::ptr::null_mut());
 
-    // POSIX_SPAWN_SETPGROUP is the portable way to ask for a new process
-    // group; the child then also becomes a session leader's child with pgid ==
-    // its own pid. Building attrs by hand (rather than the libc
-    // `posix_spawnattr_t` wrapper, which glibc exposes but musl does not)
-    // keeps this file buildable on both targets.
+    // POSIX_SPAWN_SETSID asks the child to `setsid()`, which glibc performs
+    // before `exec`. Building attrs by hand (rather than the libc
+    // `posix_spawnattr_t` wrapper, which glibc exposes but musl does not) keeps
+    // this file buildable on both targets.
     let mut attrs: libc::posix_spawnattr_t = unsafe { std::mem::zeroed() };
-    if options.new_process_group {
+    if options.new_session {
         // SAFETY: a zeroed attr struct with a flags field is the documented
         // starting point for `posix_spawnattr_init`; it is only read back
         // inside this call.
@@ -83,11 +89,11 @@ pub fn posix_spawn_with(
         // pointer and writes the flags through the pointer it is given; both
         // are valid locals.
         unsafe { libc::posix_spawnattr_getflags(&attrs, &mut flags) };
-        flags |= libc::POSIX_SPAWN_SETPGROUP as libc::c_short;
+        flags |= libc::POSIX_SPAWN_SETSID as libc::c_short;
         // SAFETY: as above.
         unsafe { libc::posix_spawnattr_setflags(&mut attrs, flags) };
     }
-    let attr_ptr = if options.new_process_group {
+    let attr_ptr = if options.new_session {
         &attrs as *const libc::posix_spawnattr_t
     } else {
         std::ptr::null()
@@ -109,7 +115,7 @@ pub fn posix_spawn_with(
         )
     };
 
-    if options.new_process_group {
+    if options.new_session {
         // SAFETY: `attrs` was initialised above and is not used afterwards.
         unsafe { libc::posix_spawnattr_destroy(&mut attrs) };
     }
@@ -134,8 +140,8 @@ pub fn kill(pid: libc::pid_t, signal: libc::c_int) -> Result<(), SyscallError> {
 
 /// Send `signal` to every process in `pid`'s process group.
 ///
-/// `pid` is expected to be a group leader created by
-/// [`SpawnOptions::with_process_group`]. This is how a stop reaches services
+/// `pid` is expected to lead its own process group, as created by
+/// [`SpawnOptions::with_session`]. This is how a stop reaches services
 /// that fork their own children (plan §1.3(6)): signalling the group delivers
 /// to all of them, where `kill(pid, ...)` would only reach the direct child.
 ///
