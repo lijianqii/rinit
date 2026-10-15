@@ -104,6 +104,12 @@ async fn supervise(signals: &mut SignalSet, manager: &mut UnitManager, notify: &
         for unit in manager.due_kills() {
             rlog!("error: {unit} ignored SIGTERM; killed");
         }
+        for unit in manager.due_health_probes() {
+            rlog!("probing {unit}");
+        }
+        for unit in manager.due_probe_timeouts() {
+            rlog!("warning: {unit}: health probe timed out");
+        }
 
         // Never block past the earliest pending deadline.
         let wait = next_deadline(manager);
@@ -197,6 +203,8 @@ fn next_deadline(manager: &UnitManager) -> std::time::Duration {
         manager.next_restart_in(),
         manager.next_start_timeout_in(),
         manager.next_kill_in(),
+        manager.next_health_in(),
+        manager.next_probe_timeout_in(),
     ]
     .into_iter()
     .flatten()

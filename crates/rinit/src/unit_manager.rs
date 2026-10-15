@@ -79,6 +79,18 @@ pub struct UnitRuntime {
     /// When a unit that ignored the start-timeout `SIGTERM` must be `SIGKILL`ed
     /// (plan §1.3(12)).
     pub kill_at: Option<Instant>,
+    /// When the next `HealthCheck` probe is due (plan §1.3(5)).
+    pub health_at: Option<Instant>,
+    /// The running health probe's pid, if one is in flight.
+    pub probe_pid: Option<libc::pid_t>,
+    /// When an in-flight health probe must be given up on.
+    pub probe_deadline: Option<Instant>,
+    /// The last probe's verdict: `Some(true)` healthy, `Some(false)` not,
+    /// `None` never probed.
+    pub healthy: Option<bool>,
+    /// Set when a stop was requested *to restart*, not to end the unit: a health
+    /// failure that asks for a restart. The next reaped exit honours it.
+    pub restart_after_stop: bool,
     /// The last `STATUS=` text, for `rctl status`.
     pub status: Option<String>,
     /// The last outcome, kept for logging and `rctl status`.
@@ -105,6 +117,11 @@ impl UnitRuntime {
             restart_at: None,
             start_deadline: None,
             kill_at: None,
+            health_at: None,
+            probe_pid: None,
+            probe_deadline: None,
+            healthy: None,
+            restart_after_stop: false,
             status: None,
             last_outcome: None,
         }
@@ -127,6 +144,18 @@ impl UnitRuntime {
 /// rather than to a deadline of "now".
 fn deadline(secs: u64) -> Option<Instant> {
     (secs > 0).then(|| Instant::now() + Duration::from_secs(secs))
+}
+
+/// Arm the next health probe for `rt`, if it has a `HealthCheck` at all.
+///
+/// A zero interval disables probing, mirroring how `TimeoutStartSec=0` disables
+/// a timeout.
+fn schedule_health(rt: &mut UnitRuntime) {
+    rt.health_at = if rt.config.health_check.is_empty() || rt.config.health_interval_sec == 0 {
+        None
+    } else {
+        Some(Instant::now() + Duration::from_secs(rt.config.health_interval_sec))
+    };
 }
 
 /// A stable 64-bit hash of the unit name, for the jitter seed.
@@ -249,6 +278,7 @@ impl UnitManager {
             ServiceKind::Simple => {
                 rt.state = UnitState::Active;
                 rt.backoff.on_active(now);
+                schedule_health(rt);
             }
             // `oneshot` completes on exit; boot waits for it directly.
             ServiceKind::Oneshot => {}
@@ -288,6 +318,7 @@ impl UnitManager {
                 rt.state = t.to;
                 rt.start_deadline = None;
                 rt.backoff.on_active(now);
+                schedule_health(rt);
                 true
             }
             Err(_) => false,
@@ -371,6 +402,144 @@ impl UnitManager {
             .min()
     }
 
+    /// Start the `HealthCheck` of every unit whose probe is due.
+    ///
+    /// A probe is an ordinary child: it is reaped by the same `waitpid` loop as
+    /// everything else, which keeps rinit's single-reaper invariant intact
+    /// (plan §1.3(6)). Its exit is recognised because the pid is remembered in
+    /// `probe_pid`. Returns the units probed, in name order.
+    pub fn due_health_probes(&mut self) -> Vec<UnitName> {
+        let now = Instant::now();
+        let mut probed = Vec::new();
+        for (name, rt) in self.units.iter_mut() {
+            if rt.state != UnitState::Active {
+                rt.health_at = None;
+                continue;
+            }
+            if rt.probe_pid.is_some() {
+                continue;
+            }
+            if !rt.health_at.is_some_and(|at| at <= now) {
+                continue;
+            }
+            rt.health_at = None;
+
+            let argv = rt.config.health_check.argv().to_vec();
+            match spawn_service_in_group(&argv, &[]) {
+                Ok(pid) => {
+                    rt.probe_pid = Some(pid);
+                    rt.probe_deadline = deadline(rt.config.health_timeout_sec);
+                    probed.push(name.clone());
+                }
+                Err(e) => {
+                    // A probe that cannot even start must not spin: wait a full
+                    // interval before trying again.
+                    rlog!("warning: {name}: health probe failed to start: {e}");
+                    schedule_health(rt);
+                }
+            }
+        }
+        probed
+    }
+
+    /// Kill health probes that outlived `HealthTimeoutSec`.
+    ///
+    /// The `SIGKILL` produces a reaped signal exit, which
+    /// [`finish_probe`](Self::finish_probe) turns into an unhealthy verdict, so
+    /// this only has to do the signalling.
+    pub fn due_probe_timeouts(&mut self) -> Vec<UnitName> {
+        let now = Instant::now();
+        let mut timed_out = Vec::new();
+        for (name, rt) in self.units.iter_mut() {
+            if let Some(at) = rt.probe_deadline
+                && at <= now
+            {
+                rt.probe_deadline = None;
+                if let Some(pid) = rt.probe_pid {
+                    let _ = process::kill_process_group(pid, libc::SIGKILL);
+                    timed_out.push(name.clone());
+                }
+            }
+        }
+        timed_out
+    }
+
+    /// Time until the next health probe is due, if any.
+    pub fn next_health_in(&self) -> Option<Duration> {
+        let now = Instant::now();
+        self.units
+            .values()
+            .filter_map(|rt| rt.health_at)
+            .map(|at| at.saturating_duration_since(now))
+            .min()
+    }
+
+    /// Time until the next probe timeout, if any.
+    pub fn next_probe_timeout_in(&self) -> Option<Duration> {
+        let now = Instant::now();
+        self.units
+            .values()
+            .filter_map(|rt| rt.probe_deadline)
+            .map(|at| at.saturating_duration_since(now))
+            .min()
+    }
+
+    /// The unit whose health probe `pid` belongs to, if any.
+    fn probe_owner(&self, pid: libc::pid_t) -> Option<UnitName> {
+        self.units
+            .iter()
+            .find(|(_, rt)| rt.probe_pid == Some(pid))
+            .map(|(name, _)| name.clone())
+    }
+
+    /// Record a finished probe and act on the verdict (plan §1.3(5)).
+    ///
+    /// A health failure is not a crash: it is marked, and only restarts when
+    /// `HealthRestartOnFailure=true`.
+    fn finish_probe(&mut self, unit: &UnitName, outcome: ExitOutcome) {
+        let Some(rt) = self.units.get_mut(unit) else {
+            return;
+        };
+        rt.probe_pid = None;
+        rt.probe_deadline = None;
+        let healthy = matches!(outcome, ExitOutcome::Success);
+        rt.healthy = Some(healthy);
+
+        if healthy {
+            rlog!("{unit} is healthy");
+            schedule_health(rt);
+            return;
+        }
+
+        rlog!("warning: {unit} failed its health check ({outcome:?})");
+        if rt.config.health_restart_on_failure && rt.pid.is_some() {
+            let pid = rt.pid.expect("checked above");
+            match process::kill_process_group(pid, libc::SIGTERM) {
+                Ok(()) => {
+                    // Mark the stop as a restart so the reaped exit re-enters
+                    // the restart path instead of ending the unit. Set only
+                    // once the signal was delivered, so a stop that had nothing
+                    // to signal cannot leave the flag dangling.
+                    rt.state = UnitState::Deactivating;
+                    rt.restart_after_stop = true;
+                }
+                Err(e) if e.errno() == libc::ESRCH => {
+                    // The unit died on its own and its exit is on its way; let
+                    // the normal crash path handle it rather than restarting
+                    // here twice.
+                    rt.state = UnitState::Inactive;
+                    rt.pid = None;
+                }
+                Err(e) => {
+                    rlog!("warning: SIGTERM to {unit} failed: {e}");
+                    schedule_health(rt);
+                }
+            }
+        } else {
+            schedule_health(rt);
+        }
+    }
+
     /// Signal a unit's process group to stop.
     ///
     /// A pending restart is cancelled: an explicit stop beats an automatic one
@@ -382,6 +551,14 @@ impl UnitManager {
         rt.restart_at = None;
         rt.start_deadline = None;
         rt.kill_at = None;
+        // An explicit stop also abandons any health probing and cancels a
+        // health-triggered restart: the operator asked for the unit to stop.
+        rt.health_at = None;
+        rt.probe_deadline = None;
+        rt.restart_after_stop = false;
+        if let Some(pid) = rt.probe_pid.take() {
+            let _ = process::kill_process_group(pid, libc::SIGKILL);
+        }
 
         match rt.pid {
             Some(pid) => match process::kill_process_group(pid, libc::SIGTERM) {
@@ -416,6 +593,13 @@ impl UnitManager {
     /// Returns `None` for a pid rinit does not own, which is not an error: a
     /// child reaped by someone else, or one already accounted for.
     pub fn on_child_exit(&mut self, pid: libc::pid_t, outcome: ExitOutcome) -> Option<Outcome> {
+        // A health probe is a child too; its exit is a verdict, not a unit's
+        // death (plan §1.3(5)).
+        if let Some(unit) = self.probe_owner(pid) {
+            self.finish_probe(&unit, outcome);
+            return None;
+        }
+
         let unit = self
             .units
             .iter()
@@ -427,11 +611,19 @@ impl UnitManager {
         rt.pid = None;
         rt.start_deadline = None;
         rt.kill_at = None;
+        rt.health_at = None;
+        rt.probe_deadline = None;
         rt.last_outcome = Some(outcome);
 
         // A stop already in flight owns the transition; the exit just confirms
-        // it, and must not be mistaken for a crash worth restarting.
+        // it, and must not be mistaken for a crash worth restarting - unless it
+        // was a health-triggered restart, which deliberately re-enters the
+        // restart path.
         if rt.state == UnitState::Deactivating {
+            if rt.restart_after_stop {
+                rt.restart_after_stop = false;
+                return Some(self.schedule_restart(&unit, now));
+            }
             rt.state = UnitState::Inactive;
             return Some(Outcome::Exited {
                 unit,
@@ -484,18 +676,33 @@ impl UnitManager {
             let state = rt.state;
             return Some(Outcome::Exited { unit, state });
         }
+        Some(self.schedule_restart(&unit, now))
+    }
 
-        // Restart wanted. Ask the breaker whether it is allowed.
+    /// Arm the backoff for `unit`, unless the breaker forbids it.
+    fn schedule_restart(&mut self, unit: &UnitName, now: u64) -> Outcome {
+        let Some(rt) = self.units.get_mut(unit) else {
+            return Outcome::Exited {
+                unit: unit.clone(),
+                state: UnitState::Inactive,
+            };
+        };
         match rt.backoff.on_failure(now) {
             Some(delay) => {
                 rt.state = UnitState::RestartWait;
                 rt.restart_at = Some(Instant::now() + delay);
-                Some(Outcome::RestartScheduled { unit, delay })
+                Outcome::RestartScheduled {
+                    unit: unit.clone(),
+                    delay,
+                }
             }
             None => {
                 rt.state = UnitState::Failed(FailedReason::StartLimitHit);
                 let failures = rt.backoff.failures_in_window();
-                Some(Outcome::StartLimitTripped { unit, failures })
+                Outcome::StartLimitTripped {
+                    unit: unit.clone(),
+                    failures,
+                }
             }
         }
     }
@@ -920,6 +1127,131 @@ mod tests {
         assert_eq!(killed.len(), 1, "the unit must be killed");
         assert_eq!(killed[0], unit);
         assert!(m.get(&unit).unwrap().kill_at.is_none(), "fires once");
+
+        cleanup(&mut m, &unit);
+    }
+
+    /// Build a manager holding one running `simple` service with a `HealthCheck`.
+    fn health_service(
+        name: &str,
+        probe: &str,
+        restart_on_failure: bool,
+    ) -> (UnitManager, UnitName) {
+        let mut cfg = config(name, RestartPolicy::No);
+        cfg.health_check = rinit_core::ExecCommand::new(vec![probe.to_string()]);
+        cfg.health_interval_sec = 3600;
+        cfg.health_timeout_sec = 5;
+        cfg.health_restart_on_failure = restart_on_failure;
+        let mut m = UnitManager::new();
+        m.add(cfg);
+        let unit = UnitName::parse(name).unwrap();
+        m.spawn_unit_with_env(&unit, &[]).expect("spawn");
+        (m, unit)
+    }
+
+    /// Make the next probe due immediately instead of waiting an interval.
+    fn make_probe_due(m: &mut UnitManager, unit: &UnitName) {
+        m.units.get_mut(unit).unwrap().health_at = Some(Instant::now() - Duration::from_secs(1));
+    }
+
+    /// A probe that exits 0 marks the unit healthy and books the next probe.
+    #[test]
+    fn a_passing_probe_marks_the_unit_healthy() {
+        let (mut m, unit) = health_service("h.service", "/bin/true", false);
+        make_probe_due(&mut m, &unit);
+
+        let probed = m.due_health_probes();
+        assert_eq!(probed.len(), 1);
+        assert_eq!(probed[0], unit);
+        let probe = m.get(&unit).unwrap().probe_pid.expect("a probe pid");
+
+        // The probe exiting 0 is fed back as a child exit.
+        m.on_child_exit(probe, ExitOutcome::Success);
+        let rt = m.get(&unit).unwrap();
+        assert_eq!(rt.healthy, Some(true));
+        assert!(rt.probe_pid.is_none());
+        assert!(rt.health_at.is_some(), "the next probe must be scheduled");
+        assert_eq!(rt.state, UnitState::Active, "a healthy unit keeps running");
+
+        cleanup(&mut m, &unit);
+    }
+
+    /// A failing probe without `HealthRestartOnFailure` marks the unit unhealthy
+    /// but leaves it running.
+    #[test]
+    fn a_failing_probe_only_marks_without_restart() {
+        let (mut m, unit) = health_service("h.service", "/bin/false", false);
+        make_probe_due(&mut m, &unit);
+
+        m.due_health_probes();
+        let probe = m.get(&unit).unwrap().probe_pid.expect("a probe pid");
+        m.on_child_exit(probe, ExitOutcome::Failure(1));
+
+        let rt = m.get(&unit).unwrap();
+        assert_eq!(rt.healthy, Some(false));
+        assert_eq!(rt.state, UnitState::Active, "no restart was requested");
+        assert!(rt.pid.is_some(), "the unit is still running");
+
+        cleanup(&mut m, &unit);
+    }
+
+    /// With `HealthRestartOnFailure`, a failing probe stops the unit so the exit
+    /// re-enters the restart path (plan §1.3(5)).
+    #[test]
+    fn a_failing_probe_restarts_when_asked() {
+        let (mut m, unit) = health_service("h.service", "/bin/false", true);
+        make_probe_due(&mut m, &unit);
+
+        m.due_health_probes();
+        let probe = m.get(&unit).unwrap().probe_pid.expect("a probe pid");
+        m.on_child_exit(probe, ExitOutcome::Failure(1));
+        assert_eq!(m.get(&unit).unwrap().state, UnitState::Deactivating);
+
+        // The unit's own process now exits from the deliberate stop, which must
+        // restart rather than end the unit.
+        let upid = m.get(&unit).unwrap().pid.expect("the unit pid");
+        let outcome = m
+            .on_child_exit(upid, ExitOutcome::Signalled(libc::SIGTERM))
+            .expect("handled");
+        assert!(
+            matches!(outcome, Outcome::RestartScheduled { .. }),
+            "a health-triggered stop must restart, got {outcome:?}"
+        );
+        assert_eq!(m.get(&unit).unwrap().state, UnitState::RestartWait);
+
+        cleanup(&mut m, &unit);
+    }
+
+    /// A probe that hangs past `HealthTimeoutSec` is killed.
+    #[test]
+    fn a_hung_probe_is_killed() {
+        let (mut m, unit) = health_service("h.service", "/bin/true", false);
+        make_probe_due(&mut m, &unit);
+        m.due_health_probes();
+        // Pretend the timeout already elapsed.
+        m.units.get_mut(&unit).unwrap().probe_deadline =
+            Some(Instant::now() - Duration::from_secs(1));
+
+        let killed = m.due_probe_timeouts();
+        assert_eq!(killed.len(), 1, "the probe must be reported");
+        assert_eq!(killed[0], unit);
+        assert!(
+            m.get(&unit).unwrap().probe_deadline.is_none(),
+            "the timeout fires once"
+        );
+
+        cleanup(&mut m, &unit);
+    }
+
+    /// A unit with no `HealthCheck` is never probed.
+    #[test]
+    fn a_unit_without_a_health_check_is_not_probed() {
+        let mut m = manager_with("a.service", RestartPolicy::No);
+        let unit = UnitName::parse("a.service").unwrap();
+        m.spawn_unit_with_env(&unit, &[]).expect("spawn");
+
+        assert!(m.due_health_probes().is_empty());
+        assert!(m.get(&unit).unwrap().health_at.is_none());
 
         cleanup(&mut m, &unit);
     }
