@@ -158,6 +158,86 @@ fn environment_and_working_directory_reach_the_service() {
     );
 }
 
+/// Plan §1.1: `ExecStartPre` runs before `ExecStart`, `ExecStartPost` after.
+#[test]
+fn exec_start_pre_and_post_run_around_the_main_command() {
+    let dir = TempDir::new("prepost");
+    dir.write("all.target", "[Unit]\nType=target\nRequires=app.service\n");
+    let app = r#"[Service]
+Type=oneshot
+ExecStartPre=/bin/sh -c "echo MARK_PRE"
+ExecStart=/bin/sh -c "echo MARK_MAIN"
+ExecStartPost=/bin/sh -c "echo MARK_POST"
+"#;
+    dir.write("app.service", app);
+
+    let log = boot_units(&dir, "all.target", Duration::from_millis(900));
+
+    let pre = log.find("MARK_PRE").expect("ExecStartPre must run");
+    let main = log.find("MARK_MAIN").expect("ExecStart must run");
+    let post = log.find("MARK_POST").expect("ExecStartPost must run");
+    assert!(
+        pre < main && main < post,
+        "the commands must run in order:\n{log}"
+    );
+}
+
+/// Plan §1.1: a failing `ExecStartPre` aborts the start - the main command must
+/// not run.
+#[test]
+fn a_failing_exec_start_pre_prevents_the_start() {
+    let dir = TempDir::new("pre-fail");
+    dir.write("all.target", "[Unit]\nType=target\nRequires=app.service\n");
+    let app = r#"[Service]
+Type=oneshot
+ExecStartPre=/bin/false
+ExecStart=/bin/sh -c "echo MARK_SHOULD_NOT_RUN"
+"#;
+    dir.write("app.service", app);
+
+    let log = boot_units(&dir, "all.target", Duration::from_millis(700));
+
+    assert!(
+        log.contains("ExecStartPre"),
+        "the failure must be logged:\n{log}"
+    );
+    assert!(
+        !log.contains("MARK_SHOULD_NOT_RUN"),
+        "ExecStart must not run after a failed ExecStartPre:\n{log}"
+    );
+}
+
+/// Plan §1.3(13): a unit whose `ExecStart` cannot be started is `Failed`, the
+/// boot continues, and everything that `Requires=` it does not start.
+#[test]
+fn a_unit_that_cannot_start_fails_its_required_dependents() {
+    let dir = TempDir::new("requires-fail");
+    dir.write(
+        "all.target",
+        "[Unit]\nType=target\nRequires=app.service dependent.service\n",
+    );
+    dir.write(
+        "app.service",
+        "[Service]\nType=simple\nExecStart=/nonexistent/rinit-test-binary\n",
+    );
+    dir.write(
+        "dependent.service",
+        "[Unit]\nRequires=app.service\n\
+         [Service]\nType=simple\nExecStart=/bin/sh -c \"echo MARK_DEPENDENT_RAN; sleep 30\"\n",
+    );
+
+    let log = boot_units(&dir, "all.target", Duration::from_millis(800));
+
+    assert!(
+        log.contains("cannot start"),
+        "the broken unit must be reported:\n{log}"
+    );
+    assert!(
+        !log.contains("MARK_DEPENDENT_RAN"),
+        "a dependent of a failed unit must not start:\n{log}"
+    );
+}
+
 /// Plan §1.1: a two-stage stop. A service that ignores `SIGTERM` must still be
 /// `SIGKILL`ed once `TimeoutStopSec` expires - otherwise shutdown would leave
 /// it running forever.

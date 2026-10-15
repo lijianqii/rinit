@@ -18,8 +18,8 @@ use crate::log::rlog;
 use crate::manager;
 use crate::notify::NotifyHub;
 use crate::readiness;
-use crate::service::{ServiceSet, reap_and_log, shutdown};
-use crate::unit_manager::{Outcome, UnitManager, reap_into_manager};
+use crate::service::{ServiceSet, reap_and_log, shutdown, spawn_service_in_group};
+use crate::unit_manager::{Outcome, UnitManager, build_service_env, reap_into_manager};
 
 /// How often the shutdown loop wakes to reap children and check `SIGKILL`
 /// deadlines. Small enough that a quick exit is noticed promptly.
@@ -101,8 +101,10 @@ async fn supervise(signals: &mut SignalSet, manager: &mut UnitManager, notify: &
         // Service anything already due before blocking, so a zero-length timer
         // does not wait for the next unrelated wake-up.
         for unit in manager.due_restarts() {
-            if let Err(e) = start_unit(manager, notify, &unit) {
-                rlog!("error: restart of {unit} failed: {e}");
+            match start_unit(manager, notify, &unit).await {
+                Ok(true) => run_start_post(manager, &unit).await,
+                Ok(false) => {}
+                Err(e) => rlog!("error: restart of {unit} failed: {e}"),
             }
         }
         for unit in manager.due_start_timeouts() {
@@ -162,7 +164,7 @@ async fn supervise(signals: &mut SignalSet, manager: &mut UnitManager, notify: &
     }
     for unit in manager.started_units() {
         let effect = manager.request_stop(&unit, RequestSource::ShutdownStop);
-        if let Err(e) = apply_effect(manager, notify, &unit, effect) {
+        if let Err(e) = apply_effect(manager, notify, &unit, effect).await {
             rlog!("warning: stopping {unit} failed: {e}");
         }
     }
@@ -210,15 +212,18 @@ async fn stop_and_reap(manager: &mut UnitManager) {
     }
 }
 
-/// Spawn `unit`, arming its `notify` socket first when it is `Type=notify`.
+/// Arm the notify socket and spawn `unit`'s `ExecStart`.
 ///
 /// The socket must exist before the process starts, or the service would fail
 /// to find `NOTIFY_SOCKET` (plan §1.3(12)).
-fn start_unit(
+///
+/// Returns whether a process was spawned. A unit that spawns nothing (a target)
+/// returns `true`: it still became active.
+fn spawn_unit(
     manager: &mut UnitManager,
     notify: &mut NotifyHub,
     unit: &UnitName,
-) -> Result<(), RuntimeError> {
+) -> Result<bool, RuntimeError> {
     let config = manager.get(unit).map(|rt| rt.config.clone());
     let env: Vec<String> = match config {
         Some(config) if config.service_kind == ServiceKind::Notify => {
@@ -227,7 +232,126 @@ fn start_unit(
         }
         _ => Vec::new(),
     };
-    manager.spawn_unit_with_env(unit, &env)
+    manager.spawn_unit_with_env(unit, &env)?;
+    Ok(manager.get(unit).is_some_and(|rt| rt.pid.is_some()))
+}
+
+/// Start `unit`: `ExecStartPre`, then `ExecStart`.
+///
+/// An `ExecStartPre` failure is a unit failure, not an infrastructure one
+/// (plan §1.1), so it is recorded through [`fail_unit`] and reported as "did not
+/// spawn". Only a genuine infrastructure failure (the notify socket) is
+/// returned as an error.
+///
+/// `ExecStartPost` is deliberately *not* run here: for a `oneshot` it must run
+/// after the command has exited, so the caller runs it at the right moment.
+async fn start_unit(
+    manager: &mut UnitManager,
+    notify: &mut NotifyHub,
+    unit: &UnitName,
+) -> Result<bool, RuntimeError> {
+    let pre = manager
+        .get(unit)
+        .map(|rt| rt.config.exec_start_pre.clone())
+        .unwrap_or_default();
+    for cmd in &pre {
+        if run_aux_command(manager, unit, cmd).await != Some(0) {
+            rlog!(
+                "error: {unit}: ExecStartPre '{}' failed",
+                cmd.argv().join(" ")
+            );
+            fail_unit(manager, unit);
+            return Ok(false);
+        }
+    }
+
+    match spawn_unit(manager, notify, unit) {
+        Ok(spawned) => Ok(spawned),
+        Err(e) => {
+            // A spawn failure (missing binary, bad WorkingDirectory, ...) is a
+            // unit failure too: plan §1.1 models it as a failed start, and the
+            // rest of the boot must still come up.
+            rlog!(
+                "error: {unit}: cannot start '{}': {e}",
+                exec_start_of(manager, unit)
+            );
+            fail_unit(manager, unit);
+            Ok(false)
+        }
+    }
+}
+
+/// Run one of a unit's auxiliary commands to completion, as the service user.
+///
+/// `ExecStartPre=`/`ExecStartPost=` (plan §1.1) are best-effort from this
+/// function's point of view: it returns the exit code, or `None` when the
+/// command could not be started, was signalled, or timed out. The caller
+/// decides whether that is fatal (it is for `ExecStartPre`) or merely logged
+/// (for `ExecStartPost`).
+async fn run_aux_command(
+    manager: &UnitManager,
+    unit: &UnitName,
+    cmd: &rinit_core::ExecCommand,
+) -> Option<i32> {
+    let rt = manager.get(unit)?;
+    let env = build_service_env(&rt.config, &[]);
+    let cwd = rt.config.working_directory.clone();
+    let timeout = rt.config.timeout_start_sec;
+    let argv = cmd.argv().to_vec();
+
+    let pid = match spawn_service_in_group(&argv, &env, Some(&cwd)) {
+        Ok(pid) => pid,
+        Err(e) => {
+            rlog!("error: {unit}: cannot start '{}': {e}", argv.join(" "));
+            return None;
+        }
+    };
+    let limit = if timeout == 0 {
+        std::time::Duration::from_secs(u32::MAX as u64)
+    } else {
+        std::time::Duration::from_secs(timeout)
+    };
+    match readiness::wait_for_exit(pid, limit).await {
+        Ok(code) => code,
+        Err(()) => {
+            // Timed out: make sure it is gone before carrying on.
+            let _ = process::kill_process_group(pid, libc::SIGKILL);
+            let _ = readiness::wait_for_exit(pid, std::time::Duration::from_secs(5)).await;
+            rlog!("error: {unit}: '{}' timed out", argv.join(" "));
+            None
+        }
+    }
+}
+
+/// Run `unit`'s `ExecStartPost=` commands, logging (never propagating) failures.
+async fn run_start_post(manager: &UnitManager, unit: &UnitName) {
+    let post = manager
+        .get(unit)
+        .map(|rt| rt.config.exec_start_post.clone())
+        .unwrap_or_default();
+    for cmd in &post {
+        if run_aux_command(manager, unit, cmd).await != Some(0) {
+            rlog!(
+                "warning: {unit}: ExecStartPost '{}' failed",
+                cmd.argv().join(" ")
+            );
+        }
+    }
+}
+
+/// Mark `unit` as failed and fail whatever hard-requires it.
+fn fail_unit(manager: &mut UnitManager, unit: &UnitName) {
+    for dependent in manager.fail_start(unit) {
+        rlog!("error: {dependent} requires {unit}, which failed; not starting it");
+    }
+}
+
+/// `unit`'s `ExecStart` for an error message, or an empty string.
+fn exec_start_of(manager: &UnitManager, unit: &UnitName) -> String {
+    manager
+        .get(unit)
+        .map(|rt| rt.config.exec_start.argv().join(" "))
+        .unwrap_or_default()
 }
 
 /// Carry out what the Job queue decided for `unit` (plan §1.3(13)).
@@ -238,7 +362,7 @@ fn start_unit(
 /// the environment that socket needs.
 ///
 /// Returns whether a process was spawned, which is what the boot log counts.
-fn apply_effect(
+async fn apply_effect(
     manager: &mut UnitManager,
     notify: &mut NotifyHub,
     unit: &UnitName,
@@ -249,11 +373,11 @@ fn apply_effect(
         // `CancelBackoffAndStart` needs no extra step: taking the unit back to
         // `Starting` clears `restart_at` on its way through.
         Some(Effect::SpawnProcess | Effect::CancelBackoffAndStart) => {
-            start_unit(manager, notify, unit).map(|()| true)
+            start_unit(manager, notify, unit).await
         }
         Some(Effect::ClearStartLimitAndStart) => {
             manager.clear_start_limit(unit);
-            start_unit(manager, notify, unit).map(|()| true)
+            start_unit(manager, notify, unit).await
         }
         // `stop_unit` cancels a pending restart too, so a stop is a stop.
         Some(Effect::SendStopSignal | Effect::CancelBackoffAndStop) => {
@@ -316,10 +440,13 @@ fn next_deadline(manager: &UnitManager) -> std::time::Duration {
 /// blocking reap rather than the main loop, because boot ordering cannot depend
 /// on an event loop that has not finished starting yet.
 ///
+/// A unit that fails to start does **not** abort the boot (plan §1.3(13)): it is
+/// recorded as failed and everything that hard-`Requires=` it is failed with it
+/// and skipped. Only a fatal setup problem is returned as an error.
+///
 /// # Errors
-/// Returns a [`RuntimeError`] if a unit fails to spawn or an initializer
-/// fails: both mean a later level would be waiting on a dependency that never
-/// came up.
+/// Returns a [`RuntimeError`] for a parse/dependency failure or an
+/// infrastructure error (a notify socket that cannot be created).
 async fn start_units(cfg: &Config, notify: &mut NotifyHub) -> Result<UnitManager, RuntimeError> {
     let plan = manager::announce_plan(&cfg.unit_dir, &cfg.default_target)?;
     let mut units = UnitManager::new();
@@ -335,14 +462,17 @@ async fn start_units(cfg: &Config, notify: &mut NotifyHub) -> Result<UnitManager
         let mut oneshots: Vec<(UnitName, libc::pid_t, u64)> = Vec::new();
         for entry in batch {
             let name = entry.name;
+            // A unit whose hard dependency already failed must not start
+            // (plan §1.3(13)).
+            if units.is_failed(name) {
+                rlog!("skipping {name}: a required unit failed");
+                continue;
+            }
+
             // The boot schedule is a set of `Dependency` start requests, so a
             // unit pulled in twice is started once (plan §1.3(11)).
             let effect = units.request_start(name, RequestSource::Dependency);
-            let spawned =
-                apply_effect(&mut units, notify, name, effect).map_err(|e| RuntimeError::Io {
-                    op: "spawn unit",
-                    source: std::io::Error::other(format!("{name}: {e}")),
-                })?;
+            let spawned = apply_effect(&mut units, notify, name, effect).await?;
             if spawned {
                 started_units += 1;
             }
@@ -353,6 +483,10 @@ async fn start_units(cfg: &Config, notify: &mut NotifyHub) -> Result<UnitManager
                 && let Some(pid) = units.get(name).and_then(|rt| rt.pid)
             {
                 oneshots.push((name.clone(), pid, entry.timeout_start_sec));
+            } else {
+                // `ExecStartPost` runs once the main command is under way. For a
+                // `oneshot` that is after it has exited, so it is run below.
+                run_start_post(&units, name).await;
             }
         }
 
@@ -360,7 +494,6 @@ async fn start_units(cfg: &Config, notify: &mut NotifyHub) -> Result<UnitManager
         // depends on them. The wait is a direct `waitpid` per pid rather than
         // the main loop, because boot ordering must not depend on an event loop
         // that has not finished starting.
-        let mut failed_oneshots: Vec<String> = Vec::new();
         for (name, pid, timeout_sec) in &oneshots {
             let timeout = if *timeout_sec == 0 {
                 std::time::Duration::from_secs(u32::MAX as u64)
@@ -371,31 +504,22 @@ async fn start_units(cfg: &Config, notify: &mut NotifyHub) -> Result<UnitManager
                 Ok(Some(0)) => {
                     rlog!("{name} completed (Active(Exited))");
                     units.mark_oneshot_done(name);
+                    run_start_post(&units, name).await;
                 }
                 Ok(Some(code)) => {
                     rlog!("error: {name} exited {code}");
-                    failed_oneshots.push(name.canonical().to_string());
+                    fail_unit(&mut units, name);
                 }
                 Ok(None) => {
                     rlog!("error: {name} was killed by a signal");
-                    failed_oneshots.push(name.canonical().to_string());
+                    fail_unit(&mut units, name);
                 }
                 Err(()) => {
                     rlog!("error: {name} did not finish within {timeout_sec}s");
-                    failed_oneshots.push(name.canonical().to_string());
+                    let _ = process::kill_process_group(*pid, libc::SIGKILL);
+                    fail_unit(&mut units, name);
                 }
             }
-        }
-        if !failed_oneshots.is_empty() {
-            // A failed initializer means everything downstream would be starting
-            // on a broken foundation, so stop here rather than limping on.
-            return Err(RuntimeError::Io {
-                op: "start units",
-                source: std::io::Error::other(format!(
-                    "level {index}: {} failed, dependent units not started",
-                    failed_oneshots.join(", ")
-                )),
-            });
         }
 
         // Targets spawn no process (plan §7.2); reaching one means its

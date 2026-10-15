@@ -187,7 +187,7 @@ fn upsert(env: &mut Vec<(String, String)>, key: &str, value: &str) {
 ///
 /// An unreadable `EnvironmentFile=` is a warning, not a start failure: a
 /// service that loses an optional file must still come up.
-fn build_service_env(config: &UnitConfig, extra_env: &[String]) -> Vec<String> {
+pub(crate) fn build_service_env(config: &UnitConfig, extra_env: &[String]) -> Vec<String> {
     let mut merged: Vec<(String, String)> = Vec::new();
     for entry in crate::service::SERVICE_ENV {
         if let Some((key, value)) = entry.split_once('=') {
@@ -333,6 +333,49 @@ impl UnitManager {
         if let Some(rt) = self.units.get_mut(unit) {
             rt.backoff.reset();
         }
+    }
+
+    /// Units that hard-`Requires=` `unit`, in name order.
+    pub fn requires_dependents(&self, unit: &UnitName) -> Vec<UnitName> {
+        self.units
+            .values()
+            .filter(|rt| rt.config.deps.requires.contains(unit))
+            .map(|rt| rt.config.name.clone())
+            .collect()
+    }
+
+    /// Record that `unit` failed to start and fail whatever hard-requires it.
+    ///
+    /// Plan §1.3(13): a dependent of a failed `Requires=` must not start. The
+    /// dependents are marked `Failed` so that a boot that has not reached them
+    /// yet skips them, rather than building on a broken foundation. Returns the
+    /// units failed as a result, so the caller can say why.
+    ///
+    /// A dependent that already has a process is left alone: it is running, and
+    /// stopping it here would turn one failure into a cascade.
+    pub fn fail_start(&mut self, unit: &UnitName) -> Vec<UnitName> {
+        if let Some(rt) = self.units.get_mut(unit)
+            && !matches!(rt.state, UnitState::Failed(_))
+        {
+            rt.pid = None;
+            rt.state = UnitState::Failed(FailedReason::StartFailure);
+        }
+        let dependents = self.requires_dependents(unit);
+        for dependent in &dependents {
+            if let Some(rt) = self.units.get_mut(dependent)
+                && rt.pid.is_none()
+            {
+                rt.state = UnitState::Failed(FailedReason::StartFailure);
+            }
+        }
+        dependents
+    }
+
+    /// Whether `unit` is in a failure state.
+    pub fn is_failed(&self, unit: &UnitName) -> bool {
+        self.units
+            .get(unit)
+            .is_some_and(|rt| matches!(rt.state, UnitState::Failed(_)))
     }
 
     /// Mark a `oneshot` as having completed successfully.
@@ -1624,6 +1667,30 @@ mod tests {
 
     // --- two-stage stop (plan §1.1) -------------------------------------
 
+    /// Plan §1.3(13): a unit that fails to start fails everything that
+    /// hard-`Requires=` it, so the dependents are not started on a broken
+    /// foundation.
+    #[test]
+    fn a_failed_dependency_fails_its_requires_dependents() {
+        let mut m = UnitManager::new();
+        m.add(config("base.service", RestartPolicy::No));
+        let mut dep = config("dep.service", RestartPolicy::No);
+        dep.deps.requires = vec![UnitName::parse("base.service").unwrap()];
+        m.add(dep);
+
+        let base = UnitName::parse("base.service").unwrap();
+        let dep = UnitName::parse("dep.service").unwrap();
+
+        assert_eq!(m.requires_dependents(&base), std::slice::from_ref(&dep));
+        let failed = m.fail_start(&base);
+        assert_eq!(
+            failed,
+            std::slice::from_ref(&dep),
+            "the dependent is reported"
+        );
+        assert!(m.is_failed(&base));
+        assert!(m.is_failed(&dep), "a dependent must not be left startable");
+    }
     /// A stop arms the `SIGKILL` follow-up at `TimeoutStopSec`, so a service
     /// that ignores `SIGTERM` is still killed. Without this the shutdown path
     /// could never escalate.
