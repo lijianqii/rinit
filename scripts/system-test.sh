@@ -81,14 +81,40 @@ echo "   initrd: ${initrd}"
 echo "   log:    ${log_file}"
 echo "   booting (timeout ${timeout_s}s, the guest is killed once assertions are satisfiable)..."
 
+# The console shell reads from the serial port, so the test has to *type* at
+# it to prove a shell is actually reachable. A here-doc piped straight into
+# qemu would be consumed long before the guest boots, so the commands are fed
+# through a FIFO on a delay instead.
+#
+# The delay has to clear the whole boot (kernel + mounts + plan + units); 14s
+# is comfortable on the aarch64 virt machine and short enough not to dominate
+# the run. If a future image boots much slower this becomes a flake, so the
+# final `exit` is what guarantees the guest releases the pipe.
+fifo="$(mktemp -u)"
+mkfifo "${fifo}"
+trap 'rm -f "${fifo}"' EXIT
+
+# Hold the write end open for the life of qemu, then type once the shell is up.
+(
+    exec 3>"${fifo}"
+    sleep 14
+    printf 'id\n' >&3   # must answer uid=0(root): the "no login needed" proof
+    sleep 1
+    printf 'exit\n' >&3 # release the console so rinit can reap the shell
+    sleep 3
+    exec 3>&-
+) &
+feeder_pid=$!
+
 # The guest never exits on its own (rinit stays PID 1), so a bounded `timeout`
 # is the expected outcome. `timeout` returns 124 when it had to stop qemu.
 set +e
 timeout -k 5 "${timeout_s}" \
     "${repo_root}/scripts/run-qemu.sh" \
     --arch "${arch}" --kernel "${kernel}" --initrd "${initrd}" \
-    ${service:+--service "${service}"} </dev/null >"${log_file}" 2>&1
+    ${service:+--service "${service}"} <"${fifo}" >"${log_file}" 2>&1
 qemu_rc=$?
+wait "${feeder_pid}" 2>/dev/null || true
 set -e
 
 # 124 = we killed it (expected). Anything else means qemu died early.
@@ -127,7 +153,7 @@ expect "mounted /tmp" "rinit: mounted /tmp"
 # M1: a real boot comes from the unit directory, not a hardcoded service.
 expect "resolved a boot plan" "boot plan for 'multi-user.target'"
 expect "the init anchor is scheduled" "plan 0: rinit-init.target"
-expect "getty is scheduled" "getty.service"
+expect "the console shell is scheduled" "shell.service"
 
 # Boot must be ordered: mounts before any unit is started.
 if [[ "$(grep -n 'rinit: mounted /tmp' "${log_file}" | head -1 | cut -d: -f1)" -lt \
@@ -148,12 +174,24 @@ else
     fail "startup levels must run in dependency order (level0=${l0} level1=${l1})"
 fi
 
-# getty is Type=simple, so it is ready at exec and must be running afterwards.
-if grep -qF "started getty.service as pid" "${log_file}"; then
-    pass "getty started as a process"
+# The console shell is the whole point of `make run`: it must actually be up
+# and still running when the boot sequence finishes.
+if grep -qF "started shell.service as pid" "${log_file}"; then
+    pass "console shell started as a process"
 else
-    fail "getty.service should have been started"
+    fail "shell.service should have been started"
 fi
+
+if grep -qF "boot complete: 1 unit(s) started" "${log_file}"; then
+    pass "the console shell is still running after boot"
+else
+    fail "the console shell must survive boot (it is a long-running service)"
+fi
+
+# A root shell must be reachable with no password. `login` is never involved,
+# so the prompt appears directly and a typed command answers immediately.
+expect "an interactive root shell is available" "~ #"
+expect "the shell accepts input without a login prompt" "uid=0(root)"
 
 # Plan §7.2: a target is an aggregation point with no process, so it must
 # never appear in the "started ... as pid" stream.
@@ -161,6 +199,14 @@ if grep -qE "started (rinit-init|multi-user)\.target as pid" "${log_file}"; then
     fail "a target must never be exec'd (plan §7.2)"
 else
     pass "no target was exec'd"
+fi
+
+# getty.service is wired into the graph but not required by the default target
+# (the shell owns the console), so it must not be started.
+if grep -qF "started getty.service" "${log_file}"; then
+    fail "getty must not start while the console shell holds ttyAMA0"
+else
+    pass "getty correctly not started alongside the console shell"
 fi
 
 expect "boot completed" "boot complete"

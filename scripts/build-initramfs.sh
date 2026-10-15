@@ -80,7 +80,18 @@ if [[ -n "${busybox_src}" ]]; then
     else
         make -C "${busybox_src}" CONFIG_PREFIX="${work}" install >/dev/null
     fi
-    printf 'root:x:0:0:root:/root:/bin/sh\n' >"${work}/etc/passwd"
+    # An *empty* password field, not `x`.
+    #
+    # `x` means "the password lives in /etc/shadow", which this initramfs does
+    # not have - busybox login then refuses every password, including the empty
+    # one, and the console sits at a prompt nobody can get past. Leaving the
+    # field empty means "no password required", which is what makes the console
+    # usable with `make run`.
+    #
+    # This is safe only because the serial port is the sole access path and the
+    # image is a development initramfs; anyone who can reach it already has the
+    # machine. See units/shell.service.
+    printf 'root::0:0:root:/root:/bin/sh\n' >"${work}/etc/passwd"
     printf 'root:x:0:\n' >"${work}/etc/group"
 fi
 

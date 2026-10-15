@@ -5,16 +5,24 @@
 # soon as its `Requires=` units are, and that in turn releases whatever waits
 # on it. That is what decouples services from each other's internals.
 #
-# `Requires=` is a *strong* dependency: getty failing means this target fails
+# `Requires=` is a *strong* dependency: shell failing means this target fails
 # too (plan §7.2). Unlike `After=`, which is ordering only, a missing or
 # broken dependency here is visible rather than silently tolerated.
 #
 # Requires= accumulates across lines; splitting a long list keeps unit files
 # readable.
+#
+# `shell.service` owns ttyAMA0, so it and `getty.service` are alternatives and
+# must not both be required: two processes on one console both misbehave.
+# Requiring the shell is what gives `make run` an interactive prompt; drop that
+# line to get a login prompt from getty instead. Neither is expressed as a
+# `Conflicts=`, because M1 parses conflicts but does not stop units - that
+# would need a live unit being stopped, which is M2's job.
 [Unit]
 Description=Multi-user system
 Type=target
 After=rinit-init.target
 
 Requires=rinit-init.target
-Requires=getty.service
+Requires=shell.service
+# Requires=getty.service

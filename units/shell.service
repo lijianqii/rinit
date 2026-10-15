@@ -1,0 +1,30 @@
+# Serial console shell (plan §4.3 "交互登录").
+#
+# An interactive root shell on the serial console, which is how you get a shell
+# with `make run`. `login` is never involved, so there is no prompt to get past
+# and no password to mistype; the shell owns ttyAMA0 from the moment it is
+# exec'd until you type `exit`.
+#
+# `ExecStart=/bin/sh` with no arguments is deliberate. A banner would need
+# something like `sh -c 'echo ...; exec /bin/sh'`, but rinit does not run a
+# shell, and busybox `ash` rejects that quoting when the string is re-parsed
+# from argv - the interpreter would exit immediately after the echo, and with
+# no reader left on the console you would be staring at a dead prompt.
+#
+# This is the bring-up and inspection path - "I want to look at something in
+# the guest". It is deliberately NOT a security boundary: anyone who can reach
+# the serial port is already on the machine.
+#
+# `Type=simple`, so rinit considers it started as soon as it is exec'd and
+# moves on to the next level; the shell itself lives on until it exits.
+#
+# To get a login prompt instead, comment out `Requires=shell.service` in
+# multi-user.target: getty.service is already wired in and starts by itself.
+[Unit]
+Description=Interactive serial console shell
+Requires=rinit-init.target
+After=rinit-init.target
+
+[Service]
+Type=simple
+ExecStart=/bin/sh

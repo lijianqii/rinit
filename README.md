@@ -59,7 +59,7 @@ crates/
     src/service.rs  # service supervision: spawn, track, reap, stop
     src/bin/        # rinit-testservice helper
   rctl/             # CLI stub (real commands land in M3)
-units/              # example unit files
+units/              # unit files; shell.service gives `make run` a root shell
 scripts/            # initramfs / qemu / kernel / system-test helpers
 ```
 
@@ -92,9 +92,10 @@ tests in `crates/*/tests/`, and an end-to-end smoke test that runs the real
 binary in `--dev` mode.
 
 `scripts/system-test.sh` is the automated form of the manual verification in
-plan §4.3: it boots the guest with a bounded test service, captures the serial
-console, and asserts the whole M0 acceptance list - including that no `Kernel
-panic` / `BUG:` / rinit panic appears. Exit codes are `0` pass, `1` assertion
+plan §4.3: it boots the guest, types at the console to prove a root shell is
+reachable without a login, captures the serial console, and asserts the whole
+M0/M1 acceptance list - including that startup levels run in dependency order
+and that no target is ever exec'd. Exit codes are `0` pass, `1` assertion
 failed, `2` missing artifacts, `3` qemu could not start. Logs land in
 `build/logs/`.
 
@@ -169,8 +170,35 @@ make MIRROR=https://... run     # different mirror
 make KERNEL_VERSION=6.6.158 BUSYBOX_VERSION=1.36.1 ...   # pin versions
 ```
 
-Exiting the guest: `SIGTERM` to PID 1 is not reachable from the qemu monitor,
-so use `Ctrl-A X` (qemu) to quit, or `poweroff` from the busybox shell.
+### Getting a shell in the guest
+
+`make run` boots into an interactive root shell on the serial console - there
+is no login prompt and no password, so you can type as soon as the banner
+appears:
+
+```
+rinit: boot complete: 1 unit(s) started from 'multi-user.target' (1 still running)
+/bin/sh: can't access tty; job control turned off
+~ # uname -m
+aarch64
+~ #
+```
+
+This is `units/shell.service`, required by `multi-user.target`. It exists for
+bring-up and inspection, and is deliberately not a security boundary: anyone
+who can reach the serial port already has the machine. `/etc/passwd` has an
+empty password field rather than `x`, so `login` is bypassed entirely.
+
+`units/getty.service` is the login-prompt alternative. Both want `ttyAMA0` and
+only one can hold the console, so they are alternatives rather than
+dependencies: drop the `Requires=shell.service` line from `multi-user.target`
+to start getty instead. (They are deliberately *not* a `Conflicts=` pair - M1
+parses conflicts but does not stop running units, which needs M2.)
+
+`poweroff -f` from the shell halts the guest; `exit` returns to the boot loop.
+
+Exiting qemu: `SIGTERM` to PID 1 is not reachable from the qemu monitor, so use
+`Ctrl-A X` (qemu) to quit.
 
 ### Skipping downloads and builds
 
