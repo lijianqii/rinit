@@ -9,13 +9,14 @@
 //! unit directory, resolves the dependency graph, and starts each *level* of
 //! the schedule in parallel before moving on (plan §3 M1).
 
-use rinit_core::UnitName;
+use rinit_core::{ServiceKind, UnitName};
 use rinit_runtime::syscall::{process, reboot, signal};
 use rinit_runtime::{RuntimeError, Signal, SignalSet};
 
 use crate::args::Config;
 use crate::log::rlog;
 use crate::manager;
+use crate::notify::NotifyHub;
 use crate::readiness;
 use crate::service::{ServiceSet, reap_and_log, shutdown};
 use crate::unit_manager::{Outcome, UnitManager, reap_into_manager};
@@ -50,8 +51,9 @@ pub async fn run(cfg: Config) -> Result<(), RuntimeError> {
     // An explicit service bypasses unit loading entirely: that is the
     // bring-up and smoke-test path, not how a real system boots.
     if cfg.service_argv.is_empty() {
-        let mut manager = start_units(&cfg)?;
-        supervise(&mut signals, &mut manager).await;
+        let mut notify = NotifyHub::new();
+        let mut manager = start_units(&cfg, &mut notify)?;
+        supervise(&mut signals, &mut manager, &mut notify).await;
         return Ok(());
     }
 
@@ -82,60 +84,95 @@ pub async fn run(cfg: Config) -> Result<(), RuntimeError> {
 
 /// The supervised main loop (plan §3 M2).
 ///
-/// Three things can wake it: a child exited, a restart backoff elapsed, or a
-/// signal arrived. The backoff timer is what makes this a loop rather than a
-/// plain `recv()` - without it a service scheduled to restart in two seconds
-/// would sit there until some unrelated signal arrived.
-async fn supervise(signals: &mut SignalSet, manager: &mut UnitManager) {
+/// Four things can wake it: a child exited, a `notify` service signalled
+/// readiness, a timer elapsed (restart backoff, start timeout, post-timeout
+/// kill), or a signal arrived. The timers are what make this a loop rather than
+/// a plain `recv()` - without them a service scheduled to restart in two
+/// seconds would sit there until some unrelated signal arrived.
+async fn supervise(signals: &mut SignalSet, manager: &mut UnitManager, notify: &mut NotifyHub) {
     loop {
-        // Fire any restart whose backoff has elapsed before blocking, so a
-        // backoff of zero does not wait for the next signal.
+        // Service anything already due before blocking, so a zero-length timer
+        // does not wait for the next unrelated wake-up.
         for unit in manager.due_restarts() {
-            if let Err(e) = manager.spawn_unit(&unit) {
+            if let Err(e) = start_unit(manager, notify, &unit) {
                 rlog!("error: restart of {unit} failed: {e}");
             }
         }
+        for unit in manager.due_start_timeouts() {
+            rlog!("error: {unit} did not signal readiness in time; stopping it");
+        }
+        for unit in manager.due_kills() {
+            rlog!("error: {unit} ignored SIGTERM; killed");
+        }
 
-        // Never block for longer than the next due restart.
-        let wait = next_restart_delay(manager);
-        let signal = tokio::select! {
-            signal = signals.recv() => signal,
-            _ = tokio::time::sleep(wait) => continue,
-        };
-
-        match signal {
-            Signal::Child => {
-                for outcome in reap_into_manager(manager) {
-                    log_outcome(&outcome);
+        // Never block past the earliest pending deadline.
+        let wait = next_deadline(manager);
+        tokio::select! {
+            signal = signals.recv() => match signal {
+                Signal::Child => {
+                    for outcome in reap_into_manager(manager) {
+                        log_outcome(&outcome);
+                    }
+                }
+                Signal::Term => {
+                    rlog!("received SIGTERM");
+                    break;
+                }
+                Signal::Int => {
+                    rlog!("received SIGINT");
+                    break;
+                }
+                Signal::Pwr => {
+                    rlog!("received SIGPWR (power failure)");
+                    break;
+                }
+            },
+            Some((unit, message)) = notify.recv() => {
+                if let Some(status) = &message.status {
+                    rlog!("{unit}: {status}");
+                }
+                if manager.on_notify(&unit, &message) {
+                    rlog!("{unit} is ready");
                 }
             }
-            Signal::Term => {
-                rlog!("received SIGTERM");
-                break;
-            }
-            Signal::Int => {
-                rlog!("received SIGINT");
-                break;
-            }
-            Signal::Pwr => {
-                rlog!("received SIGPWR (power failure)");
-                break;
-            }
+            _ = tokio::time::sleep(wait) => {}
         }
     }
 
-    // Shutdown is ordered by the Job queue in M4; for now stop every unit.
+    // Shutdown is ordered by the Job queue in M4; for now stop every unit and
+    // unlink its notify socket.
     for line in manager.summary() {
         rlog!("shutdown: {line}");
     }
     for unit in manager.units_to_stop() {
         manager.stop_unit(&unit);
     }
+    notify.disarm_all();
     tokio::time::sleep(STOP_WAIT).await;
     for outcome in reap_into_manager(manager) {
         log_outcome(&outcome);
     }
     reboot_now();
+}
+
+/// Spawn `unit`, arming its `notify` socket first when it is `Type=notify`.
+///
+/// The socket must exist before the process starts, or the service would fail
+/// to find `NOTIFY_SOCKET` (plan §1.3(12)).
+fn start_unit(
+    manager: &mut UnitManager,
+    notify: &mut NotifyHub,
+    unit: &UnitName,
+) -> Result<(), RuntimeError> {
+    let config = manager.get(unit).map(|rt| rt.config.clone());
+    let env: Vec<String> = match config {
+        Some(config) if config.service_kind == ServiceKind::Notify => {
+            notify.arm(&config)?;
+            notify.env_for(unit).into_iter().collect()
+        }
+        _ => Vec::new(),
+    };
+    manager.spawn_unit_with_env(unit, &env)
 }
 
 /// Report what a reaped exit meant to a unit.
@@ -154,13 +191,20 @@ fn log_outcome(outcome: &Outcome) {
     }
 }
 
-/// How long to block before checking for due restarts again.
-fn next_restart_delay(manager: &UnitManager) -> std::time::Duration {
-    manager
-        .next_restart_in()
-        .map_or(std::time::Duration::from_secs(3600), |d| {
-            d.max(std::time::Duration::from_millis(1))
-        })
+/// How long to block before checking the timers again.
+fn next_deadline(manager: &UnitManager) -> std::time::Duration {
+    let soonest = [
+        manager.next_restart_in(),
+        manager.next_start_timeout_in(),
+        manager.next_kill_in(),
+    ]
+    .into_iter()
+    .flatten()
+    .min();
+    // No pending timer: sleep for a long time and let a signal wake us.
+    soonest.map_or(std::time::Duration::from_secs(3600), |d| {
+        d.max(std::time::Duration::from_millis(1))
+    })
 }
 
 /// Resolve the unit directory and start every level of the schedule.
@@ -179,7 +223,7 @@ fn next_restart_delay(manager: &UnitManager) -> std::time::Duration {
 /// Returns a [`RuntimeError`] if a unit fails to spawn or an initializer
 /// fails: both mean a later level would be waiting on a dependency that never
 /// came up.
-fn start_units(cfg: &Config) -> Result<UnitManager, RuntimeError> {
+fn start_units(cfg: &Config, notify: &mut NotifyHub) -> Result<UnitManager, RuntimeError> {
     let plan = manager::announce_plan(&cfg.unit_dir, &cfg.default_target)?;
     let mut units = UnitManager::new();
     for cfg in &plan.configs {
@@ -194,7 +238,7 @@ fn start_units(cfg: &Config) -> Result<UnitManager, RuntimeError> {
         let mut oneshots: Vec<(UnitName, libc::pid_t, u64)> = Vec::new();
         for entry in batch {
             let name = entry.name;
-            units.spawn_unit(name).map_err(|e| RuntimeError::Io {
+            start_unit(&mut units, notify, name).map_err(|e| RuntimeError::Io {
                 op: "spawn unit",
                 source: std::io::Error::other(format!("{name}: {e}")),
             })?;

@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use rinit_core::unit::config::{RestartPolicy, ServiceKind};
 use rinit_core::unit::dependency::spawns_process;
 use rinit_core::unit::restart::BackoffState;
-use rinit_core::{Event, ExitOutcome, FailedReason, UnitState, transition};
+use rinit_core::{Event, ExitOutcome, FailedReason, NotifyMessage, UnitState, transition};
 use rinit_core::{UnitConfig, UnitName};
 
 use rinit_runtime::RuntimeError;
@@ -71,6 +71,16 @@ pub struct UnitRuntime {
     pub pid: Option<libc::pid_t>,
     /// When a pending restart is due.
     pub restart_at: Option<Instant>,
+    /// When a `notify` start must have signalled readiness by.
+    ///
+    /// `None` for types that do not wait, and when `TimeoutStartSec=0`
+    /// (wait forever, plan §1.1).
+    pub start_deadline: Option<Instant>,
+    /// When a unit that ignored the start-timeout `SIGTERM` must be `SIGKILL`ed
+    /// (plan §1.3(12)).
+    pub kill_at: Option<Instant>,
+    /// The last `STATUS=` text, for `rctl status`.
+    pub status: Option<String>,
     /// The last outcome, kept for logging and `rctl status`.
     pub last_outcome: Option<ExitOutcome>,
 }
@@ -93,6 +103,9 @@ impl UnitRuntime {
             backoff,
             pid: None,
             restart_at: None,
+            start_deadline: None,
+            kill_at: None,
+            status: None,
             last_outcome: None,
         }
     }
@@ -106,6 +119,14 @@ impl UnitRuntime {
     fn policy(&self) -> RestartPolicy {
         self.config.restart
     }
+}
+
+/// An absolute deadline `secs` from now, or `None` for "wait forever".
+///
+/// `TimeoutStartSec=0` means no timeout (plan §1.1), so it must map to `None`
+/// rather than to a deadline of "now".
+fn deadline(secs: u64) -> Option<Instant> {
+    (secs > 0).then(|| Instant::now() + Duration::from_secs(secs))
 }
 
 /// A stable 64-bit hash of the unit name, for the jitter seed.
@@ -189,11 +210,19 @@ impl UnitManager {
             .min()
     }
 
-    /// Spawn a unit and mark it `Starting`.
+    /// Spawn a unit, adding `extra_env` to the child's environment.
+    ///
+    /// The notify socket path travels this way: the socket is created by the
+    /// caller (which owns the async reactor), and the child learns where to
+    /// signal readiness through `NOTIFY_SOCKET`.
     ///
     /// # Errors
     /// Propagates a spawn failure; the caller decides whether that is fatal.
-    pub fn spawn_unit(&mut self, unit: &UnitName) -> Result<(), RuntimeError> {
+    pub fn spawn_unit_with_env(
+        &mut self,
+        unit: &UnitName,
+        extra_env: &[String],
+    ) -> Result<(), RuntimeError> {
         let now = self.now_millis();
         let Some(rt) = self.units.get_mut(unit) else {
             return Ok(());
@@ -209,20 +238,137 @@ impl UnitManager {
 
         let argv = rt.config.exec_start.argv().to_vec();
         // A fresh process group, so a stop reaches the whole tree (plan §1.3(6)).
-        let pid = spawn_service_in_group(&argv)?;
+        let pid = spawn_service_in_group(&argv, extra_env)?;
         rt.pid = Some(pid);
         rt.state = UnitState::Starting;
         rt.restart_at = None;
+        rt.kill_at = None;
 
-        // `simple` needs no readiness signal; `oneshot` waits for exit; `notify`
-        // waits for READY=1, which M2 models as "exec'd" until the notify
-        // socket lands.
-        if matches!(rt.config.service_kind, ServiceKind::Simple) {
-            rt.state = UnitState::Active;
-            rt.backoff.on_active(now);
+        match rt.config.service_kind {
+            // `simple` is live the moment it is exec'd.
+            ServiceKind::Simple => {
+                rt.state = UnitState::Active;
+                rt.backoff.on_active(now);
+            }
+            // `oneshot` completes on exit; boot waits for it directly.
+            ServiceKind::Oneshot => {}
+            // `notify` waits for `READY=1`, bounded by `TimeoutStartSec`
+            // (plan §1.3(12)). A zero timeout means wait forever.
+            ServiceKind::Notify => {
+                rt.start_deadline = deadline(rt.config.timeout_start_sec);
+            }
         }
         rlog!("started {unit} as pid {pid}");
         Ok(())
+    }
+
+    /// Record a notify message for `unit` and act on readiness.
+    ///
+    /// Returns `true` when the unit became `Active` on this message, so the
+    /// caller can log the transition once.
+    pub fn on_notify(&mut self, unit: &UnitName, message: &NotifyMessage) -> bool {
+        let now = self.now_millis();
+        let Some(rt) = self.units.get_mut(unit) else {
+            return false;
+        };
+        if let Some(status) = &message.status {
+            rt.status = Some(status.clone());
+        }
+        if !message.ready || rt.state != UnitState::Starting {
+            return false;
+        }
+
+        match transition(
+            rt.state,
+            Event::StartUpComplete,
+            rt.policy(),
+            rt.config.service_kind,
+        ) {
+            Ok(t) => {
+                rt.state = t.to;
+                rt.start_deadline = None;
+                rt.backoff.on_active(now);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Units whose `TimeoutStartSec` expired without a readiness signal.
+    ///
+    /// Plan §1.3(12): the start-timeout sends `SIGTERM` first, and if the
+    /// service has still not exited after `TimeoutStopSec`, `SIGKILL`. The
+    /// first stage happens here; [`due_kills`](Self::due_kills) does the second.
+    /// Returns the units that were timed out, in name order.
+    pub fn due_start_timeouts(&mut self) -> Vec<UnitName> {
+        let now = Instant::now();
+        let mut due = Vec::new();
+        for (name, rt) in self.units.iter_mut() {
+            // A unit that already left `Starting` cannot time out starting.
+            if rt.state != UnitState::Starting {
+                rt.start_deadline = None;
+                continue;
+            }
+            if let Some(at) = rt.start_deadline
+                && at <= now
+            {
+                rt.start_deadline = None;
+                if let Some(pid) = rt.pid {
+                    match process::kill_process_group(pid, libc::SIGTERM) {
+                        Ok(()) => {}
+                        Err(e) if e.errno() == libc::ESRCH => {}
+                        Err(e) => rlog!("warning: SIGTERM to {name} failed: {e}"),
+                    }
+                }
+                rt.kill_at = deadline(rt.config.timeout_stop_sec);
+                due.push(name.clone());
+            }
+        }
+        due
+    }
+
+    /// Units that ignored the start-timeout `SIGTERM` and must be `SIGKILL`ed.
+    ///
+    /// Returns the units whose process group was signalled, in name order.
+    pub fn due_kills(&mut self) -> Vec<UnitName> {
+        let now = Instant::now();
+        let mut due = Vec::new();
+        for (name, rt) in self.units.iter_mut() {
+            if let Some(at) = rt.kill_at
+                && at <= now
+            {
+                rt.kill_at = None;
+                if let Some(pid) = rt.pid {
+                    match process::kill_process_group(pid, libc::SIGKILL) {
+                        Ok(()) => due.push(name.clone()),
+                        Err(e) if e.errno() == libc::ESRCH => {}
+                        Err(e) => rlog!("warning: SIGKILL to {name} failed: {e}"),
+                    }
+                }
+            }
+        }
+        due
+    }
+
+    /// Time until the next `TimeoutStartSec` deadline, if any.
+    pub fn next_start_timeout_in(&self) -> Option<Duration> {
+        let now = Instant::now();
+        self.units
+            .values()
+            .filter(|rt| rt.state == UnitState::Starting)
+            .filter_map(|rt| rt.start_deadline)
+            .map(|at| at.saturating_duration_since(now))
+            .min()
+    }
+
+    /// Time until the next post-timeout `SIGKILL` is due, if any.
+    pub fn next_kill_in(&self) -> Option<Duration> {
+        let now = Instant::now();
+        self.units
+            .values()
+            .filter_map(|rt| rt.kill_at)
+            .map(|at| at.saturating_duration_since(now))
+            .min()
     }
 
     /// Signal a unit's process group to stop.
@@ -234,6 +380,8 @@ impl UnitManager {
             return;
         };
         rt.restart_at = None;
+        rt.start_deadline = None;
+        rt.kill_at = None;
 
         match rt.pid {
             Some(pid) => match process::kill_process_group(pid, libc::SIGTERM) {
@@ -277,6 +425,8 @@ impl UnitManager {
         let now = self.now_millis();
         let rt = self.units.get_mut(&unit)?;
         rt.pid = None;
+        rt.start_deadline = None;
+        rt.kill_at = None;
         rt.last_outcome = Some(outcome);
 
         // A stop already in flight owns the transition; the exit just confirms
@@ -289,17 +439,18 @@ impl UnitManager {
             });
         }
 
-        // A `oneshot` that was still starting has not "exited" in the sense
-        // the transition table models: its exit *is* its start-up completion.
-        // `Exit` is not a legal event from `Starting`, so which event applies
-        // depends on where the unit actually was (plan §1.3(3)).
+        // A unit that was still `Starting` has not "exited" in the sense the
+        // transition table models: its exit *is* the end of its start-up. That
+        // covers a `oneshot` finishing and a `notify` service that died (or was
+        // timed out) before signalling readiness (plan §1.3(3), §1.3(12)).
         let starting = rt.state == UnitState::Starting;
         let oneshot = rt.config.service_kind == ServiceKind::Oneshot;
 
-        let event = if oneshot && starting {
-            match outcome {
-                ExitOutcome::Success => Event::StartUpComplete,
-                _ => Event::StartUpFailed,
+        let event = if starting {
+            if oneshot && matches!(outcome, ExitOutcome::Success) {
+                Event::StartUpComplete
+            } else {
+                Event::StartUpFailed
             }
         } else {
             Event::Exit(outcome)
@@ -321,7 +472,8 @@ impl UnitManager {
 
         // A oneshot that succeeded is done, not broken: `StartUpComplete`
         // already moved it to Active(Exited).
-        if oneshot && matches!(outcome, ExitOutcome::Success) {
+        if starting && oneshot && matches!(outcome, ExitOutcome::Success) {
+            rlog!("{unit} completed (Active(Exited))");
             return Some(Outcome::Exited {
                 unit,
                 state: UnitState::ActiveExited,
@@ -448,7 +600,7 @@ mod tests {
     fn spawning_a_unit_tracks_its_pid_and_becomes_active() {
         let mut m = manager_with("a.service", RestartPolicy::No);
         let unit = UnitName::parse("a.service").unwrap();
-        m.spawn_unit(&unit).expect("spawn");
+        m.spawn_unit_with_env(&unit, &[]).expect("spawn");
         let rt = m.get(&unit).unwrap();
         assert!(rt.pid.is_some(), "the pid must be tracked");
         assert_eq!(rt.state, UnitState::Active, "Type=simple is active at exec");
@@ -470,7 +622,7 @@ mod tests {
         let mut m = UnitManager::new();
         m.add(cfg);
         let unit = UnitName::parse("t.target").unwrap();
-        m.spawn_unit(&unit).expect("start");
+        m.spawn_unit_with_env(&unit, &[]).expect("start");
         let rt = m.get(&unit).unwrap();
         assert_eq!(rt.state, UnitState::Active);
         assert!(rt.pid.is_none(), "a target must not spawn anything");
@@ -481,7 +633,7 @@ mod tests {
     fn a_killed_service_schedules_a_restart() {
         let mut m = manager_with("a.service", RestartPolicy::Always);
         let unit = UnitName::parse("a.service").unwrap();
-        m.spawn_unit(&unit).expect("spawn");
+        m.spawn_unit_with_env(&unit, &[]).expect("spawn");
         let pid = m.get(&unit).unwrap().pid.expect("pid");
         let _ = process::kill(pid, libc::SIGKILL);
 
@@ -505,7 +657,7 @@ mod tests {
     fn without_restart_a_dead_service_stays_down() {
         let mut m = manager_with("a.service", RestartPolicy::No);
         let unit = UnitName::parse("a.service").unwrap();
-        m.spawn_unit(&unit).expect("spawn");
+        m.spawn_unit_with_env(&unit, &[]).expect("spawn");
         let pid = m.get(&unit).unwrap().pid.expect("pid");
 
         let outcome = m
@@ -572,7 +724,7 @@ mod tests {
     fn an_exit_during_stop_does_not_restart() {
         let mut m = manager_with("a.service", RestartPolicy::Always);
         let unit = UnitName::parse("a.service").unwrap();
-        m.spawn_unit(&unit).expect("spawn");
+        m.spawn_unit_with_env(&unit, &[]).expect("spawn");
         let pid = m.get(&unit).unwrap().pid.expect("pid");
 
         m.stop_unit(&unit);
@@ -623,7 +775,7 @@ mod tests {
 
     /// Spawn `unit` and return the pid the manager tracked for it.
     fn spawn_pid(m: &mut UnitManager, unit: &UnitName) -> libc::pid_t {
-        m.spawn_unit(unit).expect("spawn");
+        m.spawn_unit_with_env(unit, &[]).expect("spawn");
         m.get(unit).and_then(|rt| rt.pid).expect("a tracked pid")
     }
 
@@ -656,6 +808,120 @@ mod tests {
     fn an_unknown_pid_is_ignored() {
         let mut m = manager_with("a.service", RestartPolicy::Always);
         assert!(m.on_child_exit(123_456_789, ExitOutcome::Success).is_none());
+    }
+
+    /// Build a manager holding one running `notify` service.
+    fn notify_running(name: &str) -> (UnitManager, UnitName) {
+        let mut cfg = config(name, RestartPolicy::No);
+        cfg.service_kind = ServiceKind::Notify;
+        let mut m = UnitManager::new();
+        m.add(cfg);
+        let unit = UnitName::parse(name).unwrap();
+        m.spawn_unit_with_env(&unit, &[]).expect("spawn");
+        (m, unit)
+    }
+
+    /// Kill the unit's process group and reap it, so a test leaves nothing.
+    fn cleanup(m: &mut UnitManager, unit: &UnitName) {
+        if let Some(pid) = m.get(unit).and_then(|rt| rt.pid) {
+            let _ = process::kill_process_group(pid, libc::SIGKILL);
+        }
+        let _ = wait::reap_children();
+    }
+
+    /// `notify` stays `Starting` until `READY=1` arrives (plan §1.3(12)).
+    #[test]
+    fn a_notify_unit_becomes_active_on_ready() {
+        let (mut m, unit) = notify_running("n.service");
+        assert_eq!(m.get(&unit).unwrap().state, UnitState::Starting);
+
+        let became_active = m.on_notify(
+            &unit,
+            &NotifyMessage {
+                ready: true,
+                status: None,
+                watchdog: false,
+            },
+        );
+        assert!(became_active, "READY=1 must complete start-up");
+        assert_eq!(m.get(&unit).unwrap().state, UnitState::Active);
+
+        cleanup(&mut m, &unit);
+    }
+
+    /// `STATUS=` updates the description but must not complete start-up on its
+    /// own.
+    #[test]
+    fn status_alone_does_not_make_a_unit_ready() {
+        let (mut m, unit) = notify_running("n.service");
+        let became_active = m.on_notify(
+            &unit,
+            &NotifyMessage {
+                ready: false,
+                status: Some("warming up".to_string()),
+                watchdog: false,
+            },
+        );
+        assert!(!became_active);
+        let rt = m.get(&unit).unwrap();
+        assert_eq!(rt.state, UnitState::Starting);
+        assert_eq!(rt.status.as_deref(), Some("warming up"));
+
+        cleanup(&mut m, &unit);
+    }
+
+    /// `WATCHDOG=1` is recorded but M2 takes no action on it.
+    #[test]
+    fn a_watchdog_ping_does_not_complete_start_up() {
+        let (mut m, unit) = notify_running("n.service");
+        let became_active = m.on_notify(
+            &unit,
+            &NotifyMessage {
+                ready: false,
+                status: None,
+                watchdog: true,
+            },
+        );
+        assert!(!became_active);
+        assert_eq!(m.get(&unit).unwrap().state, UnitState::Starting);
+
+        cleanup(&mut m, &unit);
+    }
+
+    /// A `TimeoutStartSec` that expires without `READY=1` sends `SIGTERM` and
+    /// arms the `SIGKILL` follow-up (plan §1.3(12)).
+    #[test]
+    fn a_silent_notify_unit_is_timed_out() {
+        let (mut m, unit) = notify_running("n.service");
+        // Pretend the deadline already passed instead of waiting for it.
+        m.units.get_mut(&unit).unwrap().start_deadline =
+            Some(Instant::now() - Duration::from_secs(1));
+
+        let timed_out = m.due_start_timeouts();
+        assert_eq!(timed_out.len(), 1, "the unit must be reported once");
+        assert_eq!(timed_out[0], unit);
+        let rt = m.get(&unit).unwrap();
+        assert!(rt.start_deadline.is_none(), "the deadline fires once");
+        assert!(rt.kill_at.is_some(), "the SIGKILL follow-up must be armed");
+
+        // And it is not reported again.
+        assert!(m.due_start_timeouts().is_empty());
+
+        cleanup(&mut m, &unit);
+    }
+
+    /// The follow-up kill fires when its `TimeoutStopSec` elapses.
+    #[test]
+    fn a_unit_that_ignores_the_stop_signal_is_killed() {
+        let (mut m, unit) = notify_running("n.service");
+        m.units.get_mut(&unit).unwrap().kill_at = Some(Instant::now() - Duration::from_secs(1));
+
+        let killed = m.due_kills();
+        assert_eq!(killed.len(), 1, "the unit must be killed");
+        assert_eq!(killed[0], unit);
+        assert!(m.get(&unit).unwrap().kill_at.is_none(), "fires once");
+
+        cleanup(&mut m, &unit);
     }
 
     #[test]

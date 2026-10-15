@@ -62,10 +62,16 @@ impl ServiceSet {
 /// stopping a unit signals its whole process group and reaches children the
 /// service forked itself (plan §1.3(6)).
 ///
+/// `extra_env` is appended to the fixed environment; it carries per-unit
+/// variables such as `NOTIFY_SOCKET`.
+///
 /// # Errors
 /// `argv` must be non-empty and contain no interior NUL bytes.
-pub fn spawn_service_in_group(argv: &[String]) -> Result<libc::pid_t, RuntimeError> {
-    let (argv, envp) = prepare(argv)?;
+pub fn spawn_service_in_group(
+    argv: &[String],
+    extra_env: &[String],
+) -> Result<libc::pid_t, RuntimeError> {
+    let (argv, envp) = prepare(argv, extra_env)?;
     let path = argv[0].as_c_str();
     process::posix_spawn_with(
         path,
@@ -83,13 +89,16 @@ pub fn spawn_service_in_group(argv: &[String]) -> Result<libc::pid_t, RuntimeErr
 /// # Errors
 /// `argv` must be non-empty and contain no interior NUL bytes.
 pub fn spawn_service(argv: &[String]) -> Result<libc::pid_t, RuntimeError> {
-    let (argv, envp) = prepare(argv)?;
+    let (argv, envp) = prepare(argv, &[])?;
     let path = argv[0].as_c_str();
     process::posix_spawn(path, &argv, &envp).map_err(RuntimeError::from)
 }
 
 /// Turn `argv` into the C forms `posix_spawn` needs, plus the resolved path.
-fn prepare(argv: &[String]) -> Result<(Vec<CString>, Vec<CString>), RuntimeError> {
+fn prepare(
+    argv: &[String],
+    extra_env: &[String],
+) -> Result<(Vec<CString>, Vec<CString>), RuntimeError> {
     // `argv[0]` must be included for posix_spawn (it becomes the program name).
     let argv: Vec<CString> = argv
         .iter()
@@ -105,6 +114,7 @@ fn prepare(argv: &[String]) -> Result<(Vec<CString>, Vec<CString>), RuntimeError
     let envp: Vec<CString> = SERVICE_ENV
         .iter()
         .map(|e| cstring("service env", e))
+        .chain(extra_env.iter().map(|e| cstring("service env", e)))
         .collect::<Result<_, _>>()
         .map_err(RuntimeError::from)?;
     Ok((argv, envp))
