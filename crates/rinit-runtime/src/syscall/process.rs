@@ -60,6 +60,22 @@ pub fn posix_spawn_with(
     envp: &[CString],
     options: SpawnOptions,
 ) -> Result<libc::pid_t, SyscallError> {
+    posix_spawn_full(path, argv, envp, options, None)
+}
+
+/// [`posix_spawn_with`] plus a working directory for the child.
+///
+/// `WorkingDirectory=` (plan §1.1) is applied in the child between `fork` and
+/// `exec` through `posix_spawn_file_actions_addchdir_np`, so the child never
+/// runs in the wrong directory. A directory that does not exist makes
+/// `posix_spawn` fail, which is the fail-closed behaviour plan §7.4 asks for.
+pub fn posix_spawn_full(
+    path: &CStr,
+    argv: &[CString],
+    envp: &[CString],
+    options: SpawnOptions,
+    working_directory: Option<&CStr>,
+) -> Result<libc::pid_t, SyscallError> {
     let mut argv_ptrs: Vec<*mut libc::c_char> = argv
         .iter()
         .map(|a| a.as_ptr() as *mut libc::c_char)
@@ -77,7 +93,8 @@ pub fn posix_spawn_with(
     // `posix_spawnattr_t` wrapper, which glibc exposes but musl does not) keeps
     // this file buildable on both targets.
     let mut attrs: libc::posix_spawnattr_t = unsafe { std::mem::zeroed() };
-    if options.new_session {
+    let use_attrs = options.new_session;
+    if use_attrs {
         // SAFETY: a zeroed attr struct with a flags field is the documented
         // starting point for `posix_spawnattr_init`; it is only read back
         // inside this call.
@@ -88,13 +105,57 @@ pub fn posix_spawn_with(
         // SAFETY: `posix_spawnattr_getflags` takes the attributes by const
         // pointer and writes the flags through the pointer it is given; both
         // are valid locals.
-        unsafe { libc::posix_spawnattr_getflags(&attrs, &mut flags) };
+        let rc = unsafe { libc::posix_spawnattr_getflags(&attrs, &mut flags) };
+        if rc != 0 {
+            // SAFETY: `attrs` was initialised above.
+            unsafe { libc::posix_spawnattr_destroy(&mut attrs) };
+            return Err(SyscallError::new("posix_spawnattr_getflags", rc));
+        }
         flags |= libc::POSIX_SPAWN_SETSID as libc::c_short;
         // SAFETY: as above.
-        unsafe { libc::posix_spawnattr_setflags(&mut attrs, flags) };
+        let rc = unsafe { libc::posix_spawnattr_setflags(&mut attrs, flags) };
+        if rc != 0 {
+            // SAFETY: `attrs` was initialised above.
+            unsafe { libc::posix_spawnattr_destroy(&mut attrs) };
+            return Err(SyscallError::new("posix_spawnattr_setflags", rc));
+        }
     }
-    let attr_ptr = if options.new_session {
+    let attr_ptr = if use_attrs {
         &attrs as *const libc::posix_spawnattr_t
+    } else {
+        std::ptr::null()
+    };
+
+    let mut file_actions: libc::posix_spawn_file_actions_t = unsafe { std::mem::zeroed() };
+    let use_file_actions = working_directory.is_some();
+    if let Some(cwd) = working_directory {
+        // SAFETY: a zeroed file-actions struct is the documented starting point
+        // for `posix_spawn_file_actions_init`; `cwd` is a valid C string.
+        if unsafe { libc::posix_spawn_file_actions_init(&mut file_actions) } != 0 {
+            if use_attrs {
+                // SAFETY: `attrs` was initialised above.
+                unsafe { libc::posix_spawnattr_destroy(&mut attrs) };
+            }
+            return Err(SyscallError::last_os_error("posix_spawn_file_actions_init"));
+        }
+        let rc =
+            unsafe { libc::posix_spawn_file_actions_addchdir_np(&mut file_actions, cwd.as_ptr()) };
+        if rc != 0 {
+            // SAFETY: both structs were initialised above.
+            unsafe {
+                libc::posix_spawn_file_actions_destroy(&mut file_actions);
+                if use_attrs {
+                    libc::posix_spawnattr_destroy(&mut attrs);
+                }
+            }
+            return Err(SyscallError::new(
+                "posix_spawn_file_actions_addchdir_np",
+                rc,
+            ));
+        }
+    }
+    let file_actions_ptr = if use_file_actions {
+        &file_actions as *const libc::posix_spawn_file_actions_t
     } else {
         std::ptr::null()
     };
@@ -102,22 +163,26 @@ pub fn posix_spawn_with(
     let mut pid: libc::pid_t = 0;
     // SAFETY: `path` is a valid NUL-terminated C string; `argv_ptrs`/`env_ptrs`
     // are NULL-terminated arrays of valid pointers that outlive the call.
-    // `attr_ptr` is either null (default behaviour) or an initialised
-    // `posix_spawnattr_t`.
+    // `attr_ptr`/`file_actions_ptr` are either null or initialised structs.
     let rc = unsafe {
         libc::posix_spawn(
             &mut pid,
             path.as_ptr(),
-            std::ptr::null(),
+            file_actions_ptr,
             attr_ptr,
             argv_ptrs.as_ptr(),
             env_ptrs.as_ptr(),
         )
     };
 
-    if options.new_session {
-        // SAFETY: `attrs` was initialised above and is not used afterwards.
-        unsafe { libc::posix_spawnattr_destroy(&mut attrs) };
+    // SAFETY: both structs were initialised above and are not used afterwards.
+    unsafe {
+        if use_file_actions {
+            libc::posix_spawn_file_actions_destroy(&mut file_actions);
+        }
+        if use_attrs {
+            libc::posix_spawnattr_destroy(&mut attrs);
+        }
     }
 
     if rc == 0 {

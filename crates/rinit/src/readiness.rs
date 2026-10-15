@@ -25,7 +25,6 @@ use rinit_core::ServiceKind;
 
 /// How often to poll while waiting for a child to exit.
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
-
 /// What a unit needed before the next startup level could begin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Readiness {
@@ -48,16 +47,20 @@ pub const fn readiness_of(kind: ServiceKind) -> Readiness {
     }
 }
 
-/// Block until `pid` exits, returning its exit code.
+/// Wait for `pid` to exit, returning its exit code.
 ///
 /// Only safe when `pid` was spawned by this process and is not being reaped
 /// concurrently.
+///
+/// This is `async` on purpose: boot waits for `oneshot` units, and blocking the
+/// single `current_thread` runtime with `std::thread::sleep` would stall the
+/// reactor that delivers signals (plan §2.1①/⑤).
 ///
 /// # Errors
 /// Returns `Err(())` when `timeout` elapses first. A child that exits on a
 /// signal is reported as `Ok(None)`: it did not succeed, but it did terminate,
 /// so the caller can distinguish "hung" from "died".
-pub fn wait_for_exit(pid: libc::pid_t, timeout: Duration) -> Result<Option<i32>, ()> {
+pub async fn wait_for_exit(pid: libc::pid_t, timeout: Duration) -> Result<Option<i32>, ()> {
     let deadline = std::time::Instant::now() + timeout;
     loop {
         let mut status: libc::c_int = 0;
@@ -87,7 +90,7 @@ pub fn wait_for_exit(pid: libc::pid_t, timeout: Duration) -> Result<Option<i32>,
         if std::time::Instant::now() >= deadline {
             return Err(());
         }
-        std::thread::sleep(POLL_INTERVAL);
+        tokio::time::sleep(POLL_INTERVAL).await;
     }
 }
 
@@ -104,32 +107,38 @@ mod tests {
         assert_eq!(readiness_of(ServiceKind::Notify), Readiness::Immediate);
     }
 
-    #[test]
-    fn waiting_reports_a_successful_exit_code() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn waiting_reports_a_successful_exit_code() {
         let pid = crate::service::spawn_service(&[
             "/bin/sh".to_string(),
             "-c".to_string(),
             "exit 0".to_string(),
         ])
         .expect("spawn");
-        assert_eq!(wait_for_exit(pid, Duration::from_secs(10)), Ok(Some(0)));
+        assert_eq!(
+            wait_for_exit(pid, Duration::from_secs(10)).await,
+            Ok(Some(0))
+        );
     }
 
-    #[test]
-    fn waiting_reports_a_nonzero_exit_code() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn waiting_reports_a_nonzero_exit_code() {
         let pid = crate::service::spawn_service(&[
             "/bin/sh".to_string(),
             "-c".to_string(),
             "exit 3".to_string(),
         ])
         .expect("spawn");
-        assert_eq!(wait_for_exit(pid, Duration::from_secs(10)), Ok(Some(3)));
+        assert_eq!(
+            wait_for_exit(pid, Duration::from_secs(10)).await,
+            Ok(Some(3))
+        );
     }
 
     /// A child killed by a signal is `Ok(None)`: it terminated, but not
     /// successfully, which the caller must treat as a failure.
-    #[test]
-    fn waiting_reports_a_signalled_child_as_unsuccessful() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn waiting_reports_a_signalled_child_as_unsuccessful() {
         let pid = crate::service::spawn_service(&[
             "/bin/sh".to_string(),
             "-c".to_string(),
@@ -138,30 +147,33 @@ mod tests {
         .expect("spawn");
         std::thread::sleep(Duration::from_millis(50));
         process::kill(pid, libc::SIGKILL).expect("kill");
-        assert_eq!(wait_for_exit(pid, Duration::from_secs(10)), Ok(None));
+        assert_eq!(wait_for_exit(pid, Duration::from_secs(10)).await, Ok(None));
     }
 
     /// A timeout must be reported as such, not mistaken for an exit.
-    #[test]
-    fn waiting_times_out_on_a_hung_child() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn waiting_times_out_on_a_hung_child() {
         let pid = crate::service::spawn_service(&[
             "/bin/sh".to_string(),
             "-c".to_string(),
             "sleep 30".to_string(),
         ])
         .expect("spawn");
-        assert_eq!(wait_for_exit(pid, Duration::from_millis(100)), Err(()));
+        assert_eq!(
+            wait_for_exit(pid, Duration::from_millis(100)).await,
+            Err(())
+        );
 
         // Clean up so the child does not leak.
         process::kill(pid, libc::SIGKILL).expect("kill");
-        let _ = wait_for_exit(pid, Duration::from_secs(5));
+        let _ = wait_for_exit(pid, Duration::from_secs(5)).await;
     }
 
     /// A `waitpid` failure that is not `EINTR` means the child is gone: the
     /// waiter must report an error rather than poll forever. This is the
     /// `ECHILD` branch that the `EINTR` retry has to be distinguished from.
-    #[test]
-    fn waiting_on_an_already_reaped_child_reports_failure() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn waiting_on_an_already_reaped_child_reports_failure() {
         let pid = crate::service::spawn_service(&[
             "/bin/sh".to_string(),
             "-c".to_string(),
@@ -175,7 +187,7 @@ mod tests {
         assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
 
         assert_eq!(
-            wait_for_exit(pid, Duration::from_secs(1)),
+            wait_for_exit(pid, Duration::from_secs(1)).await,
             Err(()),
             "an already-reaped child is an error, not an infinite wait"
         );
@@ -183,8 +195,8 @@ mod tests {
 
     /// Plan §1.1: `TimeoutStartSec=0` means wait forever, not zero seconds, so
     /// a zero timeout must not report failure the instant it is reached.
-    #[test]
-    fn a_zero_timeout_does_not_expire_immediately() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_zero_timeout_does_not_expire_immediately() {
         let mut backoff = crate::unit_manager::UnitManager::new();
         let unit = rinit_core::UnitName::parse("t.service").unwrap();
         let mut cfg = rinit_core::UnitConfig::new(unit.clone());
@@ -195,7 +207,7 @@ mod tests {
         let pid = spawn_pid(&mut backoff, &unit);
         // With no timeout the wait is unbounded, so the only way this returns is
         // the child exiting - which it does immediately.
-        assert_eq!(wait_for_exit(pid, unbounded()), Ok(Some(0)));
+        assert_eq!(wait_for_exit(pid, unbounded()).await, Ok(Some(0)));
     }
 
     /// The unbounded wait that `TimeoutStartSec=0` maps to.

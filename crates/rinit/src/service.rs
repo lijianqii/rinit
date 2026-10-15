@@ -13,13 +13,17 @@ use rinit_runtime::syscall::{cstring, process, wait};
 
 use crate::log::rlog;
 
-/// Environment handed to services. rinit's own environment (from the kernel
-/// cmdline) is not meaningful, so services get a fixed, predictable set.
-const SERVICE_ENV: &[&str] = &["PATH=/sbin:/usr/sbin:/bin:/usr/bin", "HOME=/", "TERM=linux"];
+/// The fixed base environment every service gets, as `KEY=VALUE`.
+///
+/// The manager starts from this and layers `EnvironmentFile=` and
+/// `Environment=` on top (plan §1.1); rinit's own environment (from the kernel
+/// cmdline) is not meaningful, so services never inherit it.
+pub const SERVICE_ENV: &[&str] = &["PATH=/sbin:/usr/sbin:/bin:/usr/bin", "HOME=/", "TERM=linux"];
 
 /// How long services get to exit after `SIGTERM` before rinit stops waiting.
 ///
-/// Plan §4.2 uses `TimeoutStopSec=` per unit; M0 has a single global value.
+/// Plan §4.2 uses `TimeoutStopSec=` per unit; this is only the M0 hardcoded
+/// service path, which the unit manager does not use.
 const STOP_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// The set of children rinit is responsible for.
@@ -56,25 +60,33 @@ impl ServiceSet {
     }
 }
 
-/// Launch `argv` with [`SERVICE_ENV`], in a fresh process group.
+/// Launch `argv` with `env` in a fresh session, in `working_directory`.
 ///
 /// Every service goes through this rather than [`spawn_service`], so that
 /// stopping a unit signals its whole process group and reaches children the
 /// service forked itself (plan §1.3(6)).
 ///
-/// `extra_env` is appended to the fixed environment; it carries per-unit
-/// variables such as `NOTIFY_SOCKET`.
+/// `env` is the *complete* environment (the manager composes the base, the
+/// `EnvironmentFile=` and `Environment=`); `working_directory` is applied in the
+/// child before `exec`.
 ///
 /// # Errors
 /// `argv` must be non-empty and contain no interior NUL bytes.
 pub fn spawn_service_in_group(
     argv: &[String],
-    extra_env: &[String],
+    env: &[String],
+    working_directory: Option<&str>,
 ) -> Result<libc::pid_t, RuntimeError> {
-    let (argv, envp) = prepare(argv, extra_env)?;
+    let Prepared { argv, envp, cwd } = prepare(argv, env, working_directory)?;
     let path = argv[0].as_c_str();
-    process::posix_spawn_with(path, &argv, &envp, process::SpawnOptions::with_session())
-        .map_err(RuntimeError::from)
+    process::posix_spawn_full(
+        path,
+        &argv,
+        &envp,
+        process::SpawnOptions::with_session(),
+        cwd.as_deref(),
+    )
+    .map_err(RuntimeError::from)
 }
 
 /// Launch `argv` with [`SERVICE_ENV`] in rinit's own process group.
@@ -84,16 +96,25 @@ pub fn spawn_service_in_group(
 /// # Errors
 /// `argv` must be non-empty and contain no interior NUL bytes.
 pub fn spawn_service(argv: &[String]) -> Result<libc::pid_t, RuntimeError> {
-    let (argv, envp) = prepare(argv, &[])?;
+    let base: Vec<String> = SERVICE_ENV.iter().map(|e| (*e).to_string()).collect();
+    let Prepared { argv, envp, .. } = prepare(argv, &base, None)?;
     let path = argv[0].as_c_str();
     process::posix_spawn(path, &argv, &envp).map_err(RuntimeError::from)
 }
 
-/// Turn `argv` into the C forms `posix_spawn` needs, plus the resolved path.
+/// The C forms `posix_spawn` needs, after `prepare`.
+struct Prepared {
+    argv: Vec<CString>,
+    envp: Vec<CString>,
+    cwd: Option<CString>,
+}
+
+/// Turn `argv`/`env` into the C forms `posix_spawn` needs.
 fn prepare(
     argv: &[String],
-    extra_env: &[String],
-) -> Result<(Vec<CString>, Vec<CString>), RuntimeError> {
+    env: &[String],
+    working_directory: Option<&str>,
+) -> Result<Prepared, RuntimeError> {
     // `argv[0]` must be included for posix_spawn (it becomes the program name).
     let argv: Vec<CString> = argv
         .iter()
@@ -106,13 +127,16 @@ fn prepare(
             source: std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty command"),
         });
     }
-    let envp: Vec<CString> = SERVICE_ENV
+    let envp: Vec<CString> = env
         .iter()
         .map(|e| cstring("service env", e))
-        .chain(extra_env.iter().map(|e| cstring("service env", e)))
         .collect::<Result<_, _>>()
         .map_err(RuntimeError::from)?;
-    Ok((argv, envp))
+    let cwd = match working_directory {
+        Some(dir) => Some(cstring("working directory", dir).map_err(RuntimeError::from)?),
+        None => None,
+    };
+    Ok(Prepared { argv, envp, cwd })
 }
 
 /// Drain every exited child and log it. Returns how many were reaped.

@@ -32,7 +32,7 @@ pub use config::{
 pub use dependency::{DependencyError, DependencyGraph};
 pub use job::{Job, JobQueue, JobTarget, RequestSource};
 pub use notify::{NotifyError, NotifyMessage, parse as parse_notify};
-pub use parser::{ParseError, parse as parse_unit_file};
+pub use parser::{ParseError, parse as parse_unit_file, parse_environment_file};
 pub use restart::{BackoffState, Jitter};
 pub use state::{Effect, Event, ExitOutcome, FailedReason, TransitionError, UnitState, transition};
 

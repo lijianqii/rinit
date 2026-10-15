@@ -53,7 +53,7 @@ pub async fn run(cfg: Config) -> Result<(), RuntimeError> {
     // bring-up and smoke-test path, not how a real system boots.
     if cfg.service_argv.is_empty() {
         let mut notify = NotifyHub::new();
-        let mut manager = start_units(&cfg, &mut notify)?;
+        let mut manager = start_units(&cfg, &mut notify).await?;
         supervise(&mut signals, &mut manager, &mut notify).await;
         // A dev-mode boot (`--dev`) is a host smoke test, not PID 1: returning
         // lets the test process exit instead of spinning in `reboot_now`,
@@ -320,7 +320,7 @@ fn next_deadline(manager: &UnitManager) -> std::time::Duration {
 /// Returns a [`RuntimeError`] if a unit fails to spawn or an initializer
 /// fails: both mean a later level would be waiting on a dependency that never
 /// came up.
-fn start_units(cfg: &Config, notify: &mut NotifyHub) -> Result<UnitManager, RuntimeError> {
+async fn start_units(cfg: &Config, notify: &mut NotifyHub) -> Result<UnitManager, RuntimeError> {
     let plan = manager::announce_plan(&cfg.unit_dir, &cfg.default_target)?;
     let mut units = UnitManager::new();
     for cfg in &plan.configs {
@@ -367,7 +367,7 @@ fn start_units(cfg: &Config, notify: &mut NotifyHub) -> Result<UnitManager, Runt
             } else {
                 std::time::Duration::from_secs(*timeout_sec)
             };
-            match readiness::wait_for_exit(*pid, timeout) {
+            match readiness::wait_for_exit(*pid, timeout).await {
                 Ok(Some(0)) => {
                     rlog!("{name} completed (Active(Exited))");
                     units.mark_oneshot_done(name);

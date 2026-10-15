@@ -117,6 +117,47 @@ fn a_unit_without_restart_is_left_down() {
     );
 }
 
+/// Plan §1.1: `Environment=`, `EnvironmentFile=` and `WorkingDirectory=` must
+/// actually reach the child, with `Environment=` beating the file.
+#[test]
+fn environment_and_working_directory_reach_the_service() {
+    let dir = TempDir::new("env");
+    dir.write("all.target", "[Unit]\nType=target\nRequires=env.service\n");
+
+    let env_file = dir.0.join("env.conf");
+    std::fs::write(&env_file, "ENVFILE=from-file\nOVERRIDE=from-file\n").expect("env file");
+
+    let unit = format!(
+        "[Service]\nType=oneshot\n\
+         ExecStart=/bin/sh -c \"echo PROBE MARK=$MARK ENVFILE=$ENVFILE OVERRIDE=$OVERRIDE CWD=$(pwd)\"\n\
+         Environment=MARK=hello OVERRIDE=from-unit\n\
+         EnvironmentFile={}\n\
+         WorkingDirectory=/tmp\n",
+        env_file.display()
+    );
+    dir.write("env.service", &unit);
+
+    let log = boot_units(&dir, "all.target", Duration::from_millis(800));
+
+    assert!(log.contains("PROBE"), "the service must run:\n{log}");
+    assert!(
+        log.contains("MARK=hello"),
+        "Environment= must be exported:\n{log}"
+    );
+    assert!(
+        log.contains("ENVFILE=from-file"),
+        "EnvironmentFile= must be read:\n{log}"
+    );
+    assert!(
+        log.contains("OVERRIDE=from-unit"),
+        "Environment= must win over the file:\n{log}"
+    );
+    assert!(
+        log.contains("CWD=/tmp"),
+        "WorkingDirectory= must be applied:\n{log}"
+    );
+}
+
 /// Plan §1.1: a two-stage stop. A service that ignores `SIGTERM` must still be
 /// `SIGKILL`ed once `TimeoutStopSec` expires - otherwise shutdown would leave
 /// it running forever.

@@ -168,6 +168,60 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     hash
 }
 
+/// Insert or replace `key` in a `KEY=VALUE` list, keeping one entry per key.
+fn upsert(env: &mut Vec<(String, String)>, key: &str, value: &str) {
+    if let Some(entry) = env.iter_mut().find(|(k, _)| k == key) {
+        entry.1 = value.to_string();
+    } else {
+        env.push((key.to_string(), value.to_string()));
+    }
+}
+
+/// Assemble the environment a service runs with (plan §1.1).
+///
+/// Precedence, lowest to highest: the fixed [`SERVICE_ENV`](crate::service::SERVICE_ENV)
+/// base, the unit's `EnvironmentFile=`, its `Environment=`, then rinit's own
+/// additions (`extra_env`, e.g. `NOTIFY_SOCKET`). Entries are merged rather than
+/// concatenated, so the child sees exactly one value per key and the later
+/// source wins - the plan is explicit that `Environment=` beats the file.
+///
+/// An unreadable `EnvironmentFile=` is a warning, not a start failure: a
+/// service that loses an optional file must still come up.
+fn build_service_env(config: &UnitConfig, extra_env: &[String]) -> Vec<String> {
+    let mut merged: Vec<(String, String)> = Vec::new();
+    for entry in crate::service::SERVICE_ENV {
+        if let Some((key, value)) = entry.split_once('=') {
+            upsert(&mut merged, key, value);
+        }
+    }
+    if !config.environment_file.is_empty() {
+        match std::fs::read_to_string(&config.environment_file) {
+            Ok(body) => {
+                for (key, value) in rinit_core::parse_environment_file(&body) {
+                    upsert(&mut merged, &key, &value);
+                }
+            }
+            Err(e) => rlog!(
+                "warning: {}: cannot read EnvironmentFile {}: {e}",
+                config.name,
+                config.environment_file
+            ),
+        }
+    }
+    for (key, value) in &config.environment {
+        upsert(&mut merged, key, value);
+    }
+    for entry in extra_env {
+        if let Some((key, value)) = entry.split_once('=') {
+            upsert(&mut merged, key, value);
+        }
+    }
+    merged
+        .into_iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect()
+}
+
 /// Tracks every unit and turns events into state changes and [`Outcome`]s.
 #[derive(Debug)]
 pub struct UnitManager {
@@ -312,9 +366,10 @@ impl UnitManager {
 
     /// Spawn a unit, adding `extra_env` to the child's environment.
     ///
-    /// The notify socket path travels this way: the socket is created by the
-    /// caller (which owns the async reactor), and the child learns where to
-    /// signal readiness through `NOTIFY_SOCKET`.
+    /// The child's environment is the base set, then its `EnvironmentFile=`,
+    /// then its `Environment=` (which wins over the file), then `extra_env`
+    /// (rinit's own additions such as `NOTIFY_SOCKET`). Its
+    /// `WorkingDirectory=` is applied before `exec`.
     ///
     /// # Errors
     /// Propagates a spawn failure; the caller decides whether that is fatal.
@@ -324,27 +379,43 @@ impl UnitManager {
         extra_env: &[String],
     ) -> Result<(), RuntimeError> {
         let now = self.now_millis();
+
+        // Everything the spawn needs, read through an immutable borrow so the
+        // `EnvironmentFile=` read below cannot race the state update.
+        let (argv, env, cwd, kind) = {
+            let Some(rt) = self.units.get(unit) else {
+                return Ok(());
+            };
+            if rt.pid.is_some() {
+                return Ok(());
+            }
+            // Targets are process-less; starting one is a bookkeeping no-op.
+            if !rt.spawns() {
+                if let Some(rt) = self.units.get_mut(unit) {
+                    rt.state = UnitState::Active;
+                }
+                return Ok(());
+            }
+            (
+                rt.config.exec_start.argv().to_vec(),
+                build_service_env(&rt.config, extra_env),
+                rt.config.working_directory.clone(),
+                rt.config.service_kind,
+            )
+        };
+
+        // A fresh process group, so a stop reaches the whole tree (plan §1.3(6)).
+        let pid = spawn_service_in_group(&argv, &env, Some(&cwd))?;
+
         let Some(rt) = self.units.get_mut(unit) else {
             return Ok(());
         };
-        if rt.pid.is_some() {
-            return Ok(());
-        }
-        // Targets are process-less; starting one is a bookkeeping no-op.
-        if !rt.spawns() {
-            rt.state = UnitState::Active;
-            return Ok(());
-        }
-
-        let argv = rt.config.exec_start.argv().to_vec();
-        // A fresh process group, so a stop reaches the whole tree (plan §1.3(6)).
-        let pid = spawn_service_in_group(&argv, extra_env)?;
         rt.pid = Some(pid);
         rt.state = UnitState::Starting;
         rt.restart_at = None;
         rt.kill_at = None;
 
-        match rt.config.service_kind {
+        match kind {
             // `simple` is live the moment it is exec'd.
             ServiceKind::Simple => {
                 rt.state = UnitState::Active;
@@ -496,7 +567,11 @@ impl UnitManager {
             rt.health_at = None;
 
             let argv = rt.config.health_check.argv().to_vec();
-            match spawn_service_in_group(&argv, &[]) {
+            // The probe runs as the service does: same environment, same
+            // working directory (plan §7.4).
+            let env = build_service_env(&rt.config, &[]);
+            let cwd = rt.config.working_directory.clone();
+            match spawn_service_in_group(&argv, &env, Some(&cwd)) {
                 Ok(pid) => {
                     rt.probe_pid = Some(pid);
                     rt.probe_deadline = deadline(rt.config.health_timeout_sec);

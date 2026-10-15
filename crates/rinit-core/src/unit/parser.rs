@@ -677,6 +677,33 @@ fn join_tokens(tokens: &[String]) -> String {
     out
 }
 
+/// Parse the body of an `EnvironmentFile=` into `KEY=VALUE` pairs (plan §1.1).
+///
+/// One entry per line. A bare `#` starts a comment and blank lines are ignored.
+/// There is deliberately no continuation, no quoting and no variable expansion:
+/// unlike a unit file, this format is the minimal "one variable per line" that
+/// every distribution ships, and a line that is not `KEY=VALUE` is skipped
+/// rather than failing the boot.
+pub fn parse_environment_file(contents: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for line in contents.lines() {
+        // A bare `#` ends the line, exactly as in a unit file (plan §1.0).
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if key.is_empty() {
+            continue;
+        }
+        out.push((key.to_string(), value.trim().to_string()));
+    }
+    out
+}
+
 fn invalid(line: usize, key: &str, value: &str, reason: &str) -> ParseError {
     ParseError::InvalidValue {
         line,
@@ -1485,6 +1512,58 @@ mod tests {
     fn working_directory_defaults_to_root() {
         let cfg = ok("app.service", "[Service]\nExecStart=/bin/true\n");
         assert_eq!(cfg.working_directory, "/");
+    }
+
+    // --- EnvironmentFile (plan §1.1) ------------------------------------
+
+    #[test]
+    fn environment_file_parses_key_value_lines() {
+        let body = "FOO=bar\nPATH=/usr/bin:/bin\nEMPTY=\n";
+        assert_eq!(
+            parse_environment_file(body),
+            vec![
+                ("FOO".to_string(), "bar".to_string()),
+                ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+                ("EMPTY".to_string(), String::new()),
+            ]
+        );
+    }
+
+    /// A bare `#` is a comment and blank lines are ignored, as in a unit file.
+    #[test]
+    fn environment_file_ignores_comments_and_blanks() {
+        let body = "# a comment\n\nFOO=bar # trailing comment\n   \nBAZ=qux\n";
+        assert_eq!(
+            parse_environment_file(body),
+            vec![
+                ("FOO".to_string(), "bar".to_string()),
+                ("BAZ".to_string(), "qux".to_string()),
+            ]
+        );
+    }
+
+    /// A line that is not `KEY=VALUE` is skipped, not fatal: an environment
+    /// file must never take the boot down.
+    #[test]
+    fn environment_file_skips_malformed_lines() {
+        let body = "NOEQUALS\n=novalue\nGOOD=1\n";
+        assert_eq!(
+            parse_environment_file(body),
+            vec![("GOOD".to_string(), "1".to_string())]
+        );
+    }
+
+    /// Values keep their inner spaces and are not variable-expanded.
+    #[test]
+    fn environment_file_values_are_literal() {
+        let body = "MSG=hello world\nEXPAND=${HOME}\n";
+        assert_eq!(
+            parse_environment_file(body),
+            vec![
+                ("MSG".to_string(), "hello world".to_string()),
+                ("EXPAND".to_string(), "${HOME}".to_string()),
+            ]
+        );
     }
 
     #[test]
