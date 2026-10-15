@@ -21,8 +21,9 @@ use crate::readiness;
 use crate::service::{ServiceSet, reap_and_log, shutdown};
 use crate::unit_manager::{Outcome, UnitManager, reap_into_manager};
 
-/// How long to wait after SIGTERM before declaring a stop complete.
-const STOP_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+/// How often the shutdown loop wakes to reap children and check `SIGKILL`
+/// deadlines. Small enough that a quick exit is noticed promptly.
+const SHUTDOWN_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Run the boot sequence and main loop. Returns `Ok` on a clean shutdown.
 ///
@@ -166,9 +167,46 @@ async fn supervise(signals: &mut SignalSet, manager: &mut UnitManager, notify: &
         }
     }
     notify.disarm_all();
-    tokio::time::sleep(STOP_WAIT).await;
-    for outcome in reap_into_manager(manager) {
-        log_outcome(&outcome);
+    stop_and_reap(manager).await;
+}
+
+/// Bring every unit the queue still wants running down, then wait for them.
+///
+/// The main loop has already broken on the shutdown signal, so this is where the
+/// *second* stage of a two-stage stop happens (plan §1.1, §1.3(8)):
+/// `stop_unit` sent `SIGTERM`, and any unit still alive when its
+/// `TimeoutStopSec` expires is `SIGKILL`ed. Without this loop a service that
+/// ignores `SIGTERM` would never be killed.
+async fn stop_and_reap(manager: &mut UnitManager) {
+    loop {
+        for outcome in reap_into_manager(manager) {
+            log_outcome(&outcome);
+        }
+        if manager.running_count() == 0 {
+            break;
+        }
+
+        let killed = manager.due_kills();
+        let just_killed = !killed.is_empty();
+        for unit in killed {
+            rlog!("error: {unit} ignored SIGTERM; killed");
+        }
+
+        match manager.next_kill_in() {
+            // A unit still has a stop deadline: wake then, or sooner to reap.
+            Some(wait) => tokio::time::sleep(wait.min(SHUTDOWN_POLL)).await,
+            // Nothing left to escalate. If we just sent `SIGKILL`, give it one
+            // poll to be reaped; otherwise it is unkillable (e.g. D state) and
+            // PID 1 must not hang the shutdown on it.
+            None if just_killed => tokio::time::sleep(SHUTDOWN_POLL).await,
+            None => {
+                rlog!(
+                    "warning: {} unit(s) did not exit; continuing shutdown",
+                    manager.running_count()
+                );
+                break;
+            }
+        }
     }
 }
 

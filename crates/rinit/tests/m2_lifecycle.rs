@@ -116,3 +116,38 @@ fn a_unit_without_restart_is_left_down() {
         "Restart=no must not schedule a restart:\n{log}"
     );
 }
+
+/// Plan §1.1: a two-stage stop. A service that ignores `SIGTERM` must still be
+/// `SIGKILL`ed once `TimeoutStopSec` expires - otherwise shutdown would leave
+/// it running forever.
+#[test]
+fn a_service_that_ignores_sigterm_is_killed_at_shutdown() {
+    let dir = TempDir::new("stubborn");
+    dir.write(
+        "all.target",
+        "[Unit]\nType=target\nRequires=stubborn.service\n",
+    );
+    // The shell ignores SIGTERM and keeps respawning its doomed `sleep`, so the
+    // direct child is still alive when the stop timeout expires. rinit's
+    // tokenizer only knows `"`, so the shell is handed single quotes to
+    // interpret itself (to rinit they are literal characters, not quoting).
+    let stubborn = r#"[Service]
+Type=simple
+ExecStart=/bin/sh -c "trap '' TERM; while :; do sleep 1; done"
+Restart=always
+TimeoutStopSec=1
+"#;
+    dir.write("stubborn.service", stubborn);
+
+    let log = boot_units(&dir, "all.target", Duration::from_millis(700));
+
+    assert!(log.contains("boot complete"), "boot must finish:\n{log}");
+    assert!(
+        log.contains("stubborn.service ignored SIGTERM; killed"),
+        "the stop timeout must escalate to SIGKILL:\n{log}"
+    );
+    assert!(
+        !log.contains("stubborn.service will restart in"),
+        "a deliberate stop must not restart:\n{log}"
+    );
+}

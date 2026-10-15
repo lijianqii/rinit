@@ -615,12 +615,19 @@ impl UnitManager {
     ///
     /// A pending restart is cancelled: an explicit stop beats an automatic one
     /// (plan §1.3(13)).
+    ///
+    /// The stop is two-stage (plan §1.1, §1.3(12)): `SIGTERM` now, and a
+    /// `SIGKILL` deadline `TimeoutStopSec` later - immediately, when it is `0`.
+    /// [`due_kills`](Self::due_kills) fires that deadline. Without it, a service
+    /// that ignores `SIGTERM` would never be killed, on shutdown or otherwise.
     pub fn stop_unit(&mut self, unit: &UnitName) {
         let Some(rt) = self.units.get_mut(unit) else {
             return;
         };
         rt.restart_at = None;
         rt.start_deadline = None;
+        // A fresh stop re-arms the kill deadline below, so clear any stale one
+        // (e.g. left over from a start timeout) first.
         rt.kill_at = None;
         // An explicit stop also abandons any health probing and cancels a
         // health-triggered restart: the operator asked for the unit to stop.
@@ -635,6 +642,13 @@ impl UnitManager {
             Some(pid) => match process::kill_process_group(pid, libc::SIGTERM) {
                 Ok(()) => {
                     rt.state = UnitState::Deactivating;
+                    if rt.config.timeout_stop_sec == 0 {
+                        // Plan §1.1: `TimeoutStopSec=0` means SIGKILL at once.
+                        let _ = process::kill_process_group(pid, libc::SIGKILL);
+                    } else {
+                        rt.kill_at =
+                            Some(Instant::now() + Duration::from_secs(rt.config.timeout_stop_sec));
+                    }
                     rlog!("stopping {unit} (pgid {pid})");
                 }
                 Err(e) if e.errno() == libc::ESRCH => {
@@ -1531,5 +1545,49 @@ mod tests {
         assert_eq!(m.request_start(&ghost, RequestSource::UserStart), None);
         assert_eq!(m.request_stop(&ghost, RequestSource::UserStop), None);
         assert!(m.started_units().is_empty());
+    }
+
+    // --- two-stage stop (plan §1.1) -------------------------------------
+
+    /// A stop arms the `SIGKILL` follow-up at `TimeoutStopSec`, so a service
+    /// that ignores `SIGTERM` is still killed. Without this the shutdown path
+    /// could never escalate.
+    #[test]
+    fn a_stop_arms_the_sigkill_deadline() {
+        let mut m = manager_with("a.service", RestartPolicy::No);
+        let unit = UnitName::parse("a.service").unwrap();
+        spawn_pid(&mut m, &unit);
+        m.units.get_mut(&unit).unwrap().config.timeout_stop_sec = 10;
+
+        m.stop_unit(&unit);
+
+        let rt = m.get(&unit).unwrap();
+        assert_eq!(rt.state, UnitState::Deactivating);
+        assert!(
+            rt.kill_at.is_some(),
+            "TimeoutStopSec must arm the SIGKILL follow-up"
+        );
+
+        cleanup(&mut m, &unit);
+    }
+
+    /// `TimeoutStopSec=0` means `SIGKILL` at once (plan §1.1), so there is no
+    /// deadline to wait for.
+    #[test]
+    fn a_zero_stop_timeout_kills_immediately() {
+        let mut m = manager_with("a.service", RestartPolicy::No);
+        let unit = UnitName::parse("a.service").unwrap();
+        spawn_pid(&mut m, &unit);
+        m.units.get_mut(&unit).unwrap().config.timeout_stop_sec = 0;
+
+        m.stop_unit(&unit);
+
+        let rt = m.get(&unit).unwrap();
+        assert!(
+            rt.kill_at.is_none(),
+            "TimeoutStopSec=0 signals SIGKILL now, not later"
+        );
+
+        cleanup(&mut m, &unit);
     }
 }
