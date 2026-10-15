@@ -160,7 +160,9 @@ What it does, in order (see [Makefile](Makefile)):
 Useful knobs:
 
 ```bash
-make run SERVICE=/bin/sh        # drop to an interactive busybox shell instead
+make run                        # boot units/ → interactive root shell (default)
+make run SERVICE=/bin/sh        # plain busybox shell, bypassing rinit's units
+make run SERVICE="/sbin/rinit-testservice --ticks 6"   # M0 bring-up check
 make run SKIP_BUILD=1           # boot existing artifacts; never download/compile
 make kernel                     # kernel only
 make busybox                    # busybox only
@@ -169,6 +171,10 @@ make qemu                       # boot existing artifacts
 make MIRROR=https://... run     # different mirror
 make KERNEL_VERSION=6.6.158 BUSYBOX_VERSION=1.36.1 ...   # pin versions
 ```
+
+> `SERVICE=...` puts a command on the kernel cmdline, which **replaces the unit
+> directory entirely**. If rinit logs `launched test service ...` instead of
+> `boot plan for 'multi-user.target'`, that override is set — not a stale image.
 
 ### Getting a shell in the guest
 

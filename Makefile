@@ -42,10 +42,15 @@ BUSYBOX_ARCH     ?= arm64
 JOBS             ?= $(shell nproc 2>/dev/null || echo 2)
 QEMU_MEM         ?= 128M
 
-# The hardcoded service passed to rinit (M0 has no config parsing yet).
-#   - /sbin/rinit-testservice : prints heartbeats and proves fork/exec/reap
-#   - /bin/sh                 : interactive busybox shell on the console
-SERVICE          ?= /sbin/rinit-testservice
+# Service appended to the kernel cmdline, overriding the unit directory.
+#
+# Empty by default: rinit boots units/ (which starts shell.service, so you get a
+# root shell on the console). Setting this is the M0 bring-up path and it
+# *replaces* the unit directory entirely, which is easy to mistake for "the
+# new units did not make it into the image" when they actually did.
+#   - SERVICE=/sbin/rinit-testservice --ticks 6 : prove fork/exec/reap only
+#   - SERVICE=/bin/sh                           : plain busybox shell, no rinit units
+SERVICE          ?=
 
 # `make run SKIP_BUILD=1` boots what is already built and never downloads,
 # extracts or compiles anything (it fails fast if an artifact is missing).
@@ -141,8 +146,12 @@ $(INITRAMFS): $(RINIT_BIN) $(RINIT_TEST_BIN) $(BUSYBOX_BIN) $(UNIT_FILES)
 	$(SCRIPTS)/build-initramfs.sh $(TARGET) --busybox-src $(BUSYBOX_SRC) --out $@
 
 # --- boot -----------------------------------------------------------------
+# `--service` is passed only when SERVICE is set: passing it empty would put an
+# empty token on the kernel cmdline, which rinit would reject as an empty
+# program path.
 QEMU_CMD = $(SCRIPTS)/run-qemu.sh --arch aarch64 --kernel $(KERNEL_IMAGE) \
-	--initrd $(INITRAMFS) --mem $(QEMU_MEM) --service "$(SERVICE)"
+	--initrd $(INITRAMFS) --mem $(QEMU_MEM) \
+	$(if $(strip $(SERVICE)),--service "$(SERVICE)")
 
 qemu: $(KERNEL_IMAGE) $(INITRAMFS)
 	$(QEMU_CMD)
