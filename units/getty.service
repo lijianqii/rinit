@@ -1,0 +1,10 @@
+# Serial console login (plan §4.3 example unit).
+[Unit]
+Description=Serial console getty
+Type=service
+After=rinit-init.service
+
+[Service]
+Type=simple
+ExecStart=/bin/getty -L ttyAMA0 115200 vt100
+Restart=always

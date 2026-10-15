@@ -1,0 +1,17 @@
+[package]
+name = "rctl"
+description = "rctl - command-line control client for rinit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "rctl"
+path = "src/main.rs"
+
+[dependencies]
+rinit-core.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"

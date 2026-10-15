@@ -1,0 +1,16 @@
+# Cross-compilation config (plan §2 / §4.3).
+#
+# M0 builds rinit statically linked by default: PID 1 runs before the real
+# rootfs is available, so a dynamic glibc dependency (ld-linux + libc.so.6 with
+# a matching version) is a boot-hang risk. See plan §2 "risk mitigation".
+
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
+rustflags = ["-C", "target-feature=+crt-static"]
+
+# Host/qemu-x86_64 verification build (plan §4.2): use the musl target, which
+# is statically linked by default, so the same initramfs approach works without
+# bundling a host glibc of the exact version. (Setting `crt-static` on the GNU
+# host target would break proc-macro dylibs.)
+[target.x86_64-unknown-linux-musl]
+linker = "cc"

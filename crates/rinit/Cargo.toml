@@ -1,0 +1,27 @@
+[package]
+name = "rinit"
+description = "rinit - a lightweight PID 1 init and service manager"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "rinit"
+path = "src/main.rs"
+
+# Bundled helper used as the M0 hardcoded service. It prints and spawns a
+# short-lived child periodically so PID 1 has something to reap. It is a
+# separate, tiny binary so M0 can be verified in qemu without busybox.
+[[bin]]
+name = "rinit-testservice"
+path = "src/bin/testservice.rs"
+
+[dependencies]
+rinit-core.workspace = true
+rinit-runtime.workspace = true
+libc.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+libc.workspace = true

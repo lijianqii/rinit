@@ -1,0 +1,5 @@
+# Default boot target anchor (plan §7.2).
+[Unit]
+Description=Multi-user system
+Type=target
+After=rinit-init.service

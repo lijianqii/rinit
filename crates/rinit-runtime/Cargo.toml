@@ -1,0 +1,15 @@
+[package]
+name = "rinit-runtime"
+description = "Runtime primitives for rinit: syscall wrappers, mounts, process/reap"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+rinit-core.workspace = true
+libc.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+libc.workspace = true

@@ -1,0 +1,6 @@
+/target
+**/*.rs.bk
+/build
+initramfs.cpio.gz
+*.cpio
+*.cpio.gz

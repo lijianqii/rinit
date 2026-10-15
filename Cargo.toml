@@ -1,0 +1,50 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/rinit-core",
+    "crates/rinit-runtime",
+    "crates/rinit",
+    "crates/rctl",
+]
+default-members = [
+    "crates/rinit-core",
+    "crates/rinit-runtime",
+    "crates/rinit",
+    "crates/rctl",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT OR Apache-2.0"
+
+# Pinned to versions available in the local cargo cache so the workspace builds
+# fully offline (see plan §2 risk mitigation / environment constraints).
+[workspace.dependencies]
+libc = "0.2.190"
+tokio = { version = "1.53.3", default-features = false, features = [
+    "rt",
+    "signal",
+    "time",
+    "net",
+    "sync",
+    "io-util",
+    "macros",
+] }
+rinit-core = { path = "crates/rinit-core" }
+rinit-runtime = { path = "crates/rinit-runtime" }
+
+# PID 1 hardening (plan §2.1⑦): panic must abort (watchdog/backstop resets the
+# box), and integer overflow becomes an explicit, testable panic instead of
+# silent wrapping.
+[profile.release]
+panic = "abort"
+overflow-checks = true
+lto = true
+codegen-units = 1
+strip = true
+
+[profile.dev]
+# Keep overflow checks on in dev too (default) for consistent semantics.
+overflow-checks = true
