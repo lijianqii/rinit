@@ -17,6 +17,8 @@ pub enum CoreError {
     Parse(crate::unit::parser::ParseError),
     /// The dependency graph could not be built or scheduled.
     Dependency(crate::unit::dependency::DependencyError),
+    /// An event was not legal in the unit's current state.
+    Transition(crate::unit::state::TransitionError),
     // M2+ adds: State(StateError).
 }
 
@@ -32,6 +34,12 @@ impl From<crate::unit::dependency::DependencyError> for CoreError {
     }
 }
 
+impl From<crate::unit::state::TransitionError> for CoreError {
+    fn from(e: crate::unit::state::TransitionError) -> Self {
+        CoreError::Transition(e)
+    }
+}
+
 impl fmt::Display for CoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -40,6 +48,7 @@ impl fmt::Display for CoreError {
             }
             CoreError::Parse(e) => write!(f, "{e}"),
             CoreError::Dependency(e) => write!(f, "{e}"),
+            CoreError::Transition(e) => write!(f, "{e}"),
         }
     }
 }
