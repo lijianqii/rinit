@@ -20,6 +20,7 @@ extern crate std;
 
 pub mod error;
 pub mod unit;
+pub mod users;
 
 pub use error::CoreError;
 pub use unit::state::{Effect, Event, ExitOutcome, TransitionError, transition};
@@ -28,3 +29,4 @@ pub use unit::{
     NotifyError, NotifyMessage, ParseError, RequestSource, RestartPolicy, ServiceKind, UnitConfig,
     UnitName, UnitState, UnitType, parse_notify,
 };
+pub use users::{group_gid, passwd_uid};

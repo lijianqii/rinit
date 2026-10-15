@@ -1,12 +1,20 @@
 //! Filesystem and credential wrappers the notify socket needs (plan §1.3(12)).
 //!
 //! Only the pieces with no safe `std` equivalent live here: `umask(2)`,
-//! `chmod(2)`, `chown(2)`, and the `getpwnam`/`getgrnam` lookups that turn a
-//! unit's `User=`/`Group=` into ids. Directory creation and unlinking use the
-//! safe `std::fs` API at the call site.
+//! `chmod(2)`, `chown(2)`, and the lookups that turn a unit's `User=`/`Group=`
+//! into ids. Directory creation and unlinking use the safe `std::fs` API at the
+//! call site.
+
+use rinit_core::users;
 
 use crate::error::SyscallError;
 use crate::syscall::cstring;
+
+/// The user database read to resolve a `User=` name.
+const PASSWD: &str = "/etc/passwd";
+
+/// The group database read to resolve a `Group=` name.
+const GROUP: &str = "/etc/group";
 
 /// Set the process file-creation mask, returning the previous one.
 ///
@@ -54,52 +62,50 @@ pub fn is_root() -> bool {
 /// Resolve `User=` to a uid.
 ///
 /// An empty value means the default (`root`, uid 0). A purely numeric value is
-/// taken as an id, matching systemd. Otherwise the name is looked up in the
-/// system user database.
+/// taken as an id, matching systemd. Otherwise the name is looked up in
+/// `/etc/passwd`.
+///
+/// The lookup reads the file rather than calling `getpwnam`: rinit is static,
+/// and a static `getpwnam` needs the NSS `libnss_files.so` at run time, which
+/// the initramfs does not have (see `rinit_core::users`). A name that is only
+/// resolvable through NSS - an LDAP or systemd-homed user - therefore does not
+/// resolve here. That is deliberate: on a booted system rinit must depend on
+/// nothing it cannot read from the image it booted.
 ///
 /// # Errors
 /// [`SyscallError`] with `ENOENT` when a non-numeric name does not exist.
 /// Defaulting a typo to root would silently hand a service root's socket.
 pub fn resolve_uid(user: &str) -> Result<libc::uid_t, SyscallError> {
+    let user = user.trim();
     if user.is_empty() {
         return Ok(0);
     }
     if let Ok(id) = user.parse::<libc::uid_t>() {
         return Ok(id);
     }
-    let name = cstring("user name", user)?;
-    // SAFETY: `getpwnam` returns either null or a pointer to a static `passwd`
-    // whose storage stays valid until the next lookup; we copy the uid out
-    // immediately and never hold the pointer.
-    let pw = unsafe { libc::getpwnam(name.as_ptr()) };
-    if pw.is_null() {
-        Err(SyscallError::new("getpwnam", libc::ENOENT))
-    } else {
-        // SAFETY: non-null, so it points at a valid `passwd`.
-        Ok(unsafe { (*pw).pw_uid })
-    }
+    let body = read_database(PASSWD)?;
+    users::passwd_uid(&body, user).ok_or_else(|| SyscallError::new("User= lookup", libc::ENOENT))
 }
 
-/// Resolve `Group=` to a gid. Mirrors [`resolve_uid`].
+/// Resolve `Group=` to a gid. Mirrors [`resolve_uid`], against `/etc/group`.
 ///
 /// # Errors
 /// [`SyscallError`] with `ENOENT` when a non-numeric name does not exist.
 pub fn resolve_gid(group: &str) -> Result<libc::gid_t, SyscallError> {
+    let group = group.trim();
     if group.is_empty() {
         return Ok(0);
     }
     if let Ok(id) = group.parse::<libc::gid_t>() {
         return Ok(id);
     }
-    let name = cstring("group name", group)?;
-    // SAFETY: as `resolve_uid`, with `getgrnam`/`group`.
-    let gr = unsafe { libc::getgrnam(name.as_ptr()) };
-    if gr.is_null() {
-        Err(SyscallError::new("getgrnam", libc::ENOENT))
-    } else {
-        // SAFETY: non-null, so it points at a valid `group`.
-        Ok(unsafe { (*gr).gr_gid })
-    }
+    let body = read_database(GROUP)?;
+    users::group_gid(&body, group).ok_or_else(|| SyscallError::new("Group= lookup", libc::ENOENT))
+}
+
+/// Read a name/id database, mapping an I/O failure to its `errno`.
+fn read_database(path: &'static str) -> Result<String, SyscallError> {
+    std::fs::read_to_string(path).map_err(|e| SyscallError::from_io(path, &e))
 }
 
 #[cfg(test)]
@@ -152,6 +158,20 @@ mod tests {
     fn numeric_ids_pass_through() {
         assert_eq!(resolve_uid("1234").unwrap(), 1234);
         assert_eq!(resolve_gid("4321").unwrap(), 4321);
+    }
+
+    /// A unit file may pad the value; the id must not change because of it.
+    #[test]
+    fn surrounding_whitespace_is_ignored() {
+        assert_eq!(resolve_uid(" root ").unwrap(), 0);
+        assert_eq!(resolve_gid(" 0 ").unwrap(), 0);
+    }
+
+    /// An unreadable database is a normal `ENOENT`, not a panic.
+    #[test]
+    fn a_missing_database_is_reported_as_enoent() {
+        let err = read_database("/definitely/not/here/passwd").expect_err("must fail");
+        assert_eq!(err.errno(), libc::ENOENT);
     }
 
     /// Root always exists on a Unix host, so its lookup must resolve to 0.

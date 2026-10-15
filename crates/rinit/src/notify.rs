@@ -344,7 +344,13 @@ mod tests {
         let mut cfg = notify_config("svc.service");
         cfg.user = "rinit-no-such-user-xyz".to_string();
         let err = hub.arm(&cfg).expect_err("an unknown user must fail");
-        assert!(err.to_string().contains("getpwnam"), "got: {err}");
+        match err {
+            RuntimeError::Syscall(e) => {
+                assert_eq!(e.op(), "User= lookup");
+                assert_eq!(e.errno(), libc::ENOENT);
+            }
+            other => panic!("expected a syscall error, got: {other}"),
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }
