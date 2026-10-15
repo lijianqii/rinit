@@ -33,16 +33,18 @@ rinit: mounted /dev
 rinit: mounted /tmp
 rinit: boot plan for 'multi-user.target': 4 unit(s) in 3 level(s)
 rinit: plan 0: rinit-init.target (target)
-rinit: plan 1: shell.service (service)
+rinit: plan 1: getty.service (service)
 rinit: plan 2: multi-user.target (target)
 rinit: starting level 0: 0 service(s)
 rinit: level 0 reached: rinit-init.target active
 rinit: starting level 1: 1 service(s)
-rinit: started shell.service as pid 48
+rinit: started getty.service as pid 48
 rinit: starting level 2: 0 service(s)
 rinit: level 2 reached: multi-user.target active
 rinit: boot complete: 1 unit(s) started from 'multi-user.target' (1 still running)
-/bin/sh: can't access tty; job control turned off
+
+(none) login: root
+login[48]: root login on 'ttyAMA0'
 ~ # uname -m
 aarch64
 ```
@@ -67,7 +69,7 @@ crates/
     src/service.rs  # service supervision: spawn, track, reap, stop
     src/bin/        # rinit-testservice helper
   rctl/             # CLI stub (real commands land in M3)
-units/              # unit files; shell.service gives `make run` a root shell
+units/              # unit files; getty.service is `make run`'s console login
 scripts/            # initramfs / qemu / kernel / system-test helpers
 ```
 
@@ -183,33 +185,36 @@ make KERNEL_VERSION=6.6.158 BUSYBOX_VERSION=1.36.1 ...   # pin versions
 ```
 
 The image is rebuilt whenever `rinit`, `busybox`, a file in `units/`, or one of
-the packing scripts changes — editing `units/shell.service` repacks the
+the packing scripts changes — editing `units/getty.service` repacks the
 initramfs, because the unit directory is what the guest boots.
 
 ### Getting a shell in the guest
 
-`make run` boots into an interactive root shell on the serial console - there
-is no login prompt and no password, so you can type as soon as the banner
-appears:
+`make run` boots `units/getty.service`, which puts a login prompt on the serial
+console. Type `root` and press enter — the password field in `/etc/passwd` is
+empty, so there is nothing to type after that:
 
 ```
 rinit: boot complete: 1 unit(s) started from 'multi-user.target' (1 still running)
-/bin/sh: can't access tty; job control turned off
+
+(none) login: root
+login[48]: root login on 'ttyAMA0'
 ~ # uname -m
 aarch64
 ~ #
 ```
 
-This is `units/shell.service`, required by `multi-user.target`. It exists for
-bring-up and inspection, and is deliberately not a security boundary: anyone
-who can reach the serial port already has the machine. `/etc/passwd` has an
-empty password field rather than `x`, so `login` is bypassed entirely.
+This is deliberately not a security boundary: anyone who can reach the serial
+port already has the machine, and a development initramfs is not the place for
+real credentials. Giving root a password would mean writing `/etc/shadow`,
+which is not shipped.
 
-`units/getty.service` is the login-prompt alternative. Both want `ttyAMA0` and
-only one can hold the console, so they are alternatives rather than
-dependencies: drop the `Requires=shell.service` line from `multi-user.target`
-to start getty instead. (They are deliberately *not* a `Conflicts=` pair - M1
-parses conflicts but does not stop running units, which needs M2.)
+`units/shell.service` is the alternative: it skips `login` entirely, so you get
+a `~ #` prompt with no username to type. Both units want `ttyAMA0` and two
+processes on one console both misbehave, so they are alternatives rather than
+dependencies — swap the two `Requires=` lines in `multi-user.target` to switch.
+(They are deliberately *not* a `Conflicts=` pair: M1 parses conflicts but does
+not stop running units, which needs M2.)
 
 `poweroff -f` from the shell halts the guest; `exit` returns to the boot loop.
 

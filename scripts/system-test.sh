@@ -99,9 +99,16 @@ trap 'rm -f "${fifo}"' EXIT
 (
     exec 3>"${fifo}"
     sleep 14
-    printf 'id\n' >&3   # must answer uid=0(root): the "no login needed" proof
-    sleep 1
-    printf 'exit\n' >&3 # release the console so rinit can reap the shell
+    # getty shows `login:`, so answer with the username. The password field in
+    # /etc/passwd is empty, so an empty line must be accepted - that is the
+    # property under test, and `id` afterwards proves it.
+    printf 'root\n' >&3
+    sleep 2
+    printf '\n' >&3
+    sleep 3
+    printf 'id\n' >&3
+    sleep 2
+    printf 'exit\n' >&3 # release the console so rinit can reap getty
     sleep 3
     exec 3>&-
 ) &
@@ -154,7 +161,7 @@ expect "mounted /tmp" "rinit: mounted /tmp"
 # M1: a real boot comes from the unit directory, not a hardcoded service.
 expect "resolved a boot plan" "boot plan for 'multi-user.target'"
 expect "the init anchor is scheduled" "plan 0: rinit-init.target"
-expect "the console shell is scheduled" "shell.service"
+expect "the console getty is scheduled" "getty.service"
 
 # Boot must be ordered: mounts before any unit is started.
 if [[ "$(grep -n 'rinit: mounted /tmp' "${log_file}" | head -1 | cut -d: -f1)" -lt \
@@ -175,24 +182,25 @@ else
     fail "startup levels must run in dependency order (level0=${l0} level1=${l1})"
 fi
 
-# The console shell is the whole point of `make run`: it must actually be up
-# and still running when the boot sequence finishes.
-if grep -qF "started shell.service as pid" "${log_file}"; then
-    pass "console shell started as a process"
+# getty owns the console: it must actually be up and still running when the
+# boot sequence finishes.
+if grep -qF "started getty.service as pid" "${log_file}"; then
+    pass "getty started as a process"
 else
-    fail "shell.service should have been started"
+    fail "getty.service should have been started"
 fi
 
 if grep -qF "boot complete: 1 unit(s) started" "${log_file}"; then
-    pass "the console shell is still running after boot"
+    pass "getty is still running after boot"
 else
-    fail "the console shell must survive boot (it is a long-running service)"
+    fail "getty must survive boot (it is a long-running service)"
 fi
 
-# A root shell must be reachable with no password. `login` is never involved,
-# so the prompt appears directly and a typed command answers immediately.
-expect "an interactive root shell is available" "~ #"
-expect "the shell accepts input without a login prompt" "uid=0(root)"
+# Logging in must work, and with an empty password field there is nothing to
+# type after the username. `uid=0(root)` is the proof that the whole path -
+# getty, login, /etc/passwd - actually worked.
+expect "getty presents a login prompt" "login:"
+expect "login succeeded and gave a root shell" "uid=0(root)"
 
 # Plan §7.2: a target is an aggregation point with no process, so it must
 # never appear in the "started ... as pid" stream.
@@ -202,12 +210,12 @@ else
     pass "no target was exec'd"
 fi
 
-# getty.service is wired into the graph but not required by the default target
-# (the shell owns the console), so it must not be started.
-if grep -qF "started getty.service" "${log_file}"; then
-    fail "getty must not start while the console shell holds ttyAMA0"
+# shell.service is the login-free alternative and must stay unstarted: it would
+# fight getty for ttyAMA0.
+if grep -qF "started shell.service" "${log_file}"; then
+    fail "shell.service must not start while getty holds ttyAMA0"
 else
-    pass "getty correctly not started alongside the console shell"
+    pass "shell.service correctly not started alongside getty"
 fi
 
 expect "boot completed" "boot complete"

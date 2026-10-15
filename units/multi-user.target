@@ -12,17 +12,21 @@
 # Requires= accumulates across lines; splitting a long list keeps unit files
 # readable.
 #
-# `shell.service` owns ttyAMA0, so it and `getty.service` are alternatives and
+# `getty.service` owns ttyAMA0, so it and `shell.service` are alternatives and
 # must not both be required: two processes on one console both misbehave.
-# Requiring the shell is what gives `make run` an interactive prompt; drop that
-# line to get a login prompt from getty instead. Neither is expressed as a
-# `Conflicts=`, because M1 parses conflicts but does not stop units - that
-# would need a live unit being stopped, which is M2's job.
+#
+# getty is the default entry point - you type `root` at `login:` and press enter
+# (the password field in /etc/passwd is empty, so there is nothing to type).
+# Swap the two lines below to get a shell with no login step at all.
+#
+# Neither alternative is expressed as a `Conflicts=`, because M1 parses
+# conflicts but does not stop units - that needs a live unit being stopped,
+# which is M2's job.
 [Unit]
 Description=Multi-user system
 Type=target
 After=rinit-init.target
 
 Requires=rinit-init.target
-Requires=shell.service
-# Requires=getty.service
+# Requires=shell.service
+Requires=getty.service
