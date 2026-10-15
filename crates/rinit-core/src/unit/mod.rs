@@ -16,6 +16,7 @@
 pub mod config;
 pub mod dependency;
 pub mod job;
+pub mod notify;
 pub mod parser;
 pub mod restart;
 pub mod state;
@@ -30,6 +31,7 @@ pub use config::{
 };
 pub use dependency::{DependencyError, DependencyGraph};
 pub use job::{Job, JobQueue, JobTarget, RequestSource};
+pub use notify::{NotifyError, NotifyMessage, parse as parse_notify};
 pub use parser::{ParseError, parse as parse_unit_file};
 pub use restart::{BackoffState, Jitter};
 pub use state::{Effect, Event, ExitOutcome, FailedReason, TransitionError, UnitState, transition};

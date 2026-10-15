@@ -25,6 +25,6 @@ pub use error::CoreError;
 pub use unit::state::{Effect, Event, ExitOutcome, TransitionError, transition};
 pub use unit::{
     DependencyError, DependencyGraph, ExecCommand, FailedReason, Job, JobQueue, JobTarget,
-    ParseError, RequestSource, RestartPolicy, ServiceKind, UnitConfig, UnitName, UnitState,
-    UnitType,
+    NotifyError, NotifyMessage, ParseError, RequestSource, RestartPolicy, ServiceKind, UnitConfig,
+    UnitName, UnitState, UnitType,
 };
