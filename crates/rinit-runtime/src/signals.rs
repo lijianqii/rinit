@@ -151,10 +151,21 @@ impl SignalSet {
 
         // SAFETY: `reader` owns a valid descriptor that stays open for the
         // lifetime of the returned `AsyncFd`; it is never closed or replaced.
-        let reader = unsafe { AsyncFd::register(reader) }.map_err(|e| {
-            let (_fd, io) = e.into_parts();
-            SyscallError::from_io("AsyncFd::register(signal pipe)", &io)
-        })?;
+        let reader = match unsafe { AsyncFd::register(reader) } {
+            Ok(reader) => reader,
+            Err(e) => {
+                // Registering failed, so this construction will not produce a
+                // `SignalSet` and nothing else will ever tear the handlers down.
+                // Undo them here, or `dispatch` stays installed and points at a
+                // pipe that is about to close with `writer`/`reader`.
+                let (_fd, io) = e.into_parts();
+                WRITE_FD.store(-1, Ordering::Release);
+                for (number, previous) in restore.iter().rev() {
+                    restore_disposition(*number, previous);
+                }
+                return Err(SyscallError::from_io("AsyncFd::register(signal pipe)", &io));
+            }
+        };
 
         Ok(SignalSet {
             reader,
@@ -237,7 +248,10 @@ fn install_handler(signal: Signal) -> Result<libc::sigaction, SyscallError> {
     let rc = unsafe {
         let mut action: libc::sigaction = std::mem::zeroed();
         action.sa_sigaction = dispatch as *const () as libc::sighandler_t;
-        action.sa_flags = libc::SA_RESTART;
+        // `SA_RESTART` keeps an interrupted `waitpid` from surfacing `EINTR`.
+        // `SA_NOCLDSTOP` suppresses the pointless SIGCHLD a child stop/continue
+        // would otherwise raise: rinit only cares about terminal states.
+        action.sa_flags = libc::SA_RESTART | libc::SA_NOCLDSTOP;
         libc::sigemptyset(&mut action.sa_mask);
         libc::sigaction(signal.number(), &action, &mut previous)
     };

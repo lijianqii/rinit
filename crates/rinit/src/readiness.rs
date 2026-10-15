@@ -72,6 +72,15 @@ pub fn wait_for_exit(pid: libc::pid_t, timeout: Duration) -> Result<Option<i32>,
             });
         }
         if rc == -1 {
+            // An interrupted poll is not a failure: a signal handler with
+            // `SA_RESTART` normally prevents this, but a handler installed by
+            // something else (or on another thread) can still interrupt us.
+            let errno = std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::ECHILD);
+            if errno == libc::EINTR {
+                continue;
+            }
             // ECHILD: someone else already reaped it, or it never existed.
             return Err(());
         }
@@ -146,6 +155,30 @@ mod tests {
         // Clean up so the child does not leak.
         process::kill(pid, libc::SIGKILL).expect("kill");
         let _ = wait_for_exit(pid, Duration::from_secs(5));
+    }
+
+    /// A `waitpid` failure that is not `EINTR` means the child is gone: the
+    /// waiter must report an error rather than poll forever. This is the
+    /// `ECHILD` branch that the `EINTR` retry has to be distinguished from.
+    #[test]
+    fn waiting_on_an_already_reaped_child_reports_failure() {
+        let pid = crate::service::spawn_service(&[
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "exit 0".to_string(),
+        ])
+        .expect("spawn");
+
+        // Reap it here so `wait_for_exit` finds no such child.
+        let mut status: libc::c_int = 0;
+        // SAFETY: `status` is a valid out-pointer; blocking on our own child.
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+
+        assert_eq!(
+            wait_for_exit(pid, Duration::from_secs(1)),
+            Err(()),
+            "an already-reaped child is an error, not an infinite wait"
+        );
     }
 
     /// Plan §1.1: `TimeoutStartSec=0` means wait forever, not zero seconds, so
