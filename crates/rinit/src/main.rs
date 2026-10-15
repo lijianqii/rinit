@@ -7,6 +7,8 @@
 mod args;
 mod boot;
 mod log;
+mod manager;
+mod readiness;
 mod service;
 
 use std::io::Write;

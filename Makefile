@@ -135,7 +135,9 @@ $(BUSYBOX_BIN): $(BUSYBOX_SRC)/.config
 initramfs: $(INITRAMFS)
 
 # Repacked only when the rinit binaries or busybox change.
-$(INITRAMFS): $(RINIT_BIN) $(RINIT_TEST_BIN) $(BUSYBOX_BIN)
+UNIT_FILES := $(wildcard units/*.service) $(wildcard units/*.target)
+
+$(INITRAMFS): $(RINIT_BIN) $(RINIT_TEST_BIN) $(BUSYBOX_BIN) $(UNIT_FILES)
 	$(SCRIPTS)/build-initramfs.sh $(TARGET) --busybox-src $(BUSYBOX_SRC) --out $@
 
 # --- boot -----------------------------------------------------------------

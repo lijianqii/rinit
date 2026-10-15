@@ -15,12 +15,10 @@
 //! [`service_argv_from_env`] directly.
 
 use std::ffi::OsString;
+use std::path::PathBuf;
 
 /// Environment variable that overrides the hardcoded test service.
 pub const ENV_TEST_SERVICE: &str = "RINIT_TEST_SERVICE";
-
-/// Default hardcoded test service (plan §3 M0).
-pub const DEFAULT_TEST_SERVICE: &str = "/sbin/rinit-testservice";
 
 /// Parsed startup configuration.
 #[derive(Debug, Clone)]
@@ -31,8 +29,16 @@ pub struct Config {
     pub show_help: bool,
     /// Skip the first-wave mounts and never reboot (host/dev smoke testing).
     pub skip_mounts: bool,
-    /// The hardcoded service as an argv vector (M0; no config parsing yet).
+    /// The hardcoded service as an argv vector.
+    ///
+    /// M1 replaced the single hardcoded service with the unit directory; this
+    /// stays as an explicit override that bypasses unit loading entirely, for
+    /// bring-up and the `--dev` smoke test.
     pub service_argv: Vec<String>,
+    /// Where to look for unit files (M1).
+    pub unit_dir: PathBuf,
+    /// Which target to boot (M1; plan §7.2 default target).
+    pub default_target: String,
 }
 
 /// Parse arguments (excluding `argv[0]`), honouring [`ENV_TEST_SERVICE`].
@@ -47,15 +53,19 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Config, String
 
 /// Resolve the default service argv from an environment value.
 ///
-/// `None`, or a value that is empty or only whitespace, falls back to
-/// [`DEFAULT_TEST_SERVICE`]. Otherwise the value is whitespace-split, matching
-/// the kernel cmdline form. Splitting here (rather than at spawn time) means
-/// `RINIT_TEST_SERVICE="  "` cannot produce an empty argv.
+/// `None`, or a value that is empty or only whitespace, yields an **empty**
+/// argv - which from M1 onward means "start the unit directory". Injecting
+/// [`DEFAULT_TEST_SERVICE`] here instead would make the unit path unreachable
+/// in practice, since a default is always present.
+///
+/// A whitespace-only value is treated as unset rather than as an empty
+/// command, so `RINIT_TEST_SERVICE="  "` cannot silently disable the unit
+/// directory.
 fn service_argv_from_env(value: Option<String>) -> Vec<String> {
     value
         .filter(|s| !s.trim().is_empty())
         .map(|s| s.split_whitespace().map(String::from).collect())
-        .unwrap_or_else(|| vec![DEFAULT_TEST_SERVICE.to_string()])
+        .unwrap_or_default()
 }
 
 /// Parse arguments against an explicit default service.
@@ -77,6 +87,8 @@ fn parse_with_default<I: IntoIterator<Item = OsString>>(
         show_help: false,
         skip_mounts: false,
         service_argv: default_service_argv,
+        unit_dir: PathBuf::from(rinit_runtime::DEFAULT_UNIT_DIR),
+        default_target: rinit_runtime::DEFAULT_TARGET.to_string(),
     };
 
     let mut iter = args.into_iter();
@@ -86,6 +98,19 @@ fn parse_with_default<I: IntoIterator<Item = OsString>>(
             "-h" | "--help" => cfg.show_help = true,
             "-V" | "--version" => cfg.show_version = true,
             "--dev" => cfg.skip_mounts = true,
+            "--units" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--units requires a directory".to_string())?;
+                cfg.unit_dir = PathBuf::from(value.to_string_lossy().into_owned());
+            }
+            "--default" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--default requires a target unit".to_string())?;
+                cfg.default_target = value.to_string_lossy().into_owned();
+                validate_target(&cfg.default_target)?;
+            }
             "--" => {
                 // Everything after `--` is the service command and its args.
                 cfg.service_argv = iter
@@ -107,6 +132,11 @@ fn parse_with_default<I: IntoIterator<Item = OsString>>(
             other => {
                 if let Some(value) = other.strip_prefix("--test-service=") {
                     cfg.service_argv = value.split_whitespace().map(String::from).collect();
+                } else if let Some(value) = other.strip_prefix("--units=") {
+                    cfg.unit_dir = PathBuf::from(value);
+                } else if let Some(value) = other.strip_prefix("--default=") {
+                    cfg.default_target = value.to_string();
+                    validate_target(&cfg.default_target)?;
                 } else if other.starts_with('-') {
                     return Err(format!("unknown argument: {other}"));
                 } else {
@@ -123,15 +153,24 @@ fn parse_with_default<I: IntoIterator<Item = OsString>>(
         }
     }
 
-    // Every path above can leave an empty argv (`--test-service ""`, a bare
-    // `--`, ...). Reject it here rather than letting `posix_spawn` fail later
-    // with a confusing ENOENT on an empty path.
-    match cfg.service_argv.split_first() {
-        None => return Err("no service command given".to_string()),
-        Some((program, _)) if program.is_empty() => {
-            return Err("service command has an empty program path".to_string());
-        }
-        Some(_) => {}
+    /// Reject a boot target that could never name a unit.
+    ///
+    /// Validating here turns a typo into a usage error, instead of a boot that
+    /// fails minutes later with "target not found".
+    fn validate_target(target: &str) -> Result<(), String> {
+        rinit_core::UnitName::parse(target)
+            .map(|_| ())
+            .map_err(|e| format!("--default: {e}"))
+    }
+
+    // An empty argv is legitimate from M1 onwards: a normal boot starts the
+    // unit directory, not a hardcoded command. It is only a *bad program
+    // path* if one was explicitly given and it is empty, since that would
+    // reach `posix_spawn` as an empty path and fail with a confusing ENOENT.
+    if let Some((program, _)) = cfg.service_argv.split_first()
+        && program.is_empty()
+    {
+        return Err("service command has an empty program path".to_string());
     }
 
     Ok(cfg)
@@ -147,24 +186,24 @@ Options:
   -h, --help                 Show this help and exit
   -V, --version              Show version and exit
       --dev                  Skip mounts and do not reboot (dev/smoke testing)
-      --test-service <CMD>   Hardcoded service to launch (M0); whitespace-split
-      -- <SERVICE> [ARGS]    Hardcoded service as an argv (kernel-cmdline form)
+      --units <DIR>          Unit directory (default: /etc/rinit/units)
+      --default <TARGET>     Boot target (default: multi-user.target)
+      --test-service <CMD>   Launch this instead of the unit directory
+      -- <SERVICE> [ARGS]    Service as an argv (kernel-cmdline form)
 
 Environment:
-  RINIT_TEST_SERVICE         Default for --test-service
+  RINIT_TEST_SERVICE         Service to launch instead of the unit directory
+                            (default: none - boot the unit directory)
 ";
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Parse with the built-in default service, so tests never depend on the
-    /// ambient `RINIT_TEST_SERVICE` of the developer's shell.
+    /// Parse with an empty default service, matching what a real boot does when
+    /// nothing overrides it: start the unit directory.
     fn parse_args(args: &[&str]) -> Result<Config, String> {
-        parse_with_default(
-            args.iter().map(OsString::from),
-            vec![DEFAULT_TEST_SERVICE.to_string()],
-        )
+        parse_with_default(args.iter().map(OsString::from), Vec::new())
     }
 
     fn service(cfg: &Config) -> &[String] {
@@ -179,7 +218,10 @@ mod tests {
         assert!(!cfg.show_help);
         assert!(!cfg.show_version);
         assert!(!cfg.skip_mounts);
-        assert_eq!(service(&cfg), ["/sbin/rinit-testservice"]);
+        assert!(
+            service(&cfg).is_empty(),
+            "no arguments means: start the unit directory"
+        );
     }
 
     #[test]
@@ -283,10 +325,13 @@ mod tests {
         assert_eq!(service(&cfg), ["/bin/sh", "--totally-unknown"]);
     }
 
-    /// Regression: every form can yield an empty argv. Left unchecked, this
-    /// reached `posix_spawn` as an empty path and surfaced as ENOENT.
+    /// M1 changed this contract deliberately: an empty service command is now
+    /// legal, because a normal boot starts the unit directory instead of a
+    /// hardcoded command. What must still be rejected is an explicitly given
+    /// *empty program path*, which would reach `posix_spawn` as "" and surface
+    /// as a confusing ENOENT.
     #[test]
-    fn empty_service_commands_are_rejected() {
+    fn an_absent_service_command_falls_back_to_the_unit_directory() {
         for args in [
             vec!["--test-service", ""],
             vec!["--test-service", "   "],
@@ -294,12 +339,20 @@ mod tests {
             vec!["--test-service=   "],
             vec!["--"],
         ] {
-            let err = parse_args(&args).unwrap_err();
+            let cfg = parse_args(&args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
             assert!(
-                err.contains("service command"),
-                "{args:?} should be rejected, got: {err}"
+                cfg.service_argv.is_empty(),
+                "{args:?} should yield no command"
             );
         }
+    }
+
+    #[test]
+    fn an_empty_program_path_is_still_rejected() {
+        // `--` keeps empty tokens, so this reaches argv even though the
+        // command is otherwise non-empty.
+        let err = parse_args(&["--", "", "/bin/sh"]).unwrap_err();
+        assert!(err.contains("empty program path"), "got: {err}");
     }
 
     /// `--` keeps empty tokens, so an empty program path can reach argv even
@@ -312,10 +365,60 @@ mod tests {
 
     /// A bare empty positional argument is the same hazard via the
     /// positional form.
+    /// A bare empty positional argument is the same hazard via the
+    /// positional form.
     #[test]
     fn empty_positional_program_is_rejected() {
         let err = parse_args(&[""]).unwrap_err();
         assert!(err.contains("empty program path"), "got: {err}");
+    }
+
+    // --- M1: unit directory and boot target ----------------------------
+
+    #[test]
+    fn unit_directory_and_target_default_to_the_plan_values() {
+        let cfg = parse_args(&[]).expect("parse");
+        assert_eq!(cfg.unit_dir, PathBuf::from("/etc/rinit/units"));
+        assert_eq!(cfg.default_target, "multi-user.target");
+    }
+
+    #[test]
+    fn unit_directory_can_be_overridden() {
+        for args in [vec!["--units", "/tmp/units"], vec!["--units=/tmp/units"]] {
+            let cfg = parse_args(&args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
+            assert_eq!(cfg.unit_dir, PathBuf::from("/tmp/units"), "{args:?}");
+        }
+    }
+
+    /// Plan §7.2 names `multi-user.target` as the default target and allows
+    /// `--default` to select another.
+    #[test]
+    fn boot_target_can_be_overridden() {
+        for args in [
+            vec!["--default", "rescue.target"],
+            vec!["--default=rescue.target"],
+        ] {
+            let cfg = parse_args(&args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
+            assert_eq!(cfg.default_target, "rescue.target", "{args:?}");
+        }
+    }
+
+    #[test]
+    fn unit_flags_require_values() {
+        assert!(parse_args(&["--units"]).unwrap_err().contains("--units"));
+        assert!(
+            parse_args(&["--default"])
+                .unwrap_err()
+                .contains("--default")
+        );
+    }
+
+    /// A target is validated here rather than at boot, so a typo is a usage
+    /// error instead of a failed startup.
+    #[test]
+    fn an_invalid_boot_target_is_rejected_at_parse_time() {
+        let err = parse_args(&["--default", "not a unit"]).unwrap_err();
+        assert!(err.contains("not a unit"), "got: {err}");
     }
 
     /// The default comes from the caller, not from the environment, when
@@ -338,19 +441,35 @@ mod tests {
         assert_eq!(argv, ["/bin/sh", "-c", "true"]);
     }
 
-    /// A blank environment variable must fall back to the built-in default
-    /// rather than producing an empty argv that later fails at spawn time.
+    /// A blank environment variable must behave as if it were unset - which
+    /// from M1 means "start the unit directory", not "run an empty command".
     #[test]
-    fn blank_env_value_falls_back_to_the_builtin_default() {
+    fn blank_env_value_behaves_as_unset() {
         for value in ["", "   ", "\t\n"] {
             let argv = service_argv_from_env(Some(value.to_string()));
-            assert_eq!(argv, [DEFAULT_TEST_SERVICE], "value: {value:?}");
+            assert!(argv.is_empty(), "value: {value:?} must yield no command");
         }
     }
 
+    /// With no override and no flag, a normal boot starts the unit directory.
     #[test]
-    fn missing_env_value_falls_back_to_the_builtin_default() {
-        assert_eq!(service_argv_from_env(None), [DEFAULT_TEST_SERVICE]);
+    fn a_missing_env_value_leaves_the_unit_directory_in_charge() {
+        assert!(
+            service_argv_from_env(None).is_empty(),
+            "an absent override must not inject a service"
+        );
+    }
+
+    /// The end-to-end consequence: with no arguments at all, rinit boots the
+    /// unit directory rather than a hardcoded service.
+    #[test]
+    fn no_arguments_means_boot_the_unit_directory() {
+        let cfg =
+            parse_with_default(Vec::<OsString>::new(), service_argv_from_env(None)).expect("parse");
+        assert!(
+            cfg.service_argv.is_empty(),
+            "the unit directory path must be reachable by default"
+        );
     }
 
     /// An explicit flag must beat whatever the environment says.
@@ -378,6 +497,8 @@ mod tests {
             "-V",
             "--version",
             "--dev",
+            "--units",
+            "--default",
             "--test-service",
             ENV_TEST_SERVICE,
         ] {

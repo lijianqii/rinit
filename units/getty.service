@@ -2,12 +2,18 @@
 #
 # `Type=simple` lives in `[Service]` and means "the process is the service":
 # rinit considers it started as soon as it is exec'd, with no READY= protocol.
-# `Restart=always` brings the console back if getty ever dies.
+# `Restart=always` brings the console back if getty ever dies - M2 wires the
+# actual restart; from M1 the directive is parsed and honoured by the contract
+# but nothing acts on it yet.
+#
+# The path is `/sbin/getty`, which is where busybox installs this applet; the
+# plan's example wrote `/bin/getty`, which does not exist in the initramfs.
 [Unit]
 Description=Serial console getty
+Requires=rinit-init.target
 After=rinit-init.target
 
 [Service]
 Type=simple
-ExecStart=/bin/getty -L ttyAMA0 115200 vt100
+ExecStart=/sbin/getty -L ttyAMA0 115200 vt100
 Restart=always

@@ -29,7 +29,10 @@ initrd=""
 timeout_s=60
 log_file=""
 keep_log=0
-service="/sbin/rinit-testservice --ticks 6"
+# No --service by default: from M1 the guest boots the unit directory, and
+# passing a service on the kernel cmdline would override it and skip exactly
+# the behaviour this test exists to check.
+service=""
 
 usage() { sed -n '2,22p' "$0"; }
 
@@ -84,7 +87,7 @@ set +e
 timeout -k 5 "${timeout_s}" \
     "${repo_root}/scripts/run-qemu.sh" \
     --arch "${arch}" --kernel "${kernel}" --initrd "${initrd}" \
-    --service "${service}" </dev/null >"${log_file}" 2>&1
+    ${service:+--service "${service}"} </dev/null >"${log_file}" 2>&1
 qemu_rc=$?
 set -e
 
@@ -111,8 +114,8 @@ expect() {
     fi
 }
 
-# The M0 acceptance list: boots as PID 1, mounts the first wave, forks/execs,
-# and reaps the child on SIGCHLD.
+# The M0/M1 acceptance list: boots as PID 1, mounts the first wave, resolves
+# the unit directory into a dependency-ordered schedule, and starts it.
 expect "kernel executed rinit as init" "Run /sbin/rinit as init process"
 expect "rinit started as PID 1" "starting (pid 1)"
 expect "mounted /run" "rinit: mounted /run"
@@ -120,18 +123,47 @@ expect "mounted /proc" "rinit: mounted /proc"
 expect "mounted /sys" "rinit: mounted /sys"
 expect "mounted /dev" "rinit: mounted /dev"
 expect "mounted /tmp" "rinit: mounted /tmp"
-expect "launched the test service" "rinit: launched test service"
-expect "service ran" "rinit-testservice: main started"
-expect "service exited on its own" "rinit-testservice: exiting after 6 ticks"
-expect "rinit reaped the child" "rinit: reaped child pid"
 
-# Boot must be ordered: mounts before the service launch.
+# M1: a real boot comes from the unit directory, not a hardcoded service.
+expect "resolved a boot plan" "boot plan for 'multi-user.target'"
+expect "the init anchor is scheduled" "plan 0: rinit-init.target"
+expect "getty is scheduled" "getty.service"
+
+# Boot must be ordered: mounts before any unit is started.
 if [[ "$(grep -n 'rinit: mounted /tmp' "${log_file}" | head -1 | cut -d: -f1)" -lt \
-      "$(grep -n 'launched test service' "${log_file}" | head -1 | cut -d: -f1)" ]]; then
-    pass "mounts complete before the service starts"
+      "$(grep -n 'starting level 0' "${log_file}" | head -1 | cut -d: -f1)" ]]; then
+    pass "mounts complete before any unit starts"
 else
-    fail "mounts must complete before the service starts"
+    fail "mounts must complete before any unit starts"
 fi
+
+# Levels must be entered in dependency order: nothing may start before every
+# earlier level has been reached.
+first_line() { grep -n -m1 -F "$1" "${log_file}" | cut -d: -f1; }
+l0="$(first_line 'starting level 0')"
+l1="$(first_line 'starting level 1')"
+if [[ -n "${l0}" && -n "${l1}" && "${l0}" -lt "${l1}" ]]; then
+    pass "startup levels run in dependency order"
+else
+    fail "startup levels must run in dependency order (level0=${l0} level1=${l1})"
+fi
+
+# getty is Type=simple, so it is ready at exec and must be running afterwards.
+if grep -qF "started getty.service as pid" "${log_file}"; then
+    pass "getty started as a process"
+else
+    fail "getty.service should have been started"
+fi
+
+# Plan §7.2: a target is an aggregation point with no process, so it must
+# never appear in the "started ... as pid" stream.
+if grep -qE "started (rinit-init|multi-user)\.target as pid" "${log_file}"; then
+    fail "a target must never be exec'd (plan §7.2)"
+else
+    pass "no target was exec'd"
+fi
+
+expect "boot completed" "boot complete"
 
 # The panic hook must not have fired, and the kernel must not have died.
 if grep -qF "rinit: PANIC" "${log_file}"; then

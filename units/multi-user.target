@@ -1,8 +1,20 @@
 # Default boot target (plan §7.2): the aggregation point everything else can
 # order itself after.
 #
-# `After=` is ordering only - it implies no liveness requirement, so a missing
-# `rinit-init.target` degrades rather than failing the boot (plan §1.1).
+# `Type=target` => no process is spawned for this unit; it becomes active as
+# soon as its `Requires=` units are, and that in turn releases whatever waits
+# on it. That is what decouples services from each other's internals.
+#
+# `Requires=` is a *strong* dependency: getty failing means this target fails
+# too (plan §7.2). Unlike `After=`, which is ordering only, a missing or
+# broken dependency here is visible rather than silently tolerated.
+#
+# Requires= accumulates across lines; splitting a long list keeps unit files
+# readable.
 [Unit]
 Description=Multi-user system
+Type=target
 After=rinit-init.target
+
+Requires=rinit-init.target
+Requires=getty.service

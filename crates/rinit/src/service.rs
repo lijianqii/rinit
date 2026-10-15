@@ -54,6 +54,11 @@ impl ServiceSet {
     pub fn forget(&mut self, pid: libc::pid_t) {
         self.pids.retain(|&p| p != pid);
     }
+
+    /// Whether `pid` is still being supervised.
+    pub fn contains(&self, pid: libc::pid_t) -> bool {
+        self.pids.contains(&pid)
+    }
 }
 
 /// Launch `argv` with [`SERVICE_ENV`].
