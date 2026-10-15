@@ -133,8 +133,9 @@ impl SizeBytes {
         if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
             return None;
         }
-        // Reject a leading zero run that could only come from a typo; "0" on
-        // its own is legal and means "no limit".
+        // `SizeBytes` itself places no lower bound; the parser rejects a zero
+        // limit for the cgroup directives (plan §1.1: only the timeout/restart
+        // keys may be 0).
         digits
             .parse::<u64>()
             .ok()?
@@ -301,7 +302,7 @@ pub struct UnitConfig {
     pub environment: Vec<(String, String)>,
     /// File to read further environment from.
     pub environment_file: String,
-    /// Working directory.
+    /// Working directory; `/` unless overridden (plan §1.1).
     pub working_directory: String,
     /// Health probe command; empty means no health checking.
     pub health_check: ExecCommand,
@@ -351,7 +352,7 @@ impl UnitConfig {
             ambient_capabilities: None,
             environment: Vec::new(),
             environment_file: String::new(),
-            working_directory: String::new(),
+            working_directory: String::from("/"),
             health_check: ExecCommand::empty(),
             health_interval_sec: 30,
             health_timeout_sec: 10,
@@ -396,6 +397,10 @@ mod tests {
         assert_eq!(cfg.timeout_stop_sec, 10);
         assert_eq!(cfg.health_interval_sec, 30);
         assert_eq!(cfg.health_timeout_sec, 10);
+        assert_eq!(
+            cfg.working_directory, "/",
+            "plan §1.1: the default working directory is /"
+        );
         assert!(!cfg.no_new_privileges);
         assert!(!cfg.health_restart_on_failure);
         assert_eq!(cfg.capability_bounding_set, None);

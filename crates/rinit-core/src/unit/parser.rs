@@ -179,12 +179,17 @@ impl Section {
     }
 }
 
-/// Which numeric values the contract permits.
+/// Whether a numeric directive may take the value 0.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NumberRule {
-    /// Zero is meaningful: "no timeout", "restart immediately", "disable the
-    /// breaker". Plan §1.1 spells these out per key.
-    ZeroOk,
+enum Zero {
+    /// Zero is meaningful for this key, and plan §1.1 spells out what it means:
+    /// "restart immediately" (`RestartSec`), "no timeout" (`TimeoutStartSec`),
+    /// "SIGKILL at once" (`TimeoutStopSec`), "disable the breaker"
+    /// (`StartLimitIntervalSec`).
+    Allowed,
+    /// Zero is meaningless here. Plan §1.1: "其余数值配置项不接受 0(报
+    /// `InvalidValue`)".
+    Rejected,
 }
 
 struct Parser {
@@ -347,19 +352,31 @@ impl Parser {
                 })?;
             }
             (Section::Service, "ExecStart") => {
-                self.cfg.exec_start = command(line, key, &tokens)?;
+                // An empty value leaves the command unset; `finish` then reports
+                // `MissingExecStart`, which names the unit (plan §1.1). Rejecting
+                // it here as `InvalidValue` would contradict the contract.
+                self.cfg.exec_start = command(&tokens);
             }
             (Section::Service, "ExecStop") => {
-                self.cfg.exec_stop = command(line, key, &tokens)?;
+                // `ExecStop=` (String, default empty) is legal and means "send
+                // SIGTERM" (plan §1.1).
+                self.cfg.exec_stop = command(&tokens);
             }
             (Section::Service, "ExecStartPre") => {
-                self.cfg.exec_start_pre.push(command(line, key, &tokens)?);
+                let cmd = command(&tokens);
+                if !cmd.is_empty() {
+                    self.cfg.exec_start_pre.push(cmd);
+                }
             }
             (Section::Service, "ExecStartPost") => {
-                self.cfg.exec_start_post.push(command(line, key, &tokens)?);
+                let cmd = command(&tokens);
+                if !cmd.is_empty() {
+                    self.cfg.exec_start_post.push(cmd);
+                }
             }
             (Section::Service, "HealthCheck") => {
-                self.cfg.health_check = command(line, key, &tokens)?;
+                // `HealthCheck=` empty means "no health checking" (plan §1.1).
+                self.cfg.health_check = command(&tokens);
             }
             (Section::Service, "Restart") => {
                 let declared = joined();
@@ -373,25 +390,25 @@ impl Parser {
                 })?;
             }
             (Section::Service, "RestartSec") => {
-                self.cfg.restart_sec = number(line, key, &tokens)?;
+                self.cfg.restart_sec = number(line, key, &tokens, Zero::Allowed)?;
             }
             (Section::Service, "StartLimitBurst") => {
-                self.cfg.start_limit_burst = number(line, key, &tokens)?;
+                self.cfg.start_limit_burst = number(line, key, &tokens, Zero::Rejected)?;
             }
             (Section::Service, "StartLimitIntervalSec") => {
-                self.cfg.start_limit_interval_sec = number(line, key, &tokens)?;
+                self.cfg.start_limit_interval_sec = number(line, key, &tokens, Zero::Allowed)?;
             }
             (Section::Service, "TimeoutStartSec") => {
-                self.cfg.timeout_start_sec = number(line, key, &tokens)?;
+                self.cfg.timeout_start_sec = number(line, key, &tokens, Zero::Allowed)?;
             }
             (Section::Service, "TimeoutStopSec") => {
-                self.cfg.timeout_stop_sec = number(line, key, &tokens)?;
+                self.cfg.timeout_stop_sec = number(line, key, &tokens, Zero::Allowed)?;
             }
             (Section::Service, "HealthIntervalSec") => {
-                self.cfg.health_interval_sec = number(line, key, &tokens)?;
+                self.cfg.health_interval_sec = number(line, key, &tokens, Zero::Rejected)?;
             }
             (Section::Service, "HealthTimeoutSec") => {
-                self.cfg.health_timeout_sec = number(line, key, &tokens)?;
+                self.cfg.health_timeout_sec = number(line, key, &tokens, Zero::Rejected)?;
             }
             (Section::Service, "User") => self.cfg.user = joined(),
             (Section::Service, "Group") => self.cfg.group = joined(),
@@ -414,11 +431,16 @@ impl Parser {
                 self.cfg.environment.extend(extra);
             }
             (Section::Service, "EnvironmentFile") => {
-                let path = joined();
-                require_absolute(line, key, &path)?;
-                self.cfg.environment_file = path;
+                // Like `WorkingDirectory`, an empty value is "unset", not a
+                // relative path; only a non-empty value must be absolute.
+                if !tokens.is_empty() {
+                    let path = joined();
+                    require_absolute(line, key, &path)?;
+                    self.cfg.environment_file = path;
+                }
             }
             (Section::Service, "WorkingDirectory") => {
+                // An empty value keeps the `/` default (plan §1.1).
                 if !tokens.is_empty() {
                     let path = joined();
                     require_absolute(line, key, &path)?;
@@ -440,11 +462,7 @@ impl Parser {
                 })?);
             }
             (Section::Service, "CgroupTasksMax") => {
-                let text = joined();
-                self.cfg.cgroup_tasks_max =
-                    Some(text.parse::<u64>().map_err(|_| {
-                        invalid(line, key, &text, "expected a non-negative integer")
-                    })?);
+                self.cfg.cgroup_tasks_max = Some(number(line, key, &tokens, Zero::Rejected)?);
             }
 
             (_, other) => {
@@ -668,18 +686,36 @@ fn invalid(line: usize, key: &str, value: &str, reason: &str) -> ParseError {
     }
 }
 
-fn command(line: usize, key: &str, tokens: &[String]) -> Result<ExecCommand, ParseError> {
-    if tokens.is_empty() {
-        return Err(invalid(line, key, "", "a command may not be empty"));
+/// Build a command from its tokenised value.
+///
+/// An empty value (or one that tokenises to nothing, e.g. `""`) yields an
+/// *unset* command. Each caller interprets that per the contract (plan §1.1):
+/// `ExecStart` becomes `MissingExecStart` in `finish`, `ExecStop`/
+/// `HealthCheck` mean "empty", and `ExecStartPre`/`ExecStartPost` contribute no
+/// entry.
+fn command(tokens: &[String]) -> ExecCommand {
+    if tokens.iter().all(String::is_empty) {
+        ExecCommand::empty()
+    } else {
+        ExecCommand::new(tokens.to_vec())
     }
-    Ok(ExecCommand::new(tokens.to_vec()))
 }
 
-fn number(line: usize, key: &str, tokens: &[String]) -> Result<u64, ParseError> {
-    let _rule = NumberRule::ZeroOk;
+/// Parse a numeric directive, enforcing the contract's zero policy (plan §1.1).
+fn number(line: usize, key: &str, tokens: &[String], zero: Zero) -> Result<u64, ParseError> {
     let text = join_tokens(tokens);
-    text.parse::<u64>()
-        .map_err(|_| invalid(line, key, &text, "expected a non-negative integer"))
+    let value: u64 = text
+        .parse()
+        .map_err(|_| invalid(line, key, &text, "expected a non-negative integer"))?;
+    if zero == Zero::Rejected && value == 0 {
+        return Err(invalid(
+            line,
+            key,
+            &text,
+            "0 is not allowed for this directive",
+        ));
+    }
+    Ok(value)
 }
 
 fn boolean(line: usize, key: &str, tokens: &[String]) -> Result<bool, ParseError> {
@@ -720,14 +756,18 @@ fn environment(
 }
 
 fn size(line: usize, key: &str, text: &str) -> Result<SizeBytes, ParseError> {
-    SizeBytes::parse(text).ok_or_else(|| {
-        invalid(
+    // Plan §1.1: only `RestartSec`/`StartLimitIntervalSec`/`Timeout*Sec` accept
+    // 0; a zero byte limit is meaningless (`None` already means unlimited).
+    match SizeBytes::parse(text) {
+        Some(value) if value.0 == 0 => Err(invalid(line, key, text, "0 is not a valid limit")),
+        Some(value) => Ok(value),
+        None => Err(invalid(
             line,
             key,
             text,
             "expected a byte count with an optional K/M/G suffix",
-        )
-    })
+        )),
+    }
 }
 
 /// Plan §1.1: these two directives only accept absolute paths.
@@ -938,12 +978,52 @@ mod tests {
         );
     }
 
+    /// Plan §1.1: an empty `ExecStart` is `MissingExecStart`, not a generic
+    /// `InvalidValue` - the dedicated error is what makes a unit missing its
+    /// command stand out in a boot log.
     #[test]
-    fn an_empty_command_is_rejected() {
-        assert!(matches!(
+    fn an_empty_exec_start_is_a_missing_command() {
+        assert_eq!(
             err("app.service", "[Service]\nExecStart=\n"),
-            ParseError::InvalidValue { line: 2, .. }
-        ));
+            ParseError::MissingExecStart {
+                unit: "app.service".to_string()
+            }
+        );
+    }
+
+    /// `ExecStop=` / `HealthCheck=` are `String`-typed with an empty default, so
+    /// an explicit empty value is legal (plan §1.1).
+    #[test]
+    fn an_empty_exec_stop_and_health_check_are_legal() {
+        let cfg = ok(
+            "app.service",
+            "[Service]\nExecStart=/bin/true\nExecStop=\nHealthCheck=\n",
+        );
+        assert!(cfg.exec_stop.is_empty(), "ExecStop= means SIGTERM");
+        assert!(cfg.health_check.is_empty(), "HealthCheck= means no probing");
+    }
+
+    /// `ExecStartPre=`/`ExecStartPost=` are `Vec`s, so an empty value is an
+    /// empty list, not an error (plan §1.1).
+    #[test]
+    fn an_empty_start_pre_or_post_contributes_no_entry() {
+        let cfg = ok(
+            "app.service",
+            "[Service]\nExecStartPre=\nExecStartPost=\nExecStart=/bin/true\n",
+        );
+        assert!(cfg.exec_start_pre.is_empty(), "{:?}", cfg.exec_start_pre);
+        assert!(cfg.exec_start_post.is_empty(), "{:?}", cfg.exec_start_post);
+    }
+
+    /// An explicitly empty quoted command is the same "unset" as a bare one.
+    #[test]
+    fn an_empty_quoted_command_is_unset() {
+        assert_eq!(
+            err("app.service", "[Service]\nExecStart=\"\"\n"),
+            ParseError::MissingExecStart {
+                unit: "app.service".to_string()
+            }
+        );
     }
 
     // --- continuations --------------------------------------------------
@@ -1250,6 +1330,42 @@ mod tests {
         ));
     }
 
+    /// Plan §1.1: every numeric directive *other* than the four above rejects
+    /// 0 with `InvalidValue`.
+    #[test]
+    fn zero_is_rejected_where_the_contract_gives_it_no_meaning() {
+        let cases = [
+            "StartLimitBurst=0",
+            "HealthIntervalSec=0",
+            "HealthTimeoutSec=0",
+            "CgroupTasksMax=0",
+            "CgroupMemoryMax=0",
+            "CgroupMemoryHigh=0",
+        ];
+        for line in cases {
+            let text = format!("[Service]\nExecStart=/bin/true\n{line}\n");
+            assert!(
+                matches!(
+                    err("app.service", &text),
+                    ParseError::InvalidValue { line: 3, .. }
+                ),
+                "{line} must reject 0"
+            );
+        }
+    }
+
+    /// A zero byte limit is meaningless: `None` is already "unlimited".
+    #[test]
+    fn a_zero_size_limit_is_rejected_with_a_specific_reason() {
+        let ParseError::InvalidValue { reason, .. } = err(
+            "app.service",
+            "[Service]\nExecStart=/bin/true\nCgroupMemoryMax=0\n",
+        ) else {
+            panic!("expected InvalidValue");
+        };
+        assert!(reason.contains('0'), "got: {reason}");
+    }
+
     #[test]
     fn a_non_numeric_value_is_rejected() {
         assert!(matches!(
@@ -1347,6 +1463,28 @@ mod tests {
         );
         assert_eq!(cfg.working_directory, "/var/lib/app");
         assert_eq!(cfg.environment_file, "/etc/default/app");
+    }
+
+    /// An *empty* path directive is "unset", not a relative path: only a
+    /// non-empty value must be absolute (plan §1.1).
+    #[test]
+    fn an_empty_path_directive_is_unset_not_relative() {
+        let cfg = ok(
+            "app.service",
+            "[Service]\nExecStart=/bin/true\nWorkingDirectory=\nEnvironmentFile=\n",
+        );
+        assert_eq!(
+            cfg.working_directory, "/",
+            "an empty WorkingDirectory keeps the / default"
+        );
+        assert_eq!(cfg.environment_file, "");
+    }
+
+    /// Plan §1.1: the default working directory is `/`.
+    #[test]
+    fn working_directory_defaults_to_root() {
+        let cfg = ok("app.service", "[Service]\nExecStart=/bin/true\n");
+        assert_eq!(cfg.working_directory, "/");
     }
 
     #[test]
