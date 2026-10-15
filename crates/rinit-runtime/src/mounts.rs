@@ -119,6 +119,75 @@ pub fn first_wave_mounts() -> Result<MountReport, RuntimeError> {
     first_wave_mounts_with(&mut RealMounts)
 }
 
+/// Outcome of the shutdown unmount pass.
+#[derive(Debug, Default)]
+pub struct UnmountReport {
+    /// Mount points unmounted successfully, in the order performed.
+    pub unmounted: Vec<String>,
+    /// Mount points that could not be detached, as warnings.
+    pub warnings: Vec<String>,
+}
+
+/// The mount points to unmount at shutdown, most recently mounted first.
+///
+/// Plan §1.3(8): unmount everything but the root before the final `reboot(2)`.
+/// The root is skipped - rinit is running from it, and the kernel handles it -
+/// and the order is reversed so a mount is never unmounted while something
+/// mounted on top of it is still there.
+///
+/// Pure so the `/proc/mounts` parsing (including the octal escapes for spaces)
+/// is testable without privileges.
+pub fn unmount_order(proc_mounts: &str) -> Vec<String> {
+    let mut points: Vec<String> = proc_mounts
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(1))
+        .map(unescape_mount_field)
+        .filter(|point| point != "/")
+        .collect();
+    points.reverse();
+    points
+}
+
+/// Decode the octal escapes `/proc/mounts` uses for space, tab, newline and
+/// backslash in a path.
+fn unescape_mount_field(field: &str) -> String {
+    field
+        .replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\")
+}
+
+/// Unmount everything but the root, best effort (plan §1.3(8)).
+///
+/// A mount that refuses a plain `umount2` is retried lazily (`MNT_DETACH`), and
+/// one that still will not go is reported and left alone: the shutdown must
+/// reach `reboot(2)` regardless.
+pub fn unmount_filesystems() -> UnmountReport {
+    let mut report = UnmountReport::default();
+    let Ok(contents) = std::fs::read_to_string("/proc/mounts") else {
+        // No /proc: nothing we can enumerate, so there is nothing to do.
+        return report;
+    };
+
+    for point in unmount_order(&contents) {
+        match mount::umount2(Path::new(&point), 0) {
+            Ok(()) => report.unmounted.push(point),
+            Err(first) => {
+                // Busy, or already gone. Try lazily, then give up on it.
+                if mount::umount2(Path::new(&point), libc::MNT_DETACH).is_ok() {
+                    report.unmounted.push(point);
+                } else if !matches!(first.errno(), libc::EINVAL | libc::ENOENT) {
+                    report
+                        .warnings
+                        .push(format!("umount {point} failed: {first}"));
+                }
+            }
+        }
+    }
+    report
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,5 +367,44 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&target);
+    }
+
+    // --- shutdown unmount (plan §1.3(8)) --------------------------------
+
+    /// `unmount_order` reads the mount point column, skips the root and
+    /// reverses, so a mount is never removed from under another.
+    #[test]
+    fn unmount_order_skips_root_and_reverses() {
+        let proc_mounts = "\
+/dev/sda1 / ext4 rw,relatime 0 0
+proc /proc proc rw,nosuid 0 0
+tmpfs /run tmpfs rw 0 0
+/dev/sdb1 /data ext4 rw 0 0
+";
+        assert_eq!(
+            unmount_order(proc_mounts),
+            ["/data", "/run", "/proc"],
+            "the root is kept and the rest are unmounted newest-first"
+        );
+    }
+
+    /// `/proc/mounts` escapes spaces in paths; a mount point with one must be
+    /// unmounted by its real name.
+    #[test]
+    fn unmount_order_decodes_octal_escapes() {
+        let proc_mounts = "/dev/sda1 / ext4 rw 0 0\ntmpfs /mnt/with\\040space tmpfs rw 0 0\n";
+        assert_eq!(unmount_order(proc_mounts), ["/mnt/with space"]);
+    }
+
+    /// An unmountable path reports the syscall error instead of panicking.
+    #[test]
+    fn umount_of_an_unmounted_path_reports_einval() {
+        let err = mount::umount2(Path::new("/definitely/not/mounted"), 0)
+            .expect_err("unmounting a non-mount must fail");
+        assert!(
+            [libc::EINVAL, libc::ENOENT].contains(&err.errno()),
+            "unexpected errno in {}: {err}",
+            err.errno()
+        );
     }
 }

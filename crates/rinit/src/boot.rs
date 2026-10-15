@@ -196,7 +196,7 @@ async fn supervise(signals: &mut SignalSet, manager: &mut UnitManager, notify: &
     for line in manager.summary() {
         rlog!("shutdown: {line}");
     }
-    for unit in manager.started_units() {
+    for unit in manager.shutdown_order() {
         let effect = manager.request_stop(&unit, RequestSource::ShutdownStop);
         if let Err(e) = apply_effect(manager, notify, &unit, effect).await {
             rlog!("warning: stopping {unit} failed: {e}");
@@ -547,6 +547,9 @@ async fn start_units(cfg: &Config, notify: &mut NotifyHub) -> Result<UnitManager
     for cfg in &plan.configs {
         units.add(cfg.clone());
     }
+    // Shutdown walks the startup order backwards (plan §1.3(8)), so record it
+    // while the schedule is still at hand.
+    units.set_shutdown_order(plan.levels.iter().flatten().cloned().collect());
 
     let mut started_units = 0usize;
     for (index, level) in plan.levels.iter().enumerate() {
@@ -670,9 +673,25 @@ pub fn is_pid1() -> bool {
 /// watchdog (plan §5 risk 1).
 pub fn reboot_now() -> ! {
     rlog!("rebooting");
+    // Filesystems first, then one final `sync`, so data on anything but the
+    // root is flushed before the reset (plan §1.3(8)). Best effort: the
+    // shutdown must reach `reboot(2)` even if a mount refuses to go.
+    let report = rinit_runtime::unmount_filesystems();
+    for point in &report.unmounted {
+        rlog!("unmounted {point}");
+    }
+    for warning in &report.warnings {
+        rlog!("warning: {warning}");
+    }
     reboot::sync();
     if let Err(e) = reboot::reboot(reboot::RB_AUTOBOOT) {
-        rlog!("reboot failed: {e}; halting");
+        // `reboot(2)` failed. The kernel's SysRq trigger is the last resort, so
+        // PID 1 never ends up in the "cannot shut down" state plan §1.3(8)
+        // forbids.
+        rlog!("reboot failed: {e}; trying sysrq");
+        if let Err(e) = reboot::sysrq_reboot() {
+            rlog!("sysrq reset failed: {e}; halting");
+        }
     }
     loop {
         signal::pause();

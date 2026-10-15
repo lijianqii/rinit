@@ -95,6 +95,22 @@ pub fn mount_devtmpfs(target: &Path) -> Result<(), SyscallError> {
     )
 }
 
+/// `umount2(2)` on a path.
+///
+/// `flags` is `0` for a plain unmount, or `MNT_DETACH` (lazy) for a busy mount
+/// that must still be released. See `mounts::unmount_filesystems` (plan
+/// §1.3(8)).
+pub fn umount2(target: &Path, flags: libc::c_int) -> Result<(), SyscallError> {
+    let tgt = cpath("umount2", target)?;
+    // SAFETY: `tgt` is a valid NUL-terminated path; `flags` is a scalar.
+    let rc = unsafe { libc::umount2(tgt.as_ptr(), flags) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(SyscallError::last_os_error("umount2"))
+    }
+}
+
 /// Mount the cgroup v2 unified hierarchy at `target`.
 ///
 /// Reserved for M5, where it joins the first-wave sequence. Public API of the

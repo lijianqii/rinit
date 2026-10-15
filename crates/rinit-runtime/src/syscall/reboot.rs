@@ -1,4 +1,6 @@
-//! `reboot(2)` / `sync(2)` (plan §1.3(8)).
+//! `reboot(2)` / `sync(2)` and the last-resort reset (plan §1.3(8)).
+
+use std::io::Write;
 
 use crate::error::SyscallError;
 
@@ -25,4 +27,27 @@ pub fn reboot(cmd: libc::c_int) -> Result<(), SyscallError> {
 pub fn sync() {
     // SAFETY: `sync` takes no arguments and never fails.
     unsafe { libc::sync() }
+}
+
+/// Last-resort reset through the kernel's SysRq trigger (plan §1.3(8)).
+///
+/// Used only when `reboot(2)` itself failed. Writing `b` to
+/// `/proc/sysrq-trigger` makes the kernel reboot immediately, without
+/// unmounting or syncing again - which is exactly what is wanted at that point:
+/// the graceful path already ran and failed.
+///
+/// # Errors
+/// [`SyscallError`] with `ENOENT`/`EACCES` when the trigger is unavailable
+/// (no `/proc`, `kernel.sysrq` disabled, or not root).
+pub fn sysrq_reboot() -> Result<(), SyscallError> {
+    let mut trigger = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/proc/sysrq-trigger")
+        .map_err(|e| SyscallError::from_io("open(/proc/sysrq-trigger)", &e))?;
+    trigger
+        .write_all(b"b")
+        .map_err(|e| SyscallError::from_io("write(/proc/sysrq-trigger)", &e))?;
+    trigger
+        .flush()
+        .map_err(|e| SyscallError::from_io("flush(/proc/sysrq-trigger)", &e))
 }

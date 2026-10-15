@@ -235,6 +235,8 @@ pub struct UnitManager {
     /// is where the unit actually is. Keeping them apart is what lets two
     /// sources race without producing two decisions (plan §1.3(13)).
     jobs: JobQueue,
+    /// Startup order (levels flattened), reversed for shutdown (plan §1.3(8)).
+    shutdown_order: Vec<UnitName>,
     /// Monotonic origin for the Job queue's timestamps.
     origin: Instant,
 }
@@ -245,6 +247,7 @@ impl UnitManager {
         UnitManager {
             units: BTreeMap::new(),
             jobs: JobQueue::new(),
+            shutdown_order: Vec::new(),
             origin: Instant::now(),
         }
     }
@@ -325,6 +328,70 @@ impl UnitManager {
             .filter(|(_, target)| target.target == JobTarget::Started)
             .map(|(name, _)| name)
             .collect()
+    }
+
+    /// Record the *startup* order, for shutdown to walk backwards.
+    ///
+    /// Boot passes the schedule as it started it (levels flattened); the
+    /// manager owns the reversal so the "reverse topological" rule of
+    /// plan §1.3(8) lives in one place.
+    pub fn set_shutdown_order(&mut self, order: Vec<UnitName>) {
+        self.shutdown_order = order;
+    }
+
+    /// Units to stop at shutdown: dependents before the units they depend on.
+    ///
+    /// Plan §1.3(8) stops in reverse topological order, so a service is taken
+    /// down before whatever it was started for. The startup order recorded at
+    /// boot is walked backwards and filtered to what the queue still wants
+    /// running; anything started but missing from it is appended, so no unit
+    /// can be left behind.
+    pub fn shutdown_order(&self) -> Vec<UnitName> {
+        let started = self.started_units();
+        let mut out: Vec<UnitName> = Vec::new();
+        for unit in self.shutdown_order.iter().rev() {
+            if started.contains(unit) && !out.contains(unit) {
+                out.push(unit.clone());
+            }
+        }
+        for unit in started {
+            if !out.contains(&unit) {
+                out.push(unit);
+            }
+        }
+        self.apply_conflict_order(&mut out);
+        out
+    }
+
+    /// Adjust a shutdown sequence so `Conflicts=` pairs tear down in order.
+    ///
+    /// Plan §1.3(8): shutdown stops the *superseded* unit before the one that
+    /// supersedes it, mirroring how starting the pair resolved it. A
+    /// contradictory pair (each conflicting with the other) cannot be ordered,
+    /// so the pass is bounded and simply leaves the last arrangement.
+    fn apply_conflict_order(&self, order: &mut Vec<UnitName>) {
+        for _ in 0..order.len() {
+            let mut changed = false;
+            for index in 0..order.len() {
+                let conflicts = match self.units.get(&order[index]) {
+                    Some(rt) => rt.config.deps.conflicts.clone(),
+                    None => continue,
+                };
+                for other in conflicts {
+                    if let Some(other_index) = order.iter().position(|u| u == &other)
+                        && other_index > index
+                    {
+                        let superseded = order.remove(other_index);
+                        order.insert(index, superseded);
+                        changed = true;
+                        break;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
     }
 
     /// Forget the breaker's failures so the next start is judged fresh.
@@ -1825,6 +1892,45 @@ mod tests {
     }
 
     // --- two-stage stop (plan §1.1) -------------------------------------
+
+    /// Plan §1.3(8): shutdown is the startup order reversed, so a dependent is
+    /// stopped before what it depends on.
+    #[test]
+    fn shutdown_order_reverses_the_startup_order() {
+        let mut m = UnitManager::new();
+        m.add(config("base.service", RestartPolicy::No));
+        m.add(config("app.service", RestartPolicy::No));
+        let base = UnitName::parse("base.service").unwrap();
+        let app = UnitName::parse("app.service").unwrap();
+        m.set_shutdown_order(vec![base.clone(), app.clone()]);
+        m.request_start(&app, RequestSource::Dependency);
+        m.request_start(&base, RequestSource::Dependency);
+
+        assert_eq!(m.shutdown_order(), vec![app, base]);
+    }
+
+    /// A `Conflicts=` pair is torn down with the superseded unit first.
+    #[test]
+    fn shutdown_order_stops_the_superseded_side_of_a_conflict_first() {
+        let mut m = UnitManager::new();
+        m.add(config("alpha.service", RestartPolicy::No));
+        let mut beta = config("beta.service", RestartPolicy::No);
+        beta.deps.conflicts = vec![UnitName::parse("alpha.service").unwrap()];
+        m.add(beta);
+
+        let alpha = UnitName::parse("alpha.service").unwrap();
+        let beta = UnitName::parse("beta.service").unwrap();
+        // Startup order has alpha first, so the reverse would stop beta first.
+        m.set_shutdown_order(vec![alpha.clone(), beta.clone()]);
+        m.request_start(&alpha, RequestSource::Dependency);
+        m.request_start(&beta, RequestSource::Dependency);
+
+        assert_eq!(
+            m.shutdown_order(),
+            vec![alpha, beta],
+            "beta supersedes alpha, so alpha stops first"
+        );
+    }
 
     /// Plan §1.1: starting a unit stops whatever it conflicts with.
     #[test]

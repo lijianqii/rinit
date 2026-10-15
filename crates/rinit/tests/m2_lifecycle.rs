@@ -248,6 +248,37 @@ fn a_unit_that_cannot_start_fails_its_required_dependents() {
     );
 }
 
+/// Plan §1.3(8): shutdown stops dependents before their dependencies.
+#[test]
+fn shutdown_stops_dependents_before_their_dependencies() {
+    let dir = TempDir::new("shutdown-order");
+    dir.write(
+        "all.target",
+        "[Unit]\nType=target\nRequires=base.service app.service\n",
+    );
+    dir.write(
+        "base.service",
+        "[Service]\nType=simple\nExecStart=/bin/sleep 30\n",
+    );
+    dir.write(
+        "app.service",
+        "[Unit]\nRequires=base.service\n[Service]\nType=simple\nExecStart=/bin/sleep 30\n",
+    );
+
+    let log = boot_units(&dir, "all.target", Duration::from_millis(700));
+
+    let app = log
+        .find("stopping app.service")
+        .expect("app must be stopped");
+    let base = log
+        .find("stopping base.service")
+        .expect("base must be stopped");
+    assert!(
+        app < base,
+        "the dependent must stop before its dependency:\n{log}"
+    );
+}
+
 /// Plan §1.1: starting a unit stops whatever it declares `Conflicts=`, before
 /// it starts.
 #[test]

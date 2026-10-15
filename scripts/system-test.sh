@@ -8,11 +8,15 @@
 # What it does:
 #   1. boots the guest from its unit directory (units/multi-user.target), which
 #      starts getty.service and gives an interactive root login;
-#   2. types at that login to prove a passwordless root shell is reachable;
+#   2. types at that login to prove a passwordless root shell is reachable,
+#      following the console prompts rather than guessing at delays;
 #   3. kills that console service and checks rinit restarts it (M2);
 #   4. captures the serial console to a log file;
 #   5. asserts the M0-M2 acceptance list on that log;
 #   6. reports kernel panics / oopses as failures.
+#
+# `--keep-log` keeps the log even when every assertion passes (it is always
+# kept on failure).
 #
 # Exit codes:
 #   0  all assertions passed
@@ -92,30 +96,51 @@ echo "   booting (timeout ${timeout_s}s, the guest is killed once assertions are
 # is comfortable on the aarch64 virt machine and short enough not to dominate
 # the run. If a future image boots much slower this becomes a flake, so the
 # final `exit` is what guarantees the guest releases the pipe.
-fifo="$(mktemp -u)"
+fifo_dir="$(mktemp -d "${TMPDIR:-/tmp}/rinit-system-test.XXXXXX")"
+fifo="${fifo_dir}/console"
 mkfifo "${fifo}"
-trap 'rm -f "${fifo}"' EXIT
+trap 'rm -rf "${fifo_dir}"' EXIT
 
-# Hold the write end open for the life of qemu, then type once the shell is up.
+# Wait until the console log matches a pattern, or give up after `timeout_s`.
+#
+# Driving the guest off fixed sleeps is what made the login assertion flaky: a
+# boot that finished early still worked, but one that took a moment longer had
+# the username typed before getty was listening, and the input was lost. Asking
+# the log instead makes the feeder follow the guest rather than race it.
+await_log() {
+    local timeout_s="$1" pattern="$2"
+    local deadline=$((SECONDS + timeout_s))
+    while ((SECONDS < deadline)); do
+        if grep -qE -- "${pattern}" "${log_file}"; then
+            return 0
+        fi
+        sleep 0.2
+    done
+    return 1
+}
+
+# Hold the write end open for the life of qemu, then type as the guest prompts.
 (
     exec 3>"${fifo}"
-    sleep 14
+
     # getty shows `login:`, so answer with the username. The password field in
     # /etc/passwd is empty, so an empty line must be accepted - that is the
     # property under test, and `id` afterwards proves it.
+    await_log 40 'login:' || true
     printf 'root\n' >&3
-    sleep 2
+    sleep 1
     printf '\n' >&3
-    sleep 3
+    sleep 1
     printf 'id\n' >&3
-    sleep 2
+    await_log 10 'uid=0\(root\)' || true
+
     # M2: kill the console service and let rinit bring it back. `login` execs
     # the shell, so `$$` *is* the getty process tree; killing it makes rinit
     # reap the exit and, because getty is `Restart=always`, start it again -
-    # the "自动重启" half of the milestone's acceptance test. The following
-    # sleep covers the restart backoff.
+    # the "自动重启" half of the milestone's acceptance test.
     printf 'kill -9 $$\n' >&3
-    sleep 8
+    await_log 20 'getty.service will restart in' || true
+    sleep 1
     exec 3>&-
 ) &
 feeder_pid=$!
@@ -169,24 +194,24 @@ expect "resolved a boot plan" "boot plan for 'multi-user.target'"
 expect "the init anchor is scheduled" "plan 0: rinit-init.target"
 expect "the console getty is scheduled" "getty.service"
 
-# Boot must be ordered: mounts before any unit is started.
-if [[ "$(grep -n 'rinit: mounted /tmp' "${log_file}" | head -1 | cut -d: -f1)" -lt \
-      "$(grep -n 'starting level 0' "${log_file}" | head -1 | cut -d: -f1)" ]]; then
-    pass "mounts complete before any unit starts"
-else
-    fail "mounts must complete before any unit starts"
-fi
-
-# Levels must be entered in dependency order: nothing may start before every
-# earlier level has been reached.
-first_line() { grep -n -m1 -F "$1" "${log_file}" | cut -d: -f1; }
-l0="$(first_line 'starting level 0')"
-l1="$(first_line 'starting level 1')"
-if [[ -n "${l0}" && -n "${l1}" && "${l0}" -lt "${l1}" ]]; then
-    pass "startup levels run in dependency order"
-else
-    fail "startup levels must run in dependency order (level0=${l0} level1=${l1})"
-fi
+# Boot must be ordered: mounts before any unit is started, and levels in
+# dependency order.
+line_of() { grep -n -m1 -F -- "$1" "${log_file}" | cut -d: -f1; }
+require_order() {
+    local desc="$1" first="$2" second="$3"
+    local a b
+    a="$(line_of "${first}")"
+    b="$(line_of "${second}")"
+    if [[ -n "${a}" && -n "${b}" && "${a}" -lt "${b}" ]]; then
+        pass "${desc}"
+    else
+        fail "${desc} ('${first}' at ${a:-missing}, '${second}' at ${b:-missing})"
+    fi
+}
+require_order "mounts complete before any unit starts" \
+    "rinit: mounted /tmp" "starting level 0"
+require_order "startup levels run in dependency order" \
+    "starting level 0" "starting level 1"
 
 # getty owns the console: it must actually be up and still running when the
 # boot sequence finishes.
@@ -196,10 +221,19 @@ else
     fail "getty.service should have been started"
 fi
 
-if grep -qF "boot complete: 2 unit(s) started" "${log_file}"; then
+# Both services in the closure must be started. Asserting the exact total would
+# break every time a unit is added, so check the units themselves and only that
+# the count is sane.
+if grep -qF "started fault.service as pid" "${log_file}" \
+    && grep -qF "started getty.service as pid" "${log_file}"; then
     pass "getty and the fault-injection unit were started at boot"
 else
     fail "boot should have started getty.service and fault.service"
+fi
+if grep -qE "boot complete: [1-9][0-9]* unit\(s\) started" "${log_file}"; then
+    pass "boot reported a positive number of started units"
+else
+    fail "boot should report the units it started"
 fi
 
 # Logging in must work, and with an empty password field there is nothing to
@@ -272,7 +306,13 @@ done
 echo
 if [[ ${failures} -eq 0 ]]; then
     echo "PASS: all assertions held on ${arch}"
-    [[ ${keep_log} -eq 1 ]] || true
+    if [[ ${keep_log} -eq 1 ]]; then
+        echo "log: ${log_file}"
+    else
+        # The log only matters when something failed; --keep-log asks for it
+        # either way.
+        rm -f "${log_file}"
+    fi
     exit 0
 fi
 
