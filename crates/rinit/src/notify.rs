@@ -101,8 +101,13 @@ impl NotifyHub {
 
         // Plan §1.3(12): only the service's own user may write. root can always
         // write, so an unset `User=`/`Group=` stays root and still works.
-        let uid = fs::resolve_uid(&config.user)?;
-        let gid = fs::resolve_gid(&config.group)?;
+        //
+        // Resolved by the same code that builds the service's sandbox (plan
+        // §7.4), so the socket belongs to the user the service actually runs as:
+        // `User=nobody` with no `Group=` means `nobody:nogroup` here and in the
+        // child, not `nobody:root` here and `nobody:nogroup` there.
+        let sandbox = crate::sandbox::resolve(config)?;
+        let (uid, gid) = (sandbox.uid, sandbox.gid);
         let path_str = path
             .to_str()
             .ok_or_else(|| RuntimeError::Io {

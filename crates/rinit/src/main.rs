@@ -29,6 +29,7 @@ mod logs;
 mod manager;
 mod notify;
 mod readiness;
+mod sandbox;
 mod service;
 #[cfg(test)]
 mod test_support;

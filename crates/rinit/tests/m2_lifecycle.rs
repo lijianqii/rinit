@@ -607,3 +607,152 @@ fn an_absurd_timeout_does_not_abort_the_boot() {
         "the long-running service must be stopped on shutdown:\n{log}"
     );
 }
+
+// --- §7.4: the privilege drop, end to end ---------------------------------
+//
+// These wait `SETTLE` rather than the tighter windows some tests above use:
+// every assertion here is about something the *boot* has to have got to
+// (a service started, a spawn refused, the boot finished), and a window that is
+// merely usually long enough is how this file grows a flaky test. `SETTLE`
+// matches the value the breaker test uses.
+//
+// These boot the real binary, so they exercise the whole path a unit takes -
+// `User=`/`Group=`/`NoNewPrivileges=` resolved, a sandbox built, the child
+// started through `fork`+`exec` - rather than the pieces separately. What the
+// host *cannot* do is become another user, so "a service really ran as `nobody`"
+// is the guest's assertion; what is proved here is that the directives reach the
+// child, and that when a drop cannot be carried out the unit fails instead of
+// quietly running as root.
+
+/// How long the §7.4 tests below let a boot settle before shutting it down.
+const SETTLE: Duration = Duration::from_millis(1500);
+
+/// Whether *this* test process already denies privilege escalation, which some
+/// runners do. Used as the baseline for the "no flag asked for" case, so the
+/// assertion stays about rinit rather than about the runner.
+fn no_new_privs_here() -> bool {
+    std::fs::read_to_string("/proc/self/status").is_ok_and(|status| {
+        status
+            .lines()
+            .any(|l| l.starts_with("NoNewPrivs:") && l.ends_with('1'))
+    })
+}
+
+/// `NoNewPrivileges=true` must reach the service, and a unit that does not ask
+/// for it must be left alone.
+#[test]
+fn no_new_privileges_reaches_the_service() {
+    let dir = TempDir::new("nnp");
+    dir.write(
+        "all.target",
+        "[Unit]\nType=target\nRequires=with.service without.service\n",
+    );
+
+    let with = dir.0.join("with.txt");
+    let without = dir.0.join("without.txt");
+    let unit = |flag: &str, probe: &std::path::Path| {
+        format!(
+            "[Service]\nType=oneshot\nNoNewPrivileges={flag}\n\
+             ExecStart=/bin/sh -c \"echo NNP=$(grep ^NoNewPrivs /proc/self/status | cut -f2) > {}\"\n",
+            probe.display()
+        )
+    };
+    dir.write("with.service", &unit("true", &with));
+    dir.write("without.service", &unit("false", &without));
+
+    let log = boot_units(&dir, "all.target", SETTLE);
+
+    let with_text = std::fs::read_to_string(&with)
+        .unwrap_or_else(|e| panic!("the flagged service never wrote its probe: {e}\n{log}"));
+    assert!(
+        with_text.contains("NNP=1"),
+        "NoNewPrivileges=true must reach the child:\n{with_text}"
+    );
+
+    let without_text = std::fs::read_to_string(&without)
+        .unwrap_or_else(|e| panic!("the unflagged service never wrote its probe: {e}\n{log}"));
+    let expected = if no_new_privs_here() { "1" } else { "0" };
+    assert!(
+        without_text.contains(&format!("NNP={expected}")),
+        "a unit that does not ask for the flag must inherit it, not get it:\n{without_text}"
+    );
+}
+
+/// A `User=` that cannot be resolved must fail the unit, not run it as root.
+///
+/// The service would write a probe file if it ever ran, so the file's absence is
+/// the real assertion: failing closed is only meaningful if the thing that was
+/// refused does not happen anyway.
+#[test]
+fn a_unit_with_an_unknown_user_is_failed_rather_than_run_as_root() {
+    let dir = TempDir::new("bad-user");
+    let probe = dir.0.join("ran.txt");
+    dir.write("all.target", "[Unit]\nType=target\nRequires=bad.service\n");
+    dir.write(
+        "bad.service",
+        &format!(
+            "[Service]\nType=oneshot\nUser=rinit-no-such-user-xyz\n\
+             ExecStart=/bin/sh -c \"echo RAN > {}\"\n",
+            probe.display()
+        ),
+    );
+
+    let log = boot_units(&dir, "all.target", SETTLE);
+
+    assert!(
+        log.contains("User= lookup failed"),
+        "the failure must name the lookup that could not be resolved:\n{log}"
+    );
+    assert!(
+        !probe.exists(),
+        "a service whose user is unknown must not run (as root or otherwise)"
+    );
+    assert!(
+        log.contains("boot complete"),
+        "a unit that cannot start must not abort the rest of the boot:\n{log}"
+    );
+}
+
+/// When the drop itself cannot be carried out, the unit fails - it does not
+/// quietly run as rinit's own user.
+///
+/// In `--dev` mode rinit is unprivileged, so a numeric `User=65534` cannot be
+/// honoured: whichever of `setgid`/`setgroups`/`setuid` the runner's own
+/// privileges refuse first fails, and the child stops before `exec`. The guest -
+/// where rinit is root - proves the other outcome for the same directives.
+#[test]
+fn a_drop_that_cannot_be_applied_fails_the_unit_closed() {
+    if unsafe { libc::geteuid() } == 0 {
+        // As root there is no step to refuse; the guest covers the success path.
+        return;
+    }
+    let dir = TempDir::new("cannot-drop");
+    let probe = dir.0.join("ran.txt");
+    dir.write("all.target", "[Unit]\nType=target\nRequires=drop.service\n");
+    dir.write(
+        "drop.service",
+        &format!(
+            "[Service]\nType=oneshot\nUser=65534\nGroup=65534\n\
+             ExecStart=/bin/sh -c \"echo RAN > {}\"\n",
+            probe.display()
+        ),
+    );
+
+    let log = boot_units(&dir, "all.target", SETTLE);
+
+    let named_step = ["setgid failed", "setgroups failed", "setuid failed"]
+        .iter()
+        .any(|step| log.contains(step));
+    assert!(
+        named_step,
+        "the step that could not be applied must be named:\n{log}"
+    );
+    assert!(
+        !probe.exists(),
+        "a service that could not drop privileges must not run at all"
+    );
+    assert!(
+        log.contains("boot complete"),
+        "a failed drop must not abort the rest of the boot:\n{log}"
+    );
+}

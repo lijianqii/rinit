@@ -409,8 +409,17 @@ async fn run_aux_command(
     let cwd = rt.config.working_directory.clone();
     let timeout = rt.config.timeout_start_sec;
     let argv = cmd.argv().to_vec();
+    // Plan §7.4: every `Exec*` command runs as the service user, so a
+    // preparation step cannot do what the service itself is not allowed to.
+    let sandbox = match crate::sandbox::resolve(&rt.config) {
+        Ok(sandbox) => sandbox,
+        Err(e) => {
+            rlog!("error: {unit}: cannot start '{}': {e}", argv.join(" "));
+            return None;
+        }
+    };
 
-    let pid = match spawn_service_in_group(&argv, &env, Some(&cwd), None) {
+    let pid = match spawn_service_in_group(&argv, &env, Some(&cwd), None, &sandbox) {
         Ok(pid) => pid,
         Err(e) => {
             rlog!("error: {unit}: cannot start '{}': {e}", argv.join(" "));

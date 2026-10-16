@@ -1,0 +1,25 @@
+# De-privileging acceptance unit (plan §7.4).
+#
+# Like logdemo.service it is deliberately *not* in `multi-user.target`'s
+# closure, so nothing starts it at boot: the system test starts it on demand
+# with `rctl start`, which is also how the control path gets exercised.
+#
+# It prints one line rather than three so the guest assertion can be a single
+# exact string: the uid it became, the gid it became, and the value of
+# `NoNewPrivs` in its own `/proc/self/status`. If rinit only *parsed*
+# `User=`/`Group=`/`NoNewPrivileges=` without applying them, this line would
+# read `uid=0 gid=0 nnp=0` - running as root, exactly the failure the plan's
+# §7.4 exists to prevent.
+#
+# `Type=oneshot`: the command exits, and `rctl log` reads what it printed. The
+# output still arrives from a process that is no longer root, which is the
+# other half of the claim - capture does not depend on the service's uid.
+[Unit]
+Description=Privilege drop demo (started on demand)
+
+[Service]
+Type=oneshot
+User=nobody
+Group=nogroup
+NoNewPrivileges=true
+ExecStart=/bin/sh -c "echo uid=$(id -u) gid=$(id -g) nnp=$(grep ^NoNewPrivs /proc/self/status | cut -f2)"

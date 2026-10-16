@@ -7,6 +7,7 @@
 
 use std::ffi::CString;
 
+use rinit_core::unit::sandbox::Sandbox;
 use rinit_runtime::RuntimeError;
 use rinit_runtime::syscall::wait::ChildExit;
 use rinit_runtime::syscall::{cstring, process, wait};
@@ -60,7 +61,8 @@ impl ServiceSet {
     }
 }
 
-/// Launch `argv` with `env` in a fresh session, in `working_directory`.
+/// Launch `argv` with `env` in a fresh session, in `working_directory`, under
+/// the privilege drop `sandbox` describes.
 ///
 /// Every service goes through this rather than [`spawn_service`], so that
 /// stopping a unit signals its whole process group and reaches children the
@@ -70,13 +72,20 @@ impl ServiceSet {
 /// `EnvironmentFile=` and `Environment=`); `working_directory` is applied in the
 /// child before `exec`.
 ///
+/// A sandbox that asks for nothing stays on `posix_spawn`, which is the cheaper
+/// path and the common case; one that asks for anything gets the controlled
+/// `fork`+`exec` of plan §2.3, since `posix_spawn` has no seam for those steps
+/// (see [`process::spawn_sandboxed`]).
+///
 /// # Errors
-/// `argv` must be non-empty and contain no interior NUL bytes.
+/// `argv` must be non-empty and contain no interior NUL bytes, and the spawn
+/// itself must succeed.
 pub fn spawn_service_in_group(
     argv: &[String],
     env: &[String],
     working_directory: Option<&str>,
     output: Option<libc::c_int>,
+    sandbox: &Sandbox,
 ) -> Result<libc::pid_t, RuntimeError> {
     let Prepared { argv, envp, cwd } = prepare(argv, env, working_directory)?;
     let Some(path) = argv.first().map(CString::as_c_str) else {
@@ -91,8 +100,13 @@ pub fn spawn_service_in_group(
     if let Some(fd) = output {
         options = options.with_stdio(fd);
     }
-    process::posix_spawn_full(path, &argv, &envp, options, cwd.as_deref())
-        .map_err(RuntimeError::from)
+    if sandbox.is_inherited() {
+        process::posix_spawn_full(path, &argv, &envp, options, cwd.as_deref())
+            .map_err(RuntimeError::from)
+    } else {
+        process::spawn_sandboxed(path, &argv, &envp, options, cwd.as_deref(), sandbox)
+            .map_err(RuntimeError::from)
+    }
 }
 
 /// Launch `argv` with [`SERVICE_ENV`] in rinit's own process group.

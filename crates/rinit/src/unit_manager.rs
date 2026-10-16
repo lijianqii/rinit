@@ -659,7 +659,7 @@ impl UnitManager {
 
         // Everything the spawn needs, read through an immutable borrow so the
         // `EnvironmentFile=` read below cannot race the state update.
-        let (argv, env, cwd, kind) = {
+        let (argv, env, cwd, kind, sandbox) = {
             let Some(rt) = self.units.get(unit) else {
                 return Ok(());
             };
@@ -678,11 +678,16 @@ impl UnitManager {
                 build_service_env(&rt.config, extra_env),
                 rt.config.working_directory.clone(),
                 rt.config.service_kind,
+                // `User=`/`Group=`/`NoNewPrivileges=` (plan §7.4). A name that
+                // does not resolve fails the start here, before anything is
+                // forked: running the service as root instead would be the one
+                // outcome worse than not starting it.
+                crate::sandbox::resolve(&rt.config)?,
             )
         };
 
         // A fresh process group, so a stop reaches the whole tree (plan §1.3(6)).
-        let pid = spawn_service_in_group(&argv, &env, Some(&cwd), output)?;
+        let pid = spawn_service_in_group(&argv, &env, Some(&cwd), output, &sandbox)?;
 
         let Some(rt) = self.units.get_mut(unit) else {
             return Ok(());
@@ -851,10 +856,21 @@ impl UnitManager {
 
             let argv = rt.config.health_check.argv().to_vec();
             // The probe runs as the service does: same environment, same
-            // working directory (plan §7.4).
+            // working directory, same user (plan §7.4).
             let env = build_service_env(&rt.config, &[]);
             let cwd = rt.config.working_directory.clone();
-            match spawn_service_in_group(&argv, &env, Some(&cwd), None) {
+            let sandbox = match crate::sandbox::resolve(&rt.config) {
+                Ok(sandbox) => sandbox,
+                Err(e) => {
+                    // A probe whose user cannot be resolved cannot run either;
+                    // like a probe that failed to start, it waits a whole
+                    // interval rather than spinning.
+                    rlog!("warning: {name}: health probe: {e}");
+                    schedule_health(rt);
+                    continue;
+                }
+            };
+            match spawn_service_in_group(&argv, &env, Some(&cwd), None, &sandbox) {
                 Ok(pid) => {
                     rt.probe_pid = Some(pid);
                     rt.probe_deadline = deadline(rt.config.health_timeout_sec);
@@ -1035,7 +1051,14 @@ impl UnitManager {
         } else {
             let env = build_service_env(&rt.config, &[]);
             let cwd = rt.config.working_directory.clone();
-            match spawn_service_in_group(&stop_cmd, &env, Some(&cwd), None) {
+            // `ExecStop=` runs as the service user too (plan §7.4). If its user
+            // cannot be resolved, this falls back to the signal below like any
+            // other ExecStop that cannot start.
+            let started = match crate::sandbox::resolve(&rt.config) {
+                Ok(sandbox) => spawn_service_in_group(&stop_cmd, &env, Some(&cwd), None, &sandbox),
+                Err(e) => Err(e),
+            };
+            match started {
                 Ok(stop_pid) => {
                     rt.exec_stop_pid = Some(stop_pid);
                     rt.state = UnitState::Deactivating;

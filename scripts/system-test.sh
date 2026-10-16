@@ -155,6 +155,16 @@ await_log() {
     printf 'rctl reset-failed fault.service\n' >&3
     await_log 10 'fault.service: cleared' || true
 
+    # M5 §7.4: a unit that asks to be de-privileged must actually be so. The
+    # command prints its uid, its gid and its own `NoNewPrivs` value, so this
+    # one line is the whole claim - and it is read back through `rctl log`,
+    # which also proves capture still works for a process that is not root.
+    printf 'rctl start priv.service\n' >&3
+    await_log 10 'started priv.service' || true
+    sleep 1
+    printf 'rctl log priv.service\n' >&3
+    await_log 10 'uid=65534 gid=65534 nnp=1' || true
+
     # M2: kill the console service and let rinit bring it back. `login` execs
     # the shell, so `$$` *is* the getty process tree; killing it makes rinit
     # reap the exit and, because getty is `Restart=always`, start it again -
@@ -273,6 +283,15 @@ expect "rctl started a unit on demand" "started logdemo.service"
 expect "rctl log returned captured service output" "rinit-log-marker"
 expect "rctl stop stopped a unit" "stopped logdemo.service"
 expect "rctl reset-failed cleared the failed unit" "fault.service: cleared"
+
+# M5 §7.4 acceptance: the privilege drop. `priv.service` runs
+# `/bin/sh -c "echo uid=$(id -u) gid=$(id -g) nnp=..."` as `User=nobody`,
+# `Group=nogroup`, with `NoNewPrivileges=true`, so the exact line proves three
+# things at once: the process became nobody, its group became nogroup's, and
+# the no-new-privileges flag was applied. rinit runs as root in the guest, so
+# this is the case the host cannot test at all.
+expect "a de-privileged service ran as nobody:nogroup with NoNewPrivs" \
+    "uid=65534 gid=65534 nnp=1"
 # A completed oneshot has nothing to restart, so `restart` is a conflict
 # (exit 4). `logdemo` proves it and that the unit is only started once.
 if grep -qF "logdemo.service has no process to restart" "${log_file}"; then
