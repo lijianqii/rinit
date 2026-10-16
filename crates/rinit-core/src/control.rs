@@ -73,6 +73,8 @@ pub enum Request {
         /// Lines to return.
         tail: u32,
     },
+    /// Re-read the unit directory and apply the difference (plan §7.6).
+    Reload,
 }
 
 impl Request {
@@ -86,6 +88,7 @@ impl Request {
             Request::Restart(_) => Command::Restart,
             Request::ResetFailed(_) => Command::ResetFailed,
             Request::Log { .. } => Command::Log,
+            Request::Reload => Command::Reload,
         }
     }
 
@@ -105,6 +108,7 @@ impl Request {
                 Some(unit) => format!("log {unit}"),
                 None => "log".to_string(),
             },
+            Request::Reload => "reload".to_string(),
         }
     }
 }
@@ -127,6 +131,8 @@ pub enum Command {
     ResetFailed = 6,
     /// `rctl log`.
     Log = 7,
+    /// `rctl reload` (plan §7.6).
+    Reload = 8,
 }
 
 impl Command {
@@ -145,6 +151,7 @@ impl Command {
             5 => Some(Command::Restart),
             6 => Some(Command::ResetFailed),
             7 => Some(Command::Log),
+            8 => Some(Command::Reload),
             _ => None,
         }
     }
@@ -298,6 +305,7 @@ pub fn encode_request(request: &Request) -> Vec<u8> {
             put_opt_unit(&mut out, unit.as_ref());
             out.extend_from_slice(&tail.to_le_bytes());
         }
+        Request::Reload => {}
     }
     out
 }
@@ -336,6 +344,7 @@ pub fn decode_request(body: &[u8]) -> Result<Request, ProtocolError> {
             let tail = decoder.u32()?;
             Request::Log { unit, tail }
         }
+        Command::Reload => Request::Reload,
     };
 
     if !decoder.is_empty() {
@@ -490,6 +499,20 @@ mod tests {
             unit: Some(name("app.service")),
             tail: u32::MAX,
         });
+        round_trip(Request::Reload);
+    }
+
+    /// The reload command is a new code on an existing wire, so the byte it
+    /// claims has to be one an older build did not use - and it carries no
+    /// payload, which is what makes it a one-way request.
+    #[test]
+    fn reload_is_a_payload_free_command_with_its_own_byte() {
+        assert_eq!(Request::Reload.command().byte(), 8);
+        assert_eq!(Command::from_byte(8), Some(Command::Reload));
+        assert_eq!(Request::Reload.describe(), "reload");
+        let body = encode_request(&Request::Reload);
+        assert_eq!(body.len(), 3, "version (2) + command (1), and nothing else");
+        assert!(decode_request(&body).is_ok());
     }
 
     #[test]

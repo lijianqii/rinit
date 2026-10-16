@@ -112,6 +112,7 @@ pub async fn run(cfg: Config) -> Result<(), RuntimeError> {
             cfg.watchdog_timeout_sec,
         );
         supervise(
+            &cfg,
             &mut signals,
             &mut manager,
             &mut notify,
@@ -166,6 +167,7 @@ pub async fn run(cfg: Config) -> Result<(), RuntimeError> {
 /// a plain `recv()` - without them a service scheduled to restart in two
 /// seconds would sit there until some unrelated signal arrived.
 async fn supervise(
+    cfg: &Config,
     signals: &mut SignalSet,
     manager: &mut UnitManager,
     notify: &mut NotifyHub,
@@ -246,7 +248,7 @@ async fn supervise(
                 }
             }
             Some((request, reply)) = control.recv() => {
-                let (status, text) = handle_control(manager, notify, logs, &request).await;
+                let (status, text) = handle_control(cfg, manager, notify, logs, &request).await;
                 if status == Status::Ok {
                     rlog!("control: {} ok", request.describe());
                 } else {
@@ -392,6 +394,12 @@ async fn start_unit(
     logs: &ServiceLogs,
     unit: &UnitName,
 ) -> Result<bool, RuntimeError> {
+    // Plan §7.6: a reload that changed a *running* unit left its new definition
+    // waiting for exactly this moment. It is taken before anything reads the
+    // config, so `ExecStartPre`, the notify socket and the spawn all see the same
+    // definition.
+    manager.adopt_pending_config(unit);
+
     // `Conflicts=` first: the other unit must be gone before this one starts
     // (plan §1.1).
     stop_conflicts(manager, unit).await;
@@ -563,7 +571,7 @@ fn exec_start_of(manager: &UnitManager, unit: &UnitName) -> String {
 /// the environment that socket needs.
 ///
 /// Returns whether a process was spawned, which is what the boot log counts.
-async fn apply_effect(
+pub(crate) async fn apply_effect(
     manager: &mut UnitManager,
     notify: &mut NotifyHub,
     logs: &ServiceLogs,
@@ -602,6 +610,7 @@ async fn apply_effect(
 /// running system, so it lives with the manager and the notify hub rather than
 /// with the socket that delivered it.
 async fn handle_control(
+    cfg: &Config,
     manager: &mut UnitManager,
     notify: &mut NotifyHub,
     logs: &ServiceLogs,
@@ -634,13 +643,41 @@ async fn handle_control(
         Request::Stop(unit) => control_stop(manager, notify, logs, unit).await,
         Request::Restart(unit) => control_restart(manager, notify, logs, unit).await,
         Request::ResetFailed(unit) => {
-            if manager.get(unit).is_none() {
+            if !manager.exists(unit) {
                 return (Status::NoSuchUnit, format!("no such unit: {unit}"));
             }
             manager.reset_failed(unit);
             (Status::Ok, format!("{unit}: cleared"))
         }
         Request::Log { unit, tail } => (Status::Ok, render_logs(logs, unit.as_ref(), *tail)),
+        // Plan §7.6. The reply is the report: what was added, changed, removed
+        // and deferred, so a reload is never a silent act.
+        Request::Reload => control_reload(cfg, manager, notify, logs).await,
+    }
+}
+
+/// `rctl reload`: re-read the unit directory and apply the difference.
+///
+/// A failure is the interesting reply: the plan requires the *old* configuration
+/// to stay in force, so the message names what was wrong with the new one and
+/// the running system is exactly as it was.
+async fn control_reload(
+    cfg: &Config,
+    manager: &mut UnitManager,
+    notify: &mut NotifyHub,
+    logs: &ServiceLogs,
+) -> (Status, String) {
+    match crate::reload::reload(cfg, manager, notify, logs).await {
+        Ok(report) => {
+            let mut lines = report.lines();
+            let summary = report.summary();
+            lines.push(summary.clone());
+            (Status::Ok, lines.join("\n"))
+        }
+        Err(e) => (
+            Status::Error,
+            format!("reload rejected, the running configuration is unchanged: {e}"),
+        ),
     }
 }
 
@@ -651,7 +688,7 @@ async fn control_start(
     logs: &ServiceLogs,
     unit: &UnitName,
 ) -> (Status, String) {
-    if manager.get(unit).is_none() {
+    if !manager.exists(unit) {
         return (Status::NoSuchUnit, format!("no such unit: {unit}"));
     }
     let effect = manager.request_start(unit, RequestSource::UserStart);
@@ -676,6 +713,9 @@ async fn control_stop(
     logs: &ServiceLogs,
     unit: &UnitName,
 ) -> (Status, String) {
+    if !manager.exists(unit) {
+        return (Status::NoSuchUnit, format!("no such unit: {unit}"));
+    }
     let Some(rt) = manager.get(unit) else {
         return (Status::NoSuchUnit, format!("no such unit: {unit}"));
     };
@@ -705,7 +745,7 @@ async fn control_restart(
     logs: &ServiceLogs,
     unit: &UnitName,
 ) -> (Status, String) {
-    if manager.get(unit).is_none() {
+    if !manager.exists(unit) {
         return (Status::NoSuchUnit, format!("no such unit: {unit}"));
     }
     match manager.restart_unit(unit) {
@@ -732,6 +772,11 @@ fn render_logs(logs: &ServiceLogs, unit: Option<&UnitName>, tail: u32) -> String
 
 /// A unit's detail block for `rctl status UNIT`.
 fn describe_unit(manager: &UnitManager, unit: &UnitName) -> Option<String> {
+    // `exists`, not `get`: a unit a reload removed is gone even while its stop
+    // is still in flight (plan §7.6).
+    if !manager.exists(unit) {
+        return None;
+    }
     let rt = manager.get(unit)?;
     let mut out = String::new();
     out.push_str(&format!("unit: {unit}\n"));
@@ -1045,6 +1090,16 @@ mod tests {
         NotifyHub::new_at(dir)
     }
 
+    /// A boot config for these tests: the real defaults, with a unit directory
+    /// that exists but is not used - they drive the manager directly.
+    fn test_config() -> Config {
+        let mut cfg = crate::args::parse(std::iter::empty::<std::ffi::OsString>())
+            .expect("the empty command line parses");
+        cfg.unit_dir = std::env::temp_dir().join("rinit-control-tests");
+        cfg.default_target = "multi-user.target".to_string();
+        cfg
+    }
+
     fn status_request(unit: &UnitName) -> Request {
         Request::Status {
             unit: Some(unit.clone()),
@@ -1069,7 +1124,8 @@ mod tests {
             Request::Restart(ghost.clone()),
             Request::ResetFailed(ghost.clone()),
         ] {
-            let (status, text) = handle_control(&mut manager, &mut notify, &logs, &request).await;
+            let (status, text) =
+                handle_control(&test_config(), &mut manager, &mut notify, &logs, &request).await;
             assert_eq!(status, Status::NoSuchUnit, "{}: {text}", request.describe());
         }
     }
@@ -1084,6 +1140,7 @@ mod tests {
         let app = unit("app.service");
 
         let (status, _) = handle_control(
+            &test_config(),
             &mut manager,
             &mut notify,
             &logs,
@@ -1096,18 +1153,32 @@ mod tests {
             "the unit must run"
         );
 
-        let (status, text) =
-            handle_control(&mut manager, &mut notify, &logs, &status_request(&app)).await;
+        let (status, text) = handle_control(
+            &test_config(),
+            &mut manager,
+            &mut notify,
+            &logs,
+            &status_request(&app),
+        )
+        .await;
         assert_eq!(status, Status::Ok);
         assert!(text.contains("app.service"), "{text}");
         assert!(text.contains("active"), "{text}");
         assert!(text.contains("target: started"), "{text}");
 
-        let (status, text) = handle_control(&mut manager, &mut notify, &logs, &Request::List).await;
+        let (status, text) = handle_control(
+            &test_config(),
+            &mut manager,
+            &mut notify,
+            &logs,
+            &Request::List,
+        )
+        .await;
         assert_eq!(status, Status::Ok);
         assert!(text.contains("app.service"), "{text}");
 
         let (status, _) = handle_control(
+            &test_config(),
             &mut manager,
             &mut notify,
             &logs,
@@ -1133,6 +1204,7 @@ mod tests {
         let app = unit("app.service");
 
         handle_control(
+            &test_config(),
             &mut manager,
             &mut notify,
             &logs,
@@ -1140,6 +1212,7 @@ mod tests {
         )
         .await;
         let (status, text) = handle_control(
+            &test_config(),
             &mut manager,
             &mut notify,
             &logs,
@@ -1175,6 +1248,7 @@ mod tests {
         );
 
         let (status, text) = handle_control(
+            &test_config(),
             &mut manager,
             &mut notify,
             &logs,
@@ -1210,6 +1284,7 @@ mod tests {
         }
 
         let (status, text) = handle_control(
+            &test_config(),
             &mut manager,
             &mut notify,
             &logs,
@@ -1239,6 +1314,7 @@ mod tests {
         assert!(manager.is_failed(&app));
 
         let (status, _) = handle_control(
+            &test_config(),
             &mut manager,
             &mut notify,
             &logs,

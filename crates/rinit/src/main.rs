@@ -30,6 +30,7 @@ mod logs;
 mod manager;
 mod notify;
 mod readiness;
+mod reload;
 mod sandbox;
 mod service;
 #[cfg(test)]

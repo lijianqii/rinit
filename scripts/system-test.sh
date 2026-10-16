@@ -245,6 +245,50 @@ await_log() {
     printf 'u=$(cut -d" " -f1 /proc/uptime); echo wd-uptime=$u\n' >&3
     await_log 10 'wd-uptime=' || true
 
+    # M5 §7.6: reload. The unit directory is the ramfs the initramfs unpacked
+    # `units/` into, so the console can change it while rinit is running - which
+    # is what makes "does a reload do the right thing to a live system" a
+    # question the guest can answer at all. Files are written a line at a time
+    # because the console feeds the shell a line at a time.
+    printf 'rctl reload\n' >&3
+    await_log 15 'reload: 0 added' || true
+
+    # An added unit is registered and *not* started: nothing the boot target
+    # requires pulls it in. The summary line is what separates the two.
+    printf 'echo "[Service]" > /etc/rinit/units/reload.service\n' >&3
+    printf 'echo "Type=oneshot" >> /etc/rinit/units/reload.service\n' >&3
+    printf 'echo "ExecStart=/bin/echo reloaded-service" >> /etc/rinit/units/reload.service\n' >&3
+    printf 'rctl reload\n' >&3
+    await_log 15 'registered reload.service' || true
+
+    # A changed unit that is *not* running takes the new definition at once; one
+    # that *is* running waits for its next start. `logdemo.service` is down and
+    # `getty.service` is the console itself, and both files end inside their
+    # `[Service]` section, so appending a key to them stays in that section.
+    printf 'echo "ExecStartPre=/bin/echo reloaded-pre" >> /etc/rinit/units/logdemo.service\n' >&3
+    printf 'echo "ExecStartPost=/bin/true" >> /etc/rinit/units/getty.service\n' >&3
+    printf 'rctl reload\n' >&3
+    await_log 15 'logdemo.service: new definition in force' || true
+    await_log 15 'getty.service is running' || true
+
+    # Removing the added unit: it never ran, so nothing has to be stopped, and
+    # it is gone from `rctl` afterwards.
+    printf 'rm /etc/rinit/units/reload.service\n' >&3
+    printf 'rctl reload\n' >&3
+    await_log 15 'removed reload.service' || true
+    printf 'rctl start reload.service\n' >&3
+    await_log 15 'no such unit: reload.service' || true
+
+    # A directory that does not resolve is refused whole: `getty.service` is
+    # required by the boot target, so its absence is a dangling reference. The
+    # console is itself getty, so if the refusal did *not* leave the running
+    # configuration alone, the rest of this list would not be typed at all.
+    printf 'cp /etc/rinit/units/getty.service /tmp/getty.unit\n' >&3
+    printf 'rm /etc/rinit/units/getty.service\n' >&3
+    printf 'rctl reload\n' >&3
+    await_log 15 'reload rejected' || true
+    printf 'cp /tmp/getty.unit /etc/rinit/units/getty.service\n' >&3
+
     # M2: kill the console service and let rinit bring it back. `login` execs
     # the shell, so `$$` *is* the getty process tree; killing it makes rinit
     # reap the exit and, because getty is `Restart=always`, start it again -
@@ -455,6 +499,22 @@ if [[ "${boots}" -eq 1 ]]; then
 else
     fail "the guest booted ${boots} times: the watchdog reset it"
 fi
+
+# M5 §7.6: reload, against a live system. The console edits the unit directory
+# as it goes, so these are about what rinit did to a running system rather than
+# about what a manager would do in a unit test.
+expect "rctl reload reached the control socket" "control: reload ok"
+expect "a reload that changed nothing reported exactly that" "reload: 0 added (0 started)"
+expect "an added unit was registered" "registered reload.service"
+expect "an added unit the boot target does not need was not started" "1 added (0 started)"
+expect "a changed unit that is not running took the new definition at once" \
+    "logdemo.service: new definition in force"
+expect "a changed unit that is running kept it for the next start" \
+    "getty.service is running; its new definition applies at the next start"
+expect "a removed unit was removed" "removed reload.service"
+expect "a removed unit is gone from rctl" "no such unit: reload.service"
+expect "a directory that does not resolve was refused whole" \
+    "reload rejected, the running configuration is unchanged"
 
 # A completed oneshot has nothing to restart, so `restart` is a conflict
 # (exit 4). `logdemo` proves it and that the unit is only started once.

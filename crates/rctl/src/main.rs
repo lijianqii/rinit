@@ -44,6 +44,7 @@ Commands:
   restart <UNIT>          Restart a unit
   reset-failed <UNIT>     Clear a unit's failed/start-limit state
   log [UNIT] [--tail N]   Show buffered log
+  reload                  Re-read the unit directory and apply the difference
 
 Options:
   -h, --help              Show this help and exit

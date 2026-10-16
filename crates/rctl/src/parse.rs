@@ -45,6 +45,10 @@ pub fn command_line(args: &[String]) -> Result<Parsed, String> {
         "stop" => Ok(Parsed::Request(Request::Stop(required_unit(rest)?))),
         "restart" => Ok(Parsed::Request(Request::Restart(required_unit(rest)?))),
         "reset-failed" => Ok(Parsed::Request(Request::ResetFailed(required_unit(rest)?))),
+        "reload" => {
+            ensure_no_arguments(rest)?;
+            Ok(Parsed::Request(Request::Reload))
+        }
         other => Err(format!("unknown command '{other}'")),
     }
 }
@@ -133,6 +137,15 @@ mod tests {
     fn list_takes_nothing() {
         assert_eq!(parse(&["list"]), Ok(Parsed::Request(Request::List)));
         assert!(parse(&["list", "extra"]).is_err());
+    }
+
+    /// `reload` names no unit: it is about the directory, not about one unit
+    /// (plan §7.6).
+    #[test]
+    fn reload_takes_nothing() {
+        assert_eq!(parse(&["reload"]), Ok(Parsed::Request(Request::Reload)));
+        assert!(parse(&["reload", "app.service"]).is_err());
+        assert!(parse(&["reload", "--tail", "5"]).is_err());
     }
 
     /// A bare unit name defaults to `.service`, exactly as in a unit file.

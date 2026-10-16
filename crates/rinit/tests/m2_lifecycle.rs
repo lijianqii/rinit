@@ -1419,3 +1419,254 @@ fn dev_mode_does_not_arm_the_default_watchdog_device() {
         "nothing was armed, so nothing is disarmed either:\n{log}"
     );
 }
+
+// --- §7.6: reloading the unit directory -----------------------
+
+/// Send one request to a `--dev` rinit and read its reply.
+///
+/// The client half of the protocol is `rctl`'s, but a reload needs several
+/// requests in sequence against one running rinit - and a test that shells out to
+/// `rctl` for each of them would be testing the CLI, not the reload.
+fn control(socket: &std::path::Path, request: rinit_core::Request) -> (rinit_core::Status, String) {
+    use std::io::{Read, Write};
+
+    let mut stream = std::os::unix::net::UnixStream::connect(socket).expect("connect to rinit");
+    stream
+        .write_all(&rinit_core::frame(&rinit_core::encode_request(&request)))
+        .expect("write the request");
+    let mut prefix = [0u8; rinit_core::LENGTH_PREFIX_BYTES];
+    stream
+        .read_exact(&mut prefix)
+        .expect("read the length prefix");
+    let len = rinit_core::frame_len(prefix).expect("frame length");
+    let mut body = vec![0u8; len];
+    stream.read_exact(&mut body).expect("read the body");
+    rinit_core::decode_response(&body).expect("decode the reply")
+}
+
+/// Boot `units` in `--dev` with a control socket, and wait for the socket.
+fn boot_with_control(units: &TempDir, tag: &str) -> (std::process::Child, PathBuf) {
+    let control_dir = units.0.join(format!("control-{tag}"));
+    let child = Command::new(env!("CARGO_BIN_EXE_rinit"))
+        .arg("--dev")
+        .arg("--units")
+        .arg(&units.0)
+        .arg("--default")
+        .arg("all.target")
+        .env("RINIT_CONTROL_DIR", &control_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn rinit");
+
+    let socket = control_dir.join("control.sock");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !socket.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "rinit must bind the control socket"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    (child, socket)
+}
+
+/// Ask a `--dev` rinit to stop and wait for it.
+fn stop_rinit(child: std::process::Child) {
+    // SAFETY: signalling our own child.
+    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+    let _ = child.wait_with_output();
+}
+
+/// Plan §7.6: a reload applies the difference between the directory and what is
+/// running, while the system keeps running.
+///
+/// Four cases, and they are the plan's: an added unit the target requires is
+/// started, a changed unit that is running keeps its old definition until the
+/// next start, a changed unit that is not running takes the new one at once, and
+/// a removed unit is stopped and then gone from `rctl`.
+#[test]
+fn a_reload_applies_the_difference_without_a_restart() {
+    let dir = TempDir::new("reload");
+    dir.write("all.target", "[Unit]\nType=target\nRequires=app.service\n");
+    dir.write(
+        "app.service",
+        "[Unit]\nDescription=first\n[Service]\nType=simple\nExecStart=/bin/sleep 30\n",
+    );
+    dir.write(
+        "lonely.service",
+        "[Service]\nType=simple\nExecStart=/bin/sleep 30\n",
+    );
+    let (child, socket) = boot_with_control(&dir, "reload");
+    let unit = |name: &str| rinit_core::UnitName::parse(name).expect("unit name");
+
+    // A reload that changes nothing still has to say so.
+    let (status, text) = control(&socket, rinit_core::Request::Reload);
+    assert_eq!(status, rinit_core::Status::Ok, "{text}");
+    assert!(text.contains("0 added"), "got: {text}");
+    assert!(
+        text.contains("3 unchanged"),
+        "all three files are unchanged: {text}"
+    );
+
+    // Added *and* wanted: the boot target requires it now, so it starts.
+    dir.write(
+        "all.target",
+        "[Unit]\nType=target\nRequires=app.service extra.service\n",
+    );
+    dir.write(
+        "extra.service",
+        "[Service]\nType=simple\nExecStart=/bin/sleep 30\n",
+    );
+    let (status, text) = control(&socket, rinit_core::Request::Reload);
+    assert_eq!(status, rinit_core::Status::Ok, "{text}");
+    assert!(text.contains("registered extra.service"), "got: {text}");
+    assert!(
+        text.contains("started extra.service"),
+        "the boot target requires it: {text}"
+    );
+    let (status, text) = control(
+        &socket,
+        rinit_core::Request::Status {
+            unit: Some(unit("extra.service")),
+            tail: 0,
+        },
+    );
+    assert_eq!(status, rinit_core::Status::Ok, "{text}");
+    assert!(text.contains("state: active"), "it must really run: {text}");
+
+    // Changed while running: the old definition stays until the next start.
+    dir.write(
+        "app.service",
+        "[Unit]\nDescription=second\n[Service]\nType=simple\nExecStart=/bin/sleep 30\n",
+    );
+    let (status, text) = control(&socket, rinit_core::Request::Reload);
+    assert_eq!(status, rinit_core::Status::Ok, "{text}");
+    assert!(
+        text.contains("app.service is running; its new definition applies at the next start"),
+        "got: {text}"
+    );
+    let (_, text) = control(
+        &socket,
+        rinit_core::Request::Status {
+            unit: Some(unit("app.service")),
+            tail: 0,
+        },
+    );
+    assert!(
+        text.contains("description: first"),
+        "a running unit keeps the definition it is running: {text}"
+    );
+
+    // ...and after a stop and a start, the new one is the one in use.
+    let (status, _) = control(&socket, rinit_core::Request::Stop(unit("app.service")));
+    assert_eq!(status, rinit_core::Status::Ok);
+    std::thread::sleep(Duration::from_millis(400));
+    let (status, _) = control(&socket, rinit_core::Request::Start(unit("app.service")));
+    assert_eq!(status, rinit_core::Status::Ok);
+    std::thread::sleep(Duration::from_millis(400));
+    let (_, text) = control(
+        &socket,
+        rinit_core::Request::Status {
+            unit: Some(unit("app.service")),
+            tail: 0,
+        },
+    );
+    assert!(
+        text.contains("description: second"),
+        "the deferred definition takes over at the next start: {text}"
+    );
+
+    // Removed while running: stopped, then gone from every protocol answer.
+    let (status, text) = control(&socket, rinit_core::Request::Start(unit("lonely.service")));
+    assert_eq!(status, rinit_core::Status::Ok, "{text}");
+    fs::remove_file(dir.0.join("lonely.service")).expect("remove the unit file");
+    let (status, text) = control(&socket, rinit_core::Request::Reload);
+    assert_eq!(status, rinit_core::Status::Ok, "{text}");
+    assert!(
+        text.contains("stopped lonely.service: its unit file is gone"),
+        "got: {text}"
+    );
+    assert!(text.contains("removed lonely.service"), "got: {text}");
+    let (status, _) = control(&socket, rinit_core::Request::Start(unit("lonely.service")));
+    assert_eq!(
+        status,
+        rinit_core::Status::NoSuchUnit,
+        "a removed unit is gone, not merely stopped"
+    );
+    let (_, text) = control(&socket, rinit_core::Request::List);
+    assert!(
+        !text.contains("lonely.service"),
+        "`list` has to agree with `start`: {text}"
+    );
+
+    stop_rinit(child);
+}
+
+/// Plan §7.6's boundary: a directory that does not resolve is not applied at all.
+///
+/// Two ways to break it - a reference to a unit that is gone, and a dependency
+/// cycle - and in both cases the reply has to be an error that says the running
+/// configuration is untouched, which this checks from the other side by asking
+/// what is running afterwards.
+#[test]
+fn a_reload_the_graph_rejects_changes_nothing() {
+    let dir = TempDir::new("reload-rejected");
+    dir.write("all.target", "[Unit]\nType=target\nRequires=app.service\n");
+    dir.write(
+        "app.service",
+        "[Service]\nType=simple\nExecStart=/bin/sleep 30\n",
+    );
+    let (child, socket) = boot_with_control(&dir, "reload-rejected");
+    let unit = |name: &str| rinit_core::UnitName::parse(name).expect("unit name");
+
+    // A `Requires=` with nothing behind it: the reference is dangling.
+    fs::remove_file(dir.0.join("app.service")).expect("remove the unit file");
+    let (status, text) = control(&socket, rinit_core::Request::Reload);
+    assert_eq!(status, rinit_core::Status::Error, "{text}");
+    assert!(
+        text.contains("the running configuration is unchanged"),
+        "got: {text}"
+    );
+    let (status, text) = control(
+        &socket,
+        rinit_core::Request::Status {
+            unit: Some(unit("app.service")),
+            tail: 0,
+        },
+    );
+    assert_eq!(
+        status,
+        rinit_core::Status::Ok,
+        "the old configuration has to survive the rejection: {text}"
+    );
+
+    // A cycle: two units that wait for each other.
+    dir.write(
+        "app.service",
+        "[Service]\nType=simple\nExecStart=/bin/sleep 30\n",
+    );
+    dir.write(
+        "a.service",
+        "[Unit]\nRequires=b.service\n[Service]\nType=simple\nExecStart=/bin/sleep 30\n",
+    );
+    dir.write(
+        "b.service",
+        "[Unit]\nRequires=a.service\n[Service]\nType=simple\nExecStart=/bin/sleep 30\n",
+    );
+    let (status, text) = control(&socket, rinit_core::Request::Reload);
+    assert_eq!(status, rinit_core::Status::Error, "{text}");
+    assert!(
+        text.contains("the running configuration is unchanged"),
+        "got: {text}"
+    );
+    let (status, _) = control(&socket, rinit_core::Request::Start(unit("a.service")));
+    assert_eq!(
+        status,
+        rinit_core::Status::NoSuchUnit,
+        "a rejected reload must not have registered anything either"
+    );
+
+    stop_rinit(child);
+}

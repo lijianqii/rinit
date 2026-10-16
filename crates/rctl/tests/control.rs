@@ -94,6 +94,50 @@ fn a_successful_command_prints_the_reply_and_exits_zero() {
     );
 }
 
+/// `rctl reload` asks the server to re-read the unit directory, and prints the
+/// report it gets back (plan §7.6).
+#[test]
+fn reload_asks_the_server_to_reread_the_directory() {
+    let dir = TempDir::new("reload");
+    let (_, server) = serve_one(
+        &dir,
+        Status::Ok,
+        "registered extra.service\nstarted extra.service: the boot target requires it\n\
+         reload: 1 added (1 started), 0 changed (0 deferred), 0 removed (0 stopped), 3 unchanged",
+    );
+
+    let output = run_rctl(&dir, &["reload"]);
+
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("registered extra.service"), "got: {stdout}");
+    assert!(
+        stdout.contains("1 added"),
+        "the summary belongs in the reply: {stdout}"
+    );
+    assert_eq!(server.join().expect("server"), Request::Reload);
+}
+
+/// A reload the server refuses is an ordinary error: exit 1, and the reason -
+/// which says the running configuration is untouched - on stderr.
+#[test]
+fn a_rejected_reload_is_reported_as_an_error() {
+    let dir = TempDir::new("reload-rejected");
+    let (_, server) = serve_one(
+        &dir,
+        Status::Error,
+        "reload rejected, the running configuration is unchanged: app.service: not found",
+    );
+
+    let output = run_rctl(&dir, &["reload"]);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty(), "nothing belongs on stdout");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unchanged"), "got: {stderr}");
+    let _ = server.join();
+}
+
 /// A reply that is not `Ok` goes to stderr and sets the plan's exit code
 /// (plan §3 M3: 3 = no such unit, 4 = conflict).
 #[test]

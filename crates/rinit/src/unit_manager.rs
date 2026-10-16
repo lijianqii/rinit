@@ -17,7 +17,7 @@ use rinit_core::unit::dependency::spawns_process;
 use rinit_core::unit::restart::BackoffState;
 use rinit_core::{Effect, Event, ExitOutcome, FailedReason, NotifyMessage, UnitState, transition};
 use rinit_core::{Job, JobQueue, JobTarget, RequestSource, UnitConfig, UnitName};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use rinit_runtime::RuntimeError;
@@ -26,6 +26,23 @@ use rinit_runtime::syscall::{process, wait};
 use crate::cgroup::Cgroup;
 use crate::log::rlog;
 use crate::service::spawn_service_in_group;
+
+/// What registering a unit definition did (plan §7.6).
+///
+/// The four answers are the plan's classification of a reload's diff, and the
+/// manager is the only place that can give them: "did this change take effect"
+/// depends on whether the unit has a process, which is state the manager owns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigChange {
+    /// The unit was not known: registered, `Inactive`.
+    Added,
+    /// Known and not running: the new definition is in force now.
+    Applied,
+    /// Known and running: the new definition waits for the next start.
+    Deferred,
+    /// Known, and the definition is identical.
+    Unchanged,
+}
 
 /// What happened to a unit when a child was reaped.
 ///
@@ -117,6 +134,21 @@ pub struct UnitRuntime {
     /// cgroup's and survives a restart when the directory had to be kept, so
     /// only a *change* across this run is this run's OOM kill.
     pub oom_kills_at_start: Option<u64>,
+    /// A reload's replacement definition, waiting for the next start
+    /// (plan §7.6).
+    ///
+    /// A running unit keeps the definition it was started with - including the
+    /// `ExecStop=` that will stop it - and picks this one up at its next start.
+    /// That is the plan's "运行中单元延迟到下次重启时生效", and keeping the *old*
+    /// config in place until then is what makes "delayed" mean delayed.
+    pub pending_config: Option<UnitConfig>,
+    /// Whether a reload found this unit's file gone (plan §7.6).
+    ///
+    /// The runtime itself has to stay while a stop is in flight - the `SIGKILL`
+    /// deadline and the reaping both need it - so removal is a tombstone: every
+    /// protocol answer treats the unit as gone (`exists`), and the entry is
+    /// dropped by the next reload that finds it still retired and now down.
+    pub retired: bool,
 }
 
 impl UnitRuntime {
@@ -148,12 +180,37 @@ impl UnitRuntime {
             status: None,
             last_outcome: None,
             oom_kills_at_start: None,
+            pending_config: None,
+            retired: false,
         }
     }
 
     /// Whether this unit should get a process at all.
     fn spawns(&self) -> bool {
         spawns_process(&self.config)
+    }
+
+    /// Whether the unit has a process, or is on its way to not having one.
+    ///
+    /// Deliberately *not* "the state is active": a `oneshot` that finished is
+    /// `Active(Exited)` with no process, and a reload must be free to replace its
+    /// definition - there is nothing running to protect.
+    fn is_up(&self) -> bool {
+        self.pid.is_some() || self.state == UnitState::Deactivating
+    }
+
+    /// Take a reload's definition, if the unit has settled enough to adopt it
+    /// (plan §7.6).
+    ///
+    /// Called at the start of a start, which is the only moment the two
+    /// definitions could disagree in a way that matters.
+    pub fn adopt_pending_config(&mut self) {
+        if self.is_up() {
+            return;
+        }
+        if let Some(config) = self.pending_config.take() {
+            self.config = config;
+        }
     }
 
     /// The effective restart policy.
@@ -256,8 +313,13 @@ pub struct UnitManager {
     /// is where the unit actually is. Keeping them apart is what lets two
     /// sources race without producing two decisions (plan §1.3(13)).
     jobs: JobQueue,
-    /// Units whose start was queued behind a stop in progress (plan §1.3(13)).
-    queued_starts: BTreeSet<UnitName>,
+    /// Starts queued behind a stop in progress, and who asked for each
+    /// (plan §1.3(13)).
+    ///
+    /// The source is kept because the request is *re-made* when the stop
+    /// finishes (see `due_queued_starts`), and re-making it with the wrong
+    /// priority would let a queued dependency start outrank a user stop.
+    queued_starts: BTreeMap<UnitName, RequestSource>,
     /// Startup order (levels flattened), reversed for shutdown (plan §1.3(8)).
     shutdown_order: Vec<UnitName>,
     /// Monotonic origin for the Job queue's timestamps.
@@ -273,7 +335,7 @@ impl UnitManager {
         UnitManager {
             units: BTreeMap::new(),
             jobs: JobQueue::new(),
-            queued_starts: BTreeSet::new(),
+            queued_starts: BTreeMap::new(),
             shutdown_order: Vec::new(),
             origin: Instant::now(),
             cgroup: Cgroup::disabled(),
@@ -294,15 +356,87 @@ impl UnitManager {
         self.origin.elapsed().as_millis() as u64
     }
 
-    /// Register a unit, in `Inactive`.
-    pub fn add(&mut self, config: UnitConfig) {
+    /// Register a unit, or update a known one (plan §7.6).
+    ///
+    /// A unit that is already known keeps its runtime state - a reload must not
+    /// reset a running service's pid, state or backoff - and the new definition
+    /// either takes over now (nothing is running) or waits for the next start.
+    /// See [`UnitRuntime::pending_config`].
+    pub fn add(&mut self, config: UnitConfig) -> ConfigChange {
         let name = config.name.clone();
-        self.units.insert(name, UnitRuntime::new(config));
+        let Some(rt) = self.units.get_mut(&name) else {
+            self.units.insert(name, UnitRuntime::new(config));
+            return ConfigChange::Added;
+        };
+        // The file is back (or never left): the unit is a unit again.
+        rt.retired = false;
+        if rt.config == config {
+            return ConfigChange::Unchanged;
+        }
+        if rt.is_up() {
+            rt.pending_config = Some(config);
+            ConfigChange::Deferred
+        } else {
+            rt.config = config;
+            rt.pending_config = None;
+            ConfigChange::Applied
+        }
+    }
+
+    /// Whether a unit is known *and* still has a unit file (plan §7.6).
+    ///
+    /// This, not [`get`](Self::get), is what the control protocol asks: a unit a
+    /// reload removed is gone as far as `rctl` is concerned, even while its stop
+    /// is still in flight and the runtime therefore still exists.
+    pub fn exists(&self, unit: &UnitName) -> bool {
+        self.units.get(unit).is_some_and(|rt| !rt.retired)
+    }
+
+    /// Mark `unit` as removed by a reload (plan §7.6).
+    ///
+    /// Hidden from every protocol answer from now on; the entry stays until its
+    /// stop has landed, and the next reload drops it.
+    pub fn retire(&mut self, unit: &UnitName) {
+        if let Some(rt) = self.units.get_mut(unit) {
+            rt.retired = true;
+        }
+    }
+
+    /// Drop retired entries that have nothing left in flight (plan §7.6).
+    ///
+    /// Returns how many went. Called at the start of a reload, so the tombstones
+    /// a previous reload left behind are collected exactly when the directory is
+    /// known to be the truth again.
+    pub fn prune_retired(&mut self) -> usize {
+        let before = self.units.len();
+        self.units.retain(|_, rt| !rt.retired || rt.is_up());
+        before - self.units.len()
+    }
+
+    /// Every known unit, retired ones included, in name order.
+    pub fn names(&self) -> Vec<UnitName> {
+        self.units.keys().cloned().collect()
+    }
+
+    /// Whether `unit` has a process, or is on its way to not having one.
+    pub fn is_up(&self, unit: &UnitName) -> bool {
+        self.units.get(unit).is_some_and(UnitRuntime::is_up)
     }
 
     /// Read a unit.
     pub fn get(&self, unit: &UnitName) -> Option<&UnitRuntime> {
         self.units.get(unit)
+    }
+
+    /// Take a pending reload definition at the start of a start (plan §7.6).
+    ///
+    /// Called by the start path rather than by a state change, because "the next
+    /// start" is the only moment the plan gives a new definition permission to
+    /// take over from a running one.
+    pub fn adopt_pending_config(&mut self, unit: &UnitName) {
+        if let Some(rt) = self.units.get_mut(unit) {
+            rt.adopt_pending_config();
+        }
     }
 
     /// Ask for `unit` to be started, merging with any request already held.
@@ -337,6 +471,7 @@ impl UnitManager {
             return None;
         }
         let at = self.now_millis();
+        self.forget_spent_target(unit);
         self.jobs.submit(Job::new(unit.clone(), target, source, at));
         let effect = self.effect_for(unit);
 
@@ -355,7 +490,7 @@ impl UnitManager {
             // picks it up once the stop finishes.
             JobTarget::Started => {
                 if effect.is_none() && self.is_deactivating(unit) {
-                    self.queued_starts.insert(unit.clone());
+                    self.queued_starts.insert(unit.clone(), source);
                 }
             }
             // An explicit stop beats a start that was still queued.
@@ -389,19 +524,45 @@ impl UnitManager {
     /// Plan §1.3(13): the start is not applied to a unit that is still tearing
     /// down, so it is applied here, on the first pass after the stop completes.
     pub fn due_queued_starts(&mut self) -> Vec<UnitName> {
-        let queued: Vec<UnitName> = self.queued_starts.iter().cloned().collect();
+        let queued: Vec<(UnitName, RequestSource)> = self
+            .queued_starts
+            .iter()
+            .map(|(unit, source)| (unit.clone(), *source))
+            .collect();
         let mut ready = Vec::new();
-        for unit in queued {
+        for (unit, source) in queued {
             // Still stopping: leave it queued.
             if self.is_deactivating(&unit) {
                 continue;
             }
             self.queued_starts.remove(&unit);
-            if self.effect_for(&unit) == Some(Effect::SpawnProcess) {
+            // The start is *re-made* rather than read back from the target. A
+            // stop that came from a request leaves the merged target at
+            // `Stopped`, and a start does not outrank a user stop
+            // (plan §1.3(11)) - so asking again, now that the stop is done and
+            // its target is spent, is what makes the queued start happen.
+            if self.request(&unit, JobTarget::Started, source) == Some(Effect::SpawnProcess) {
                 ready.push(unit);
             }
         }
         ready
+    }
+
+    /// Forget a target the unit already satisfies (plan §1.3(13)).
+    ///
+    /// `JobQueue`'s precedence is about requests that are still *outstanding*,
+    /// and a target the unit has reached is not outstanding. Without this it
+    /// would veto every later request from a lower-priority source, forever:
+    /// `rctl stop app.service` is a `UserStop`, `rctl start` is a `UserStart`,
+    /// and a user start does not outrank a user stop - so the unit could never
+    /// be started again. That is a bug, not a feature of the priority order.
+    fn forget_spent_target(&mut self, unit: &UnitName) {
+        let Some(state) = self.units.get(unit).map(|rt| rt.state) else {
+            return;
+        };
+        if let Some((Effect::None, _)) = self.jobs.reconcile(unit, state) {
+            self.jobs.forget(unit);
+        }
     }
 
     /// Restart `unit`: stop it if it is running, then start it again.
@@ -1371,9 +1532,13 @@ impl UnitManager {
     }
 
     /// A human-readable summary line per unit, for the boot log and `rctl`.
+    ///
+    /// Retired units are left out: a reload removed them, and `rctl list` must
+    /// agree with `rctl start` about which units exist (plan §7.6).
     pub fn summary(&self) -> Vec<String> {
         self.units
             .values()
+            .filter(|rt| !rt.retired)
             .map(|rt| {
                 let pid = match rt.pid {
                     Some(p) => format!(" pid {p}"),
@@ -2377,6 +2542,72 @@ mod tests {
         cleanup(&mut m, &unit);
     }
 
+    /// A user stop must not make a later user start impossible.
+    ///
+    /// `UserStop` outranks `UserStart` (plan §1.3(11)), and the merged target
+    /// used to survive the stop it asked for - so `rctl stop app.service`
+    /// followed by `rctl start app.service` answered "already active" and left
+    /// the unit inactive. Precedence is about requests that are still
+    /// outstanding; one that has been carried out is spent, not outstanding.
+    #[test]
+    fn a_user_start_after_a_user_stop_starts_the_unit_again() {
+        let _guard = crate::test_support::children_lock();
+        let mut m = manager_with("a.service", RestartPolicy::No);
+        let unit = UnitName::parse("a.service").unwrap();
+        m.request_start(&unit, RequestSource::Dependency);
+        let pid = spawn_pid(&mut m, &unit);
+
+        m.request_stop(&unit, RequestSource::UserStop);
+        m.stop_unit(&unit);
+        let _ = process::kill_process_group(pid, libc::SIGKILL);
+        let _ = m.on_child_exit(pid, ExitOutcome::Signalled(libc::SIGKILL));
+        assert_eq!(m.get(&unit).unwrap().state, UnitState::Inactive);
+
+        assert_eq!(
+            m.request_start(&unit, RequestSource::UserStart),
+            Some(Effect::SpawnProcess),
+            "the stop that has been carried out must not veto the start"
+        );
+        assert_eq!(m.target_of(&unit), Some(JobTarget::Started));
+        cleanup(&mut m, &unit);
+    }
+
+    /// The same, for a start that arrived while the requested stop was still in
+    /// flight: it is queued, and it has to be *applied* once the stop finishes.
+    #[test]
+    fn a_start_queued_behind_a_requested_stop_is_applied() {
+        let _guard = crate::test_support::children_lock();
+        let mut m = manager_with("a.service", RestartPolicy::No);
+        let unit = UnitName::parse("a.service").unwrap();
+        m.request_start(&unit, RequestSource::Dependency);
+        let pid = spawn_pid(&mut m, &unit);
+
+        m.request_stop(&unit, RequestSource::UserStop);
+        m.stop_unit(&unit);
+        assert_eq!(
+            m.request_start(&unit, RequestSource::UserStart),
+            None,
+            "the start waits for the stop"
+        );
+        assert!(m.due_queued_starts().is_empty(), "still stopping");
+
+        let _ = process::kill_process_group(pid, libc::SIGKILL);
+        let _ = m.on_child_exit(pid, ExitOutcome::Signalled(libc::SIGKILL));
+        assert_eq!(m.get(&unit).unwrap().state, UnitState::Inactive);
+
+        assert_eq!(
+            m.due_queued_starts(),
+            std::slice::from_ref(&unit),
+            "the queued start is applied once the stop is done"
+        );
+        assert_eq!(
+            m.target_of(&unit),
+            Some(JobTarget::Started),
+            "and it took the target back from the spent stop"
+        );
+        cleanup(&mut m, &unit);
+    }
+
     /// An explicit stop cancels a queued start.
     #[test]
     fn a_stop_cancels_a_queued_start() {
@@ -2450,5 +2681,116 @@ mod tests {
         assert_eq!(m.target_of(&unit), Some(JobTarget::Started));
         m.request_stop(&unit, RequestSource::UserStop);
         assert_eq!(m.target_of(&unit), Some(JobTarget::Stopped));
+    }
+
+    // --- §7.6: what a reload does to the manager -------------------
+
+    /// Registering a definition answers one of four things, and the two that
+    /// matter are the ones plan §7.6 separates: a *stopped* unit takes the new
+    /// definition now, a *running* one keeps the old one until its next start.
+    #[test]
+    fn a_reload_applies_a_new_definition_now_or_defers_it_to_the_next_start() {
+        let _guard = crate::test_support::children_lock();
+        let mut m = UnitManager::new();
+        let unit = UnitName::parse("app.service").unwrap();
+        let original = config("app.service", RestartPolicy::No);
+
+        assert_eq!(m.add(original.clone()), ConfigChange::Added);
+        assert_eq!(m.get(&unit).unwrap().state, UnitState::Inactive);
+        assert_eq!(m.add(original.clone()), ConfigChange::Unchanged);
+
+        // Not running: in force immediately, and nothing is left pending.
+        let mut first = original.clone();
+        first.description = "first".to_string();
+        assert_eq!(m.add(first), ConfigChange::Applied);
+        assert_eq!(m.get(&unit).unwrap().config.description, "first");
+        assert!(m.get(&unit).unwrap().pending_config.is_none());
+
+        // Running: the process keeps the definition it was started with - which
+        // is what makes the deferral real, `ExecStop=` included - and the new one
+        // waits.
+        m.spawn_unit_with_output(&unit, &[], None).expect("spawn");
+        let mut second = original.clone();
+        second.description = "second".to_string();
+        assert_eq!(m.add(second), ConfigChange::Deferred);
+        assert_eq!(
+            m.get(&unit).unwrap().config.description,
+            "first",
+            "a running unit must keep the definition it is running"
+        );
+        assert_eq!(
+            m.get(&unit)
+                .unwrap()
+                .pending_config
+                .as_ref()
+                .map(|c| c.description.clone()),
+            Some("second".to_string())
+        );
+
+        // A start that finds the unit still up does not take it either: only a
+        // real start does.
+        m.adopt_pending_config(&unit);
+        assert_eq!(m.get(&unit).unwrap().config.description, "first");
+
+        // Let it settle, then the next start adopts the pending definition.
+        let pid = m.get(&unit).unwrap().pid.expect("spawned");
+        let _ = process::kill_process_group(pid, libc::SIGKILL);
+        let _ = m.on_child_exit(pid, ExitOutcome::Signalled(libc::SIGKILL));
+        m.adopt_pending_config(&unit);
+        assert_eq!(m.get(&unit).unwrap().config.description, "second");
+        assert!(m.get(&unit).unwrap().pending_config.is_none());
+    }
+
+    /// A removed unit is hidden from the protocol immediately, but the runtime
+    /// stays while its stop is in flight - the `SIGKILL` deadline and the reaping
+    /// both need it - and is dropped by the next reload once it is down.
+    #[test]
+    fn a_retired_unit_is_hidden_at_once_and_pruned_once_it_is_down() {
+        let _guard = crate::test_support::children_lock();
+        // Not running: hidden and pruned in one go.
+        let mut m = manager_with("app.service", RestartPolicy::No);
+        let unit = UnitName::parse("app.service").unwrap();
+        assert!(m.exists(&unit));
+
+        m.retire(&unit);
+        assert!(
+            !m.exists(&unit),
+            "a removed unit is gone as far as rctl is concerned"
+        );
+        assert!(
+            !m.summary().iter().any(|line| line.contains("app.service")),
+            "and `rctl list` must agree: {:?}",
+            m.summary()
+        );
+        assert!(m.get(&unit).is_some(), "the entry itself is still there");
+        assert_eq!(m.prune_retired(), 1);
+        assert!(
+            m.get(&unit).is_none(),
+            "and is dropped once nothing is in flight"
+        );
+
+        // Running: the entry has to survive the prune, because the stop needs it.
+        let mut m = manager_with("app.service", RestartPolicy::No);
+        m.spawn_unit_with_output(&unit, &[], None).expect("spawn");
+        m.retire(&unit);
+        assert_eq!(
+            m.prune_retired(),
+            0,
+            "an in-flight stop still needs the entry"
+        );
+        assert!(m.get(&unit).is_some());
+
+        // A file that comes back makes it a unit again, state and all.
+        assert_eq!(
+            m.add(config("app.service", RestartPolicy::No)),
+            ConfigChange::Unchanged
+        );
+        assert!(m.exists(&unit), "re-registering clears the tombstone");
+        assert_eq!(m.get(&unit).unwrap().state, UnitState::Active);
+
+        m.stop_unit(&unit);
+        if let Some(pid) = m.get(&unit).unwrap().pid {
+            let _ = process::kill_process_group(pid, libc::SIGKILL);
+        }
     }
 }
