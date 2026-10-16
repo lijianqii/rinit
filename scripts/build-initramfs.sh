@@ -73,6 +73,12 @@ install -m 0755 "${bin_dir}/rctl" "${work}/bin/rctl"
 # smoke test; shipping a ~1 MB binary that no unit refers to would only bloat
 # the image. The guest's services come from units/ and busybox.
 
+# Plan §1.3(9)'s second wave: the mount table rinit reads after the first wave.
+# It ships in the image because the second wave runs at *boot* - a table written
+# at run time would be too late - and it is the repo's `fstab` verbatim so the
+# guest's evidence points at a file instead of at the packing script.
+install -m 0644 "${repo_root}/fstab" "${work}/etc/fstab"
+
 # The unit directory, which is what the guest actually boots.
 for glob in "${repo_root}"/units/*.service "${repo_root}"/units/*.target; do
     [[ -e "${glob}" ]] || continue

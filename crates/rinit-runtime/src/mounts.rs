@@ -34,6 +34,19 @@ pub trait MountOps {
     fn mount_devtmpfs(&mut self, target: &Path) -> Result<(), SyscallError>;
     /// Mount the cgroup v2 unified hierarchy.
     fn mount_cgroup2(&mut self, target: &Path) -> Result<(), SyscallError>;
+    /// Mount an arbitrary filesystem (plan §1.3(9)'s second wave).
+    ///
+    /// `flags` are the `MS_*` bits an fstab entry's options translated to, and
+    /// `data` is whatever is left of the option string - the part the filesystem
+    /// itself parses (`mode=0755`, `size=64m`).
+    fn mount_fs(
+        &mut self,
+        source: &str,
+        target: &Path,
+        fstype: &str,
+        flags: libc::c_ulong,
+        data: Option<&str>,
+    ) -> Result<(), SyscallError>;
 }
 
 /// The real thing: `mkdir(2)` + `mount(2)` through the audited syscall layer.
@@ -63,6 +76,17 @@ impl MountOps for RealMounts {
 
     fn mount_cgroup2(&mut self, target: &Path) -> Result<(), SyscallError> {
         mount::mount_cgroup2(target)
+    }
+
+    fn mount_fs(
+        &mut self,
+        source: &str,
+        target: &Path,
+        fstype: &str,
+        flags: libc::c_ulong,
+        data: Option<&str>,
+    ) -> Result<(), SyscallError> {
+        mount::mount(source, target, fstype, flags, data)
     }
 }
 
@@ -285,6 +309,20 @@ mod tests {
 
         fn mount_cgroup2(&mut self, target: &Path) -> Result<(), SyscallError> {
             self.step("mount_cgroup2", target)
+        }
+
+        /// The first wave never calls this, and a test that sees it happen has
+        /// found the two waves mixed up - so it fails rather than recording a
+        /// step nobody meant to take.
+        fn mount_fs(
+            &mut self,
+            _source: &str,
+            _target: &Path,
+            _fstype: &str,
+            _flags: libc::c_ulong,
+            _data: Option<&str>,
+        ) -> Result<(), SyscallError> {
+            Err(SyscallError::new("mount_fs", libc::EINVAL))
         }
     }
 

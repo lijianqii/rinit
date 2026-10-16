@@ -64,10 +64,21 @@ pub struct Config {
     /// is a *mirror* of the ring, not a replacement, so `rctl log` does not
     /// depend on it.
     pub log_file: Option<PathBuf>,
+    /// Where the second-wave mount table lives (plan §1.3(9)), or `None` to skip
+    /// the second wave.
+    ///
+    /// `--fstab <PATH>`; the default is the plan's own path, and an empty value
+    /// or `none` turns it off. A `nofstab` token on the kernel command line still
+    /// wins over both, because that is what a board passes when it has mounted
+    /// what it needs itself.
+    pub fstab: Option<PathBuf>,
 }
 
 /// Where captured service output is persisted by default (plan §1.3(7)).
 pub const DEFAULT_LOG_FILE: &str = "/var/log/rinit/log";
+
+/// Where the second-wave mount table lives by default (plan §1.3(9)).
+pub const DEFAULT_FSTAB: &str = "/etc/fstab";
 
 /// Parse arguments (excluding `argv[0]`), honouring [`ENV_TEST_SERVICE`].
 ///
@@ -121,6 +132,7 @@ fn parse_with_default<I: IntoIterator<Item = OsString>>(
         watchdog_device: None,
         watchdog_timeout_sec: rinit_runtime::syscall::watchdog::DEFAULT_TIMEOUT_SEC,
         log_file: Some(PathBuf::from(DEFAULT_LOG_FILE)),
+        fstab: Some(PathBuf::from(DEFAULT_FSTAB)),
     };
 
     let mut iter = args.into_iter();
@@ -154,6 +166,12 @@ fn parse_with_default<I: IntoIterator<Item = OsString>>(
                     .next()
                     .ok_or_else(|| "--watchdog requires a device path".to_string())?;
                 cfg.watchdog_device = Some(PathBuf::from(value.to_string_lossy().into_owned()));
+            }
+            "--fstab" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--fstab requires a path".to_string())?;
+                cfg.fstab = log_file_path(&value.to_string_lossy());
             }
             "--log-file" => {
                 let value = iter
@@ -195,6 +213,8 @@ fn parse_with_default<I: IntoIterator<Item = OsString>>(
                     validate_target(&cfg.default_target)?;
                 } else if let Some(value) = other.strip_prefix("--cgroup-root=") {
                     cfg.cgroup_root = Some(PathBuf::from(value));
+                } else if let Some(value) = other.strip_prefix("--fstab=") {
+                    cfg.fstab = log_file_path(value);
                 } else if let Some(value) = other.strip_prefix("--log-file=") {
                     cfg.log_file = log_file_path(value);
                 } else if let Some(value) = other.strip_prefix("--watchdog=") {
@@ -227,12 +247,13 @@ fn parse_with_default<I: IntoIterator<Item = OsString>>(
             .map_err(|e| format!("--default: {e}"))
     }
 
-    /// The path `--log-file` names, or `None` for "do not persist".
+    /// A path an optional-feature flag names, or `None` for "do not do it".
     ///
     /// `none` is spelled out rather than only accepting an empty value because a
     /// kernel command line cannot easily carry an empty argument - and the two
     /// spellings meaning the same thing is one fewer difference between a boot
-    /// and a `make run`.
+    /// and a `make run`. Used by `--log-file` and `--fstab`, which are the two
+    /// things a board may want to point somewhere else or turn off entirely.
     fn log_file_path(value: &str) -> Option<PathBuf> {
         let value = value.trim();
         if value.is_empty() || value.eq_ignore_ascii_case("none") {
@@ -302,6 +323,8 @@ Options:
                              (default: 30)
       --log-file <PATH>      Mirror captured service output to this file
                              (default: /var/log/rinit/log; 'none' disables)
+      --fstab <PATH>         Second-wave mount table (plan §1.3(9))
+                             (default: /etc/fstab; 'none' disables)
       --test-service <CMD>   Launch this instead of the unit directory
       -- <SERVICE> [ARGS]    Service as an argv (kernel-cmdline form)
 
@@ -644,6 +667,31 @@ mod tests {
     fn cgroup_root_without_a_value_is_an_error() {
         let err = parse_args(&["--cgroup-root"]).expect_err("must fail");
         assert!(err.contains("--cgroup-root"), "got: {err}");
+    }
+
+    // --- the second wave of mounts (plan §1.3(9)) ---------------------
+
+    /// The fstab path defaults to the plan's, both flag forms name another, and
+    /// `none` (or an empty value) turns the second wave off.
+    #[test]
+    fn the_fstab_path_defaults_to_the_plans_and_can_be_turned_off() {
+        assert_eq!(
+            parse_args(&[]).unwrap().fstab,
+            Some(PathBuf::from(DEFAULT_FSTAB))
+        );
+        assert_eq!(
+            parse_args(&["--fstab", "/tmp/fstab"]).unwrap().fstab,
+            Some(PathBuf::from("/tmp/fstab"))
+        );
+        assert_eq!(
+            parse_args(&["--fstab=/tmp/fstab"]).unwrap().fstab,
+            Some(PathBuf::from("/tmp/fstab"))
+        );
+        for off in ["none", "NONE", ""] {
+            assert_eq!(parse_args(&["--fstab", off]).unwrap().fstab, None);
+        }
+        let missing = parse_args(&["--fstab"]).expect_err("must fail");
+        assert!(missing.contains("--fstab"), "got: {missing}");
     }
 
     // --- the log file (plan §1.3(7)) ----------------------------------

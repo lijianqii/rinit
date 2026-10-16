@@ -13,13 +13,13 @@ answers plan §6's checklist line by line, with one exception - the 72 h soak, w
 is a deployment-time run of `make soak` rather than a feature.
 
 What is in place, and what it is proven by. Every claim below is either a host
-test (`make check`) or a guest assertion (`make test-system`, 90 of them in
+test (`make check`) or a guest assertion (`make test-system`, 92 of them in
 `scripts/system-test.sh`); "proven on the host" always means the fake-runtime or
 `--dev` form of the same code path, and the guest means the real one.
 
 | milestone | content | evidence |
 | --------- | ------- | -------- |
-| M0 | PID 1 via `rdinit=`, first-wave mounts (`/run` → `/proc` → `/sys` → `/dev` → `/tmp` → `/sys/fs/cgroup`) with fatal/degradable rules per plan §1.3(9), `SIGCHLD` + `waitpid(-1, WNOHANG)` reaping, panic hook to `/dev/kmsg` | guest: "mounted /run…", "mounted /sys/fs/cgroup", "no rinit panic"; host: `crates/rinit/tests/smoke.rs` |
+| M0 | PID 1 via `rdinit=`, first-wave mounts (`/run` → `/proc` → `/sys` → `/dev` → `/tmp` → `/sys/fs/cgroup`) with fatal/degradable rules per plan §1.3(9), the second wave (`/etc/fstab`, plan §1.3(9)) in file order with failures logged and the boot continuing, `SIGCHLD` + `waitpid(-1, WNOHANG)` reaping, panic hook to `/dev/kmsg` | guest: "mounted /run…", "mounted /sys/fs/cgroup", "mounted /data (fstab)", "fstab-tmpfs /data tmpfs", "no rinit panic"; host: `crates/rinit-runtime/src/fstab.rs` (6), `crates/rinit/tests/smoke.rs` |
 | M1 | unit files parsed from `/etc/rinit/units`, dependency graph resolved, units started level by level with each level in parallel | guest: "resolved a boot plan", "startup levels run in dependency order", "no target was exec'd" |
 | M2 | supervision (spawn, track, reap, two-stage stop), restart policy with backoff and a circuit breaker, health probes, `Type=notify` readiness, the in-memory log ring and its optional file mirror (plan §1.3(7)) | guest: "a crashed service is scheduled for restart", "the breaker tripped on the failing unit"; host: `crates/rinit/tests/m2_lifecycle.rs` (33 tests) |
 | M3 | control socket + `rctl` (`list`, `status`, `start`, `stop`, `restart`, `reset-failed`, `log`, `reload`), with a documented exit-code contract | guest: "rctl list reached the control socket" and the five assertions after it; host: `crates/rctl/tests/control.rs` (8 tests) |
@@ -41,6 +41,7 @@ rinit: mounted /dev
 rinit: mounted /tmp
 rinit: mounted /sys/fs/cgroup
 rinit: cgroup v2 ready at /sys/fs/cgroup
+rinit: mounted /data (fstab)
 rinit: boot plan for 'multi-user.target': 17 unit(s) in 3 level(s)
 rinit: plan 0: rinit-init.target (target)
 rinit: plan 1: fault.service (service)
@@ -292,10 +293,10 @@ make test-system    # boot aarch64 qemu and assert the acceptance list
 make test           # check + test-system
 ```
 
-`cargo test --offline --workspace` (what `make check` runs last) executes **675
+`cargo test --offline --workspace` (what `make check` runs last) executes **682
 tests** across eleven binaries. The four shapes, and why each is not redundant:
 
-- **unit tests** next to the code (core 314, rinit 179, rinit-runtime 92,
+- **unit tests** next to the code (core 320, rinit 180, rinit-runtime 92,
   rctl 11), including `proptest` properties over the parser;
 - **integration tests** in `crates/*/tests/`: the syscall layer against the real
   kernel (`rinit-runtime` 21: run unprivileged, they assert that each drop is
@@ -315,7 +316,7 @@ tests** across eleven binaries. The four shapes, and why each is not redundant:
   259200'` is the 72-hour acceptance run the plan asks for;
 - **the guest system test** (`scripts/system-test.sh`, plan §4.3): boots the real
   initramfs on aarch64 qemu, types at the console to prove a root shell is
-  reachable, drives `rctl` against the running system, and asserts 90 things -
+  reachable, drives `rctl` against the running system, and asserts 92 things -
   including that levels run in dependency order, that no target is ever exec'd,
   the §7.4 privilege-drop outcomes, the §7.3 limits read back out of the guest's
   own kernel, §7.5's watchdog on the real device qemu attaches, §7.6's reload
@@ -447,7 +448,7 @@ repository or a measurement in this README:
 
 | plan §6 | where it stands |
 | ------- | --------------- |
-| boots as PID 1 in qemu (128M) with no kernel panic | `make test-system`: 90 assertions, including "no rinit panic" and four kernel-log checks |
+| boots as PID 1 in qemu (128M) with no kernel panic | `make test-system`: 92 assertions, including "no rinit panic" and four kernel-log checks |
 | 20 services in parallel, visibly faster than serial | **19.2x**: `make parallel` - 20 `oneshot` services that each sleep 1 s finish in 1065 ms together and 20 424 ms chained |
 | crash-restart, breaker, health checks | `make test-system` ("a crashed service is scheduled for restart", "the breaker tripped on the failing unit") and `crates/rinit/tests/m2_lifecycle.rs` |
 | `rctl` can start, stop, query and read logs | `make test-system`'s M3 block and `crates/rctl/tests/control.rs` |
@@ -583,6 +584,8 @@ rinit [OPTIONS] [-- <SERVICE> [ARGS...]]
                              (default: 30)
       --log-file <PATH>      Mirror captured service output to this file
                              (default: /var/log/rinit/log; 'none' disables)
+      --fstab <PATH>         Second-wave mount table (plan §1.3(9))
+                             (default: /etc/fstab; 'none' disables)
       --test-service <CMD>   Launch this instead of the unit directory
       -- <SERVICE> [ARGS]    Service as an argv (kernel-cmdline form)
 ```

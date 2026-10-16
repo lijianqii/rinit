@@ -44,6 +44,12 @@ still boots with every unit unlimited.
 - busybox (or equivalent) for the units themselves: `sh`, `sleep`, `cat`, `grep`,
   `awk`, `cut`, `test` are what the acceptance tests use. rinit itself needs none
   of them - it execs a unit's `ExecStart` directly.
+- `/etc/fstab` if the board has filesystems to mount after the first wave
+  (plan §1.3(9)). It is optional: no file means no second wave, and `nofstab` on
+  the kernel command line means the same. Entries are six fields, `noauto` is
+  skipped, UUID/LABEL are *not* resolved, and a failing entry is a warning with
+  the boot continuing - rinit creates each mountpoint, as it does for the first
+  wave. `--fstab <PATH>` moves the file, which is also the test seam.
 - `/etc/passwd` and `/etc/group` if any unit uses `User=`/`Group=`. rinit parses
   them itself (no NSS, no `libnss_files.so`), so a minimal
   `name:passwd:uid:gid:...` file is enough.

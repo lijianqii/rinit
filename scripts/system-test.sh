@@ -145,6 +145,13 @@ await_log() {
     printf 'v=$(grep VmRSS /proc/1/status); echo idle-$v\n' >&3
     await_log 10 'idle-VmRSS:' || true
 
+    # Plan §1.3(9): the second wave. The image ships an `/etc/fstab` with one
+    # entry (a `tmpfs` on `/data`), so what is asserted is the kernel's mount
+    # table rather than rinit's log line - one is a claim about the filesystem,
+    # the other about intent.
+    printf 'm=$(grep " /data " /proc/mounts); echo fstab-$m\n' >&3
+    await_log 10 'fstab-tmpfs /data tmpfs' || true
+
     # M3: drive rinit from the guest console. Each step waits for output that
     # only that command can produce, so a failure surfaces as a timeout rather
     # than as a race.
@@ -478,6 +485,11 @@ expect "mounted /proc" "rinit: mounted /proc"
 expect "mounted /sys" "rinit: mounted /sys"
 expect "mounted /dev" "rinit: mounted /dev"
 expect "mounted /tmp" "rinit: mounted /tmp"
+
+# M0's second wave (plan §1.3(9)): `/etc/fstab`, mounted after the first wave, and
+# the filesystem there afterwards - `/proc/mounts` is the kernel's answer.
+expect "rinit mounted an /etc/fstab entry" "rinit: mounted /data (fstab)"
+expect "and the kernel has a filesystem on it" "fstab-tmpfs /data tmpfs"
 
 # M1: a real boot comes from the unit directory, not a hardcoded service.
 expect "resolved a boot plan" "boot plan for 'multi-user.target'"

@@ -83,6 +83,10 @@ pub async fn run(cfg: Config) -> Result<(), RuntimeError> {
         rlog!("dev mode: skipping first-wave mounts");
     } else {
         report_mounts().await?;
+        // Plan §1.3(9): the second wave, `/etc/fstab`, after the first - it needs
+        // `/proc` for the command line that can veto it, and it is the reason the
+        // first wave has to be complete before anything else runs.
+        report_fstab(&cfg).await?;
     }
 
     // Plan §7.3: the hierarchy is brought up once, here, before any unit can
@@ -1212,6 +1216,52 @@ async fn report_mounts() -> Result<(), RuntimeError> {
         rlog!("warning: {warning}");
     }
     Ok(())
+}
+
+/// Mount whatever `/etc/fstab` asks for (plan §1.3(9)).
+///
+/// Three ways for this to do nothing, and all of them are normal: no `--fstab`
+/// path (or `none`), no such file, or `nofstab` on the kernel command line. A
+/// failure per entry is a warning and the boot carries on - a data partition that
+/// will not mount is a degraded system, not a dead one.
+async fn report_fstab(cfg: &Config) -> Result<(), RuntimeError> {
+    let Some(path) = &cfg.fstab else {
+        rlog!("second-wave mounts: disabled");
+        return Ok(());
+    };
+    let cmdline = cmdline();
+    if !rinit_runtime::fstab::enabled(&cmdline) {
+        rlog!("second-wave mounts: 'nofstab' on the kernel command line");
+        return Ok(());
+    }
+
+    let path = path.clone();
+    let report = tokio::task::spawn_blocking(move || {
+        let mut ops = rinit_runtime::RealMounts;
+        rinit_runtime::fstab::run_with(&mut ops, &path)
+    })
+    .await
+    .map_err(|e| RuntimeError::Join {
+        op: "mount",
+        detail: e.to_string(),
+    })??;
+
+    for point in &report.mounted {
+        rlog!("mounted {point} (fstab)");
+    }
+    for warning in &report.warnings {
+        rlog!("warning: {warning}");
+    }
+    Ok(())
+}
+
+/// The kernel command line, or an empty string when it cannot be read.
+///
+/// The second wave's veto (`nofstab`) lives there, and a system where
+/// `/proc/cmdline` cannot be read is one where the answer is the default rather
+/// than a failed boot.
+fn cmdline() -> String {
+    std::fs::read_to_string("/proc/cmdline").unwrap_or_default()
 }
 
 /// True when this process is PID 1.
