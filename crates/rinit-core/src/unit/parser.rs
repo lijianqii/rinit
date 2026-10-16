@@ -447,6 +447,19 @@ impl Parser {
                     self.cfg.working_directory = path;
                 }
             }
+            (Section::Service, "TTYPath") => {
+                // Plan §7.11. An empty value is "unset", like
+                // `WorkingDirectory`: a service with no controlling terminal
+                // keeps inheriting rinit's descriptors.
+                if !tokens.is_empty() {
+                    let path = joined();
+                    require_absolute(line, key, &path)?;
+                    self.cfg.tty_path = Some(path);
+                }
+            }
+            (Section::Service, "TTYReset") => {
+                self.cfg.tty_reset = boolean(line, key, &tokens)?;
+            }
             (Section::Service, "PIDFile") => {
                 // Plan §7.10: where a `forking` daemon leaves its pid. An empty
                 // value is "unset", like `WorkingDirectory`, which makes the
@@ -1272,6 +1285,46 @@ mod tests {
                 "[Unit]\nType=widget\n[Service]\nExecStart=/bin/true\n"
             ),
             ParseError::InvalidValue { line: 2, .. }
+        ));
+    }
+
+    /// Plan §7.11: the two terminal directives, and the rules they share with
+    /// the other path-valued ones.
+    #[test]
+    fn the_terminal_directives_parse() {
+        let cfg = ok(
+            "getty.service",
+            "[Service]\nExecStart=/sbin/getty\nTTYPath=/dev/ttyAMA0\n",
+        );
+        assert_eq!(cfg.tty_path.as_deref(), Some("/dev/ttyAMA0"));
+        assert!(cfg.tty_reset, "resetting the terminal is the default");
+
+        let cfg = ok(
+            "getty.service",
+            "[Service]\nExecStart=/sbin/getty\nTTYPath=/dev/ttyAMA0\nTTYReset=false\n",
+        );
+        assert!(!cfg.tty_reset);
+
+        // An empty value is "unset", not a path of "" - and a relative path is
+        // refused where it is written, like every other path rinit opens.
+        let cfg = ok(
+            "getty.service",
+            "[Service]\nExecStart=/sbin/getty\nTTYPath=\n",
+        );
+        assert_eq!(cfg.tty_path, None);
+        assert!(matches!(
+            err(
+                "getty.service",
+                "[Service]\nExecStart=/sbin/getty\nTTYPath=dev/ttyAMA0\n"
+            ),
+            ParseError::InvalidValue { line: 3, .. }
+        ));
+        assert!(matches!(
+            err(
+                "getty.service",
+                "[Service]\nExecStart=/sbin/getty\nTTYReset=yes\n"
+            ),
+            ParseError::InvalidValue { line: 3, .. }
         ));
     }
 

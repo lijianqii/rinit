@@ -91,6 +91,7 @@ pub fn spawn_service_in_group(
     output: Option<libc::c_int>,
     sandbox: &Sandbox,
     cgroup_procs: Option<&Path>,
+    tty: Option<process::ChildTty<'_>>,
 ) -> Result<libc::pid_t, RuntimeError> {
     let Prepared { argv, envp, cwd } = prepare(argv, env, working_directory)?;
     let Some(path) = argv.first().map(CString::as_c_str) else {
@@ -106,7 +107,10 @@ pub fn spawn_service_in_group(
         options = options.with_stdio(fd);
     }
     let procs = cgroup_procs.map(cpath).transpose()?;
-    if sandbox.is_inherited() && procs.is_none() {
+    // The `posix_spawn` fast path cannot do either of the child-side jobs: it
+    // has no way to place the process in a cgroup (plan §7.3) or to take over a
+    // terminal (plan §7.11), both of which happen inside the child.
+    if sandbox.is_inherited() && procs.is_none() && tty.is_none() {
         process::posix_spawn_full(path, &argv, &envp, options, cwd.as_deref())
             .map_err(RuntimeError::from)
     } else {
@@ -117,7 +121,10 @@ pub fn spawn_service_in_group(
             options,
             cwd.as_deref(),
             sandbox,
-            procs.as_deref(),
+            process::ChildPaths {
+                cgroup_procs: procs.as_deref(),
+                tty,
+            },
         )
         .map_err(RuntimeError::from)
     }

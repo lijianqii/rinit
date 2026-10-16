@@ -297,6 +297,22 @@ pub struct UnitConfig {
     pub exec_start_post: Vec<ExecCommand>,
     /// Stop command; empty means `SIGTERM`.
     pub exec_stop: ExecCommand,
+    /// A controlling terminal for the unit (plan §7.11).
+    ///
+    /// `None` means the service inherits rinit's own descriptors and no
+    /// controlling terminal - what every unit did until this existed, and what
+    /// most want. `Some(path)` makes the child open that device after `setsid`,
+    /// take it as its controlling terminal and use it as stdin/stdout/stderr,
+    /// which is what a `getty`-like service needs before it can run a login
+    /// shell.
+    pub tty_path: Option<String>,
+    /// Whether to reset the terminal when taking it over (plan §7.11).
+    ///
+    /// A virtual hangup: the queues are flushed and whoever was using the
+    /// terminal is told it is gone, which is what makes a respawned console
+    /// service start from a clean terminal rather than on top of the last
+    /// session's leftovers.
+    pub tty_reset: bool,
     /// Where a `Type=forking` daemon writes its pid (plan §7.10).
     ///
     /// `None` means rinit has to find the daemon itself, which it can only do
@@ -386,6 +402,8 @@ impl UnitConfig {
             environment: Vec::new(),
             environment_file: String::new(),
             working_directory: String::from("/"),
+            tty_path: None,
+            tty_reset: true,
             pid_file: None,
             health_check: ExecCommand::empty(),
             health_interval_sec: 30,

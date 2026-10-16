@@ -857,7 +857,7 @@ impl UnitManager {
 
         // Everything the spawn needs, read through an immutable borrow so the
         // `EnvironmentFile=` read below cannot race the state update.
-        let (argv, env, cwd, kind, sandbox, limits) = {
+        let (argv, env, cwd, kind, sandbox, limits, tty_path, tty_reset) = {
             let Some(rt) = self.units.get(unit) else {
                 return Ok(());
             };
@@ -883,6 +883,10 @@ impl UnitManager {
                 crate::sandbox::resolve(&rt.config)?,
                 // The cgroup limits the unit asked for (plan §7.3).
                 CgroupLimits::from_config(&rt.config),
+                // The controlling terminal, if the unit asked for one
+                // (plan §7.11): the path and whether to reset it.
+                rt.config.tty_path.clone(),
+                rt.config.tty_reset,
             )
         };
 
@@ -914,6 +918,19 @@ impl UnitManager {
             .then(|| self.cgroup.oom_kills(unit))
             .flatten();
 
+        // Plan §7.11: the terminal path goes through the same C-string
+        // conversion as every other path rinit opens, so an interior NUL is a
+        // failed start rather than a silently different device. The `CString`
+        // outlives the spawn because the child borrows it.
+        let tty_cpath = tty_path
+            .as_deref()
+            .map(|path| rinit_runtime::syscall::cstring("TTYPath", path))
+            .transpose()?;
+        let tty = tty_cpath.as_ref().map(|path| process::ChildTty {
+            path: path.as_c_str(),
+            reset: tty_reset,
+        });
+
         // A fresh process group, so a stop reaches the whole tree (plan §1.3(6)).
         let pid = spawn_service_in_group(
             &argv,
@@ -922,6 +939,7 @@ impl UnitManager {
             output,
             &sandbox,
             cgroup_procs.as_deref(),
+            tty,
         )?;
 
         let Some(rt) = self.units.get_mut(unit) else {
@@ -1172,7 +1190,7 @@ impl UnitManager {
             // (`probe_pid`), and having it join would keep the unit's cgroup
             // populated across the probe - which is exactly the state plan §7.3
             // reads as "still running, do not remove this directory".
-            match spawn_service_in_group(&argv, &env, Some(&cwd), None, &sandbox, None) {
+            match spawn_service_in_group(&argv, &env, Some(&cwd), None, &sandbox, None, None) {
                 Ok(pid) => {
                     rt.probe_pid = Some(pid);
                     rt.probe_deadline = deadline(rt.config.health_timeout_sec);
@@ -1378,7 +1396,7 @@ impl UnitManager {
                 // directory look populated for as long as it runs, and plan
                 // §7.3 reads a populated directory as a reason to keep it.
                 Ok(sandbox) => {
-                    spawn_service_in_group(&stop_cmd, &env, Some(&cwd), None, &sandbox, None)
+                    spawn_service_in_group(&stop_cmd, &env, Some(&cwd), None, &sandbox, None, None)
                 }
                 Err(e) => Err(e),
             };

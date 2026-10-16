@@ -77,6 +77,8 @@ of that). `After` alone orders without pulling in, exactly as in systemd.
 | `ExecStartPost` | command | none | Run after the main command is under way (after exit, for `oneshot`). Repeatable. |
 | `ExecStop` | command | empty | The stop action. **Empty means `SIGTERM`** to the process group and to every process in the unit's cgroup. |
 | `PIDFile` | absolute path | none | Where a `Type=forking` daemon writes its pid (plan §7.10). |
+| `TTYPath` | absolute path | none | A controlling terminal for the service (plan §7.11): the child opens it after `setsid`, takes it with `TIOCSCTTY` and uses it as stdin/stdout/stderr. |
+| `TTYReset` | `true`/`false` | `true` | Hang the terminal up when taking it over, so a respawned console service starts on a clean one rather than on the last session's leftovers. Best effort: a device that does not implement it is still used. |
 | `WorkingDirectory` | absolute path | `/` | The child's working directory. Empty keeps the default. |
 | `Environment` | `KEY=VALUE` (one or more) | empty | Environment for every `Exec*` of the unit. Repeatable. |
 | `EnvironmentFile` | absolute path | none | Read further `KEY=VALUE` lines from this file. One that cannot be read is a warning, not a failure - a board without the file still boots. |
@@ -93,6 +95,13 @@ of that). `After` alone orders without pulling in, exactly as in systemd.
   set - through the unit's own cgroup, and only when that cgroup holds exactly one
   process. Anything else fails the start, naming the reason, rather than guessing
   (plan §7.10).
+
+`TTYPath=` is what a `getty`-like service needs before it can run a login shell.
+Two consequences are worth knowing: the terminal replaces the log ring for that
+unit (its output goes to the terminal, so `rctl log` has nothing), and a
+`TTYPath=` that cannot become a controlling terminal - a mistyped device, or
+something that is not a terminal at all - **fails the start**, naming the step,
+rather than leaving a service that believes it owns a terminal.
 
 ### Restarts and timeouts
 

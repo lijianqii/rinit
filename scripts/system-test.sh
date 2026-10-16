@@ -320,6 +320,14 @@ await_log() {
     printf 's=$(rctl status badfork.service | grep state); echo bf-state=$s\n' >&3
     await_log 10 'bf-state=' || true
 
+    # M5 §7.11: the terminal path. The guest has no spare tty - the console is
+    # getty's - so what it can prove here is the fail-closed half: a `TTYPath=`
+    # that is not a terminal must fail the start rather than hand the service a
+    # terminal it does not have. The success path is the pty test in
+    # `crates/rinit/tests/m2_lifecycle.rs`, which can create one on demand.
+    printf 'rctl start tty.service\n' >&3
+    await_log 15 'ioctl(TIOCSCTTY)' || true
+
     # Stopping the unit has to stop the *daemon*: it is the unit's process, and
     # it is not in the process group the stop signal addresses, so this is also
     # the assertion for the fallback that reaches the pid itself.
@@ -617,6 +625,10 @@ expect "a forking unit whose PIDFile was never written failed its start" \
     "cannot locate the daemon: cannot read PIDFile /run/not-written.pid"
 expect "and the failed forking unit is not active" "bf-state=state: failed"
 expect "stopping a forking unit stopped the daemon it took over" "daemon-gone"
+
+# M5 §7.11: a `TTYPath=` that is not a terminal is a failed start, not a service
+# that believes it owns a terminal.
+expect "a TTYPath that is not a terminal fails the start" "ioctl(TIOCSCTTY) failed"
 
 # A completed oneshot has nothing to restart, so `restart` is a conflict
 # (exit 4). `logdemo` proves it and that the unit is only started once.

@@ -20,6 +20,48 @@ use crate::syscall::{cred, fs, wait};
 /// signals `kill(-pgid, ...)`, which reaches children the service forked
 /// itself. Signalling only the direct child would leave those grandchildren
 /// running and holding the port the next start wants.
+/// `ioctl(2)` request that makes the file behind the descriptor the calling
+/// process's controlling terminal (plan §7.11).
+///
+/// `_IO('T', 0x0E)` from `include/uapi/asm-generic/ioctls.h`. `libc` does not
+/// export it for Linux - only for the BSDs and Fuchsia - so it is spelled out
+/// here, and [`the_terminal_ioctls_are_the_ones_the_kernel_header_defines`]
+/// recomputes it from the `_IO` layout rather than trusting the literal.
+pub const TIOCSCTTY: libc::c_ulong = 0x540E;
+
+/// `ioctl(2)` request that hangs up the terminal: the queues are flushed and the
+/// session using it is signalled (plan §7.11's `TTYReset=`).
+///
+/// `_IO('T', 0x37)`, same header, same reason as [`TIOCSCTTY`].
+pub const TIOCVHANGUP: libc::c_ulong = 0x5437;
+
+/// A controlling terminal to hand a child (plan §7.11).
+///
+/// `TTYPath=` plus `TTYReset=`: the device to open, and whether to hang it up
+/// first so a respawned console service starts on a clean terminal.
+#[derive(Debug, Clone, Copy)]
+pub struct ChildTty<'a> {
+    /// The device, e.g. `/dev/ttyAMA0`.
+    pub path: &'a CStr,
+    /// Whether to [`TIOCVHANGUP`] it when taking it over.
+    pub reset: bool,
+}
+
+/// The child-side setup that borrows a path rather than owning a flag.
+///
+/// Kept together because both are "a file the child opens and acts on after the
+/// fork, before it drops anything": the unit's `cgroup.procs` (plan §7.3) and its
+/// controlling terminal (plan §7.11). They also arrive together - a service that
+/// asks for either leaves the `posix_spawn` fast path, because neither can be
+/// done without running code in the child.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ChildPaths<'a> {
+    /// The unit's `cgroup.procs`, when the unit asked for cgroup limits.
+    pub cgroup_procs: Option<&'a CStr>,
+    /// The controlling terminal to take over, when the unit asked for one.
+    pub tty: Option<ChildTty<'a>>,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SpawnOptions {
     /// Start the child in a new *session* (`setsid`).
@@ -290,7 +332,7 @@ pub fn spawn_sandboxed(
     options: SpawnOptions,
     working_directory: Option<&CStr>,
     sandbox: &Sandbox,
-    cgroup_procs: Option<&CStr>,
+    paths: ChildPaths<'_>,
 ) -> Result<libc::pid_t, SyscallError> {
     let setup = ChildSetup {
         path,
@@ -299,7 +341,7 @@ pub fn spawn_sandboxed(
         options,
         working_directory,
         sandbox,
-        cgroup_procs,
+        paths,
     };
 
     // Close-on-exec, which is what makes "empty read" mean "the child exec'd":
@@ -351,9 +393,8 @@ struct ChildSetup<'a> {
     options: SpawnOptions,
     working_directory: Option<&'a CStr>,
     sandbox: &'a Sandbox,
-    /// The unit's `cgroup.procs`, when the unit asked for cgroup limits
-    /// (plan §7.3).
-    cgroup_procs: Option<&'a CStr>,
+    /// The files the child opens and acts on after the fork (plan §7.3, §7.11).
+    paths: ChildPaths<'a>,
 }
 
 /// The work of a child created by [`spawn_sandboxed`], which never returns.
@@ -385,6 +426,16 @@ fn child_exec(setup: &ChildSetup<'_>, report_read: libc::c_int, report_write: li
         }
     }
 
+    // Plan §7.11: a controlling terminal, if the unit asked for one. After
+    // `setsid` - only a session leader with no controlling terminal may take
+    // one - and after the `stdio` redirection above, which this deliberately
+    // overrides: a service with a `TTYPath=` talks to the terminal, not to the
+    // log ring. Before the identity steps below, which need root to open a
+    // device node.
+    if let Some(tty) = &setup.paths.tty {
+        setup_tty(tty, report_write);
+    }
+
     if let Some(directory) = setup.working_directory {
         // Before the drop, deliberately: a directory the service's own user
         // cannot enter is still the directory it was configured to start in,
@@ -401,7 +452,7 @@ fn child_exec(setup: &ChildSetup<'_>, report_read: libc::c_int, report_write: li
     // is also what makes the placement exact: nothing the service does (and
     // nothing it forks) can happen before this, since the child does not reach
     // `execve` until this returns.
-    if let Some(procs) = setup.cgroup_procs {
+    if let Some(procs) = setup.paths.cgroup_procs {
         // SAFETY: `getpid` takes no arguments and never fails.
         let pid = unsafe { libc::getpid() };
         if let Err(errno) = crate::syscall::cgroup::join_from_child(procs, pid) {
@@ -450,6 +501,47 @@ fn child_exec(setup: &ChildSetup<'_>, report_read: libc::c_int, report_write: li
         )
     };
     die(report_write, ChildStep::Exec);
+}
+
+/// Open `tty.path` and make it the child's controlling terminal.
+///
+/// Never returns on failure: a `TTYPath=` that cannot be taken over is a failed
+/// start, because a `getty`-like service with no controlling terminal cannot run
+/// a login shell at all - and finding that out later, from a service that started
+/// and misbehaved, is worse than a named failure here.
+///
+/// The reset is best effort, deliberately: it is a virtual hangup, and a device
+/// that does not implement it still works as a terminal. Defaulting `TTYReset=`
+/// to on must not be able to fail a start on its own.
+fn setup_tty(tty: &ChildTty<'_>, report_write: libc::c_int) {
+    // `O_NOCTTY` so the open itself does not acquire the terminal implicitly:
+    // taking it over is the explicit `TIOCSCTTY` below, which is also what
+    // makes "this failed" and "this was never attempted" tell apart.
+    // SAFETY: `path` is a valid, NUL-terminated path.
+    let fd = unsafe { libc::open(tty.path.as_ptr(), libc::O_RDWR | libc::O_NOCTTY) };
+    if fd < 0 {
+        die(report_write, ChildStep::OpenTty);
+    }
+    if tty.reset {
+        // SAFETY: `fd` is a terminal descriptor we just opened, and this ioctl
+        // takes no argument.
+        unsafe { libc::ioctl(fd, TIOCVHANGUP) };
+    }
+    // SAFETY: as above; `TIOCSCTTY` takes an `int` argument, and this kernel
+    // accepts 0 for "take it over unconditionally".
+    if unsafe { libc::ioctl(fd, TIOCSCTTY, 0) } < 0 {
+        die(report_write, ChildStep::SetControllingTerminal);
+    }
+    for target in [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+        // SAFETY: both descriptors are valid; `dup2` closes `target` first.
+        if unsafe { libc::dup2(fd, target) } < 0 {
+            die(report_write, ChildStep::Dup2);
+        }
+    }
+    if fd > libc::STDERR_FILENO {
+        // SAFETY: `fd` is ours and no longer needed: it is 0, 1 and 2 now.
+        unsafe { libc::close(fd) };
+    }
 }
 
 /// Report the current `errno` for `step` and exit with 127.
@@ -513,7 +605,13 @@ fn read_report(fd: libc::c_int) -> Result<Option<(ChildStep, i32)>, SyscallError
     let report = u64::from_le_bytes(buf);
     let code = (report & 0xff) as u8;
     let errno = ((report >> 8) & 0xffff_ffff) as u32 as i32;
-    Ok(Some((ChildStep::from_code(code), errno)))
+    // An unknown code cannot come from this build's child, so it is a bug worth
+    // reporting rather than labelling `execve`: the previous `_ => Exec` fallback
+    // did exactly that, and every step added after it silently reported itself as
+    // a failed `exec`.
+    let step =
+        ChildStep::from_code(code).ok_or_else(|| SyscallError::new("child report", libc::EIO))?;
+    Ok(Some((step, errno)))
 }
 
 /// Reap a child that failed before `exec`.
@@ -563,6 +661,10 @@ enum ChildStep {
     /// Plan §7.3's placement step: the child writes its own pid into the unit's
     /// `cgroup.procs`.
     JoinCgroup = 12,
+    /// Plan §7.11: opening the unit's `TTYPath=`.
+    OpenTty = 13,
+    /// Plan §7.11: `ioctl(TIOCSCTTY)` on it.
+    SetControllingTerminal = 14,
 }
 
 impl ChildStep {
@@ -582,6 +684,8 @@ impl ChildStep {
             ChildStep::SetBoundingSet => "prctl(PR_CAPBSET_DROP)",
             ChildStep::RaiseAmbient => "prctl(PR_CAP_AMBIENT)",
             ChildStep::JoinCgroup => "cgroup.procs",
+            ChildStep::OpenTty => "open(TTYPath)",
+            ChildStep::SetControllingTerminal => "ioctl(TIOCSCTTY)",
         }
     }
 
@@ -602,21 +706,27 @@ impl ChildStep {
     /// The step a report code names, or `Exec` for a code this build does not
     /// know - which can only be a child from a different build, and is best
     /// reported as a command that did not start.
-    const fn from_code(code: u8) -> Self {
+    const fn from_code(code: u8) -> Option<Self> {
         match code {
-            0 => ChildStep::Chdir,
-            1 => ChildStep::Setsid,
-            2 => ChildStep::Dup2,
-            4 => ChildStep::NoNewPrivileges,
-            5 => ChildStep::SetGroup,
-            6 => ChildStep::SetGroups,
-            7 => ChildStep::SetUser,
-            8 => ChildStep::KeepCapabilities,
-            9 => ChildStep::SetInheritable,
-            10 => ChildStep::SetBoundingSet,
-            11 => ChildStep::RaiseAmbient,
-            12 => ChildStep::JoinCgroup,
-            _ => ChildStep::Exec,
+            0 => Some(ChildStep::Chdir),
+            1 => Some(ChildStep::Setsid),
+            2 => Some(ChildStep::Dup2),
+            // A failed `execve` *is* reported; a successful one is the child
+            // closing the pipe, which is why the parent treats end-of-file as
+            // "the child exec'd".
+            3 => Some(ChildStep::Exec),
+            4 => Some(ChildStep::NoNewPrivileges),
+            5 => Some(ChildStep::SetGroup),
+            6 => Some(ChildStep::SetGroups),
+            7 => Some(ChildStep::SetUser),
+            8 => Some(ChildStep::KeepCapabilities),
+            9 => Some(ChildStep::SetInheritable),
+            10 => Some(ChildStep::SetBoundingSet),
+            11 => Some(ChildStep::RaiseAmbient),
+            12 => Some(ChildStep::JoinCgroup),
+            13 => Some(ChildStep::OpenTty),
+            14 => Some(ChildStep::SetControllingTerminal),
+            _ => None,
         }
     }
 }

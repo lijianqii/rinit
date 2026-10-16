@@ -1,0 +1,23 @@
+# `TTYPath=` acceptance unit (plan §7.11).
+#
+# This is a *negative* example, like `fault.service`: it exists to be refused.
+# `/dev/null` opens happily and is not a terminal, so `ioctl(TIOCSCTTY)` answers
+# `ENOTTY` - and the start has to fail, naming the step, rather than hand the
+# service a controlling terminal it does not have. A `getty` that came up without
+# one would look active and be unable to run a login shell, which is the failure
+# this rule exists to prevent.
+#
+# The *success* path is not here: proving a terminal was taken over needs a real
+# tty, and the guest has none to spare - its only one is the console getty is
+# using. `crates/rinit/tests/m2_lifecycle.rs` creates a pty for that, and the
+# service there writes to `/dev/tty`, which only a process with a controlling
+# terminal can do.
+#
+# Started on demand (`rctl start tty.service`) so the console drives it.
+[Unit]
+Description=TTYPath failure demo (started on demand)
+
+[Service]
+Type=oneshot
+TTYPath=/dev/null
+ExecStart=/bin/sh -c "echo should-not-run"

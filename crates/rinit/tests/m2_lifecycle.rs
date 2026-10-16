@@ -1553,6 +1553,171 @@ fn a_forking_unit_whose_daemon_cannot_be_located_fails_its_start() {
     }
 }
 
+// --- §7.11: a controlling terminal ----------------------------
+
+/// A pty pair: the master end stays with the test, and the slave's path is what
+/// a unit's `TTYPath=` names.
+///
+/// `libc` has no Linux binding for the pty helpers, so this is `/dev/ptmx` plus
+/// the two ioctls that stand in for `unlockpt` and `ptsname`, with the values
+/// from `asm-generic/ioctls.h`: `TIOCSPTLCK` is `_IOW('T', 0x31, int)` and
+/// `TIOCGPTN` is `_IOR('T', 0x30, unsigned int)`.
+struct Pty {
+    master: libc::c_int,
+    slave: String,
+}
+
+const TIOCSPTLCK: libc::c_ulong = 0x4004_5431;
+const TIOCGPTN: libc::c_ulong = 0x8004_5430;
+
+impl Pty {
+    fn open() -> Self {
+        // SAFETY: `open` on a character device with scalar flags.
+        let master = unsafe { libc::open(c"/dev/ptmx".as_ptr(), libc::O_RDWR | libc::O_NOCTTY) };
+        assert!(master >= 0, "open /dev/ptmx");
+
+        let mut unlock: libc::c_int = 0;
+        // SAFETY: `unlock` is an `int` for the duration of the call.
+        assert_eq!(
+            unsafe { libc::ioctl(master, TIOCSPTLCK, &mut unlock) },
+            0,
+            "unlock the slave"
+        );
+        let mut number: libc::c_uint = 0;
+        // SAFETY: `number` is an `unsigned int` for the duration of the call.
+        assert_eq!(
+            unsafe { libc::ioctl(master, TIOCGPTN, &mut number) },
+            0,
+            "read the slave number"
+        );
+
+        // Non-blocking, so `wait_for` polls instead of parking on a read that
+        // may never see another byte.
+        // SAFETY: scalar `fcntl` calls on a descriptor this test owns.
+        let flags = unsafe { libc::fcntl(master, libc::F_GETFL) };
+        unsafe { libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+
+        Pty {
+            master,
+            slave: format!("/dev/pts/{number}"),
+        }
+    }
+
+    fn slave(&self) -> &str {
+        &self.slave
+    }
+
+    /// Everything the master has to say right now.
+    fn drain(&self) -> String {
+        let mut buf = [0u8; 1024];
+        // SAFETY: a read into a buffer this frame owns, on a non-blocking fd.
+        let n = unsafe { libc::read(self.master, buf.as_mut_ptr().cast(), buf.len()) };
+        if n > 0 {
+            String::from_utf8_lossy(&buf[..n as usize]).into_owned()
+        } else {
+            String::new()
+        }
+    }
+
+    /// Poll the master for `needle` until `timeout`.
+    fn wait_for(&self, needle: &str, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut seen = String::new();
+        while std::time::Instant::now() < deadline {
+            seen.push_str(&self.drain());
+            if seen.contains(needle) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+}
+
+impl Drop for Pty {
+    fn drop(&mut self) {
+        // SAFETY: the descriptor is ours and this is the last use.
+        unsafe { libc::close(self.master) };
+    }
+}
+
+/// Plan §7.11: `TTYPath=`. The service gets that device as its *controlling
+/// terminal*, and the assertion is the one thing that cannot be faked: writing
+/// to `/dev/tty` only works for a process that has one, so `via-tty` arriving at
+/// the master side of the pty means `setsid` + `open` + `TIOCSCTTY` + `dup2` all
+/// did what the unit asked for.
+#[test]
+fn a_unit_with_a_tty_path_gets_it_as_its_controlling_terminal() {
+    let dir = TempDir::new("tty");
+    let pty = Pty::open();
+    dir.write(
+        "all.target",
+        "[Unit]
+Type=target
+Requires=tty.service
+",
+    );
+    dir.write(
+        "tty.service",
+        &format!(
+            "[Service]
+Type=oneshot
+TTYPath={}
+             ExecStart=/bin/sh -c \"echo via-tty > /dev/tty; exit 0\"\n",
+            pty.slave()
+        ),
+    );
+
+    let (log, seen) = boot_units_inspect(&dir, "all.target", SETTLE, libc::SIGTERM, &[], || {
+        pty.wait_for("via-tty", Duration::from_secs(2))
+    });
+
+    assert!(
+        seen,
+        "the service must have a controlling terminal (read: {:?}):\n{log}",
+        pty.drain()
+    );
+    assert!(
+        log.contains("tty.service completed"),
+        "and it must have exited 0:\n{log}"
+    );
+}
+
+/// And a `TTYPath=` that cannot become a controlling terminal fails the start,
+/// rather than running a service that believes it owns a terminal.
+///
+/// `/dev/null` is the case: it opens, and `TIOCSCTTY` answers `ENOTTY` - which is
+/// exactly what a mistyped device would do on a real board.
+#[test]
+fn a_tty_path_that_is_not_a_terminal_fails_the_start() {
+    let dir = TempDir::new("tty-bad");
+    dir.write(
+        "all.target",
+        "[Unit]
+Type=target
+Requires=tty.service
+",
+    );
+    dir.write(
+        "tty.service",
+        "[Service]
+Type=oneshot
+TTYPath=/dev/null
+         ExecStart=/bin/sh -c \"echo should-not-run > /dev/null\"\n",
+    );
+
+    let log = boot_units(&dir, "all.target", SETTLE);
+
+    assert!(
+        log.contains("ioctl(TIOCSCTTY) failed"),
+        "the failing step has to be named:\n{log}"
+    );
+    assert!(
+        log.contains("all.target requires tty.service, which failed"),
+        "and the unit must not be treated as up:\n{log}"
+    );
+}
+
 // --- §7.6: reloading the unit directory -----------------------
 
 /// Send one request to a `--dev` rinit and read its reply.

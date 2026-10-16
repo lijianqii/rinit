@@ -465,7 +465,9 @@ async fn run_aux_command(
     // An `ExecStartPre=`/`ExecStartPost=` command runs outside the unit's
     // cgroup: preparation is not the service, and these run before the cgroup
     // is arranged (or while the service itself already fills it).
-    let pid = match spawn_service_in_group(&argv, &env, Some(&cwd), None, &sandbox, None) {
+    // An `ExecStartPre=`/`ExecStartPost=` command runs *outside* the unit's
+    // cgroup and without its `TTYPath=`: it is preparation, not the service.
+    let pid = match spawn_service_in_group(&argv, &env, Some(&cwd), None, &sandbox, None, None) {
         Ok(pid) => pid,
         Err(e) => {
             rlog!("error: {unit}: cannot start '{}': {e}", argv.join(" "));

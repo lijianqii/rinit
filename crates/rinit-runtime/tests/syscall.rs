@@ -363,7 +363,7 @@ fn run_captured(
         process::SpawnOptions::default().with_stdio(write_end.as_raw_fd()),
         directory.as_deref(),
         sandbox,
-        None,
+        process::ChildPaths::default(),
     )
     .expect("sandboxed spawn");
 
@@ -474,7 +474,7 @@ fn a_missing_working_directory_fails_the_spawn_closed() {
         process::SpawnOptions::default(),
         Some(c"/rinit-there-is-no-such-directory"),
         &Sandbox::inherit(),
-        None,
+        process::ChildPaths::default(),
     )
     .expect_err("a missing WorkingDirectory must not spawn");
     assert_eq!(err.op(), "chdir");
@@ -499,7 +499,7 @@ fn a_missing_command_is_reported_as_execve_enoent() {
         process::SpawnOptions::default(),
         None,
         &Sandbox::inherit(),
-        None,
+        process::ChildPaths::default(),
     )
     .expect_err("a missing command must not spawn");
     assert_eq!(err.op(), "execve");
@@ -533,7 +533,7 @@ fn a_step_that_cannot_be_applied_fails_the_spawn_closed() {
             groups: Some(Vec::new()),
             ..Sandbox::inherit()
         },
-        None,
+        process::ChildPaths::default(),
     )
     .expect_err("an unprivileged rinit cannot set the group list");
     assert_eq!(err.op(), "setgroups");
@@ -542,4 +542,19 @@ fn a_step_that_cannot_be_applied_fails_the_spawn_closed() {
         wait::reap_children().is_empty(),
         "the child that could not drop privileges must have been reaped"
     );
+}
+
+/// The two terminal ioctls are magic numbers like the watchdog's, and `libc` has
+/// no Linux binding for either, so they are recomputed from
+/// `asm-generic/ioctls.h` rather than trusted: `_IO('T', n)` is `(type << 8) | n`,
+/// with no direction or size bits - which is why these two are `0x54xx` while a
+/// `_IOR` such as `TIOCGPTN` is not (plan §7.11).
+#[test]
+fn the_terminal_ioctls_are_the_ones_the_kernel_header_defines() {
+    const fn io(kind: u64, nr: u64) -> libc::c_ulong {
+        ((kind << 8) | nr) as libc::c_ulong
+    }
+    let base = b'T' as u64;
+    assert_eq!(process::TIOCSCTTY, io(base, 0x0E));
+    assert_eq!(process::TIOCVHANGUP, io(base, 0x37));
 }
