@@ -10,6 +10,7 @@
 #   make check       pre-commit gate: fmt + clippy + host tests (no cross toolchain)
 #   make test        check + the qemu system test
 #   make test-system boot the guest and assert the M0/M1 acceptance list
+#   make soak        long-run leak check: restart churn while watching RSS/fds
 #   make help        show this help
 #   make clean       remove build outputs (keeps downloads)
 #   make distclean   remove everything, including downloads
@@ -60,7 +61,7 @@ MAKE_BUSYBOX     := $(MAKE) -C $(BUSYBOX_SRC) ARCH=$(BUSYBOX_ARCH) CROSS_COMPILE
 
 .DEFAULT_GOAL    := run
 .PHONY: run kernel busybox rinit initramfs qemu help clean distclean \
-        check test test-system
+        check test test-system soak
 
 help:
 	@sed -n '2,/^# ====/p' $(MAKEFILE_LIST) | sed '$$d' | sed 's/^# \{0,1\}//'
@@ -163,6 +164,14 @@ test: check
 # serial console. Logs land in build/logs/.
 test-system: $(KERNEL_IMAGE) $(INITRAMFS)
 	$(SCRIPTS)/system-test.sh --kernel $(KERNEL_IMAGE) --initrd $(INITRAMFS)
+
+# `soak` is the M4 long-run leak check: sustained restart churn plus a loop
+# driving the control socket, watching RSS, descriptors and zombies. The default
+# 60 seconds is a commit-time regression; plan §3 M4's acceptance run is
+# `make soak SOAK_ARGS='--seconds 259200'` (72 hours) on the target.
+SOAK_ARGS ?= --seconds 60
+soak:
+	$(SCRIPTS)/soak.sh $(SOAK_ARGS)
 
 # --- housekeeping ---------------------------------------------------------
 clean:
