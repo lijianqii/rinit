@@ -316,6 +316,15 @@ impl UnitManager {
         self.jobs.submit(Job::new(unit.clone(), target, source, at));
         let effect = self.effect_for(unit);
 
+        // A satisfied request can still have a state to reach with no side
+        // effect at all - `Stopped` against `Active(Exited)` or `Failed` lands
+        // in `Inactive` (plan §1.3(13)). The manager owns state, so it applies
+        // that part here rather than leaving the unit parked in a state the
+        // caller has no way to fix.
+        if effect == Some(Effect::None) {
+            self.apply_none_transition(unit);
+        }
+
         match target {
             // Plan §1.3(13): a start against a stop in progress waits for it.
             // That is only knowable here, so remember it; `due_queued_starts`
@@ -331,6 +340,18 @@ impl UnitManager {
             }
         }
         effect
+    }
+
+    /// Apply the state part of a request that needs no side effect.
+    fn apply_none_transition(&mut self, unit: &UnitName) {
+        let Some(actual) = self.units.get(unit).map(|rt| rt.state) else {
+            return;
+        };
+        if let Some((Effect::None, to)) = self.jobs.reconcile(unit, actual)
+            && let Some(rt) = self.units.get_mut(unit)
+        {
+            rt.state = to;
+        }
     }
 
     fn is_deactivating(&self, unit: &UnitName) -> bool {

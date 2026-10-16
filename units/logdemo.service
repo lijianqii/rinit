@@ -1,0 +1,12 @@
+# Demo unit for the `rctl` system test (plan §3 M3).
+#
+# It is deliberately *not* in `multi-user.target`'s closure, so nothing starts
+# it at boot. Both halves of that are useful to verify from the guest console:
+# an unrelated unit stays down on its own, and `rctl start` can bring it up on
+# demand. Its output is what `rctl log logdemo.service` reads back.
+[Unit]
+Description=rctl log demo (not started at boot)
+
+[Service]
+Type=oneshot
+ExecStart=/bin/echo rinit-log-marker

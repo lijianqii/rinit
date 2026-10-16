@@ -13,6 +13,7 @@ use std::os::fd::AsRawFd;
 
 use rinit_core::{
     Effect, ExitOutcome, JobTarget, Request, RequestSource, ServiceKind, Status, UnitName,
+    UnitState,
 };
 use rinit_runtime::syscall::{process, reboot, signal};
 use rinit_runtime::{RuntimeError, Signal, SignalSet};
@@ -625,12 +626,17 @@ async fn control_stop(
     logs: &ServiceLogs,
     unit: &UnitName,
 ) -> (Status, String) {
-    if manager.get(unit).is_none() {
+    let Some(rt) = manager.get(unit) else {
         return (Status::NoSuchUnit, format!("no such unit: {unit}"));
-    }
+    };
+    // A unit that is already down (or failed) has nothing to stop; anything
+    // else - running or a completed oneshot - is a real transition.
+    let was_up = !matches!(rt.state, UnitState::Inactive | UnitState::Failed(_));
+
     let effect = manager.request_stop(unit, RequestSource::UserStop);
     match effect {
-        Some(Effect::None) => (Status::Ok, format!("{unit} is already stopped")),
+        Some(Effect::None) if !was_up => (Status::Ok, format!("{unit} is already stopped")),
+        Some(Effect::None) => (Status::Ok, format!("stopped {unit}")),
         None => (Status::Ok, format!("{unit} is already stopping")),
         Some(effect) => match apply_effect(manager, notify, logs, unit, Some(effect)).await {
             Ok(_) => (Status::Ok, format!("stopped {unit}")),

@@ -134,6 +134,27 @@ await_log() {
     printf 'id\n' >&3
     await_log 10 'uid=0\(root\)' || true
 
+    # M3: drive rinit from the guest console. Each step waits for output that
+    # only that command can produce, so a failure surfaces as a timeout rather
+    # than as a race.
+    printf 'rctl list\n' >&3
+    await_log 10 'logdemo.service: inactive' || true
+    printf 'rctl status getty.service\n' >&3
+    await_log 10 'target: started' || true
+    printf 'rctl start logdemo.service\n' >&3
+    await_log 10 'started logdemo.service' || true
+    # Give the oneshot a moment to run and its output to reach the buffer.
+    sleep 1
+    printf 'rctl log logdemo.service\n' >&3
+    await_log 10 'rinit-log-marker' || true
+    # A completed oneshot has nothing to restart: exit 4.
+    printf 'rctl restart logdemo.service\n' >&3
+    await_log 10 'no process to restart' || true
+    printf 'rctl stop logdemo.service\n' >&3
+    await_log 10 'stopped logdemo.service' || true
+    printf 'rctl reset-failed fault.service\n' >&3
+    await_log 10 'fault.service: cleared' || true
+
     # M2: kill the console service and let rinit bring it back. `login` execs
     # the shell, so `$$` *is* the getty process tree; killing it makes rinit
     # reap the exit and, because getty is `Restart=always`, start it again -
@@ -242,8 +263,31 @@ fi
 expect "getty presents a login prompt" "login:"
 expect "login succeeded and gave a root shell" "uid=0(root)"
 
-# M2 acceptance (plan §3): kill a service and watch the manager restart it. The
-# console shell *is* the getty process tree, so `kill -9 $$` is a real crash of
+# M3 acceptance (plan §3): the guest's own `rctl` drives the running system and
+# reads its logs back. `list`/`status`/`start`/`log`/`stop`/`reset-failed` are
+# all exercised from the console above; the assertions check the output each one
+# is the only possible source of.
+expect "rctl list reached the control socket" "logdemo.service: inactive"
+expect "rctl status described the console unit" "target: started"
+expect "rctl started a unit on demand" "started logdemo.service"
+expect "rctl log returned captured service output" "rinit-log-marker"
+expect "rctl stop stopped a unit" "stopped logdemo.service"
+expect "rctl reset-failed cleared the failed unit" "fault.service: cleared"
+# A completed oneshot has nothing to restart, so `restart` is a conflict
+# (exit 4). `logdemo` proves it and that the unit is only started once.
+if grep -qF "logdemo.service has no process to restart" "${log_file}"; then
+    pass "rctl reported a restart conflict"
+else
+    fail "rctl restart of a completed oneshot should be a conflict"
+fi
+# An unrelated unit must not be pulled into the boot (plan §1.3(1)).
+if [[ "$(grep -cF 'started logdemo.service as pid' "${log_file}")" -eq 1 ]]; then
+    pass "logdemo.service only started because rctl asked"
+else
+    fail "logdemo.service must not be started at boot"
+fi
+
+# M2 acceptance (plan §3): kill a service and watch the manager restart it. The# console shell *is* the getty process tree, so `kill -9 $$` is a real crash of
 # getty.service; a `Restart=always` unit must come back.
 expect "a crashed service is scheduled for restart" "getty.service will restart in"
 if [[ "$(grep -cF 'started getty.service as pid' "${log_file}")" -ge 2 ]]; then

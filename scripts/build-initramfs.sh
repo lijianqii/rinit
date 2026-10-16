@@ -42,6 +42,10 @@ if [[ ! -x "${bin_dir}/rinit" ]]; then
     echo "error: ${bin_dir}/rinit not found; run 'cargo build --release --target ${triple}'" >&2
     exit 1
 fi
+if [[ ! -x "${bin_dir}/rctl" ]]; then
+    echo "error: ${bin_dir}/rctl not found; run 'cargo build --release --target ${triple}'" >&2
+    exit 1
+fi
 
 work="$(mktemp -d)"
 trap 'rm -rf "${work}"' EXIT
@@ -50,6 +54,10 @@ trap 'rm -rf "${work}"' EXIT
 install -d "${work}"/{sbin,bin,etc/rinit/units,proc,sys,dev,run,tmp,root}
 
 install -m 0755 "${bin_dir}/rinit" "${work}/sbin/rinit"
+# The control client goes where a user can type it. It is useless without the
+# socket rinit creates at boot (plan §1.3(10)), which is why the two ship
+# together.
+install -m 0755 "${bin_dir}/rctl" "${work}/bin/rctl"
 
 # rinit-testservice is deliberately NOT packed. It is a M0 bring-up helper used
 # to prove fork/exec/reap, and it is still built into target/ for the host
