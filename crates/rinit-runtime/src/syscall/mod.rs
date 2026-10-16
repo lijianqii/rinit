@@ -8,6 +8,7 @@ use std::ffi::CString;
 
 use crate::error::SyscallError;
 
+pub mod cgroup;
 pub mod cred;
 pub mod fs;
 pub mod mount;

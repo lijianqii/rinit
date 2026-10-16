@@ -1,8 +1,8 @@
 //! First-wave mount orchestration (plan §1.3(9)).
 //!
 //! Order is fixed: `/run` (tmpfs) -> `/proc` -> `/sys` -> `/dev` (devtmpfs),
-//! all fatal; `/tmp` (tmpfs) is degradable. cgroup v2 is a reserved slot that
-//! stays off until M5.
+//! all fatal; `/tmp` (tmpfs) and `/sys/fs/cgroup` (cgroup2) are degradable, and
+//! last, because neither is needed to start a service that does not use it.
 //!
 //! The policy is expressed against the [`MountOps`] trait rather than against
 //! `mount(2)` directly. That split exists so the fatal-vs-degradable rules -
@@ -14,6 +14,7 @@
 use std::path::Path;
 
 use crate::error::{RuntimeError, SyscallError};
+use crate::syscall::cgroup;
 use crate::syscall::mount;
 
 /// The side-effecting primitives the first-wave sequence needs.
@@ -31,6 +32,8 @@ pub trait MountOps {
     fn mount_sysfs(&mut self, target: &Path) -> Result<(), SyscallError>;
     /// Mount `devtmpfs`.
     fn mount_devtmpfs(&mut self, target: &Path) -> Result<(), SyscallError>;
+    /// Mount the cgroup v2 unified hierarchy.
+    fn mount_cgroup2(&mut self, target: &Path) -> Result<(), SyscallError>;
 }
 
 /// The real thing: `mkdir(2)` + `mount(2)` through the audited syscall layer.
@@ -56,6 +59,10 @@ impl MountOps for RealMounts {
 
     fn mount_devtmpfs(&mut self, target: &Path) -> Result<(), SyscallError> {
         mount::mount_devtmpfs(target)
+    }
+
+    fn mount_cgroup2(&mut self, target: &Path) -> Result<(), SyscallError> {
+        mount::mount_cgroup2(target)
     }
 }
 
@@ -88,7 +95,8 @@ fn fatal(
 /// Returns the fatal [`SyscallError`] if any of `/run`, `/proc`, `/sys` or
 /// `/dev` fails to mount, aborting the sequence immediately - later steps are
 /// not attempted, since mounting `/dev` without `/proc` is never useful.
-/// A `/tmp` failure is collected as a warning and the sequence continues.
+/// A `/tmp` or `/sys/fs/cgroup` failure is collected as a warning and the
+/// sequence continues.
 pub fn first_wave_mounts_with(ops: &mut impl MountOps) -> Result<MountReport, RuntimeError> {
     let mut report = MountReport::default();
 
@@ -107,7 +115,18 @@ pub fn first_wave_mounts_with(ops: &mut impl MountOps) -> Result<MountReport, Ru
         Err(e) => report.warnings.push(format!("mount /tmp failed: {e}")),
     }
 
-    // cgroup v2 reserved for M5: intentionally not mounted here.
+    // Degradable, and last. Plan §7.3 says a unit whose limits cannot be
+    // enforced runs unlimited with a warning rather than not running at all, so
+    // neither a kernel built without cgroups nor a refused mount may stop the
+    // boot. The other half of the same decision lives in `syscall::cgroup`:
+    // this mount failing and `cgroup.controllers` being unreadable both end in
+    // the same logged warning.
+    match ops.mount_cgroup2(Path::new(cgroup::CGROUP_ROOT)) {
+        Ok(()) => report.mounted.push(cgroup::CGROUP_ROOT),
+        Err(e) => report
+            .warnings
+            .push(format!("mount {} failed: {e}", cgroup::CGROUP_ROOT)),
+    }
 
     Ok(report)
 }
@@ -199,22 +218,25 @@ mod tests {
     struct FakeMounts {
         calls: Vec<String>,
         fail: Option<(&'static str, Option<&'static str>)>,
+        /// Additional injected failures, so a test can break more than one step
+        /// (e.g. both degradable mounts).
+        fail_many: Vec<(&'static str, &'static str)>,
     }
 
     impl FakeMounts {
         /// Fail `step` wherever it appears.
         fn failing(step: &'static str) -> Self {
             FakeMounts {
-                calls: Vec::new(),
                 fail: Some((step, None)),
+                ..FakeMounts::default()
             }
         }
 
         /// Fail `step`, but only for `target`.
         fn failing_at(step: &'static str, target: &'static str) -> Self {
             FakeMounts {
-                calls: Vec::new(),
                 fail: Some((step, Some(target))),
+                ..FakeMounts::default()
             }
         }
 
@@ -226,6 +248,13 @@ mod tests {
             if let Some((fail_name, fail_target)) = self.fail
                 && fail_name == name
                 && fail_target.is_none_or(|t| t == target_s)
+            {
+                return Err(SyscallError::new(name, libc::EPERM));
+            }
+            if self
+                .fail_many
+                .iter()
+                .any(|(fail_name, fail_target)| *fail_name == name && *fail_target == target_s)
             {
                 return Err(SyscallError::new(name, libc::EPERM));
             }
@@ -253,6 +282,10 @@ mod tests {
         fn mount_devtmpfs(&mut self, target: &Path) -> Result<(), SyscallError> {
             self.step("mount_devtmpfs", target)
         }
+
+        fn mount_cgroup2(&mut self, target: &Path) -> Result<(), SyscallError> {
+            self.step("mount_cgroup2", target)
+        }
     }
 
     /// The order is fixed by plan §1.3(9); a reorder would change semantics
@@ -270,9 +303,13 @@ mod tests {
                 "mount_sysfs /sys",
                 "mount_devtmpfs /dev",
                 "mount_tmpfs /tmp",
+                "mount_cgroup2 /sys/fs/cgroup",
             ]
         );
-        assert_eq!(report.mounted, ["/run", "/proc", "/sys", "/dev", "/tmp"]);
+        assert_eq!(
+            report.mounted,
+            ["/run", "/proc", "/sys", "/dev", "/tmp", "/sys/fs/cgroup"]
+        );
         assert!(report.warnings.is_empty(), "{:?}", report.warnings);
     }
 
@@ -304,18 +341,22 @@ mod tests {
         }
     }
 
-    /// `/tmp` is the one degradable mount: its failure warns, and the earlier
-    /// mounts still count as done.
+    /// `/tmp` is the one degradable *early* mount: its failure warns, the
+    /// earlier mounts still count as done, and the sequence still reaches the
+    /// cgroup mount.
     #[test]
     fn tmp_failure_degrades_to_a_warning() {
         let mut ops = FakeMounts::failing_at("mount_tmpfs", "/tmp");
         let report = first_wave_mounts_with(&mut ops).expect("boot must survive /tmp");
 
-        assert_eq!(report.mounted, ["/run", "/proc", "/sys", "/dev"]);
+        assert_eq!(
+            report.mounted,
+            ["/run", "/proc", "/sys", "/dev", "/sys/fs/cgroup"]
+        );
         assert_eq!(
             ops.calls.len(),
-            5,
-            "/tmp is still attempted: {:?}",
+            6,
+            "/tmp is still attempted, and cgroup still follows: {:?}",
             ops.calls
         );
         assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
@@ -324,6 +365,36 @@ mod tests {
             "warning must name the mount: {:?}",
             report.warnings
         );
+    }
+
+    /// A refused cgroup mount is plan §7.3's degrade case: warn, keep booting,
+    /// let every unit run unlimited. It is not fatal even though the limits a
+    /// unit asks for will then not be enforced - not booting helps nobody.
+    #[test]
+    fn cgroup_mount_failure_degrades_to_a_warning() {
+        let mut ops = FakeMounts::failing("mount_cgroup2");
+        let report = first_wave_mounts_with(&mut ops).expect("boot must survive no cgroups");
+
+        assert_eq!(report.mounted, ["/run", "/proc", "/sys", "/dev", "/tmp"]);
+        assert_eq!(ops.calls.len(), 6, "{:?}", ops.calls);
+        assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+        assert!(
+            report.warnings[0].contains("/sys/fs/cgroup"),
+            "warning must name the mount: {:?}",
+            report.warnings
+        );
+    }
+
+    /// Both degradable steps can fail in the same boot; each gets its own
+    /// warning, so one does not hide the other.
+    #[test]
+    fn both_degradable_mounts_can_fail_without_stopping_the_boot() {
+        let mut ops = FakeMounts::failing_at("mount_tmpfs", "/tmp");
+        ops.fail_many.push(("mount_cgroup2", "/sys/fs/cgroup"));
+        let report = first_wave_mounts_with(&mut ops).expect("boot must survive both");
+
+        assert_eq!(report.mounted, ["/run", "/proc", "/sys", "/dev"]);
+        assert_eq!(report.warnings.len(), 2, "{:?}", report.warnings);
     }
 
     /// The report is what the boot log prints, so a failure must be

@@ -1,0 +1,390 @@
+//! cgroup v2 file operations (plan §7.3).
+//!
+//! The cgroup directory is a *parameter* here, not a constant. Production
+//! passes paths under `/sys/fs/cgroup`; the tests below pass a directory of
+//! ordinary files, which is what makes the write order, the pid placement and
+//! the cleanup rules checkable on a developer host with no cgroup hierarchy, no
+//! root and no `/sys`.
+//!
+//! What the files are: attributes, written whole and last-write-wins. The write
+//! is an `O_WRONLY|O_TRUNC` open of a file that must already exist - *not*
+//! `std::fs::write`, which adds `O_CREAT`. On cgroupfs the difference is
+//! invisible (kernfs cannot create files, so `O_CREAT` does nothing there), but
+//! it matters for what the code means: an attribute that is not there - because
+//! its controller was never enabled - has to be reported as a failed write, not
+//! turned into a file that then accepts the value and enforces nothing. It is
+//! also what lets the tests below stand in for cgroupfs faithfully, since an
+//! ordinary directory *can* create files.
+//!
+//! No policy lives here. Whether a skipped limit is a warning or a failed start,
+//! and whether a `rmdir` that returns `EBUSY` matters, are plan §7.3 decisions
+//! and belong to the caller (`rinit`'s `cgroup` module).
+
+use std::io::Write;
+use std::path::Path;
+
+#[cfg(test)]
+use std::path::PathBuf;
+
+use crate::error::SyscallError;
+
+/// The file that exists in every cgroup of a real v2 hierarchy, and in no other
+/// mount of that name.
+///
+/// Plan §7.3 makes exactly this file the availability test ("`cgroup.controllers`
+/// 不存在时降级"), and it is the right one: its presence is what distinguishes a
+/// unified v2 hierarchy from a v1 mount or an empty directory.
+const CONTROLLERS: &str = "cgroup.controllers";
+
+/// Where the unified hierarchy is mounted (plan §1.3(9) item 6, plan §7.3).
+///
+/// The first-wave mounts put it there, and the cgroup code then treats it as
+/// the directory it configures - one constant, so the two cannot drift.
+pub const CGROUP_ROOT: &str = "/sys/fs/cgroup";
+
+/// The file that turns a controller on for a cgroup's *children*.
+const SUBTREE_CONTROL: &str = "cgroup.subtree_control";
+
+/// Writing a pid here moves that process into the cgroup.
+const PROCS: &str = "cgroup.procs";
+
+/// `populated <0|1>` here says whether the cgroup still has live members.
+const EVENTS: &str = "cgroup.events";
+
+/// Whether `dir` is a cgroup of the unified (v2) hierarchy.
+///
+/// A read failure of any kind - missing, permission, not a directory - means
+/// "not usable", which is what the caller needs; the reason is not worth
+/// distinguishing, because the response is the same warning either way.
+pub fn is_v2(dir: &Path) -> bool {
+    std::fs::read_to_string(dir.join(CONTROLLERS)).is_ok()
+}
+
+/// The controllers available to `dir`, as the kernel lists them.
+///
+/// One space-separated line, e.g. `cpuset cpu io memory pids`.
+pub fn read_controllers(dir: &Path) -> Result<String, SyscallError> {
+    let path = dir.join(CONTROLLERS);
+    std::fs::read_to_string(&path).map_err(|e| SyscallError::from_io("cgroup.controllers", &e))
+}
+
+/// Enable controllers (`"+cpu +memory"`) for `dir`'s children.
+///
+/// # Errors
+/// The kernel refuses this - `ENOENT` for a controller it does not have,
+/// `EBUSY` when the cgroup has processes of its own - and the caller decides
+/// what that means.
+pub fn enable_controllers(dir: &Path, line: &str) -> Result<(), SyscallError> {
+    write_file(&dir.join(SUBTREE_CONTROL), line, "cgroup.subtree_control")
+}
+
+/// Create `dir` (and its parents) if it does not exist.
+pub fn create(dir: &Path) -> Result<(), SyscallError> {
+    std::fs::create_dir_all(dir).map_err(|e| SyscallError::from_io("cgroup mkdir", &e))
+}
+
+/// Write one limit file inside `dir` (e.g. `memory.max` = `33554432`).
+pub fn write_limit(dir: &Path, file: &str, value: &str) -> Result<(), SyscallError> {
+    // Naming the attribute is what makes a failed start diagnosable; the names
+    // are the closed set `CgroupLimits::files()` produces.
+    let op: &'static str = match file {
+        "cpu.max" => "cgroup cpu.max",
+        "memory.max" => "cgroup memory.max",
+        "memory.high" => "cgroup memory.high",
+        "pids.max" => "cgroup pids.max",
+        _ => "cgroup limit",
+    };
+    write_file(&dir.join(file), value, op)
+}
+
+/// Move `pid` into `dir` by writing it to `cgroup.procs`.
+///
+/// The kernel moves the process and everything it has already forked, and any
+/// process it forks afterwards is born in the same cgroup (plan §7.3(3)).
+pub fn place_process(dir: &Path, pid: libc::pid_t) -> Result<(), SyscallError> {
+    write_file(&dir.join(PROCS), &pid.to_string(), "cgroup.procs")
+}
+
+/// The pids currently in `dir`, as `cgroup.procs` lists them.
+///
+/// Tokens that are not pids are skipped rather than turned into an error: this
+/// is read on the stop path, where being unable to parse one line must not
+/// leave the rest of a process tree unsignalled.
+pub fn processes(dir: &Path) -> Result<Vec<libc::pid_t>, SyscallError> {
+    let path = dir.join(PROCS);
+    let body =
+        std::fs::read_to_string(&path).map_err(|e| SyscallError::from_io("cgroup.procs", &e))?;
+    Ok(body
+        .split_whitespace()
+        .filter_map(|token| token.parse().ok())
+        .collect())
+}
+
+/// Whether `dir` still has members, from `cgroup.events`.
+///
+/// # Errors
+/// [`SyscallError`] with `EINVAL` when the file exists but does not carry the
+/// `populated` line. The caller would otherwise have to guess, and guessing
+/// "empty" here is guessing that a process is dead.
+pub fn is_populated(dir: &Path) -> Result<bool, SyscallError> {
+    let path = dir.join(EVENTS);
+    let body =
+        std::fs::read_to_string(&path).map_err(|e| SyscallError::from_io("cgroup.events", &e))?;
+    for line in body.lines() {
+        if let Some(value) = line.strip_prefix("populated") {
+            return match value.trim() {
+                "0" => Ok(false),
+                "1" => Ok(true),
+                _ => Err(SyscallError::new("cgroup.events populated", libc::EINVAL)),
+            };
+        }
+    }
+    Err(SyscallError::new("cgroup.events populated", libc::EINVAL))
+}
+
+/// Remove `dir`.
+///
+/// # Errors
+/// A cgroup that still has processes fails this with `EBUSY` (and an ordinary
+/// directory with `ENOTEMPTY`); the caller treats both as "keep the directory,
+/// warn" rather than as a failed stop (plan §7.3's `rmdir` rule).
+pub fn remove(dir: &Path) -> Result<(), SyscallError> {
+    std::fs::remove_dir(dir).map_err(|e| SyscallError::from_io("cgroup rmdir", &e))
+}
+
+/// Write `value` to `path`, mapping the failure to `op`.
+///
+/// The file must already exist (see the module docs): a cgroup attribute is
+/// either there because its controller is enabled, or absent because it is not,
+/// and those two must not look alike. The write is flushed explicitly rather
+/// than relying on `Drop`, because a limit takes effect when the write reaches
+/// the kernel - a short write that only surfaced at close would leave a limit
+/// that never applied.
+fn write_file(path: &Path, value: &str, op: &'static str) -> Result<(), SyscallError> {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .map_err(|e| SyscallError::from_io(op, &e))?;
+    // The attribute parser in the kernel reads the whole buffer; a partial write
+    // would be a truncated number, so a short write is an error, not a retry.
+    file.write_all(value.as_bytes())
+        .map_err(|e| SyscallError::from_io(op, &e))?;
+    file.flush().map_err(|e| SyscallError::from_io(op, &e))
+}
+
+/// A throwaway directory for a test, removed on drop.
+#[cfg(test)]
+struct Scratch(PathBuf);
+
+#[cfg(test)]
+impl Scratch {
+    fn new(tag: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("rinit-cgroup-{}-{tag}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        Scratch(dir)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+
+    /// A subdirectory of the scratch, created for the caller.
+    fn subdir(&self, name: &str) -> PathBuf {
+        let dir = self.0.join(name);
+        std::fs::create_dir_all(&dir).expect("subdir");
+        dir
+    }
+}
+
+#[cfg(test)]
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.0).ok();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The plan's availability test is the controllers file: an empty directory
+    /// is not a v2 hierarchy, and one with the file is.
+    #[test]
+    fn the_controllers_file_is_what_makes_a_directory_a_v2_hierarchy() {
+        let scratch = Scratch::new("is-v2");
+        assert!(!is_v2(scratch.path()), "an empty directory is not a cgroup");
+
+        std::fs::write(scratch.path().join(CONTROLLERS), "cpu memory pids\n").unwrap();
+        assert!(is_v2(scratch.path()));
+
+        // A directory that is not there at all is equally unusable.
+        assert!(!is_v2(&scratch.path().join("nope")));
+    }
+
+    /// The controller list is read verbatim, so the pure intersection in
+    /// `rinit-core` sees exactly what the kernel wrote.
+    #[test]
+    fn the_controller_list_is_read_back_verbatim() {
+        let scratch = Scratch::new("controllers");
+        std::fs::write(scratch.path().join(CONTROLLERS), "cpu memory pids\n").unwrap();
+        assert_eq!(
+            read_controllers(scratch.path()).unwrap(),
+            "cpu memory pids\n"
+        );
+    }
+
+    /// Enabling writes the caller's line into `cgroup.subtree_control`; the line
+    /// itself is `rinit-core`'s business.
+    #[test]
+    fn enabling_writes_the_line_to_subtree_control() {
+        let scratch = Scratch::new("enable");
+        let dir = scratch.path();
+        assert_eq!(
+            enable_controllers(dir, "+cpu")
+                .expect_err("no file yet")
+                .errno(),
+            libc::ENOENT,
+            "a missing control file is reported, not created"
+        );
+
+        std::fs::write(dir.join(SUBTREE_CONTROL), "").unwrap();
+        enable_controllers(dir, "+cpu +memory").expect("enable");
+        assert_eq!(
+            std::fs::read_to_string(dir.join(SUBTREE_CONTROL)).unwrap(),
+            "+cpu +memory"
+        );
+    }
+
+    /// A limit lands in the file named for it, as the kernel would read it.
+    #[test]
+    fn a_limit_is_written_to_its_own_file() {
+        let scratch = Scratch::new("limit");
+        let dir = scratch.subdir("rinit");
+        std::fs::write(dir.join("memory.max"), "max").unwrap();
+
+        write_limit(&dir, "memory.max", "33554432").expect("write");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("memory.max")).unwrap(),
+            "33554432"
+        );
+    }
+
+    /// An attribute that is not there - the controller was never enabled - must
+    /// stay absent and report `ENOENT`; creating a file that accepts the value
+    /// and enforces nothing is the one outcome that must not happen.
+    #[test]
+    fn a_write_to_an_absent_attribute_is_enoent_and_creates_nothing() {
+        let scratch = Scratch::new("absent");
+        let dir = scratch.subdir("rinit");
+
+        let err = write_limit(&dir, "pids.max", "64").expect_err("must fail");
+        assert_eq!(err.errno(), libc::ENOENT);
+        assert!(
+            !dir.join("pids.max").exists(),
+            "the write must not manufacture the attribute"
+        );
+    }
+
+    /// A write into a cgroup that was never created must fail with the real
+    /// errno: that is the difference between "the limit applied" and "the unit
+    /// is running unbounded".
+    #[test]
+    fn a_limit_write_into_a_missing_cgroup_reports_enoent() {
+        let scratch = Scratch::new("missing");
+        let err = write_limit(&scratch.path().join("rinit/x.service"), "cpu.max", "1 2")
+            .expect_err("must fail");
+        assert_eq!(err.errno(), libc::ENOENT);
+        assert_eq!(err.op(), "cgroup cpu.max");
+    }
+
+    /// Placement is a decimal pid, nothing else - the kernel parses this file as
+    /// a number, and a trailing newline is not part of the value.
+    #[test]
+    fn placing_a_process_writes_the_pid_in_decimal() {
+        let scratch = Scratch::new("place");
+        let dir = scratch.subdir("rinit");
+        std::fs::write(dir.join(PROCS), "").unwrap();
+
+        place_process(&dir, 4321).expect("place");
+        assert_eq!(std::fs::read_to_string(dir.join(PROCS)).unwrap(), "4321");
+    }
+
+    /// Reading the member list must survive the shapes a real file has: a
+    /// trailing newline, blank lines, and (defensively) junk.
+    #[test]
+    fn the_process_list_is_parsed_leniently() {
+        let scratch = Scratch::new("processes");
+        let dir = scratch.subdir("rinit");
+
+        std::fs::write(dir.join(PROCS), "101\n202\n").unwrap();
+        assert_eq!(processes(&dir).unwrap(), vec![101, 202]);
+
+        std::fs::write(dir.join(PROCS), "101\n\n 202 \nnot-a-pid\n").unwrap();
+        assert_eq!(
+            processes(&dir).unwrap(),
+            vec![101, 202],
+            "unparsable tokens are skipped, not fatal"
+        );
+
+        std::fs::write(dir.join(PROCS), "").unwrap();
+        assert!(processes(&dir).unwrap().is_empty());
+    }
+
+    /// `populated` is the exit confirmation plan §7.3 asks for, so `1` and `0`
+    /// must be distinguished and anything else must be an error rather than a
+    /// guess.
+    #[test]
+    fn populated_is_read_from_the_events_file() {
+        let scratch = Scratch::new("events");
+        let dir = scratch.subdir("rinit");
+
+        std::fs::write(dir.join(EVENTS), "populated 1\nfrozen 0\n").unwrap();
+        assert!(is_populated(&dir).unwrap());
+
+        std::fs::write(dir.join(EVENTS), "populated 0\n").unwrap();
+        assert!(!is_populated(&dir).unwrap());
+
+        std::fs::write(dir.join(EVENTS), "populated maybe\n").unwrap();
+        assert_eq!(
+            is_populated(&dir).expect_err("unparsable").errno(),
+            libc::EINVAL
+        );
+
+        std::fs::write(dir.join(EVENTS), "frozen 0\n").unwrap();
+        assert_eq!(
+            is_populated(&dir).expect_err("no populated line").errno(),
+            libc::EINVAL
+        );
+
+        std::fs::remove_file(dir.join(EVENTS)).unwrap();
+        assert_eq!(
+            is_populated(&dir).expect_err("missing").errno(),
+            libc::ENOENT
+        );
+    }
+
+    /// Cleanup removes the directory, and fails on a directory that still has
+    /// anything in it - the condition the caller must tolerate as a warning.
+    #[test]
+    fn removing_a_group_removes_it_and_refuses_a_full_one() {
+        let scratch = Scratch::new("remove");
+        let empty = scratch.subdir("empty");
+        remove(&empty).expect("empty cgroup removes");
+        assert!(!empty.exists());
+
+        let full = scratch.subdir("full");
+        std::fs::write(full.join(PROCS), "1").unwrap();
+        let err = remove(&full).expect_err("a cgroup with members must not vanish");
+        assert_eq!(
+            err.errno(),
+            libc::ENOTEMPTY,
+            "an ordinary directory reports ENOTEMPTY where cgroupfs reports EBUSY"
+        );
+        assert!(
+            full.exists(),
+            "the directory is kept, as plan §7.3 requires"
+        );
+    }
+}
