@@ -90,8 +90,7 @@ pub fn spawn_service_in_group(
     working_directory: Option<&str>,
     output: Option<libc::c_int>,
     sandbox: &Sandbox,
-    cgroup_procs: Option<&Path>,
-    tty: Option<process::ChildTty<'_>>,
+    place: ChildPlacement<'_>,
 ) -> Result<libc::pid_t, RuntimeError> {
     let Prepared { argv, envp, cwd } = prepare(argv, env, working_directory)?;
     let Some(path) = argv.first().map(CString::as_c_str) else {
@@ -102,15 +101,20 @@ pub fn spawn_service_in_group(
             source: std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty command"),
         });
     };
+    let listen_fd = place.listen_fd;
     let mut options = process::SpawnOptions::with_session();
     if let Some(fd) = output {
         options = options.with_stdio(fd);
     }
-    let procs = cgroup_procs.map(cpath).transpose()?;
-    // The `posix_spawn` fast path cannot do either of the child-side jobs: it
-    // has no way to place the process in a cgroup (plan §7.3) or to take over a
-    // terminal (plan §7.11), both of which happen inside the child.
-    if sandbox.is_inherited() && procs.is_none() && tty.is_none() {
+    // Plan §7.9: the listening socket, when rinit is holding one for this unit.
+    if let Some(fd) = listen_fd {
+        options = options.with_listen_fd(fd);
+    }
+    let procs = place.cgroup_procs.map(cpath).transpose()?;
+    // The `posix_spawn` fast path cannot do any of the child-side jobs: placing
+    // the process in a cgroup (plan §7.3), taking over a terminal (plan §7.11) or
+    // handing it a listening socket (plan §7.9) all happen inside the child.
+    if sandbox.is_inherited() && procs.is_none() && place.tty.is_none() && listen_fd.is_none() {
         process::posix_spawn_full(path, &argv, &envp, options, cwd.as_deref())
             .map_err(RuntimeError::from)
     } else {
@@ -123,11 +127,27 @@ pub fn spawn_service_in_group(
             sandbox,
             process::ChildPaths {
                 cgroup_procs: procs.as_deref(),
-                tty,
+                tty: place.tty,
             },
         )
         .map_err(RuntimeError::from)
     }
+}
+
+/// What the child does with the world it is handed, after the fork.
+///
+/// Grouped because they travel together and are all "a file the child opens, a
+/// descriptor it inherits, or a place it puts itself": the unit's cgroup
+/// (plan §7.3), its controlling terminal (plan §7.11) and its listening socket
+/// (plan §7.9).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ChildPlacement<'a> {
+    /// The unit's `cgroup.procs`, when the unit asked for limits.
+    pub cgroup_procs: Option<&'a Path>,
+    /// The controlling terminal to take over, when the unit asked for one.
+    pub tty: Option<process::ChildTty<'a>>,
+    /// The listening socket to hand over on fd 3, when rinit holds one.
+    pub listen_fd: Option<libc::c_int>,
 }
 
 /// Turn a path into the C form the child needs.

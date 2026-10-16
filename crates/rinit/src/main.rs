@@ -20,6 +20,7 @@
     )
 )]
 
+mod activation;
 mod args;
 mod boot;
 mod cgroup;

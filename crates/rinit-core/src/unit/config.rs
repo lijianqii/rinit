@@ -297,6 +297,22 @@ pub struct UnitConfig {
     pub exec_start_post: Vec<ExecCommand>,
     /// Stop command; empty means `SIGTERM`.
     pub exec_stop: ExecCommand,
+    /// A socket rinit binds on the unit's behalf and starts it from
+    /// (plan §7.9's `SocketActivate=`).
+    ///
+    /// One path rather than a list: the idle rule is per unit, and several
+    /// listeners for one unit would make "how long has it been idle" a question
+    /// with one answer per socket. rinit keeps the listening socket for as long as
+    /// it runs and hands it to the service when it starts it, which is what lets
+    /// the service be disposable.
+    pub socket_activate: Option<String>,
+    /// How long the unit may stay up with nothing arriving before rinit stops it
+    /// (plan §7.9's `IdleTimeoutSec=`).
+    ///
+    /// `0` - the default - never stops it. The directive exists to save memory,
+    /// and a service that is expected to be needed again shortly should say so
+    /// with a number rather than be stopped by surprise.
+    pub idle_timeout_sec: u64,
     /// Socket paths this unit creates (plan §7.8's `Sockets=`).
     ///
     /// rinit creates nothing here - the unit's own process binds the socket. The
@@ -418,6 +434,8 @@ impl UnitConfig {
             tty_path: None,
             tty_reset: true,
             pid_file: None,
+            socket_activate: None,
+            idle_timeout_sec: 0,
             sockets: Vec::new(),
             needs_socket: Vec::new(),
             health_check: ExecCommand::empty(),

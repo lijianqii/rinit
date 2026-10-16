@@ -328,6 +328,20 @@ await_log() {
     printf 'rctl start tty.service\n' >&3
     await_log 15 'ioctl(TIOCSCTTY)' || true
 
+    # M5 §7.9: socket activation. The guest cannot connect (busybox `nc` has no
+    # Unix-socket support), so what it asserts is the rest of the mechanism: the
+    # socket is bound at boot while the unit stays down, and a start - by hand,
+    # which is the second way in - hands the service the *listening* socket.
+    printf 'test -S /run/api.sock && echo api-socket-bound || echo api-socket-missing\n' >&3
+    await_log 10 'api-socket-bound' || true
+    printf 's=$(rctl status api.service | grep state); echo api-state=$s\n' >&3
+    await_log 10 'api-state=' || true
+    printf 'rctl start api.service\n' >&3
+    await_log 15 'started api.service' || true
+    sleep 1
+    printf 'rctl log api.service\n' >&3
+    await_log 10 'activated-fd-3' || true
+
     # M5 §7.8: sockets as dependencies. The provider creates its socket a second
     # after it is exec'd, so the consumer's start has to *wait for the path* - and
     # `rctl start sockc.service` blocks until it appears, which is why the reply
@@ -678,6 +692,15 @@ expect "stopping a forking unit stopped the daemon it took over" "daemon-gone"
 # M5 §7.11: a `TTYPath=` that is not a terminal is a failed start, not a service
 # that believes it owns a terminal.
 expect "a TTYPath that is not a terminal fails the start" "ioctl(TIOCSCTTY) failed"
+
+# M5 §7.9: the socket rinit binds is a real one, the unit behind it is not started
+# until something asks, and a start hands over the listening socket on fd 3.
+expect "rinit bound the socket before any unit started" \
+    "api.service: listening on /run/api.sock"
+expect "a socket-activated unit is listed but not started" "api.service: inactive"
+expect "the socket is a real one on the filesystem" "api-socket-bound"
+expect "and the unit is inactive behind it" "api-state=state: inactive"
+expect "starting it hands the service the listening socket" "activated-fd-3"
 
 # M5 §7.8: the socket directives. The consumer could only say `socket-present`
 # after waiting for the path, and the unit whose path never appears fails its

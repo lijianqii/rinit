@@ -117,9 +117,13 @@ instead of silently losing a setting. The common ones:
   when the directory is loaded) - instances are started by name. systemd gets the
   first from `[Install]` symlinks and the second from the same.
 - `Sockets=`/`NeedsSocket=` work as a *dependency* (plan §7.8): the provider
-  declares the path, the consumer waits for it. What is not implemented is socket
-  *activation* (plan §7.9) - rinit never binds a socket on a unit's behalf, so an
-  idle service is resident rather than started on demand.
+  declares the path, the consumer waits for it.
+- `SocketActivate=`/`IdleTimeoutSec=` work as *activation* (plan §7.9): rinit
+  binds the socket, the first connection starts the service, and the service is
+  handed the listening socket on fd 3 with `LISTEN_FDS=1`. Two differences from
+  systemd: the socket is bound at boot only (a reload that adds an activated unit
+  needs a restart), and there is no `Accept=yes` inetd-style mode - rinit always
+  passes the listening socket.
 - `Type=idle`/`dbus`, `$MAINPID`, cgroup v1: not implemented.
 - `PermissionsStartOnly=` and the `+`/`-`/`!` prefixes: every `Exec*` runs as the
   unit's `User=`.

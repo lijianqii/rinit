@@ -77,6 +77,8 @@ of that). `After` alone orders without pulling in, exactly as in systemd.
 | `ExecStartPost` | command | none | Run after the main command is under way (after exit, for `oneshot`). Repeatable. |
 | `ExecStop` | command | empty | The stop action. **Empty means `SIGTERM`** to the process group and to every process in the unit's cgroup. |
 | `PIDFile` | absolute path | none | Where a `Type=forking` daemon writes its pid (plan §7.10). |
+| `SocketActivate` | absolute path | none | A socket rinit binds and starts the unit from (plan §7.9): the unit is *not* started at boot, the first connection is. The service is handed the listening socket on fd 3, with `LISTEN_FDS=1`. |
+| `IdleTimeoutSec` | seconds, `0` = never stop | `0` | How long a socket-activated unit may stay up with no *new* connection before rinit stops it. |
 | `Sockets` | absolute path (repeatable) | none | A socket path this unit creates (plan §7.8). rinit creates nothing - this is the declaration that lets another unit's `NeedsSocket=` resolve to *this* unit. |
 | `NeedsSocket` | absolute path (repeatable) | none | A socket path this unit needs before it starts (plan §7.8). The unit waits for the path, bounded by `TimeoutStartSec`, and fails its start if it never appears. |
 | `TTYPath` | absolute path | none | A controlling terminal for the service (plan §7.11): the child opens it after `setsid`, takes it with `TIOCSCTTY` and uses it as stdin/stdout/stderr. |
@@ -97,6 +99,42 @@ of that). `After` alone orders without pulling in, exactly as in systemd.
   set - through the unit's own cgroup, and only when that cgroup holds exactly one
   process. Anything else fails the start, naming the reason, rather than guessing
   (plan §7.10).
+
+### Socket activation
+
+`SocketActivate=` inverts the usual arrangement: rinit binds the socket, the unit
+waits, and a connection is what starts the service (plan §7.9). The point is the
+memory an idle system does not spend, so this is for a service that is needed
+rarely and started quickly.
+
+```ini
+[Service]
+Type=simple
+SocketActivate=/run/api.sock
+IdleTimeoutSec=60
+ExecStart=/usr/bin/api
+```
+
+- **The unit is not started at boot.** `rctl list` shows it `inactive` and the
+  socket exists anyway; nothing starts it until something connects (or an
+  operator runs `rctl start`).
+- **The service gets the listening socket**, on fd 3, with `LISTEN_FDS=1` in its
+  environment - the contract `sd_listen_fds` implements. It accepts the connection
+  itself; rinit never accepts, because the accepted connection belongs to the
+  service.
+- **`IdleTimeoutSec=` stops it again** once nothing has connected for that long.
+  "Idle" is counted from the last *arrival* - the start, or a connection since -
+  so a service serving one long-lived connection looks idle, exactly as it does
+  under systemd. That is why the default is `0`, never stop.
+- **The socket outlives the service.** rinit holds it for as long as rinit runs,
+  and removes it on shutdown, so a client sees a service that comes and goes
+  rather than a socket that does.
+
+Two limits worth knowing: the socket is bound at boot, so a *reload* that adds or
+removes an activated unit takes effect only after a restart; and rinit does not
+create the directory policy around the socket beyond making it `0666` (systemd's
+own `SocketMode=` default) - a deployment that wants it narrower puts the socket in
+a directory with the permissions it means.
 
 ### Sockets as dependencies
 

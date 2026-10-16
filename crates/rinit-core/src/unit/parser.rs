@@ -449,6 +449,19 @@ impl Parser {
                     self.cfg.working_directory = path;
                 }
             }
+            (Section::Service, "SocketActivate") => {
+                // Plan §7.9. An empty value is "unset", like `TTYPath=`.
+                if !tokens.is_empty() {
+                    let path = joined();
+                    require_absolute(line, key, &path)?;
+                    self.cfg.socket_activate = Some(path);
+                }
+            }
+            (Section::Service, "IdleTimeoutSec") => {
+                // `0` is meaningful - never stop the service - so it is allowed,
+                // like `RestartSec` and the `Timeout*Sec` family.
+                self.cfg.idle_timeout_sec = number(line, key, &tokens, Zero::Allowed)?;
+            }
             (Section::Service, "Sockets") => {
                 let path = joined();
                 require_absolute(line, key, &path)?;
@@ -1297,6 +1310,40 @@ mod tests {
                 "[Unit]\nType=widget\n[Service]\nExecStart=/bin/true\n"
             ),
             ParseError::InvalidValue { line: 2, .. }
+        ));
+    }
+
+    /// Plan §7.9: the socket-activation pair, and the rules they share with the
+    /// other path-valued directives.
+    #[test]
+    fn the_socket_activation_directives_parse() {
+        let cfg = ok(
+            "api.service",
+            "[Service]\nExecStart=/bin/true\nSocketActivate=/run/api.sock\n\
+             IdleTimeoutSec=60\n",
+        );
+        assert_eq!(cfg.socket_activate.as_deref(), Some("/run/api.sock"));
+        assert_eq!(cfg.idle_timeout_sec, 60);
+
+        // `0` means "never stop it", so it is a value rather than a mistake.
+        let cfg = ok(
+            "api.service",
+            "[Service]\nExecStart=/bin/true\nSocketActivate=/run/api.sock\nIdleTimeoutSec=0\n",
+        );
+        assert_eq!(cfg.idle_timeout_sec, 0);
+
+        // And the path rules are the ones every other directive follows.
+        let cfg = ok(
+            "api.service",
+            "[Service]\nExecStart=/bin/true\nSocketActivate=\n",
+        );
+        assert_eq!(cfg.socket_activate, None);
+        assert!(matches!(
+            err(
+                "api.service",
+                "[Service]\nExecStart=/bin/true\nSocketActivate=run/api.sock\n"
+            ),
+            ParseError::InvalidValue { line: 3, .. }
         ));
     }
 

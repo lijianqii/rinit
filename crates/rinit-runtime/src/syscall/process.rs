@@ -35,6 +35,13 @@ pub const TIOCSCTTY: libc::c_ulong = 0x540E;
 /// `_IO('T', 0x37)`, same header, same reason as [`TIOCSCTTY`].
 pub const TIOCVHANGUP: libc::c_ulong = 0x5437;
 
+/// The descriptor a socket-activated service finds its socket on
+/// (plan §7.9).
+///
+/// A fixed number rather than a range: the plan asks for one listening socket per
+/// unit, and fd 3 is where every socket-activation protocol puts it.
+/// `LISTEN_FDS=1` in the child's environment says how many are there.
+pub const LISTEN_FD: libc::c_int = 3;
 
 /// A controlling terminal to hand a child (plan §7.11).
 ///
@@ -67,6 +74,12 @@ pub struct ChildPaths<'a> {
 pub struct SpawnOptions {
     /// Start the child in a new *session* (`setsid`).
     pub new_session: bool,
+    /// The listening socket to hand the child on [`LISTEN_FD`] (plan §7.9).
+    ///
+    /// `dup2` clears `O_CLOEXEC` on the new descriptor, which is what makes it
+    /// survive the `execve` - and rinit's own copy keeps the flag, so a service
+    /// exiting takes only its own reference with it.
+    pub listen_fd: Option<libc::c_int>,
     /// Redirect the child's `stdout` and `stderr` onto this descriptor.
     ///
     /// Used to capture service output for `rctl log` (plan §1.3(7)). `None`
@@ -89,8 +102,15 @@ impl SpawnOptions {
     pub const fn with_session() -> Self {
         SpawnOptions {
             new_session: true,
+            listen_fd: None,
             stdio: None,
         }
+    }
+
+    /// Hand the child a listening socket on fd 3 (plan §7.9).
+    pub const fn with_listen_fd(mut self, fd: libc::c_int) -> Self {
+        self.listen_fd = Some(fd);
+        self
     }
 
     /// Redirect the child's output onto `fd`.
@@ -413,6 +433,19 @@ fn child_exec(setup: &ChildSetup<'_>, report_read: libc::c_int, report_write: li
         // leader (its group is the parent's), so this cannot fail with `EPERM`.
         if unsafe { libc::setsid() } < 0 {
             die(report_write, ChildStep::Setsid);
+        }
+    }
+
+    // Plan §7.9: the listening socket, on the number socket-activated services
+    // look at. Before the identity steps below, both because `dup2` is what clears
+    // the flag that would otherwise close it at `exec`, and because a unit that
+    // drops privileges may not be able to do it afterwards.
+    if let Some(fd) = setup.options.listen_fd {
+        // SAFETY: `fd` is a listening socket the parent opened and holds open for
+        // the child's sake; `dup2` closes the target first and cannot fail here
+        // except out of descriptors.
+        if unsafe { libc::dup2(fd, LISTEN_FD) } < 0 {
+            die(report_write, ChildStep::Dup2);
         }
     }
 

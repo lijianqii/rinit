@@ -1,0 +1,23 @@
+# `SocketActivate=` acceptance unit (plan §7.9).
+#
+# rinit binds `/run/api.sock` and holds it; this service is *not* started at boot,
+# and comes up when a connection arrives. What it prints is the contract it was
+# handed: `LISTEN_FDS=1` in the environment and the listening socket on fd 3, so a
+# service that checks `/proc/self/fd/3` finds a socket rather than an accepted
+# connection or nothing at all.
+#
+# The guest cannot *connect* - busybox `nc` has no Unix-socket support - so the
+# console drives the other path: `rctl start api.service` starts it by hand, with
+# the same socket handed over. That is what makes the fd assertion meaningful here;
+# the connection-driven start is `crates/rinit/tests/m2_lifecycle.rs`, where a
+# `UnixStream` can be opened on demand.
+#
+# No `IdleTimeoutSec=`: the guest starts it once and reads the log, and a service
+# that stops itself mid-assertion would be a test that races itself.
+[Unit]
+Description=socket-activated demo (started by a connection, or by rctl)
+
+[Service]
+Type=oneshot
+SocketActivate=/run/api.sock
+ExecStart=/bin/sh -c "if test -S /proc/self/fd/3; then echo activated-fd-3; else echo no-fd-3; fi"

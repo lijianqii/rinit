@@ -1553,6 +1553,107 @@ fn a_forking_unit_whose_daemon_cannot_be_located_fails_its_start() {
     }
 }
 
+// --- §7.9: socket activation ----------------------------------
+
+/// Plan §7.9: rinit binds the socket, and the first connection is what starts the
+/// service - which is handed the *listening* socket on fd 3, not an accepted
+/// connection.
+///
+/// The service proves both halves itself: `test -S /proc/self/fd/3` is true only for a
+/// descriptor that is a socket, and the probe file is written after it. The
+/// connection happens while rinit is up but the unit is still down, which is the
+/// state the mechanism exists for.
+#[test]
+fn a_socket_activated_unit_starts_on_its_first_connection() {
+    let dir = TempDir::new("activation");
+    let sock = std::env::temp_dir().join(format!("rinit-activation-{}.sock", std::process::id()));
+    let probe = std::env::temp_dir().join(format!("rinit-activation-probe-{}", std::process::id()));
+    for stale in [&sock, &probe] {
+        let _ = fs::remove_file(stale);
+    }
+    dir.write("all.target", "[Unit]\nType=target\nRequires=api.service\n");
+    dir.write(
+        "api.service",
+        &format!(
+            "[Service]\nType=oneshot\nSocketActivate={}\n\
+             ExecStart=/bin/sh -c \"test -S /proc/self/fd/3 && echo activated > {} || echo no-fd > {}\"\n",
+            sock.display(),
+            probe.display(),
+            probe.display()
+        ),
+    );
+
+    let (log, (connected, probed)) =
+        boot_units_inspect(&dir, "all.target", SETTLE, libc::SIGTERM, &[], || {
+            let connected = std::os::unix::net::UnixStream::connect(&sock).is_ok();
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            let mut probed = String::new();
+            while std::time::Instant::now() < deadline {
+                if let Ok(text) = fs::read_to_string(&probe) {
+                    probed = text;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            (connected, probed)
+        });
+    for stale in [&sock, &probe] {
+        let _ = fs::remove_file(stale);
+    }
+
+    assert!(connected, "the socket has to be bound by boot time:\n{log}");
+    assert!(
+        log.contains("api.service: waiting for a connection"),
+        "a socket-activated unit is bound, not started:\n{log}"
+    );
+    assert!(
+        log.contains("api.service: started by a connection"),
+        "and a connection is what starts it:\n{log}"
+    );
+    assert_eq!(
+        probed.trim(),
+        "activated",
+        "the service must have the *listening* socket on fd 3, not an accepted one"
+    );
+}
+
+/// And it is stopped again once nothing has arrived: the socket stays, the memory
+/// does not - which is the whole reason to use this instead of a resident
+/// service.
+#[test]
+fn an_idle_socket_activated_unit_is_stopped() {
+    let dir = TempDir::new("activation-idle");
+    let sock = std::env::temp_dir().join(format!("rinit-idle-{}.sock", std::process::id()));
+    let _ = fs::remove_file(&sock);
+    dir.write("all.target", "[Unit]\nType=target\nRequires=api.service\n");
+    dir.write(
+        "api.service",
+        &format!(
+            "[Service]\nType=simple\nSocketActivate={}\nIdleTimeoutSec=1\n\
+             ExecStart=/bin/sleep 30\n",
+            sock.display()
+        ),
+    );
+
+    let log = boot_units_inspect(&dir, "all.target", SETTLE, libc::SIGTERM, &[], || {
+        // Start it, then leave it alone for longer than its idle timeout.
+        let connected = std::os::unix::net::UnixStream::connect(&sock).is_ok();
+        std::thread::sleep(Duration::from_millis(2500));
+        connected
+    })
+    .0;
+    let _ = fs::remove_file(&sock);
+
+    assert!(
+        log.contains("api.service: started by a connection"),
+        "the connection starts it:\n{log}"
+    );
+    assert!(
+        log.contains("stopping api.service: idle"),
+        "and being idle stops it again:\n{log}"
+    );
+}
+
 // --- §7.8: sockets as dependencies ----------------------------
 
 /// Plan §7.8: a `NeedsSocket=` unit waits for the *path*, not for the providing

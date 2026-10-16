@@ -18,6 +18,7 @@ use rinit_core::{
 use rinit_runtime::syscall::{process, reboot, signal};
 use rinit_runtime::{RuntimeError, Signal, SignalSet};
 
+use crate::activation::Activated;
 use crate::args::Config;
 use crate::control::ControlServer;
 use crate::log::rlog;
@@ -109,7 +110,10 @@ pub async fn run(cfg: Config) -> Result<(), RuntimeError> {
         if let Some(path) = &cfg.log_file {
             logs.persist_to(path);
         }
-        let mut manager = start_units(&cfg, &mut notify, &logs, cgroup).await?;
+        // Plan §7.9: the sockets rinit holds for units that asked to be started
+        // by a connection rather than at boot.
+        let mut activation = Activated::disabled();
+        let mut manager = start_units(&cfg, &mut notify, &logs, cgroup, &mut activation).await?;
         // The control socket is bound after the mounts, so `/run` exists
         // (plan §1.3(10)); a failure to bind it is only a warning.
         let mut control = ControlServer::bind(cfg.skip_mounts);
@@ -123,16 +127,21 @@ pub async fn run(cfg: Config) -> Result<(), RuntimeError> {
             cfg.watchdog_device.clone(),
             cfg.watchdog_timeout_sec,
         );
+        let mut supervised = Supervised {
+            notify: &mut notify,
+            control: &mut control,
+            logs: &logs,
+        };
         supervise(
             &cfg,
             &mut signals,
             &mut manager,
-            &mut notify,
-            &mut control,
-            &logs,
+            &mut supervised,
             &mut watchdog,
+            &mut activation,
         )
         .await;
+        activation.disarm();
         // Graceful shutdown disarms the hardware (plan §7.5's magic close). A
         // hung loop never gets here, and that is the mechanism.
         watchdog.disarm();
@@ -178,14 +187,22 @@ pub async fn run(cfg: Config) -> Result<(), RuntimeError> {
 /// kill), or a signal arrived. The timers are what make this a loop rather than
 /// a plain `recv()` - without them a service scheduled to restart in two
 /// seconds would sit there until some unrelated signal arrived.
+struct Supervised<'a> {
+    /// Where a started service's readiness arrives.
+    notify: &'a mut NotifyHub,
+    /// Where `rctl` is answered.
+    control: &'a mut ControlServer,
+    /// Where services' output goes (plan §1.3(7)).
+    logs: &'a ServiceLogs,
+}
+
 async fn supervise(
     cfg: &Config,
     signals: &mut SignalSet,
     manager: &mut UnitManager,
-    notify: &mut NotifyHub,
-    control: &mut ControlServer,
-    logs: &ServiceLogs,
+    supervised: &mut Supervised<'_>,
     watchdog: &mut Watchdog,
+    activation: &mut Activated,
 ) {
     // Set when the shutdown was triggered by power failure, which runs under a
     // much smaller budget (plan §7.1).
@@ -199,7 +216,7 @@ async fn supervise(
         // Service anything already due before blocking, so a zero-length timer
         // does not wait for the next unrelated wake-up.
         for unit in manager.due_restarts() {
-            match start_unit(manager, notify, logs, &unit).await {
+            match start_unit(manager, supervised.notify, supervised.logs, &unit).await {
                 Ok(true) => run_start_post(manager, &unit).await,
                 Ok(false) => {}
                 Err(e) => rlog!("error: restart of {unit} failed: {e}"),
@@ -207,7 +224,7 @@ async fn supervise(
         }
         // A start that arrived while its unit was stopping (plan §1.3(13)).
         for unit in manager.due_queued_starts() {
-            match start_unit(manager, notify, logs, &unit).await {
+            match start_unit(manager, supervised.notify, supervised.logs, &unit).await {
                 Ok(true) => run_start_post(manager, &unit).await,
                 Ok(false) => {}
                 Err(e) => rlog!("error: queued start of {unit} failed: {e}"),
@@ -225,11 +242,27 @@ async fn supervise(
         for unit in manager.due_probe_timeouts() {
             rlog!("warning: {unit}: health probe timed out");
         }
+        // Plan §7.9's idle rule: nobody has connected for `IdleTimeoutSec=`, so
+        // the service is stopped and the socket stays - which is the memory the
+        // directive exists to reclaim.
+        for unit in manager.due_idle_units() {
+            rlog!("stopping {unit}: idle");
+            let effect = manager.request_stop(&unit, RequestSource::UserStop);
+            if let Err(e) =
+                apply_effect(manager, supervised.notify, supervised.logs, &unit, effect).await
+            {
+                rlog!("error: cannot stop idle {unit}: {e}");
+            }
+        }
 
         // Never block past the earliest pending deadline - which includes the
         // next watchdog feed, or a pending feed would be slept through and the
         // hardware would reset a perfectly healthy init.
         let wait = next_deadline(manager).min(watchdog.next_feed_in());
+        // Plan §7.9: a connection on an activated socket. Collected here rather
+        // than handled in the `select!` arm, because the arm cannot borrow the
+        // socket set while its own `recv` is one of the branches.
+        let mut woke_socket: Option<UnitName> = None;
         tokio::select! {
             signal = signals.recv() => match signal {
                 Signal::Child => {
@@ -251,7 +284,7 @@ async fn supervise(
                     break;
                 }
             },
-            Some((unit, message)) = notify.recv() => {
+            Some((unit, message)) = supervised.notify.recv() => {
                 if let Some(status) = &message.status {
                     rlog!("{unit}: {status}");
                 }
@@ -259,8 +292,8 @@ async fn supervise(
                     rlog!("{unit} is ready");
                 }
             }
-            Some((request, reply)) = control.recv() => {
-                let (status, text) = handle_control(cfg, manager, notify, logs, &request).await;
+            Some((request, reply)) = supervised.control.recv() => {
+                let (status, text) = handle_control(cfg, manager, supervised.notify, supervised.logs, &request).await;
                 if status == Status::Ok {
                     rlog!("control: {} ok", request.describe());
                 } else {
@@ -270,6 +303,22 @@ async fn supervise(
                 let _ = reply.send((status, text));
             }
             _ = tokio::time::sleep(wait) => {}
+            Some(unit) = activation.recv() => {
+                woke_socket = Some(unit);
+            }
+        }
+
+        if let Some(unit) = woke_socket {
+            // A connection is the request: start the service if it is not already
+            // up, and either way the clock on being idle starts again.
+            manager.note_connection(&unit);
+            if !manager.is_running(&unit) {
+                match start_unit(manager, supervised.notify, supervised.logs, &unit).await {
+                    Ok(true) => rlog!("{unit}: started by a connection"),
+                    Ok(false) => rlog!("warning: {unit} did not start for its connection"),
+                    Err(e) => rlog!("error: cannot start {unit} for its connection: {e}"),
+                }
+            }
         }
     }
 
@@ -286,11 +335,13 @@ async fn supervise(
     }
     for unit in manager.shutdown_order() {
         let effect = manager.request_stop(&unit, RequestSource::ShutdownStop);
-        if let Err(e) = apply_effect(manager, notify, logs, &unit, effect).await {
+        if let Err(e) =
+            apply_effect(manager, supervised.notify, supervised.logs, &unit, effect).await
+        {
             rlog!("warning: stopping {unit} failed: {e}");
         }
     }
-    notify.disarm_all();
+    supervised.notify.disarm_all();
     let budget = fast.then_some(FAST_SHUTDOWN_BUDGET);
     stop_and_reap(manager, budget).await;
 }
@@ -364,13 +415,21 @@ fn spawn_unit(
     unit: &UnitName,
 ) -> Result<bool, RuntimeError> {
     let config = manager.get(unit).map(|rt| rt.config.clone());
-    let env: Vec<String> = match config {
+    let mut env: Vec<String> = match config {
         Some(config) if config.service_kind == ServiceKind::Notify => {
             notify.arm(&config)?;
             notify.env_for(unit).into_iter().collect()
         }
         _ => Vec::new(),
     };
+
+    // Plan §7.9: a unit rinit holds a socket for gets it on fd 3, and says so in
+    // the environment - the contract a service reads to know it was activated
+    // rather than started by hand.
+    let listen_fd = manager.listener_fd(unit);
+    if listen_fd.is_some() {
+        env.push(crate::activation::LISTEN_FDS_ENV.to_string());
+    }
 
     // Capture the service's output for `rctl log` (plan §1.3(7)). Losing the
     // log is not a reason to refuse to start the service, so a failure here is
@@ -382,8 +441,12 @@ fn spawn_unit(
             None
         }
     };
-    let spawned =
-        manager.spawn_unit_with_output(unit, &env, output.as_ref().map(|fd| fd.as_raw_fd()));
+    let spawned = manager.spawn_unit_with_output(
+        unit,
+        &env,
+        output.as_ref().map(|fd| fd.as_raw_fd()),
+        listen_fd,
+    );
     // Close rinit's copy of the write end: as long as it is open the reader
     // never sees end-of-file, and the pump task would live forever.
     drop(output);
@@ -490,7 +553,14 @@ async fn run_aux_command(
     // is arranged (or while the service itself already fills it).
     // An `ExecStartPre=`/`ExecStartPost=` command runs *outside* the unit's
     // cgroup and without its `TTYPath=`: it is preparation, not the service.
-    let pid = match spawn_service_in_group(&argv, &env, Some(&cwd), None, &sandbox, None, None) {
+    let pid = match spawn_service_in_group(
+        &argv,
+        &env,
+        Some(&cwd),
+        None,
+        &sandbox,
+        crate::service::ChildPlacement::default(),
+    ) {
         Ok(pid) => pid,
         Err(e) => {
             rlog!("error: {unit}: cannot start '{}': {e}", argv.join(" "));
@@ -920,6 +990,7 @@ fn next_deadline(manager: &UnitManager) -> std::time::Duration {
         manager.next_kill_in(),
         manager.next_health_in(),
         manager.next_probe_timeout_in(),
+        manager.next_idle_in(),
     ]
     .into_iter()
     .flatten()
@@ -954,6 +1025,7 @@ async fn start_units(
     notify: &mut NotifyHub,
     logs: &ServiceLogs,
     cgroup: crate::cgroup::Cgroup,
+    activation: &mut Activated,
 ) -> Result<UnitManager, RuntimeError> {
     let plan = manager::announce_plan(&cfg.unit_dir, &cfg.default_target)?;
     let mut units = UnitManager::new();
@@ -964,6 +1036,37 @@ async fn start_units(
     }
     // Plan §7.7: the templates, so `rctl start worker@1.service` can make one.
     units.set_templates(plan.templates.clone());
+
+    // Plan §7.9: bind the sockets of every unit that asked to be started by a
+    // connection, *before* any level runs - the socket outliving the service is
+    // the whole mechanism, and a client that connects to a socket bound a moment
+    // later has already been told the service does not exist.
+    let activated: Vec<(UnitName, String)> = plan
+        .configs
+        .iter()
+        .filter_map(|config| {
+            config
+                .socket_activate
+                .as_ref()
+                .map(|path| (config.name.clone(), path.clone()))
+        })
+        .collect();
+    for (unit, path) in activated {
+        match activation.bind(&unit, std::path::Path::new(&path)) {
+            Ok(()) => {
+                if let Some(fd) = activation.listener_fd(&unit) {
+                    units.set_listener(&unit, fd);
+                }
+            }
+            // A socket rinit cannot bind is a failed unit, not a failed boot: the
+            // rest of the system has no reason to stop because one service cannot
+            // be reached.
+            Err(e) => {
+                rlog!("error: {unit}: cannot bind {path}: {e}");
+                fail_unit(&mut units, &unit);
+            }
+        }
+    }
     // Shutdown walks the startup order backwards (plan §1.3(8)), so record it
     // while the schedule is still at hand.
     units.set_shutdown_order(plan.levels.iter().flatten().cloned().collect());
@@ -984,6 +1087,12 @@ async fn start_units(
             // (plan §1.3(13)).
             if units.is_failed(name) {
                 rlog!("skipping {name}: a required unit failed");
+                continue;
+            }
+            // Plan §7.9: a socket-activated unit is bound, not started. Its
+            // service comes up when a connection does.
+            if units.listener_fd(name).is_some() {
+                rlog!("{name}: waiting for a connection");
                 continue;
             }
 

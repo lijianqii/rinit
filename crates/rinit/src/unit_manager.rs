@@ -136,6 +136,11 @@ pub struct UnitRuntime {
     pub status: Option<String>,
     /// The last outcome, kept for logging and `rctl status`.
     pub last_outcome: Option<ExitOutcome>,
+    /// When an idle socket-activated unit should be stopped (plan §7.9).
+    ///
+    /// Set when the unit starts, and re-armed by the supervisor when a connection
+    /// arrives; `0` in `IdleTimeoutSec=` means never, which is no deadline at all.
+    pub idle_at: Option<Instant>,
     /// The unit cgroup's OOM-kill count when this start began, or `None` when
     /// there is no cgroup to ask (plan §7.3).
     ///
@@ -188,6 +193,7 @@ impl UnitRuntime {
             exec_stop_pid: None,
             status: None,
             last_outcome: None,
+            idle_at: None,
             oom_kills_at_start: None,
             pending_config: None,
             retired: false,
@@ -336,6 +342,15 @@ pub struct UnitManager {
     /// Where units' cgroup limits are applied (plan §7.3); disabled unless the
     /// boot sequence brought a hierarchy up.
     cgroup: Cgroup,
+    /// The listening socket each activated unit's service should be handed
+    /// (plan §7.9), as a raw descriptor.
+    ///
+    /// A *mirror* of `activation::Activated`, which owns the sockets: the manager
+    /// needs the number where a service is spawned, and passing it down the whole
+    /// start path would mean threading the socket set through every caller of
+    /// `apply_effect`. The owner keeps this in step when a socket is bound or
+    /// released, and a descriptor is only ever a `dup2` source.
+    listen_fds: BTreeMap<UnitName, libc::c_int>,
     /// Template units by canonical name, with their file text (plan §7.7).
     ///
     /// Held in memory rather than re-read from disk so an instance can be made
@@ -354,8 +369,22 @@ impl UnitManager {
             shutdown_order: Vec::new(),
             origin: Instant::now(),
             cgroup: Cgroup::disabled(),
+            listen_fds: BTreeMap::new(),
             templates: BTreeMap::new(),
         }
+    }
+
+    /// Record the listening socket a unit's service should be handed
+    /// (plan §7.9).
+    ///
+    /// Called by whoever bound it; the descriptor stays `activation`'s to close.
+    pub fn set_listener(&mut self, unit: &UnitName, fd: libc::c_int) {
+        self.listen_fds.insert(unit.clone(), fd);
+    }
+
+    /// The descriptor to hand `unit`'s service, if it has one.
+    pub fn listener_fd(&self, unit: &UnitName) -> Option<libc::c_int> {
+        self.listen_fds.get(unit).copied()
     }
 
     /// Give the manager the directory's template units (plan §7.7).
@@ -905,12 +934,13 @@ impl UnitManager {
         unit: &UnitName,
         extra_env: &[String],
         output: Option<libc::c_int>,
+        listen_fd: Option<libc::c_int>,
     ) -> Result<(), RuntimeError> {
         let now = self.now_millis();
 
         // Everything the spawn needs, read through an immutable borrow so the
         // `EnvironmentFile=` read below cannot race the state update.
-        let (argv, env, cwd, kind, sandbox, limits, tty_path, tty_reset) = {
+        let (argv, env, cwd, kind, sandbox, limits, tty_path, tty_reset, idle_secs) = {
             let Some(rt) = self.units.get(unit) else {
                 return Ok(());
             };
@@ -940,6 +970,13 @@ impl UnitManager {
                 // (plan §7.11): the path and whether to reset it.
                 rt.config.tty_path.clone(),
                 rt.config.tty_reset,
+                // Plan §7.9: the idle clock starts when the service does, and
+                // only a unit that asked to be stopped for being idle has one.
+                rt.config
+                    .socket_activate
+                    .as_ref()
+                    .filter(|_| rt.config.idle_timeout_sec > 0)
+                    .map(|_| rt.config.idle_timeout_sec),
             )
         };
 
@@ -991,8 +1028,11 @@ impl UnitManager {
             Some(&cwd),
             output,
             &sandbox,
-            cgroup_procs.as_deref(),
-            tty,
+            crate::service::ChildPlacement {
+                cgroup_procs: cgroup_procs.as_deref(),
+                tty,
+                listen_fd,
+            },
         )?;
 
         let Some(rt) = self.units.get_mut(unit) else {
@@ -1004,6 +1044,7 @@ impl UnitManager {
         rt.kill_at = None;
         rt.exec_stop_pid = None;
         rt.oom_kills_at_start = oom_kills_at_start;
+        rt.idle_at = idle_secs.and_then(deadline);
 
         match kind {
             // `simple` is live the moment it is exec'd.
@@ -1031,6 +1072,42 @@ impl UnitManager {
         Ok(())
     }
 
+    /// Re-arm an idle unit's deadline, or clear it (plan §7.9).
+    ///
+    /// Called when a connection arrives: a unit that is being used is not idle,
+    /// and the clock starts again from the last thing that happened.
+    pub fn note_connection(&mut self, unit: &UnitName) {
+        if let Some(rt) = self.units.get_mut(unit) {
+            rt.idle_at =
+                deadline(rt.config.idle_timeout_sec).filter(|_| rt.config.idle_timeout_sec > 0);
+        }
+    }
+
+    /// Units whose idle deadline has passed (plan §7.9).
+    ///
+    /// The deadline is cleared here and the *decision* is left to the caller: one
+    /// that fires while something is queued on the socket means the unit is
+    /// working, not idle, and the caller re-arms it.
+    pub fn due_idle_units(&mut self) -> Vec<UnitName> {
+        let now = Instant::now();
+        let mut due = Vec::new();
+        for (name, rt) in self.units.iter_mut() {
+            if let Some(at) = rt.idle_at
+                && at <= now
+            {
+                rt.idle_at = None;
+                due.push(name.clone());
+            }
+        }
+        due
+    }
+
+    /// Whether the unit is started: a socket-activated one is not, until a
+    /// connection arrives (plan §7.9).
+    pub fn is_running(&self, unit: &UnitName) -> bool {
+        self.units.get(unit).is_some_and(|rt| rt.pid.is_some())
+    }
+
     /// Become `Active` with `daemon` as the unit's process (plan §7.10).
     ///
     /// The boot loop waits for a `forking` unit's main process itself rather than
@@ -1042,6 +1119,7 @@ impl UnitManager {
             rt.pid = Some(daemon);
             rt.state = UnitState::Active;
             rt.start_deadline = None;
+            rt.idle_at = None;
             rt.backoff.on_active(now);
             schedule_health(rt);
         }
@@ -1191,6 +1269,16 @@ impl UnitManager {
     }
 
     /// Time until the next post-timeout `SIGKILL` is due, if any.
+    /// Time until the next idle deadline, if any (plan §7.9).
+    pub fn next_idle_in(&self) -> Option<Duration> {
+        let now = Instant::now();
+        self.units
+            .values()
+            .filter_map(|rt| rt.idle_at)
+            .map(|at| at.saturating_duration_since(now))
+            .min()
+    }
+
     pub fn next_kill_in(&self) -> Option<Duration> {
         let now = Instant::now();
         self.units
@@ -1243,7 +1331,14 @@ impl UnitManager {
             // (`probe_pid`), and having it join would keep the unit's cgroup
             // populated across the probe - which is exactly the state plan §7.3
             // reads as "still running, do not remove this directory".
-            match spawn_service_in_group(&argv, &env, Some(&cwd), None, &sandbox, None, None) {
+            match spawn_service_in_group(
+                &argv,
+                &env,
+                Some(&cwd),
+                None,
+                &sandbox,
+                crate::service::ChildPlacement::default(),
+            ) {
                 Ok(pid) => {
                     rt.probe_pid = Some(pid);
                     rt.probe_deadline = deadline(rt.config.health_timeout_sec);
@@ -1448,9 +1543,14 @@ impl UnitManager {
                 // probe: a stop command joining the unit's cgroup would make the
                 // directory look populated for as long as it runs, and plan
                 // §7.3 reads a populated directory as a reason to keep it.
-                Ok(sandbox) => {
-                    spawn_service_in_group(&stop_cmd, &env, Some(&cwd), None, &sandbox, None, None)
-                }
+                Ok(sandbox) => spawn_service_in_group(
+                    &stop_cmd,
+                    &env,
+                    Some(&cwd),
+                    None,
+                    &sandbox,
+                    crate::service::ChildPlacement::default(),
+                ),
                 Err(e) => Err(e),
             };
             match started {
@@ -1875,7 +1975,8 @@ mod tests {
         let _guard = crate::test_support::children_lock();
         let mut m = manager_with("a.service", RestartPolicy::No);
         let unit = UnitName::parse("a.service").unwrap();
-        m.spawn_unit_with_output(&unit, &[], None).expect("spawn");
+        m.spawn_unit_with_output(&unit, &[], None, None)
+            .expect("spawn");
         let rt = m.get(&unit).unwrap();
         assert!(rt.pid.is_some(), "the pid must be tracked");
         assert_eq!(rt.state, UnitState::Active, "Type=simple is active at exec");
@@ -1898,7 +1999,8 @@ mod tests {
         let mut m = UnitManager::new();
         m.add(cfg);
         let unit = UnitName::parse("t.target").unwrap();
-        m.spawn_unit_with_output(&unit, &[], None).expect("start");
+        m.spawn_unit_with_output(&unit, &[], None, None)
+            .expect("start");
         let rt = m.get(&unit).unwrap();
         assert_eq!(rt.state, UnitState::Active);
         assert!(rt.pid.is_none(), "a target must not spawn anything");
@@ -1910,7 +2012,8 @@ mod tests {
         let _guard = crate::test_support::children_lock();
         let mut m = manager_with("a.service", RestartPolicy::Always);
         let unit = UnitName::parse("a.service").unwrap();
-        m.spawn_unit_with_output(&unit, &[], None).expect("spawn");
+        m.spawn_unit_with_output(&unit, &[], None, None)
+            .expect("spawn");
         let pid = m.get(&unit).unwrap().pid.expect("pid");
         let _ = process::kill(pid, libc::SIGKILL);
 
@@ -1935,7 +2038,8 @@ mod tests {
         let _guard = crate::test_support::children_lock();
         let mut m = manager_with("a.service", RestartPolicy::No);
         let unit = UnitName::parse("a.service").unwrap();
-        m.spawn_unit_with_output(&unit, &[], None).expect("spawn");
+        m.spawn_unit_with_output(&unit, &[], None, None)
+            .expect("spawn");
         let pid = m.get(&unit).unwrap().pid.expect("pid");
 
         let outcome = m
@@ -2004,7 +2108,8 @@ mod tests {
         let _guard = crate::test_support::children_lock();
         let mut m = manager_with("a.service", RestartPolicy::Always);
         let unit = UnitName::parse("a.service").unwrap();
-        m.spawn_unit_with_output(&unit, &[], None).expect("spawn");
+        m.spawn_unit_with_output(&unit, &[], None, None)
+            .expect("spawn");
         let pid = m.get(&unit).unwrap().pid.expect("pid");
 
         m.stop_unit(&unit);
@@ -2057,7 +2162,8 @@ mod tests {
 
     /// Spawn `unit` and return the pid the manager tracked for it.
     fn spawn_pid(m: &mut UnitManager, unit: &UnitName) -> libc::pid_t {
-        m.spawn_unit_with_output(unit, &[], None).expect("spawn");
+        m.spawn_unit_with_output(unit, &[], None, None)
+            .expect("spawn");
         m.get(unit).and_then(|rt| rt.pid).expect("a tracked pid")
     }
 
@@ -2100,7 +2206,8 @@ mod tests {
         let mut m = UnitManager::new();
         m.add(cfg);
         let unit = UnitName::parse(name).unwrap();
-        m.spawn_unit_with_output(&unit, &[], None).expect("spawn");
+        m.spawn_unit_with_output(&unit, &[], None, None)
+            .expect("spawn");
         (m, unit)
     }
 
@@ -2226,7 +2333,8 @@ mod tests {
         let mut m = UnitManager::new();
         m.add(cfg);
         let unit = UnitName::parse(name).unwrap();
-        m.spawn_unit_with_output(&unit, &[], None).expect("spawn");
+        m.spawn_unit_with_output(&unit, &[], None, None)
+            .expect("spawn");
         (m, unit)
     }
 
@@ -2334,7 +2442,8 @@ mod tests {
         let _guard = crate::test_support::children_lock();
         let mut m = manager_with("a.service", RestartPolicy::No);
         let unit = UnitName::parse("a.service").unwrap();
-        m.spawn_unit_with_output(&unit, &[], None).expect("spawn");
+        m.spawn_unit_with_output(&unit, &[], None, None)
+            .expect("spawn");
 
         assert!(m.due_health_probes().is_empty());
         assert!(m.get(&unit).unwrap().health_at.is_none());
@@ -3057,7 +3166,8 @@ mod tests {
         // Running: the process keeps the definition it was started with - which
         // is what makes the deferral real, `ExecStop=` included - and the new one
         // waits.
-        m.spawn_unit_with_output(&unit, &[], None).expect("spawn");
+        m.spawn_unit_with_output(&unit, &[], None, None)
+            .expect("spawn");
         let mut second = original.clone();
         second.description = "second".to_string();
         assert_eq!(m.add(second), ConfigChange::Deferred);
@@ -3099,7 +3209,8 @@ mod tests {
         let unit = UnitName::parse("app.service").unwrap();
         let running = config("app.service", RestartPolicy::No);
         m.add(running.clone());
-        m.spawn_unit_with_output(&unit, &[], None).expect("spawn");
+        m.spawn_unit_with_output(&unit, &[], None, None)
+            .expect("spawn");
 
         let mut changed = running.clone();
         changed.description = "withdrawn".to_string();
@@ -3150,7 +3261,8 @@ mod tests {
 
         // Running: the entry has to survive the prune, because the stop needs it.
         let mut m = manager_with("app.service", RestartPolicy::No);
-        m.spawn_unit_with_output(&unit, &[], None).expect("spawn");
+        m.spawn_unit_with_output(&unit, &[], None, None)
+            .expect("spawn");
         m.retire(&unit);
         assert_eq!(
             m.prune_retired(),
