@@ -160,8 +160,8 @@ check:
 test: check
 	$(MAKE) test-system
 
-# `test-system` boots the guest and asserts the M0/M1 acceptance list on the
-# serial console. Logs land in build/logs/.
+# `test-system` boots the guest and asserts the acceptance list (M0-M5,
+# `scripts/system-test.sh`) on the serial console. Logs land in build/logs/.
 test-system: $(KERNEL_IMAGE) $(INITRAMFS)
 	$(SCRIPTS)/system-test.sh --kernel $(KERNEL_IMAGE) --initrd $(INITRAMFS)
 

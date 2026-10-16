@@ -12,7 +12,7 @@
 #      following the console prompts rather than guessing at delays;
 #   3. kills that console service and checks rinit restarts it (M2);
 #   4. captures the serial console to a log file;
-#   5. asserts the M0-M2 acceptance list on that log;
+#   5. asserts the M0-M5 acceptance list on that log;
 #   6. reports kernel panics / oopses as failures.
 #
 # `--keep-log` keeps the log even when every assertion passes (it is always
@@ -224,7 +224,7 @@ expect() {
     fi
 }
 
-# The M0-M2 acceptance list: boots as PID 1, mounts the first wave, resolves
+# The M0/M1 acceptance list: boots as PID 1, mounts the first wave, resolves
 # the unit directory into a dependency-ordered schedule, and starts it.
 expect "kernel executed rinit as init" "Run /sbin/rinit as init process"
 expect "rinit started as PID 1" "starting (pid 1)"
