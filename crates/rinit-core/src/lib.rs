@@ -18,10 +18,15 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+pub mod control;
 pub mod error;
 pub mod unit;
 pub mod users;
 
+pub use control::{
+    Command, LENGTH_PREFIX_BYTES, MAX_FRAME_BYTES, PROTOCOL_VERSION, ProtocolError, Request,
+    Status, decode_request, decode_response, encode_request, encode_response, frame, frame_len,
+};
 pub use error::CoreError;
 pub use unit::state::{Effect, Event, ExitOutcome, TransitionError, transition};
 pub use unit::{
