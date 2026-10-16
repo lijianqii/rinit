@@ -1,0 +1,26 @@
+# Template unit demo (plan §7.7).
+#
+# The `@` with nothing after it is what makes this a *template*: rinit will not
+# start it, and says so - it is the definition every instance of it is made from.
+# `rctl start worker@42.service` is what brings one into being, and the
+# specifiers are expanded into the file's text *before* it is parsed, so the
+# command the service runs is the one below with `%i` already replaced:
+#
+#   %i  the instance          ("42")
+#   %n  the full unit name    ("worker@42.service")
+#   %p  the prefix            ("worker")
+#   %%  a literal per cent
+#
+# The `Environment=` line exists to show that a specifier is expanded anywhere in
+# the file, not only in `ExecStart=`, and `$INSTANCE` in the command is the
+# *shell* expanding the environment the `Environment=` line set - the two are
+# different mechanisms, which is exactly why the demo prints both.
+#
+# Started on demand, like the other demo units, so the console drives it.
+[Unit]
+Description=template demo (started on demand)
+
+[Service]
+Type=oneshot
+Environment=INSTANCE=%i
+ExecStart=/bin/sh -c "echo worker-instance=%i name=%n prefix=%p env=$INSTANCE"

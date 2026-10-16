@@ -19,7 +19,7 @@ test (`make check`) or a guest assertion (`make test-system`, 74 of them in
 | M2 | supervision (spawn, track, reap, two-stage stop), restart policy with backoff and a circuit breaker, health probes, `Type=notify` readiness, the in-memory log ring and its optional file mirror (plan §1.3(7)) | guest: "a crashed service is scheduled for restart", "the breaker tripped on the failing unit"; host: `crates/rinit/tests/m2_lifecycle.rs` (33 tests) |
 | M3 | control socket + `rctl` (`list`, `status`, `start`, `stop`, `restart`, `reset-failed`, `log`, `reload`), with a documented exit-code contract | guest: "rctl list reached the control socket" and the five assertions after it; host: `crates/rctl/tests/control.rs` (8 tests) |
 | M4 | soak harness for sustained churn (`make soak`), leak and descriptor fixes, `--dev` control-socket peer relaxation | `scripts/soak.sh` (see [Testing](#testing)); `crates/rinit-core/tests/allocations.rs` |
-| M5 (in progress) | **§7.3–§7.6, §7.10 and §7.11 done.** cgroup v2: `CgroupCPUMax=`, `CgroupMemoryMax=`, `CgroupMemoryHigh=`, `CgroupTasksMax=` under `rinit/<unit>`, the process placing itself, stop-flow signalling of the cgroup's members, `rmdir` cleanup, and OOM-kill detection into the restart policy. Sandboxing: `User=`, `Group=`, `NoNewPrivileges=`, `CapabilityBoundingSet=`, `AmbientCapabilities=`. Hardware watchdog: `/dev/watchdog` armed at boot, fed from the supervisor loop's health checkpoint, magic-closed on shutdown. Reload: `rctl reload` re-reads the unit directory, adds, changes, defers and removes, and refuses a directory that does not resolve. Legacy daemons: `Type=forking` with `PIDFile=`, located through the file or the unit's own cgroup. Terminals: `TTYPath=`/`TTYReset=` give a service a controlling terminal (plan §7.11). **Next**: the P3 items (§7.7 templates, §7.8 `Sockets=`, §7.9 socket activation) | guest: "a limited unit was placed in its own cgroup", "the memory hard and soft limits were written in bytes", "a stopped unit's cgroup was removed", "the kernel OOM-killed a process inside the unit's cgroup", "rinit armed the guest's watchdog device", "the driver took the timeout rinit set", "the guest outlived the watchdog timeout with the device armed", "an added unit the boot target does not need was not started", "a changed unit that is running kept it for the next start", "a directory that does not resolve was refused whole", "the unit is active with the daemon the PIDFile named", "stopping a forking unit stopped the daemon it took over", "a TTYPath that is not a terminal fails the start", "a de-privileged service ran as nobody:nogroup with NoNewPrivs", "an empty CapabilityBoundingSet left a root service with no capabilities", "ambient capabilities reached a de-privileged service"; host: `crates/rinit/src/cgroup.rs` (19 tests), `crates/rinit-core/src/unit/cgroup.rs` (9), `crates/rinit-runtime/src/syscall/cgroup.rs` (14), `crates/rinit/src/watchdog.rs` (6), `crates/rinit-runtime/src/syscall/watchdog.rs` (6), `crates/rinit/src/unit_manager.rs` (5 for the reload itself, `reload.rs` is policy over them), `crates/rinit/tests/m2_lifecycle.rs` (6, end to end), `crates/rinit/src/sandbox.rs` (14), `crates/rinit-core/src/unit/sandbox.rs` (9), `crates/rinit-runtime/src/syscall/cred.rs` (14) |
+| M5 (in progress) | **§7.3–§7.7 and §7.10–§7.11 done.** cgroup v2: `CgroupCPUMax=`, `CgroupMemoryMax=`, `CgroupMemoryHigh=`, `CgroupTasksMax=` under `rinit/<unit>`, the process placing itself, stop-flow signalling of the cgroup's members, `rmdir` cleanup, and OOM-kill detection into the restart policy. Sandboxing: `User=`, `Group=`, `NoNewPrivileges=`, `CapabilityBoundingSet=`, `AmbientCapabilities=`. Hardware watchdog: `/dev/watchdog` armed at boot, fed from the supervisor loop's health checkpoint, magic-closed on shutdown. Reload: `rctl reload` re-reads the unit directory, adds, changes, defers and removes, and refuses a directory that does not resolve. Legacy daemons: `Type=forking` with `PIDFile=`, located through the file or the unit's own cgroup. Terminals: `TTYPath=`/`TTYReset=` give a service a controlling terminal (plan §7.11). Templates: `worker@.service` with `%i`/`%n`/`%p` expanded at instantiation (plan §7.7). **Next**: the P3 items §7.8 `Sockets=` and §7.9 socket activation | guest: "a limited unit was placed in its own cgroup", "the memory hard and soft limits were written in bytes", "a stopped unit's cgroup was removed", "the kernel OOM-killed a process inside the unit's cgroup", "rinit armed the guest's watchdog device", "the driver took the timeout rinit set", "the guest outlived the watchdog timeout with the device armed", "an added unit the boot target does not need was not started", "a changed unit that is running kept it for the next start", "a directory that does not resolve was refused whole", "the unit is active with the daemon the PIDFile named", "stopping a forking unit stopped the daemon it took over", "a TTYPath that is not a terminal fails the start", "a template is not a unit to start", "every specifier was expanded before the command ran", "a de-privileged service ran as nobody:nogroup with NoNewPrivs", "an empty CapabilityBoundingSet left a root service with no capabilities", "ambient capabilities reached a de-privileged service"; host: `crates/rinit/src/cgroup.rs` (19 tests), `crates/rinit-core/src/unit/cgroup.rs` (9), `crates/rinit-runtime/src/syscall/cgroup.rs` (14), `crates/rinit/src/watchdog.rs` (6), `crates/rinit-runtime/src/syscall/watchdog.rs` (6), `crates/rinit/src/unit_manager.rs` (5 for the reload itself, `reload.rs` is policy over them), `crates/rinit/tests/m2_lifecycle.rs` (7, end to end), `crates/rinit/src/sandbox.rs` (14), `crates/rinit-core/src/unit/sandbox.rs` (9), `crates/rinit-runtime/src/syscall/cred.rs` (14) |
 
 A real boot of the committed tree on the serial console (`…` elides kernel
 noise; the lines below are the ones `make test-system` asserts on). The last
@@ -36,7 +36,7 @@ rinit: mounted /dev
 rinit: mounted /tmp
 rinit: mounted /sys/fs/cgroup
 rinit: cgroup v2 ready at /sys/fs/cgroup
-rinit: boot plan for 'multi-user.target': 12 unit(s) in 3 level(s)
+rinit: boot plan for 'multi-user.target': 14 unit(s) in 3 level(s)
 rinit: plan 0: rinit-init.target (target)
 rinit: plan 1: fault.service (service)
 rinit: plan 1: getty.service (service)
@@ -58,10 +58,11 @@ rinit: reaped pid 50
 rinit: error: fault.service hit its start limit (2 failures); not restarting
 ```
 
-Note that the plan resolves **12 units** and starts **2**: everything in `units/`
+Note that the plan resolves **14 units** and starts **2**: everything in `units/`
 is parsed and ordered, and only the boot target's closure is started. The demo
-units (`priv`, `caps`, `ambient`, `logdemo`, `cglimit`, `cgrun`, `oom`) are
-outside it on purpose and are driven by `rctl` in the system test. The watchdog's
+units (`priv`, `caps`, `ambient`, `logdemo`, `cglimit`, `cgrun`, `oom`, `forking`,
+`tty`) and the one template (`worker@`) are outside it on purpose and are driven
+by `rctl` in the system test. The watchdog's
 `10s` is `make test-system`'s own shortening of the 30 s default (see the CLI
 section above); the arm line itself is what the committed binary prints, and
 `make run` shows `30s ... every 15s` for the same boot.
@@ -118,23 +119,23 @@ changed", and "one removed":
 
 ```
 ~ # rctl reload
-rinit: reload: 0 added (0 started), 0 changed (0 deferred), 0 removed (0 stopped), 12 unchanged
+rinit: reload: 0 added (0 started), 0 changed (0 deferred), 0 removed (0 stopped), 14 unchanged
 ~ # echo "[Service]" > /etc/rinit/units/reload.service
 ~ # echo "Type=oneshot" >> /etc/rinit/units/reload.service
 ~ # echo "ExecStart=/bin/echo reloaded-service" >> /etc/rinit/units/reload.service
 ~ # rctl reload
 rinit: reload: registered reload.service
-rinit: reload: 1 added (0 started), 0 changed (0 deferred), 0 removed (0 stopped), 12 unchanged
+rinit: reload: 1 added (0 started), 0 changed (0 deferred), 0 removed (0 stopped), 14 unchanged
 ~ # echo "ExecStartPre=/bin/echo reloaded-pre" >> /etc/rinit/units/logdemo.service
 ~ # echo "ExecStartPost=/bin/true" >> /etc/rinit/units/getty.service
 ~ # rctl reload
 rinit: reload: logdemo.service: new definition in force
 rinit: reload: getty.service is running; its new definition applies at the next start
-rinit: reload: 0 added (0 started), 2 changed (1 deferred), 0 removed (0 stopped), 11 unchanged
+rinit: reload: 0 added (0 started), 2 changed (1 deferred), 0 removed (0 stopped), 13 unchanged
 ~ # rm /etc/rinit/units/reload.service
 ~ # rctl reload
 rinit: reload: removed reload.service
-rinit: reload: 0 added (0 started), 1 changed (1 deferred), 1 removed (0 stopped), 11 unchanged
+rinit: reload: 0 added (0 started), 1 changed (1 deferred), 1 removed (0 stopped), 13 unchanged
 ```
 
 `1 added (0 started)` is the plan's "注册,不自动启动(除非是 default.target 依赖)" in
@@ -182,6 +183,26 @@ no `Cgroup*=` to fall back to. Both are reasons not to guess: the unit fails, sa
 which file it read, and its dependents are told - which is the plan's "无法定位 →
 Failed" and the reason `forking` is the one type this README recommends against for
 anything new.
+
+§7.7's template unit, which is the one case where a *name* is the feature. The
+file is `worker@.service`; the instance does not exist until someone asks for it,
+and the expansion happens before the parser sees the command:
+
+```
+~ # rctl start worker@.service
+rctl: worker@.service is a template; start an instance, e.g. worker@<name>.service
+~ # rctl start worker@42.service
+rinit: started worker@42.service as pid 137
+~ # rctl log worker@42.service
+worker@42.service: worker-instance=42 name=worker@42.service prefix=worker env=42
+```
+
+`%i`, `%n` and `%p` are the instance, the full name and the prefix; `env=42` is
+the same expansion inside an `Environment=` line, which is why the demo prints
+both - `$INSTANCE` in the command is the *shell* reading the environment, a
+different mechanism from the substitution. The template itself is listed as what
+it is (`worker@.service: template`) and refuses to start, and an instance is a unit
+like any other from that point on.
 
 ## Layout
 
@@ -236,17 +257,17 @@ make test-system    # boot aarch64 qemu and assert the acceptance list
 make test           # check + test-system
 ```
 
-`cargo test --offline --workspace` (what `make check` runs last) executes **654
+`cargo test --offline --workspace` (what `make check` runs last) executes **666
 tests** across eleven binaries. The four shapes, and why each is not redundant:
 
-- **unit tests** next to the code (core 304, rinit 174, rinit-runtime 92,
+- **unit tests** next to the code (core 309, rinit 179, rinit-runtime 92,
   rctl 11), including `proptest` properties over the parser;
 - **integration tests** in `crates/*/tests/`: the syscall layer against the real
   kernel (`rinit-runtime` 21: run unprivileged, they assert that each drop is
   *refused* rather than silently skipped - `EPERM` from `setuid(0)`, `setgroups`,
   `PR_CAPBSET_DROP`, `capset` and the ambient raise, each naming the call that
   failed - with the root-only success paths deferred to the guest), the
-  lifecycle end to end in `--dev` mode (`rinit/tests/m2_lifecycle.rs` 35), the
+  lifecycle end to end in `--dev` mode (`rinit/tests/m2_lifecycle.rs` 36), the
   control CLI (`rctl/tests/control.rs` 8), the smoke test that runs the real
   binary (`rinit/tests/smoke.rs` 2), the allocation guard
   (`rinit-core/tests/allocations.rs` 2), and `shipped_units.rs` 4 - every unit in
@@ -367,6 +388,11 @@ cargo llvm-cov --offline --workspace --html                  # target/llvm-cov/h
   unit that declares no cgroup - has nothing left pointing at it. The happy path
   needs no cgroup, because `PIDFile=` names the daemon; this is only the timeout
   path of a unit that is misbehaving.
+- **A unit file cannot name a template instance** (plan §7.7): `Requires=worker@1.service`
+  is rejected when the directory is loaded, because the dependency graph is built
+  from the files and an instance is not one of them. Instances are started by name,
+  which is also what creates them; systemd's `[Install]`/`WantedBy=` symlinks are
+  what rinit has no equivalent of.
 - `signals.rs`'s pipe-full path (handler drops a byte) is not forced in a test.
 - RSS-at-boot is not measured yet, so plan §0.1's memory column is still open
   (`/proc/<pid>/status` inside the guest: ≤2 MB idle, ≤6 MB with 20 services),
@@ -382,7 +408,7 @@ repository or a measurement in this README:
 
 | plan §6 | where it stands |
 | ------- | --------------- |
-| boots as PID 1 in qemu (128M) with no kernel panic | `make test-system`: 79 assertions, including "no rinit panic" and four kernel-log checks |
+| boots as PID 1 in qemu (128M) with no kernel panic | `make test-system`: 82 assertions, including "no rinit panic" and four kernel-log checks |
 | 20 services in parallel, visibly faster than serial | **19.2x**: `make parallel` - 20 `oneshot` services that each sleep 1 s finish in 1065 ms together and 20 424 ms chained |
 | crash-restart, breaker, health checks | `make test-system` ("a crashed service is scheduled for restart", "the breaker tripped on the failing unit") and `crates/rinit/tests/m2_lifecycle.rs` |
 | `rctl` can start, stop, query and read logs | `make test-system`'s M3 block and `crates/rctl/tests/control.rs` |

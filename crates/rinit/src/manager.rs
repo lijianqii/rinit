@@ -12,6 +12,7 @@
 //! acceptance criterion (10+ units, visibly faster than serial) falls out of
 //! the schedule rather than needing special-casing.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use rinit_core::unit::dependency::spawns_process;
@@ -37,6 +38,13 @@ pub struct BootPlan {
     pub default_target: UnitName,
     /// Non-fatal problems worth reporting.
     pub warnings: Vec<String>,
+    /// Template units, by canonical name, with their file *text* (plan §7.7).
+    ///
+    /// The text rather than a parsed config, because an instance is made by
+    /// expanding the specifiers and parsing the result: `%i` has to be in place
+    /// before the parser sees the command it appears in. A template is also not a
+    /// unit - it has no place in `configs`, and cannot be started.
+    pub templates: BTreeMap<String, String>,
 }
 
 /// Load, parse and resolve the unit directory.
@@ -51,7 +59,18 @@ pub fn plan_boot(unit_dir: &Path, default_target: &str) -> Result<BootPlan, Runt
     let (files, warnings) = load_unit_files(unit_dir)?;
 
     let mut configs: Vec<UnitConfig> = Vec::with_capacity(files.len());
+    let mut templates: BTreeMap<String, String> = BTreeMap::new();
     for file in &files {
+        if file.name.is_template() {
+            // Parsed here and thrown away, so a template with a typo fails the
+            // boot it belongs to rather than the first start that uses it. The
+            // text is what is kept: an instance is parsed from it with the
+            // specifiers already expanded.
+            rinit_core::unit::parser::parse(&file.name, &file.contents)
+                .map_err(|e| annotate(e, &file.path))?;
+            templates.insert(file.name.canonical().to_string(), file.contents.clone());
+            continue;
+        }
         let cfg = rinit_core::unit::parser::parse(&file.name, &file.contents)
             .map_err(|e| annotate(e, &file.path))?;
         configs.push(cfg);
@@ -91,6 +110,7 @@ pub fn plan_boot(unit_dir: &Path, default_target: &str) -> Result<BootPlan, Runt
         levels,
         default_target: target,
         warnings,
+        templates,
     })
 }
 
@@ -234,6 +254,60 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// Plan §7.7: a `worker@.service` file is a *template* - not a unit, and not
+    /// something the boot can start - while its text is kept for instances.
+    #[test]
+    fn a_template_is_kept_as_text_and_not_registered_as_a_unit() {
+        let dir = TempDir::new("template");
+        dir.write("rinit-init.target", "[Unit]\nType=target\n");
+        dir.write(
+            "multi-user.target",
+            "[Unit]\nType=target\nRequires=rinit-init.target\n",
+        );
+        dir.write(
+            "worker@.service",
+            "[Service]\nExecStart=/bin/echo worker-%i\n",
+        );
+
+        let plan = plan_boot(&dir.0, "multi-user.target").expect("plan");
+
+        assert!(
+            plan.configs.iter().all(|c| !c.name.is_template()),
+            "a template is not a unit: {:?}",
+            plan.configs
+                .iter()
+                .map(|c| c.name.canonical())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            plan.templates.get("worker@.service").map(String::as_str),
+            Some("[Service]\nExecStart=/bin/echo worker-%i\n"),
+            "and its text is what an instance is made from"
+        );
+    }
+
+    /// A template that does not parse is a failed *boot*, not a surprise on the
+    /// first `rctl start`: it is parsed where it is loaded, and the result thrown
+    /// away.
+    #[test]
+    fn a_template_that_does_not_parse_fails_the_plan() {
+        let dir = TempDir::new("template-bad");
+        dir.write("rinit-init.target", "[Unit]\nType=target\n");
+        dir.write(
+            "multi-user.target",
+            "[Unit]\nType=target\nRequires=rinit-init.target\n",
+        );
+        dir.write(
+            "worker@.service",
+            "[Service]\nExecStart=/bin/true\nNoSuchKey=1\n",
+        );
+
+        assert!(
+            plan_boot(&dir.0, "multi-user.target").is_err(),
+            "a template with an unknown key has to be caught here"
+        );
     }
 
     /// The M1 acceptance criterion: a real dependency graph resolves into few

@@ -186,6 +186,10 @@ pub async fn reload(
         }
     }
 
+    // The directory's templates come with it: a reload can add, change or remove
+    // one, and instances made after it must be made from the new text (plan §7.7).
+    manager.set_templates(plan.templates.clone());
+
     // 4. Shutdown walks the current schedule backwards (plan §1.3(8)), so the
     //    order is replaced with the one just resolved. Units started by hand and
     //    not in the schedule are appended by `shutdown_order` itself.

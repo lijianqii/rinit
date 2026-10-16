@@ -328,6 +328,17 @@ await_log() {
     printf 'rctl start tty.service\n' >&3
     await_log 15 'ioctl(TIOCSCTTY)' || true
 
+    # M5 §7.7: a template unit. `worker@.service` is not a unit - it cannot be
+    # started - and the instance the console asks for is created out of it with
+    # the specifiers already expanded.
+    printf 'rctl start worker@.service\n' >&3
+    await_log 15 'is a template; start an instance' || true
+    printf 'rctl start worker@42.service\n' >&3
+    await_log 15 'started worker@42.service' || true
+    sleep 1
+    printf 'rctl log worker@42.service\n' >&3
+    await_log 15 'worker-instance=42' || true
+
     # Plan §1.3(7): the log file. The guest boots with the default path, so this
     # checks the plan's own setting rather than a flag the test invented - and the
     # directory it names does not exist in the initramfs, so rinit having created
@@ -636,6 +647,14 @@ expect "stopping a forking unit stopped the daemon it took over" "daemon-gone"
 # M5 §7.11: a `TTYPath=` that is not a terminal is a failed start, not a service
 # that believes it owns a terminal.
 expect "a TTYPath that is not a terminal fails the start" "ioctl(TIOCSCTTY) failed"
+
+# M5 §7.7: a template is a name to instantiate, and an instance is a unit with
+# the specifiers expanded into the command it runs.
+expect "a template is not a unit to start" \
+    "worker@.service is a template; start an instance"
+expect "an instance was created from its template" "started worker@42.service"
+expect "every specifier was expanded before the command ran" \
+    "worker-instance=42 name=worker@42.service prefix=worker env=42"
 
 # Plan §1.3(7): the default log file exists and holds what a service wrote.
 log_lines="$(grep -oE 'logfile-marker=[0-9]+' "${log_file}" | tail -1 | cut -d= -f2)"

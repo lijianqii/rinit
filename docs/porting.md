@@ -111,9 +111,13 @@ instead of silently losing a setting. The common ones:
   `Requires=`/`Wants=` instead.
 - `WantedBy`-style *reverse* dependencies: rinit resolves forwards. A unit is
   started because a target reads it, not because it names a target.
-- Template units (`worker@.service`, `%i`), `Sockets=` and socket activation,
-  `Type=idle`/`dbus`, `$MAINPID`, cgroup v1: not implemented (plan §7.7-§7.11,
-  P3).
+- Template units work (`worker@.service`, `%i`/`%n`/`%p`), but with two systemd
+  differences: there is no `enable`, so nothing starts an instance at boot, and a
+  *unit file* cannot name an instance (`Requires=worker@1.service` is rejected
+  when the directory is loaded) - instances are started by name. systemd gets the
+  first from `[Install]` symlinks and the second from the same.
+- `Sockets=` and socket activation, `Type=idle`/`dbus`, `$MAINPID`, cgroup v1:
+  not implemented (plan §7.8-§7.9, P3).
 - `PermissionsStartOnly=` and the `+`/`-`/`!` prefixes: every `Exec*` runs as the
   unit's `User=`.
 - `Type=forking` works, but the `PIDFile=` has to have been written by the time

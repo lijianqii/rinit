@@ -14,6 +14,7 @@
 
 use std::path::PathBuf;
 
+use rinit_core::UnitName;
 use rinit_core::unit::cgroup::CgroupLimits;
 use rinit_core::unit::config::{RestartPolicy, ServiceKind, SizeBytes};
 use rinit_core::unit::parser::parse;
@@ -21,6 +22,39 @@ use rinit_runtime::units::load_unit_files;
 
 fn units_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../units")
+}
+
+/// The template unit (plan §7.7): the guest asserts that starting
+/// `worker@42.service` runs a command with `%i`, `%n` and `%p` already expanded -
+/// including in `Environment=` - so this pins the file that has to expand that
+/// way, and that the expansion is what parses.
+#[test]
+fn the_template_unit_expands_into_what_the_guest_checks() {
+    let (files, _) = load_unit_files(&units_dir()).expect("load units/");
+    let file = files
+        .iter()
+        .find(|f| f.name.canonical() == "worker@.service")
+        .expect("worker@.service is shipped");
+    assert!(
+        file.name.is_template(),
+        "the file name is what makes it a template, and not a unit"
+    );
+
+    let instance = UnitName::parse("worker@42.service").expect("valid name");
+    let expanded =
+        rinit_core::substitute(&file.contents, &instance).expect("every specifier is known");
+    let cfg = parse(&instance, &expanded).expect("the expansion parses");
+
+    assert_eq!(
+        cfg.exec_start.argv().last().map(String::as_str),
+        Some("echo worker-instance=42 name=worker@42.service prefix=worker env=$INSTANCE"),
+        "the specifiers are expanded before the parser ever sees the command"
+    );
+    assert_eq!(
+        cfg.environment,
+        vec![("INSTANCE".to_string(), "42".to_string())],
+        "and in `Environment=`, which is why the demo prints both"
+    );
 }
 
 #[test]

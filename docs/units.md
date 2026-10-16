@@ -180,6 +180,52 @@ ExecStart=/sbin/getty -L ttyAMA0 115200 vt100
 Restart=always
 ```
 
+## Template units
+
+A unit file whose name has an `@` with nothing after it - `worker@.service` - is
+a **template**: not a unit, and not something anything can start. It is the
+definition every instance of it is made from.
+
+```
+$ rctl list
+worker@.service: template
+$ rctl start worker@.service
+rctl: worker@.service is a template; start an instance, e.g. worker@<name>.service
+$ rctl start worker@42.service
+started worker@42.service
+```
+
+Starting `worker@42.service` instantiates the template: the specifiers below are
+expanded into the file's **text**, and the result is parsed as an ordinary unit.
+An instance is a unit like any other from then on - it has its own name, its own
+state, its own cgroup and its own log - and nothing ever expands it again.
+
+| specifier | expands to | for `worker@42.service` |
+| --------- | ---------- | ---------------------- |
+| `%i` | the instance | `42` |
+| `%n` | the full unit name | `worker@42.service` |
+| `%p` | the prefix | `worker` |
+| `%%` | a literal per cent | `%` |
+
+Expansion happens over the whole file rather than one field at a time, so a
+specifier works in `Environment=`, in `WorkingDirectory=` and in a comment alike.
+Anything after a `%` that is not in the table is an **error** rather than a
+literal: a template with a typo fails the start, saying which specifier it did not
+understand, instead of handing a service the wrong argument. (`%%` is how you
+write a per cent that is not a specifier - which matters because the same `%`
+otherwise reaches the command line untouched.)
+
+Two things to know before using one:
+
+- **A unit file cannot name an instance.** `Requires=worker@1.service` is
+  rejected at load time ("no such unit file exists"), because the dependency graph
+  is built from the files in the directory and an instance is not one of them.
+  Instances are started by name (`rctl start worker@42.service`), which is also
+  what creates them.
+- **There is no `enable`.** Nothing makes an instance start at boot, because
+  that is what systemd's `[Install]`/`WantedBy=` symlinks are for and rinit has
+  neither.
+
 ## Not supported
 
 Deliberately, per plan §2.2's scope, and each is a decision rather than an
@@ -187,7 +233,6 @@ oversight (the README's deviation list has the reasoning):
 
 - `PermissionsStartOnly=` and the `+`/`-`/`!` command prefixes: every `Exec*`
   runs as `User=`/`Group=`.
-- Template units (`worker@.service`, `%i`) and instances - plan §7.7.
 - `Sockets=` and socket activation, `WantedBy=`/`[Install]` sections (rinit has
   no `enable`: the boot target's closure is what starts), `Type=idle`/`dbus`,
   `$MAINPID`, cgroup v1, and every other directive not in the tables above. An

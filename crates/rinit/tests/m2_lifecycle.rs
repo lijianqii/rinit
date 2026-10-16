@@ -1553,6 +1553,103 @@ fn a_forking_unit_whose_daemon_cannot_be_located_fails_its_start() {
     }
 }
 
+// --- §7.7: template units -------------------------------------
+
+/// Plan §7.7: the specifiers are expanded *before the parser sees the command*,
+/// and asking for an instance is what creates it.
+///
+/// The service echoes what it was handed, so the assertion is about the command
+/// line the template produced rather than about what rinit meant to produce -
+/// and a second instance shows that instances are units of their own.
+#[test]
+fn starting_an_instance_expands_its_template() {
+    let dir = TempDir::new("template");
+    dir.write(
+        "all.target",
+        "[Unit]
+Type=target
+Requires=app.service
+",
+    );
+    dir.write(
+        "app.service",
+        "[Service]
+Type=simple
+ExecStart=/bin/sleep 30
+",
+    );
+    dir.write(
+        "worker@.service",
+        "[Service]
+Type=oneshot
+Environment=INSTANCE=%i
+\
+         ExecStart=/bin/sh -c \"echo instance=%i name=%n prefix=%p env=$INSTANCE\"\n",
+    );
+    let (child, socket) = boot_with_control(&dir, "template");
+    let unit = |name: &str| rinit_core::UnitName::parse(name).expect("unit name");
+
+    // The template exists, is listed as what it is, and cannot be started.
+    let (_, list) = control(&socket, rinit_core::Request::List);
+    assert!(list.contains("worker@.service: template"), "got: {list}");
+    let (status, text) = control(&socket, rinit_core::Request::Start(unit("worker@.service")));
+    assert_eq!(status, rinit_core::Status::Error, "{text}");
+    assert!(
+        text.contains("is a template; start an instance"),
+        "the refusal has to say what to do: {text}"
+    );
+
+    // An instance does not exist until someone asks for it.
+    let (status, text) = control(
+        &socket,
+        rinit_core::Request::Status {
+            unit: Some(unit("worker@1.service")),
+            tail: 0,
+        },
+    );
+    assert_eq!(status, rinit_core::Status::NoSuchUnit, "{text}");
+
+    // Asking for one creates it, expanded.
+    let (status, text) = control(
+        &socket,
+        rinit_core::Request::Start(unit("worker@1.service")),
+    );
+    assert_eq!(status, rinit_core::Status::Ok, "{text}");
+    std::thread::sleep(Duration::from_millis(400));
+    let (_, text) = control(
+        &socket,
+        rinit_core::Request::Log {
+            unit: Some(unit("worker@1.service")),
+            tail: 0,
+        },
+    );
+    assert!(
+        text.contains("instance=1 name=worker@1.service prefix=worker env=1"),
+        "every specifier, expanded before the command ran: {text}"
+    );
+
+    // And a second instance is a second unit.
+    let (status, _) = control(
+        &socket,
+        rinit_core::Request::Start(unit("worker@2.service")),
+    );
+    assert_eq!(status, rinit_core::Status::Ok);
+    std::thread::sleep(Duration::from_millis(400));
+    let (_, text) = control(
+        &socket,
+        rinit_core::Request::Log {
+            unit: Some(unit("worker@2.service")),
+            tail: 0,
+        },
+    );
+    assert!(
+        text.contains("instance=2 name=worker@2.service"),
+        "got: {text}"
+    );
+
+    stop_rinit(child);
+}
+
 // --- §1.3(7): the log file ------------------------------------
 
 /// Plan §1.3(7): the ring can be mirrored to a file, which is what makes a log

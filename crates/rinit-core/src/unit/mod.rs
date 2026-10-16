@@ -15,6 +15,8 @@
 //! - [`sandbox`] — the ordered privilege-drop plan for a service (plan §7.4).
 //! - [`cgroup`] — the cgroup v2 limits a unit asks for, and the files they
 //!   become (plan §7.3).
+//! - [`template`] — template units and the `%i`/`%n`/`%p` specifiers
+//!   (plan §7.7).
 
 pub mod cgroup;
 pub mod config;
@@ -25,6 +27,7 @@ pub mod parser;
 pub mod restart;
 pub mod sandbox;
 pub mod state;
+pub mod template;
 
 use alloc::string::{String, ToString};
 use core::fmt;
@@ -42,6 +45,7 @@ pub use parser::{ParseError, parse as parse_unit_file, parse_environment_file};
 pub use restart::{BackoffState, Jitter};
 pub use sandbox::{Sandbox, SandboxStep};
 pub use state::{Effect, Event, ExitOutcome, FailedReason, TransitionError, UnitState, transition};
+pub use template::substitute;
 
 /// The kind of a unit (plan §1.1 `[Unit] Type`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -126,18 +130,54 @@ impl UnitName {
     }
 
     /// The instance part of a template instance (e.g. `"1"` for
-    /// `worker@1.service`), if any. Template expansion itself is M3+/P3.
+    /// `worker@1.service`), if any (plan §7.7).
     ///
     /// Only the *first* `@` separates the template from the instance, so
-    /// `worker@a@b.service` has instance `"a@b"`.
+    /// `worker@a@b.service` has instance `"a@b"`. A template's own name
+    /// (`worker@.service`) has no instance: that is what makes it a template.
     pub fn instance(&self) -> Option<&str> {
-        let stem = self
-            .canonical
-            .strip_suffix(self.ty.suffix())
-            .unwrap_or(&self.canonical);
-        stem.split_once('@')
+        self.stem()
+            .split_once('@')
             .map(|(_, instance)| instance)
             .filter(|i| !i.is_empty())
+    }
+
+    /// Whether this name *is* a template: a name with an `@` and no instance,
+    /// like `worker@.service` (plan §7.7).
+    pub fn is_template(&self) -> bool {
+        self.stem().contains('@') && self.instance().is_none()
+    }
+
+    /// The template an instance came from: `worker@1.service` → `worker@.service`
+    /// (plan §7.7).
+    ///
+    /// `None` for a template itself and for a name with no `@` at all, which are
+    /// the two things that are not instances of anything.
+    pub fn template(&self) -> Option<UnitName> {
+        let (prefix, instance) = self.stem().split_once('@')?;
+        if instance.is_empty() {
+            return None;
+        }
+        let mut canonical = String::with_capacity(self.canonical.len());
+        canonical.push_str(prefix);
+        canonical.push('@');
+        canonical.push_str(self.ty.suffix());
+        UnitName::parse(&canonical).ok()
+    }
+
+    /// The part before the `@` (or the whole stem), which is what `%p` expands
+    /// to (plan §7.7).
+    pub fn prefix(&self) -> &str {
+        self.stem()
+            .split_once('@')
+            .map_or(self.stem(), |(prefix, _)| prefix)
+    }
+
+    /// The canonical name without its type suffix.
+    fn stem(&self) -> &str {
+        self.canonical
+            .strip_suffix(self.ty.suffix())
+            .unwrap_or(&self.canonical)
     }
 }
 
@@ -242,6 +282,36 @@ mod tests {
         let u = UnitName::parse("foo.SERVICE").unwrap();
         assert_eq!(u.canonical(), "foo.SERVICE.service");
         assert_eq!(u.unit_type(), UnitType::Service);
+    }
+
+    /// Plan §7.7's three name questions: whether a name is a template, which
+    /// template an instance came from, and what `%p` expands to.
+    #[test]
+    fn templates_and_their_instances_are_told_apart() {
+        let instance = UnitName::parse("worker@1.service").unwrap();
+        assert!(!instance.is_template());
+        assert_eq!(
+            instance.template().map(|t| t.canonical().to_string()),
+            Some("worker@.service".to_string())
+        );
+        assert_eq!(instance.prefix(), "worker");
+
+        let template = UnitName::parse("worker@.service").unwrap();
+        assert!(template.is_template());
+        assert_eq!(template.template(), None, "a template is not an instance");
+        assert_eq!(template.prefix(), "worker", "and still knows its prefix");
+
+        let plain = UnitName::parse("worker.service").unwrap();
+        assert!(!plain.is_template());
+        assert_eq!(plain.template(), None);
+        assert_eq!(plain.prefix(), "worker");
+
+        // A target template is the same question about a different suffix.
+        let target = UnitName::parse("check@a.target").unwrap();
+        assert_eq!(
+            target.template().map(|t| t.canonical().to_string()),
+            Some("check@.target".to_string())
+        );
     }
 
     /// `split_once('@')` keeps everything after the first `@` as the instance.

@@ -336,6 +336,12 @@ pub struct UnitManager {
     /// Where units' cgroup limits are applied (plan §7.3); disabled unless the
     /// boot sequence brought a hierarchy up.
     cgroup: Cgroup,
+    /// Template units by canonical name, with their file text (plan §7.7).
+    ///
+    /// Held in memory rather than re-read from disk so an instance can be made
+    /// after a reload replaced the directory, and so the expansion uses the text
+    /// the plan was built from.
+    templates: BTreeMap<String, String>,
 }
 
 impl UnitManager {
@@ -348,7 +354,49 @@ impl UnitManager {
             shutdown_order: Vec::new(),
             origin: Instant::now(),
             cgroup: Cgroup::disabled(),
+            templates: BTreeMap::new(),
         }
+    }
+
+    /// Give the manager the directory's template units (plan §7.7).
+    pub fn set_templates(&mut self, templates: BTreeMap<String, String>) {
+        self.templates = templates;
+    }
+
+    /// Whether `unit` is a template - a name that exists to be instantiated and
+    /// cannot be started itself (plan §7.7).
+    pub fn is_template(&self, unit: &UnitName) -> bool {
+        unit.is_template() && self.templates.contains_key(unit.canonical())
+    }
+
+    /// Bring a template instance into being, if it is one (plan §7.7).
+    ///
+    /// The expansion happens here, once, and the result is parsed as an ordinary
+    /// unit: from this point on an instance is a unit like any other and nothing
+    /// re-expands its text. That is the plan's "替换仅在解析期完成一次" - and it is
+    /// also what makes an instance name containing a `%` harmless.
+    ///
+    /// # Errors
+    /// The reason the instance could not be made, for the caller to report: not
+    /// an instance name at all, no such template, a `%` specifier this build does
+    /// not know, or a template whose expansion does not parse.
+    pub fn instantiate(&mut self, unit: &UnitName) -> Result<(), String> {
+        let Some(template) = unit.template() else {
+            return Err(format!("{unit} is not a template instance"));
+        };
+        let Some(text) = self.templates.get(template.canonical()) else {
+            return Err(format!("no template {}", template.canonical()));
+        };
+        let expanded = rinit_core::substitute(text, unit).ok_or_else(|| {
+            format!(
+                "{} has a %-specifier that is not %i, %n, %p or %%",
+                template.canonical()
+            )
+        })?;
+        let config = rinit_core::unit::parser::parse(unit, &expanded)
+            .map_err(|e| format!("{}: {e}", template.canonical()))?;
+        self.units.insert(unit.clone(), UnitRuntime::new(config));
+        Ok(())
     }
 
     /// Give the manager the cgroup side of the boot (plan §7.3).
@@ -481,7 +529,12 @@ impl UnitManager {
         source: RequestSource,
     ) -> Option<Effect> {
         if !self.units.contains_key(unit) {
-            return None;
+            // Plan §7.7: asking for an instance *is* what creates it. A failure
+            // here is reported by the caller, which has somewhere to put a
+            // message; `request` only has an effect to return.
+            if self.instantiate(unit).is_err() {
+                return None;
+            }
         }
         let at = self.now_millis();
         self.forget_spent_target(unit);
@@ -1651,17 +1704,20 @@ impl UnitManager {
     /// Retired units are left out: a reload removed them, and `rctl list` must
     /// agree with `rctl start` about which units exist (plan §7.6).
     pub fn summary(&self) -> Vec<String> {
-        self.units
-            .values()
-            .filter(|rt| !rt.retired)
-            .map(|rt| {
-                let pid = match rt.pid {
-                    Some(p) => format!(" pid {p}"),
-                    None => String::new(),
-                };
-                format!("{}: {}{pid}", rt.config.name, rt.state)
-            })
-            .collect()
+        let templates = self
+            .templates
+            .keys()
+            .map(|name| format!("{name}: template"));
+        let units = self.units.values().filter(|rt| !rt.retired).map(|rt| {
+            let pid = match rt.pid {
+                Some(p) => format!(" pid {p}"),
+                None => String::new(),
+            };
+            format!("{}: {}{pid}", rt.config.name, rt.state)
+        });
+        // A template is not a unit, so it has no state - but an operator looking
+        // for the unit they want to start needs to see that it exists.
+        units.chain(templates).collect()
     }
 }
 
@@ -2880,6 +2936,99 @@ mod tests {
         assert_eq!(m.target_of(&unit), Some(JobTarget::Started));
         m.request_stop(&unit, RequestSource::UserStop);
         assert_eq!(m.target_of(&unit), Some(JobTarget::Stopped));
+    }
+
+    // --- §7.7: template instances ----------------------------------
+
+    /// Asking for an instance is what creates it, and each one is a unit of its
+    /// own: two instances of one template share nothing but the text.
+    #[test]
+    fn an_instance_is_created_from_its_template_and_is_its_own_unit() {
+        let mut m = UnitManager::new();
+        let mut templates = BTreeMap::new();
+        templates.insert(
+            "worker@.service".to_string(),
+            "[Service]\nExecStart=/bin/echo worker-%i (%n, %p)%%\n".to_string(),
+        );
+        m.set_templates(templates);
+
+        let first = UnitName::parse("worker@blue.service").unwrap();
+        assert_eq!(m.instantiate(&first), Ok(()));
+        let second = UnitName::parse("worker@green.service").unwrap();
+        assert_eq!(m.instantiate(&second), Ok(()));
+
+        let argv = |unit: &UnitName| {
+            m.get(unit)
+                .expect("registered")
+                .config
+                .exec_start
+                .argv()
+                .join(" ")
+        };
+        assert_eq!(
+            argv(&first),
+            "/bin/echo worker-blue (worker@blue.service, worker)%"
+        );
+        assert_eq!(
+            argv(&second),
+            "/bin/echo worker-green (worker@green.service, worker)%"
+        );
+        assert!(
+            m.get(&first).unwrap().config.name == first
+                && m.get(&second).unwrap().config.name == second,
+            "each instance is its own unit, named after itself"
+        );
+    }
+
+    /// The template itself is not a unit, and the three ways an instance can fail
+    /// to be made each say which one it was.
+    #[test]
+    fn instantiation_reports_why_it_could_not_be_done() {
+        let mut m = UnitManager::new();
+        let mut templates = BTreeMap::new();
+        templates.insert(
+            "worker@.service".to_string(),
+            "[Service]\nExecStart=/bin/echo %j\n".to_string(),
+        );
+        m.set_templates(templates);
+
+        // A `%` specifier this build does not know.
+        let bad = UnitName::parse("worker@1.service").unwrap();
+        let why = m.instantiate(&bad).expect_err("must be refused");
+        assert!(
+            why.contains("%j") || why.contains("%-specifier"),
+            "got: {why}"
+        );
+
+        // A name that is not an instance at all.
+        let plain = UnitName::parse("plain.service").unwrap();
+        let why = m.instantiate(&plain).expect_err("must be refused");
+        assert!(why.contains("not a template instance"), "got: {why}");
+
+        // An instance of a template that does not exist.
+        let orphan = UnitName::parse("other@1.service").unwrap();
+        let why = m.instantiate(&orphan).expect_err("must be refused");
+        assert!(why.contains("no template other@.service"), "got: {why}");
+
+        // And a template is startable only through an instance, which is what
+        // `is_template` lets a caller say.
+        assert!(m.is_template(&UnitName::parse("worker@.service").unwrap()));
+        assert!(!m.is_template(&bad));
+        assert!(
+            m.summary()
+                .iter()
+                .any(|line| line == "worker@.service: template"),
+            "`rctl list` has to show that it exists: {:?}",
+            m.summary()
+        );
+    }
+
+    /// A template that was never given to the manager is not a template, so a
+    /// typo cannot pass for one.
+    #[test]
+    fn a_template_name_with_no_template_behind_it_is_not_one() {
+        let m = UnitManager::new();
+        assert!(!m.is_template(&UnitName::parse("worker@.service").unwrap()));
     }
 
     // --- §7.6: what a reload does to the manager -------------------

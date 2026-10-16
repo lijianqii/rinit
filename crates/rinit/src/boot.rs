@@ -696,7 +696,21 @@ async fn control_start(
     unit: &UnitName,
 ) -> (Status, String) {
     if !manager.exists(unit) {
-        return (Status::NoSuchUnit, format!("no such unit: {unit}"));
+        // Plan §7.7's boundary: a template is a name to instantiate, not a unit,
+        // and saying which is which is the whole message.
+        if manager.is_template(unit) {
+            return (
+                Status::Error,
+                format!(
+                    "{unit} is a template; start an instance, e.g. {}@<name>.service",
+                    unit.prefix()
+                ),
+            );
+        }
+        // An instance of a template does not exist until someone asks for it.
+        if let Err(why) = manager.instantiate(unit) {
+            return (Status::NoSuchUnit, format!("no such unit: {unit} ({why})"));
+        }
     }
     let effect = manager.request_start(unit, RequestSource::UserStart);
     match effect {
@@ -884,6 +898,8 @@ async fn start_units(
     for cfg in &plan.configs {
         units.add(cfg.clone());
     }
+    // Plan §7.7: the templates, so `rctl start worker@1.service` can make one.
+    units.set_templates(plan.templates.clone());
     // Shutdown walks the startup order backwards (plan §1.3(8)), so record it
     // while the schedule is still at hand.
     units.set_shutdown_order(plan.levels.iter().flatten().cloned().collect());
