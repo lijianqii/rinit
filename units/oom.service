@@ -1,0 +1,40 @@
+# cgroup v2 OOM-kill acceptance unit (plan §7.3).
+#
+# Plan §7.3's last bullet is "与健康检测联动:检测到 OOM kill 后进入重启策略" - an OOM
+# kill has to be *detected* and the unit then follows its restart policy, rather
+# than being left dead with a bare `SIGKILL` as the only clue.
+#
+# This unit makes the kernel's cgroup OOM killer fire for real, which is the
+# half no host test can do: with `CgroupMemoryMax=16M`, the shell below doubles a
+# string until the cgroup cannot satisfy the allocation, and the memory
+# controller then kills a process *inside this cgroup* - the system-wide OOM
+# killer would say nothing about the unit's limit.
+#
+# Three things are asserted from the console, and only the first is the kernel's:
+#
+#   Memory cgroup out of memory: Killed process ...   the kernel's own record
+#   killed by the cgroup OOM killer (memory.max=...)  rinit naming the cause
+#   oom.service will restart in                       the restart policy
+#
+# The counter rinit reads (`memory.events`' `oom_kill`) is what makes the
+# middle line honest. `SIGKILL` is also how a stop timeout and a shutdown
+# arrive, so the signal alone cannot say an OOM kill happened - and because the
+# cgroup directory is *kept* across a restart (the restart path does not clean
+# up), a bare "the counter is not zero" would be wrong too. rinit therefore
+# compares it against the value it read before the service could allocate.
+#
+# `StartLimitBurst=2` bounds the demo: the first OOM schedules a restart, the
+# second trips the breaker, so this cannot churn for the rest of the run.
+# `Type=simple` matters - the shell is Active when the kill lands, which is the
+# state the restart policy is written against.
+[Unit]
+Description=cgroup v2 OOM-kill demo (started on demand)
+
+[Service]
+Type=simple
+CgroupMemoryMax=16M
+Restart=on-failure
+RestartSec=1
+StartLimitBurst=2
+StartLimitIntervalSec=300
+ExecStart=/bin/sh -c "x=a; while :; do x=$x$x; done"

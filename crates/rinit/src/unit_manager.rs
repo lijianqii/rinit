@@ -27,7 +27,8 @@ use crate::cgroup::Cgroup;
 use crate::log::rlog;
 use crate::service::spawn_service_in_group;
 
-/// What happened to a unit when a child was reaped.///
+/// What happened to a unit when a child was reaped.
+///
 /// The manager applies the change itself - it owns the state, the backoff and
 /// the restart timer - so this is a *report* for logging and tests, not an
 /// instruction. An earlier version returned an `Action` for the caller to
@@ -109,6 +110,13 @@ pub struct UnitRuntime {
     pub status: Option<String>,
     /// The last outcome, kept for logging and `rctl status`.
     pub last_outcome: Option<ExitOutcome>,
+    /// The unit cgroup's OOM-kill count when this start began, or `None` when
+    /// there is no cgroup to ask (plan §7.3).
+    ///
+    /// A baseline rather than a bare "was it killed": the counter is the
+    /// cgroup's and survives a restart when the directory had to be kept, so
+    /// only a *change* across this run is this run's OOM kill.
+    pub oom_kills_at_start: Option<u64>,
 }
 
 impl UnitRuntime {
@@ -139,6 +147,7 @@ impl UnitRuntime {
             exec_stop_pid: None,
             status: None,
             last_outcome: None,
+            oom_kills_at_start: None,
         }
     }
 
@@ -722,6 +731,15 @@ impl UnitManager {
             None
         };
 
+        // Plan §7.3's OOM detection needs a baseline from *before* the service
+        // could allocate anything, so it is read here - after the setup, with
+        // nothing spawned yet. A unit in its own cgroup is the only one whose
+        // counter means anything: without one it is running in rinit's.
+        let oom_kills_at_start = cgroup_procs
+            .is_some()
+            .then(|| self.cgroup.oom_kills(unit))
+            .flatten();
+
         // A fresh process group, so a stop reaches the whole tree (plan §1.3(6)).
         let pid = spawn_service_in_group(
             &argv,
@@ -740,6 +758,7 @@ impl UnitManager {
         rt.restart_at = None;
         rt.kill_at = None;
         rt.exec_stop_pid = None;
+        rt.oom_kills_at_start = oom_kills_at_start;
 
         match kind {
             // `simple` is live the moment it is exec'd.
@@ -1202,12 +1221,37 @@ impl UnitManager {
 
         let now = self.now_millis();
         let rt = self.units.get_mut(&unit)?;
+        let oom_baseline = rt.oom_kills_at_start.take();
         rt.pid = None;
         rt.start_deadline = None;
         rt.kill_at = None;
         rt.health_at = None;
         rt.probe_deadline = None;
         rt.last_outcome = Some(outcome);
+
+        // Plan §7.3's OOM link, and it belongs on *every* exit path rather than
+        // only the ones that restart. `SIGKILL` is also how a stop timeout and
+        // an outside `kill -9` arrive, so the kernel's own counter is what says
+        // which one this was - and when it was the cgroup's killer, the memory
+        // limit that caused it is the thing an operator needs to see, whether
+        // the unit comes back or not.
+        if matches!(outcome, ExitOutcome::Signalled(libc::SIGKILL))
+            && let Some(before) = oom_baseline
+            && let Some(after) = self.cgroup.oom_kills(&unit)
+            && after > before
+        {
+            let limit = CgroupLimits::from_config(&rt.config)
+                .files()
+                .into_iter()
+                .find(|(_, file, _)| *file == "memory.max")
+                .map(|(_, _, value)| value);
+            match limit {
+                Some(value) => {
+                    rlog!("{unit} was killed by the cgroup OOM killer (memory.max={value})");
+                }
+                None => rlog!("{unit} was killed by the cgroup OOM killer"),
+            }
+        }
 
         // A stop already in flight owns the transition; the exit just confirms
         // it, and must not be mistaken for a crash worth restarting - unless it

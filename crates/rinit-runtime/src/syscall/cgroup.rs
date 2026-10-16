@@ -218,6 +218,47 @@ pub fn is_populated(dir: &Path) -> Result<bool, SyscallError> {
     Err(SyscallError::new("cgroup.events populated", libc::EINVAL))
 }
 
+/// `memory.events` carries the memory controller's counters as `key value`
+/// lines; `oom_kill` is the one plan §7.3 needs.
+const MEMORY_EVENTS: &str = "memory.events";
+
+/// How many times the cgroup OOM killer has killed a process in `dir`.
+///
+/// Plan §7.3 asks for the OOM kill to be *detected* rather than assumed from the
+/// signal, and this is the only place the kernel records one: `oom_kill` in
+/// `memory.events` counts kills the memory controller performed in this cgroup
+/// (as opposed to the system-wide OOM killer, which says nothing about a unit).
+/// A `SIGKILL` is also how a stop timeout and an external `kill -9` look, so the
+/// counter is what tells them apart.
+///
+/// `Ok(None)` is the answer for both halves of "this kernel does not report it":
+/// no `memory.events` at all (no `CONFIG_MEMCG`) and no `oom_kill` line in one
+/// that exists. Neither is an error - a unit with a `CgroupMemoryMax=` has to
+/// keep working on a kernel that cannot report OOM kills, exactly as
+/// [`crate::syscall::cgroup`]'s limit writes tolerate a missing attribute - and
+/// neither is `0`, which would claim "no kills yet" about a file nobody read.
+///
+/// # Errors
+/// A file that exists and cannot be read (permissions, I/O). A malformed value
+/// reads as absent rather than as an error: the counter is diagnostic, and a
+/// kernel that prints something unexpected should not turn a unit's death into
+/// a second failure.
+pub fn oom_kills(dir: &Path) -> Result<Option<u64>, SyscallError> {
+    let path = dir.join(MEMORY_EVENTS);
+    let body = match std::fs::read_to_string(&path) {
+        Ok(body) => body,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(SyscallError::from_io("cgroup memory.events", &e)),
+    };
+    Ok(body.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        match (fields.next(), fields.next()) {
+            (Some("oom_kill"), Some(value)) => value.parse().ok(),
+            _ => None,
+        }
+    }))
+}
+
 /// Remove `dir`.
 ///
 /// # Errors
@@ -439,6 +480,42 @@ mod tests {
             is_populated(&dir).expect_err("missing").errno(),
             libc::ENOENT
         );
+    }
+
+    /// The OOM counter is the one thing that separates a cgroup OOM kill from
+    /// any other `SIGKILL`, so it has to be read out of `memory.events` - and
+    /// its absence has to be distinguishable from a `0`.
+    #[test]
+    fn an_oom_kill_is_read_out_of_the_memory_events_file() {
+        let scratch = Scratch::new("oom-events");
+        let dir = scratch.subdir("rinit");
+
+        std::fs::write(
+            dir.join(MEMORY_EVENTS),
+            "low 0\nhigh 3\nmax 1\noom 1\noom_kill 2\n",
+        )
+        .unwrap();
+        assert_eq!(oom_kills(&dir).unwrap(), Some(2));
+
+        // A kernel without `CONFIG_MEMCG` has no file to read...
+        std::fs::remove_file(dir.join(MEMORY_EVENTS)).unwrap();
+        assert_eq!(oom_kills(&dir).unwrap(), None);
+
+        // ...and one with the controller but a different kernel version may not
+        // report this key. Neither may read as "no kills yet".
+        std::fs::write(dir.join(MEMORY_EVENTS), "low 0\nhigh 0\nmax 0\n").unwrap();
+        assert_eq!(oom_kills(&dir).unwrap(), None);
+
+        // A counter is diagnostic: a value that does not parse is absent, not a
+        // second failure on top of the unit's death.
+        std::fs::write(dir.join(MEMORY_EVENTS), "oom_kill many\n").unwrap();
+        assert_eq!(oom_kills(&dir).unwrap(), None);
+
+        // A file that is there and unreadable *is* an error, so the caller can
+        // tell "this kernel does not report it" from "I could not look".
+        let io = scratch.subdir("io");
+        std::fs::create_dir(io.join(MEMORY_EVENTS)).unwrap();
+        assert!(oom_kills(&io).is_err());
     }
 
     /// Cleanup removes the directory, and fails on a directory that still has

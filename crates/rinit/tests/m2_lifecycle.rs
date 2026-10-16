@@ -1139,3 +1139,154 @@ fn a_limit_this_kernel_cannot_express_does_not_stop_the_unit() {
     );
     assert!(log.contains("boot complete"), "the boot carries on:\n{log}");
 }
+
+/// Plan §7.3's OOM link: a service the cgroup's own OOM killer took has to be
+/// reported as *that*, and follow the unit's restart policy - a bare `SIGKILL`
+/// cannot say whether a timeout, an outside `kill -9` or the memory limit is
+/// what happened.
+///
+/// The two halves are assembled here the way the kernel assembles them in the
+/// guest: the service dies of `SIGKILL`, and `memory.events`' `oom_kill` moves.
+/// The guest run is what proves the kernel really does both when a service
+/// exceeds `memory.max`; this proves rinit reads the pair correctly.
+#[test]
+fn a_cgroup_oom_kill_is_named_and_the_unit_restarts() {
+    let dir = TempDir::new("units-oom");
+    dir.write(
+        "all.target",
+        "[Unit]\nType=target\nRequires=worker.service\n",
+    );
+    dir.write(
+        "worker.service",
+        "[Service]\nType=simple\nExecStart=/bin/sleep 30\nCgroupMemoryMax=16M\n\
+         Restart=on-failure\nRestartSec=0\n",
+    );
+    let cg = FakeCgroup::new("oom", "cpu memory pids\n");
+    cg.unit(
+        "worker.service",
+        "cpu memory pids\n",
+        &[
+            "memory.max",
+            "cgroup.procs",
+            "cgroup.events",
+            "memory.events",
+        ],
+    );
+    fs::write(
+        cg.0.join("rinit/worker.service/cgroup.events"),
+        "populated 0\n",
+    )
+    .unwrap();
+    fs::write(
+        cg.0.join("rinit/worker.service/memory.events"),
+        "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n",
+    )
+    .unwrap();
+
+    // The pid is returned rather than asserted: `inspect` must not panic, or
+    // rinit is left running.
+    let (log, killed) = boot_units_inspect(
+        &dir,
+        "all.target",
+        SETTLE,
+        libc::SIGTERM,
+        &["--cgroup-root", cg.path()],
+        || {
+            let procs = fs::read_to_string(cg.0.join("rinit/worker.service/cgroup.procs"))
+                .unwrap_or_default();
+            let pid: libc::pid_t = procs.trim().parse().unwrap_or(-1);
+            // The kernel's record of a kill it performed in this cgroup...
+            fs::write(
+                cg.0.join("rinit/worker.service/memory.events"),
+                "low 0\nhigh 0\nmax 0\noom 1\noom_kill 1\n",
+            )
+            .unwrap();
+            // ...and the death itself. `SIGKILL` is what an OOM kill arrives as,
+            // which is exactly why the counter is needed to tell them apart.
+            if pid > 0 {
+                // SAFETY: signalling the service this test started.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+            // Long enough for the reaper to log the cause and schedule the
+            // restart before the harness shuts rinit down.
+            std::thread::sleep(Duration::from_millis(400));
+            pid
+        },
+    );
+
+    assert!(killed > 0, "the service must have placed its own pid");
+    assert!(
+        log.contains("killed by the cgroup OOM killer"),
+        "the cause of the SIGKILL must be named:\n{log}"
+    );
+    assert!(
+        log.contains("memory.max=16777216"),
+        "the memory limit that caused the kill must be named:\n{log}"
+    );
+    assert!(
+        log.contains("worker.service will restart in"),
+        "an OOM-killed unit follows its restart policy:\n{log}"
+    );
+}
+
+/// A `SIGKILL` with the counter unchanged is **not** an OOM kill, and must not
+/// be reported as one: `Restart=always` restarts it either way, so the only
+/// thing that changes is what the log claims happened.
+#[test]
+fn a_sigkill_the_cgroup_did_not_make_is_not_reported_as_an_oom_kill() {
+    let dir = TempDir::new("units-not-oom");
+    dir.write(
+        "all.target",
+        "[Unit]\nType=target\nRequires=worker.service\n",
+    );
+    dir.write(
+        "worker.service",
+        "[Service]\nType=simple\nExecStart=/bin/sleep 30\nCgroupMemoryMax=16M\n\
+         Restart=always\nRestartSec=0\n",
+    );
+    let cg = FakeCgroup::new("not-oom", "cpu memory pids\n");
+    cg.unit(
+        "worker.service",
+        "cpu memory pids\n",
+        &[
+            "memory.max",
+            "cgroup.procs",
+            "cgroup.events",
+            "memory.events",
+        ],
+    );
+    fs::write(
+        cg.0.join("rinit/worker.service/memory.events"),
+        "oom_kill 0\n",
+    )
+    .unwrap();
+
+    let (log, killed) = boot_units_inspect(
+        &dir,
+        "all.target",
+        SETTLE,
+        libc::SIGTERM,
+        &["--cgroup-root", cg.path()],
+        || {
+            let procs = fs::read_to_string(cg.0.join("rinit/worker.service/cgroup.procs"))
+                .unwrap_or_default();
+            let pid: libc::pid_t = procs.trim().parse().unwrap_or(-1);
+            if pid > 0 {
+                // SAFETY: signalling the service this test started.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+            std::thread::sleep(Duration::from_millis(400));
+            pid
+        },
+    );
+
+    assert!(killed > 0, "the service must have placed its own pid");
+    assert!(
+        !log.contains("OOM killer"),
+        "an unchanged counter must not be reported as an OOM kill:\n{log}"
+    );
+    assert!(
+        log.contains("worker.service will restart in"),
+        "the unit still follows its restart policy:\n{log}"
+    );
+}

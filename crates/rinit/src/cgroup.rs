@@ -190,6 +190,30 @@ impl Cgroup {
         Ok(Some(dir.join("cgroup.procs")))
     }
 
+    /// How many times the cgroup OOM killer has killed a process in this unit's
+    /// cgroup (plan §7.3's "检测到 OOM kill 后进入重启策略").
+    ///
+    /// This is the reading half of that rule; the manager decides what to do
+    /// with it. `None` means "no answer": no hierarchy, no cgroup for this unit,
+    /// or a kernel that does not report the counter. It deliberately does not
+    /// collapse into `0`, because `0` is a claim - "this unit's cgroup has not
+    /// been OOM-killed" - and only the kernel can make it.
+    pub fn oom_kills(&self, unit: &UnitName) -> Option<u64> {
+        let dir = self.dir(unit)?;
+        match cgroup::oom_kills(&dir) {
+            Ok(count) => count,
+            Err(e) => {
+                // Diagnostic, so the unit's death is reported either way and
+                // this only says why the cause could not be named.
+                rlog!(
+                    "warning: {unit}: cannot read {}/memory.events: {e}",
+                    dir.display()
+                );
+                None
+            }
+        }
+    }
+
     /// Send `signal` to every process in the unit's cgroup (plan §7.3's stop
     /// flow: "向 `cgroup.procs` 中所有 PID 发 `SIGTERM`").
     ///
@@ -735,6 +759,32 @@ mod tests {
         cgroup.signal_members(&unit("signalled"), libc::SIGTERM);
         cgroup.signal_members(&unit("no-such-unit.service"), libc::SIGKILL);
         Cgroup::disabled().signal_members(&unit("signalled"), libc::SIGTERM);
+    }
+
+    /// The OOM counter is read back from the unit's own `memory.events`, and
+    /// every way of having no answer stays `None` rather than becoming a `0`
+    /// about a hierarchy that was never asked.
+    #[test]
+    fn the_oom_counter_is_read_from_the_units_memory_events() {
+        let h = Hierarchy::new("oom", "memory\n");
+        let cgroup = prepare(false, Some(h.root.clone()));
+
+        let dir = h.with_unit("oomed.service", "memory\n", &["memory.events"]);
+        std::fs::write(dir.join("memory.events"), "oom 3\noom_kill 1\n").unwrap();
+        assert_eq!(cgroup.oom_kills(&unit("oomed")), Some(1));
+
+        // The second kill moves the counter, which is what the manager compares
+        // a start-time baseline against.
+        std::fs::write(dir.join("memory.events"), "oom 4\noom_kill 2\n").unwrap();
+        assert_eq!(cgroup.oom_kills(&unit("oomed")), Some(2));
+
+        // A unit with no cgroup of its own, a kernel without the controller, and
+        // a disabled hierarchy all have no answer to give.
+        assert_eq!(cgroup.oom_kills(&unit("never-cgrouped.service")), None);
+        let bare = h.with_unit("no-count.service", "memory\n", &[]);
+        assert_eq!(cgroup.oom_kills(&unit("no-count")), None);
+        assert_eq!(Cgroup::disabled().oom_kills(&unit("oomed")), None);
+        assert!(bare.exists());
     }
 
     /// Dev mode must not touch the machine's own hierarchy, and an explicit root

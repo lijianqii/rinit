@@ -208,6 +208,15 @@ await_log() {
     printf 'test -d /sys/fs/cgroup/rinit/cglimit.service && echo cglimit-left || echo cglimit-gone\n' >&3
     await_log 10 'cglimit-gone' || true
 
+    # M5 §7.3: the OOM link. This unit allocates past its own `memory.max`, so
+    # the *cgroup* OOM killer takes it; rinit has to name that as the cause and
+    # then follow the unit's restart policy. The string doubling is the cheapest
+    # way to fill 16M from a shell.
+    printf 'rctl start oom.service\n' >&3
+    await_log 10 'started oom.service' || true
+    await_log 20 'killed by the cgroup OOM killer' || true
+    await_log 20 'oom.service will restart in' || true
+
     # M2: kill the console service and let rinit bring it back. `login` execs
     # the shell, so `$$` *is* the getty process tree; killing it makes rinit
     # reap the exit and, because getty is `Restart=always`, start it again -
@@ -381,6 +390,17 @@ expect "the task limit was applied to the cgroup" "pids=64"
 expect "a running unit was inside its cgroup" "cgrun-populated"
 expect "a stopped unit's cgroup was removed" "cgrun-gone"
 expect "a finished oneshot's cgroup was removed" "cglimit-gone"
+
+# M5 §7.3's OOM link. The first line is the kernel's own record of a kill it
+# performed *in this cgroup* (plan §7.3: "内核 OOM-killer 在 cgroup 内挑选进程杀,
+# 不影响整机"); the second is rinit reading `memory.events`' counter and naming
+# the limit, which is what a bare `SIGKILL` cannot say; the third is the restart
+# the plan's "检测到 OOM kill 后进入重启策略" asks for.
+expect "the kernel OOM-killed a process inside the unit's cgroup" \
+    "Memory cgroup out of memory: Killed process"
+expect "rinit named the OOM kill and the memory limit behind it" \
+    "killed by the cgroup OOM killer (memory.max=16777216)"
+expect "an OOM-killed unit entered the restart policy" "oom.service will restart in"
 
 # A completed oneshot has nothing to restart, so `restart` is a conflict
 # (exit 4). `logdemo` proves it and that the unit is only started once.

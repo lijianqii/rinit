@@ -15,7 +15,7 @@
 use std::path::PathBuf;
 
 use rinit_core::unit::cgroup::CgroupLimits;
-use rinit_core::unit::config::{RestartPolicy, SizeBytes};
+use rinit_core::unit::config::{RestartPolicy, ServiceKind, SizeBytes};
 use rinit_core::unit::parser::parse;
 use rinit_runtime::units::load_unit_files;
 
@@ -175,5 +175,30 @@ fn the_cgroup_units_ask_for_what_the_guest_checks() {
         run.exec_start.argv(),
         ["/bin/sleep", "60"],
         "a service that stays up long enough for the console to look at it"
+    );
+
+    // §7.3's OOM link: the limit that makes the cgroup's own OOM killer fire,
+    // and the policy that has to restart the unit once it has. `Type=simple` is
+    // part of the assertion - the shell has to be `Active` when the kill lands,
+    // which is the state the restart policy is written against.
+    let oom = body("oom.service");
+    let oom_limits = CgroupLimits::from_config(&oom);
+    assert_eq!(
+        oom_limits.memory_max,
+        SizeBytes::parse("16M"),
+        "the limit the guest's own kernel is expected to enforce"
+    );
+    assert_eq!(
+        oom.restart,
+        RestartPolicy::OnFailure,
+        "an OOM kill is the failure the unit has to come back from"
+    );
+    assert_eq!(oom.service_kind, ServiceKind::Simple);
+    let argv = oom.exec_start.argv();
+    assert_eq!(argv.first().map(String::as_str), Some("/bin/sh"));
+    let command = argv.get(2).expect("the shell command is one argument");
+    assert_eq!(
+        command, "x=a; while :; do x=$x$x; done",
+        "the doubling loop has to reach the shell exactly as written, `$` included"
     );
 }

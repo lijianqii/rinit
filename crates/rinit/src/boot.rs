@@ -731,7 +731,8 @@ fn describe_unit(manager: &UnitManager, unit: &UnitName) -> Option<String> {
     Some(out)
 }
 
-/// Report what a reaped exit meant to a unit.///
+/// Report what a reaped exit meant to a unit.
+///
 /// The manager applies the state change itself as it reaps; this only narrates
 /// it, so an operator watching the console can see a service come back.
 fn log_outcome(outcome: &Outcome) {
