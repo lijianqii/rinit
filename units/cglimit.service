@@ -1,0 +1,34 @@
+# cgroup v2 limit acceptance unit (plan §7.3).
+#
+# Everything asserted about this unit is read back out of the *kernel* rather
+# than trusted from rinit's log:
+#
+#   self=$(cat /proc/$$/cgroup)      this service process's own cgroup
+#   child=$(cat /proc/self/cgroup)   a process the service forked
+#   cpu/mem/high/pids=$(cat ...)     the unit's own cgroup attributes
+#
+# `0::` is the v2 unified-hierarchy marker, so the first line also shows the
+# guest really is running one hierarchy rather than the split v1 one.
+#
+# The forked child is the other half of §7.3: "子进程 fork 后自动继承父进程 cgroup
+# (内核保证),无需额外跟踪孙进程" is a claim about what rinit does *not* have to do.
+# Because placement is a step inside the child itself (it writes its own pid to
+# `cgroup.procs` before it drops privileges), everything the service forks
+# afterwards is inside the same cgroup - which is what `child=` checks, since
+# `$(...)` runs `cat` as a child of this shell.
+#
+# `CgroupCPUMax=50%` is the percentage form. The kernel wants `quota period` in
+# microseconds, so the file has to read `50000 100000`.
+#
+# Started on demand (`rctl start cglimit.service`) like the §7.4 units, so the
+# console drives it and the assertions have a known starting point.
+[Unit]
+Description=cgroup v2 limit demo (started on demand)
+
+[Service]
+Type=oneshot
+CgroupCPUMax=50%
+CgroupMemoryMax=32M
+CgroupMemoryHigh=24M
+CgroupTasksMax=64
+ExecStart=/bin/sh -c "d=/sys/fs/cgroup/rinit/cglimit.service; echo self=$(cat /proc/$$/cgroup) child=$(cat /proc/self/cgroup); echo cpu=$(cat $d/cpu.max) mem=$(cat $d/memory.max) high=$(cat $d/memory.high) pids=$(cat $d/pids.max)"

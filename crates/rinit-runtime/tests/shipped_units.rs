@@ -14,6 +14,8 @@
 
 use std::path::PathBuf;
 
+use rinit_core::unit::cgroup::CgroupLimits;
+use rinit_core::unit::config::{RestartPolicy, SizeBytes};
 use rinit_core::unit::parser::parse;
 use rinit_runtime::units::load_unit_files;
 
@@ -100,4 +102,78 @@ fn the_capability_units_ask_for_what_the_guest_checks() {
         assert_eq!(caps.len(), 1);
         assert_eq!(caps[0].as_str(), "net_bind_service");
     }
+}
+
+/// The cgroup units the guest asserts on (plan §7.3).
+///
+/// What matters here is the same tokeniser assumption as `priv.service`: the
+/// whole `sh -c` command has to survive as one argument, because it is what
+/// reads the kernel's own view back. A unit file that quietly lost `$$` would
+/// still start - and would report the wrong process's cgroup.
+#[test]
+fn the_cgroup_units_ask_for_what_the_guest_checks() {
+    let (files, _) = load_unit_files(&units_dir()).expect("load units/");
+    let body = |name: &str| {
+        let file = files
+            .iter()
+            .find(|f| f.name.canonical() == name)
+            .unwrap_or_else(|| panic!("{name} is shipped"));
+        parse(&file.name, &file.contents)
+            .unwrap_or_else(|e| panic!("{} does not parse: {e}", file.path.display()))
+    };
+
+    let limit = body("cglimit.service");
+    let limits = CgroupLimits::from_config(&limit);
+    assert!(
+        !limits.is_empty(),
+        "cglimit.service is the unit the limits are asserted on"
+    );
+    let files: Vec<_> = limits
+        .files()
+        .into_iter()
+        .map(|(_, file, value)| (file, value))
+        .collect();
+    assert_eq!(
+        files,
+        vec![
+            ("cpu.max", "50000 100000".to_string()),
+            ("memory.max", (32u64 * 1024 * 1024).to_string()),
+            ("memory.high", (24u64 * 1024 * 1024).to_string()),
+            ("pids.max", "64".to_string()),
+        ],
+        "the four attributes the guest reads back, in the order they are written"
+    );
+
+    let argv = limit.exec_start.argv();
+    assert_eq!(argv.first().map(String::as_str), Some("/bin/sh"));
+    let command = argv.get(2).expect("the shell command is one argument");
+    for needle in [
+        "/sys/fs/cgroup/rinit/cglimit.service",
+        "self=$(cat /proc/$$/cgroup)",
+        "child=$(cat /proc/self/cgroup)",
+        "cpu=$(cat $d/cpu.max)",
+        "mem=$(cat $d/memory.max)",
+        "high=$(cat $d/memory.high)",
+        "pids=$(cat $d/pids.max)",
+    ] {
+        assert!(
+            command.contains(needle),
+            "the quoted command must survive tokenisation intact, missing {needle:?} in: {command:?}"
+        );
+    }
+
+    let run = body("cgrun.service");
+    let run_limits = CgroupLimits::from_config(&run);
+    assert_eq!(
+        run_limits.memory_max,
+        SizeBytes::parse("32M"),
+        "a running unit, so the limits exist while it is up"
+    );
+    assert_eq!(run_limits.tasks_max, Some(64));
+    assert_eq!(run.restart, RestartPolicy::No, "the stop has to be a stop");
+    assert_eq!(
+        run.exec_start.argv(),
+        ["/bin/sleep", "60"],
+        "a service that stays up long enough for the console to look at it"
+    );
 }

@@ -89,7 +89,28 @@ $(KERNEL_SRC)/.config: $(KERNEL_TARBALL)
 	mkdir -p $(SRC_DIR)
 	tar -C $(SRC_DIR) -xf $(KERNEL_TARBALL)
 	$(MAKE_KERNEL) defconfig
+	# The generic defconfig leaves CPU bandwidth provisioning off, and it is
+	# what `cpu.max` hangs off: the cgroup v2 file set is built inside
+	# `#ifdef CONFIG_CFS_BANDWIDTH` (kernel/sched/core.c, `cpu_files[]`), so a
+	# kernel without it has the `cpu` controller and `cpu.weight` but no
+	# `cpu.max` at all - and `CgroupCPUMax=` (plan §7.3) would have nothing to
+	# write. Plan §7.3 puts exactly this in M5's hands: "否则 M5 需检查内核
+	# config". `CONFIG_FAIR_GROUP_SCHED`, which it depends on, is already on.
+	sed -i -e 's/^# CONFIG_CFS_BANDWIDTH is not set$$/CONFIG_CFS_BANDWIDTH=y/' \
+	       $(KERNEL_SRC)/.config
 	$(MAKE_KERNEL) olddefconfig
+	# `olddefconfig` drops a symbol whose dependencies are unmet without
+	# saying anything, so a defconfig change upstream could silently take
+	# `cpu.max` away again. The four the plan's §7.3 limits hang off are
+	# checked here, where the failure is a build error rather than a guest
+	# boot with limits that do not exist: `CgroupCPUMax=` needs the cpu
+	# controller and CFS bandwidth, `CgroupMemoryMax=`/`CgroupMemoryHigh=`
+	# need the memory controller, `CgroupTasksMax=` needs the pids one.
+	@for opt in CGROUP_SCHED CFS_BANDWIDTH MEMCG CGROUP_PIDS; do \
+	    grep -q "^CONFIG_$$opt=y$$" $(KERNEL_SRC)/.config || { \
+	        echo "kernel config: CONFIG_$$opt is not set (plan §7.3 needs it)" >&2; \
+	        exit 1; }; \
+	done
 
 kernel: $(KERNEL_IMAGE)
 

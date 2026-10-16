@@ -179,6 +179,35 @@ await_log() {
     printf 'rctl log ambient.service\n' >&3
     await_log 10 'amb=0000000000000400' || true
 
+    # M5 §7.3: cgroup v2 limits. `cglimit.service` reads its own placement and
+    # its own limits back out of the kernel, so the assertions on its output are
+    # about what the kernel did rather than what rinit meant to do.
+    printf 'rctl start cglimit.service\n' >&3
+    await_log 10 'started cglimit.service' || true
+    sleep 1
+    printf 'rctl log cglimit.service\n' >&3
+    await_log 10 'cpu=50000 100000' || true
+
+    # M5 §7.3: a *running* unit is inside its cgroup, and a stopped one leaves
+    # nothing behind. `$(cat ...)` and `test -n` are how the console asks the
+    # kernel directly: `cgroup.procs` is a live view (and st_size 0, so `test -s`
+    # would be answered by `stat` rather than by the processes in it), and
+    # `test -d` after the stop is the cleanup.
+    printf 'rctl start cgrun.service\n' >&3
+    await_log 10 'started cgrun.service' || true
+    sleep 1
+    printf 'p=$(cat /sys/fs/cgroup/rinit/cgrun.service/cgroup.procs); test -n "$p" && echo cgrun-populated || echo cgrun-empty\n' >&3
+    await_log 10 'cgrun-populated' || true
+    printf 'rctl stop cgrun.service\n' >&3
+    await_log 10 'stopped cgrun.service' || true
+    sleep 1
+    printf 'test -d /sys/fs/cgroup/rinit/cgrun.service && echo cgrun-left || echo cgrun-gone\n' >&3
+    await_log 10 'cgrun-gone' || true
+    # The oneshot has exited by the time its log is read, so its cgroup has to
+    # be gone too - the same cleanup, reached by the other exit path.
+    printf 'test -d /sys/fs/cgroup/rinit/cglimit.service && echo cglimit-left || echo cglimit-gone\n' >&3
+    await_log 10 'cglimit-gone' || true
+
     # M2: kill the console service and let rinit bring it back. `login` execs
     # the shell, so `$$` *is* the getty process tree; killing it makes rinit
     # reap the exit and, because getty is `Restart=always`, start it again -
@@ -321,6 +350,38 @@ expect "an empty CapabilityBoundingSet left a root service with no capabilities"
 # holding exactly one bit is the least-privilege shape §7.4 is for.
 expect "ambient capabilities reached a de-privileged service" \
     "uid=65534 amb=0000000000000400 eff=0000000000000400 bnd=0000000000000400"
+
+# M5 §7.3 acceptance: cgroup v2. The hierarchy is mounted by rinit's own first
+# wave, then brought up (controllers enabled, the `rinit/` group created) before
+# any unit starts, which is what makes a unit's attributes exist at all.
+expect "rinit mounted the cgroup v2 hierarchy" "rinit: mounted /sys/fs/cgroup"
+expect "the cgroup v2 hierarchy was brought up" "cgroup v2 ready at /sys/fs/cgroup"
+
+# What the *kernel* says about a limited unit, read back by the unit itself.
+# `self=` is the service process's own `/proc/<pid>/cgroup`; `0::` is the v2
+# unified-hierarchy marker, and `/rinit/cglimit.service` is the placement §7.3
+# asks for.
+expect "a limited unit was placed in its own cgroup" \
+    "self=0::/rinit/cglimit.service"
+# A process the service forked is in the same cgroup, inherited by the kernel
+# without rinit tracking anything.
+expect "a process the service forked inherited its cgroup" \
+    "child=0::/rinit/cglimit.service"
+# `CgroupCPUMax=50%` against the kernel's 100000us period.
+expect "the CPU quota was converted from a percentage" "cpu=50000 100000"
+# Bytes, not the `32M` spelling the unit file uses.
+expect "the memory hard and soft limits were written in bytes" \
+    "mem=33554432 high=25165824"
+expect "the task limit was applied to the cgroup" "pids=64"
+
+# The live half: a running unit's cgroup holds a process, and after the stop the
+# directory is gone. Both are read from the guest's own view of cgroupfs, and
+# neither can be faked by a host test - an ordinary directory of stand-in
+# attribute files is never empty enough to `rmdir`.
+expect "a running unit was inside its cgroup" "cgrun-populated"
+expect "a stopped unit's cgroup was removed" "cgrun-gone"
+expect "a finished oneshot's cgroup was removed" "cglimit-gone"
+
 # A completed oneshot has nothing to restart, so `restart` is a conflict
 # (exit 4). `logdemo` proves it and that the unit is only started once.
 if grep -qF "logdemo.service has no process to restart" "${log_file}"; then

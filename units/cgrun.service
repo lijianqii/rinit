@@ -1,0 +1,24 @@
+# cgroup v2 stop/cleanup acceptance unit (plan §7.3).
+#
+# A service that stays up, so the guest console can ask the kernel two questions
+# about it that the host cannot answer: is a *running* unit inside its cgroup
+# (`cgroup.procs` is non-empty while it runs), and is the directory gone once it
+# has stopped (`test -d` after `rctl stop`)?
+#
+# The removal is the half the host tests deliberately do not cover: an ordinary
+# directory full of stand-in attribute files cannot be `rmdir`'d, so only a real
+# cgroupfs shows that cleanup actually happens. §7.3's flow is what makes it
+# safe - `SIGTERM` to every pid in `cgroup.procs`, then the exit, then the
+# `cgroup.events` `populated=0` confirmation, then `rmdir`.
+#
+# `Restart=` is left at its default (`no`) so the stop really is a stop.
+#
+# Started on demand, and stopped by the console like any other unit.
+[Unit]
+Description=cgroup v2 stop/cleanup demo (started on demand)
+
+[Service]
+Type=simple
+CgroupMemoryMax=32M
+CgroupTasksMax=64
+ExecStart=/bin/sleep 60

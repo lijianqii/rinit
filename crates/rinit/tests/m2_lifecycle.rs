@@ -1041,11 +1041,11 @@ fn a_missing_hierarchy_warns_and_still_boots() {
     );
 }
 
-/// A limit that *cannot* be written fails the unit, and the service does not
-/// run: starting it anyway would leave it unbounded while its unit file claims
+/// A limit the kernel *refuses* fails the unit, and the service does not run:
+/// starting it anyway would leave it unbounded while its unit file claims
 /// otherwise.
 #[test]
-fn a_limit_that_cannot_be_written_fails_the_start() {
+fn a_limit_the_kernel_refuses_fails_the_start() {
     let dir = TempDir::new("units-fail-closed");
     let probe = dir.0.join("ran.txt");
     dir.write(
@@ -1060,10 +1060,12 @@ fn a_limit_that_cannot_be_written_fails_the_start() {
             probe.display()
         ),
     );
-    // The controller is available, but the attribute is not: exactly what a
-    // failed write looks like from the caller's side.
+    // The controller is available and the attribute is there, but it cannot be
+    // written: exactly what a refused value looks like from the caller's side
+    // (a directory stands in for `EISDIR`).
     let cg = FakeCgroup::new("fail-closed", "cpu memory pids\n");
-    cg.unit("worker.service", "cpu memory pids\n", &[]);
+    cg.unit("worker.service", "cpu memory pids\n", &["cpu.max"]);
+    fs::create_dir(cg.0.join("rinit/worker.service/memory.max")).expect("attribute as directory");
 
     let log = boot_units_extra(
         &dir,
@@ -1078,7 +1080,7 @@ fn a_limit_that_cannot_be_written_fails_the_start() {
         "the failed start must be reported:\n{log}"
     );
     assert!(
-        log.contains("cpu.max") || log.contains("memory.max"),
+        log.contains("memory.max"),
         "the failing attribute must be named:\n{log}"
     );
     assert!(
@@ -1089,4 +1091,51 @@ fn a_limit_that_cannot_be_written_fails_the_start() {
         log.contains("boot complete"),
         "a failed limit write must not abort the rest of the boot:\n{log}"
     );
+}
+
+/// A limit this kernel cannot *express* is not the same thing, and must not stop
+/// the unit: `cpu.max` is built only with `CONFIG_CFS_BANDWIDTH`, and a unit
+/// written for one kernel has to keep working on another.
+#[test]
+fn a_limit_this_kernel_cannot_express_does_not_stop_the_unit() {
+    let dir = TempDir::new("units-capability-gap");
+    let probe = dir.0.join("ran.txt");
+    dir.write(
+        "all.target",
+        "[Unit]\nType=target\nRequires=worker.service\n",
+    );
+    dir.write(
+        "worker.service",
+        &format!(
+            "[Service]\nType=oneshot\nCgroupCPUMax=50%\n\
+             ExecStart=/bin/sh -c \"echo RAN > {}\"\n",
+            probe.display()
+        ),
+    );
+    // The controller is there, the attribute is not: the kernel does not have
+    // CPU bandwidth provisioning.
+    let cg = FakeCgroup::new("capability-gap", "cpu memory pids\n");
+    cg.unit("worker.service", "cpu memory pids\n", &[]);
+
+    let log = boot_units_extra(
+        &dir,
+        "all.target",
+        SETTLE,
+        libc::SIGTERM,
+        &["--cgroup-root", cg.path()],
+    );
+
+    assert!(
+        log.contains("this kernel does not provide cpu.max"),
+        "the skipped limit must be named as a missing attribute:\n{log}"
+    );
+    assert!(
+        !log.contains("cannot start"),
+        "a limit the kernel cannot express must not be a failed start:\n{log}"
+    );
+    assert!(
+        probe.exists(),
+        "the unit runs, unlimited, with the warning as the record of why"
+    );
+    assert!(log.contains("boot complete"), "the boot carries on:\n{log}");
 }

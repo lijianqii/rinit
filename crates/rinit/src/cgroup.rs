@@ -8,17 +8,22 @@
 //! - **No usable hierarchy** - plan §7.3's only stated degrade case ("`cgroup.controllers`
 //!   不存在时降级"): log a warning once, and every unit runs unlimited. A system
 //!   that cannot limit anyone must still boot.
-//! - **The unit's own cgroup cannot be arranged** - a read-only or otherwise
-//!   unwritable hierarchy, or a controller the running kernel does not provide:
-//!   the same class of problem as "not mounted", since the mechanism is simply
-//!   not available for that unit. Warn, skip what cannot be applied, and let the
-//!   unit run. A kernel built without `CONFIG_CGROUP_PIDS` must not stop a
-//!   `CgroupTasksMax=` unit from starting.
-//! - **A limit that exists could not be written** - the hierarchy is there and
-//!   the attribute is there, so a failure means the request itself is wrong (a
-//!   `cpu.max` period the kernel rejects, say). That fails the start, naming the
-//!   attribute. Starting the service anyway would run it unbounded while its unit
-//!   file claims otherwise, which is precisely the outcome §7.3 exists to prevent.
+//! - **The unit's own cgroup cannot be arranged, or this kernel cannot express
+//!   a limit** - a read-only or otherwise unwritable hierarchy, a controller the
+//!   running kernel does not provide, or an attribute it does not provide
+//!   (`cpu.max` needs `CONFIG_CFS_BANDWIDTH`; the `cpu` controller is there
+//!   either way). All three are the same class of problem as "not mounted": the
+//!   mechanism is simply not available for that unit. Warn, skip what cannot be
+//!   applied, and let the unit run. A kernel built without `CONFIG_CGROUP_PIDS`
+//!   must not stop a `CgroupTasksMax=` unit from starting, and neither must one
+//!   built without CPU bandwidth provisioning.
+//! - **A limit that exists was refused** - the hierarchy is there and the
+//!   attribute is there, and the kernel said no to the value (an out-of-range
+//!   `cpu.max` period, say). That fails the start, naming the attribute.
+//!   Starting the service anyway would run it unbounded while its unit file
+//!   claims otherwise, which is precisely the outcome §7.3 exists to prevent.
+//!   The line between the two is the errno: `ENOENT` on opening an attribute is
+//!   the kernel not having it, anything else is the request being refused.
 //!
 //! Placement is the child's job, not the parent's: [`Cgroup::setup`] creates the
 //! cgroup and writes the limits *before* the fork, and returns the
@@ -81,12 +86,13 @@ impl Cgroup {
     /// must join (plan §7.3).
     ///
     /// Returns the `cgroup.procs` the spawned child should write itself into, or
-    /// `None` when there is nothing to join - no hierarchy, no directives, or no
-    /// controller of this kernel's that the unit asked for.
+    /// `None` when there is nothing to join - no hierarchy, no directives, or
+    /// nothing this kernel can enforce for that unit.
     ///
     /// # Errors
-    /// A write to an attribute that exists. See the module docs for why that is
-    /// the one failure that must stop a start.
+    /// A write to an attribute the kernel provides that the kernel then refused.
+    /// See the module docs for why that is the one failure that must stop a
+    /// start, and why an attribute the kernel does not provide is not one.
     pub fn setup(
         &self,
         unit: &UnitName,
@@ -132,6 +138,22 @@ impl Cgroup {
                 continue;
             }
             if let Err(e) = cgroup::write_limit(&dir, file, &value) {
+                // `ENOENT` is the kernel saying it does not provide this
+                // attribute at all, not a refusal of the value: `cpu.max` is
+                // built only with `CONFIG_CFS_BANDWIDTH`, for instance, and the
+                // `cpu` controller is there either way. That is the same kind of
+                // difference as a missing controller - a capability of the
+                // running kernel - so it gets the same answer: skip the limit,
+                // say so, and let the unit run. Any other errno is the write
+                // itself being refused, which is about what the unit asked for,
+                // and that must not start a service the unit file claims is
+                // bounded.
+                if e.errno() == libc::ENOENT {
+                    rlog!(
+                        "warning: {unit}: this kernel does not provide {file}; that limit is not applied"
+                    );
+                    continue;
+                }
                 rlog!("{unit}: {file} = {value} failed in {}", dir.display());
                 return Err(RuntimeError::from(e));
             }
@@ -139,6 +161,19 @@ impl Cgroup {
         }
 
         if applied.is_empty() {
+            // Every directive was skipped: the unit asked to be bounded and this
+            // kernel cannot bound it, which the warnings above have named. The
+            // directory goes back down so a unit running in rinit's own cgroup
+            // does not leave an empty one behind - and because placement has to
+            // mean something, there is nothing to join.
+            match cgroup::remove(&dir) {
+                Ok(()) => {}
+                Err(e) if e.errno() == libc::ENOENT => {}
+                Err(e) => rlog!(
+                    "warning: {unit}: cannot remove unused cgroup {}: {e}",
+                    dir.display()
+                ),
+            }
             return Ok(None);
         }
         rlog!(
@@ -543,13 +578,16 @@ mod tests {
     fn a_failed_limit_write_fails_the_start() {
         let h = Hierarchy::new("badwrite", "memory\n");
         let cgroup = prepare(false, Some(h.root.clone()));
-        // `memory.max` is deliberately absent: the controller is available but
-        // the attribute is not, so the write fails with `ENOENT`.
+        // `memory.max` is a *directory*, which the kernel does not do: the
+        // stand-in for "the attribute is there and the write was refused"
+        // (`EISDIR`), as against "the kernel does not provide it" (`ENOENT`,
+        // covered below).
         let dir = h.with_unit("broken.service", "memory\n", &["memory.high"]);
+        std::fs::create_dir(dir.join("memory.max")).unwrap();
 
         let err = cgroup
             .setup(&unit("broken"), &limits())
-            .expect_err("a limit that cannot be written must stop the start");
+            .expect_err("a limit the kernel refuses must stop the start");
         assert!(
             err.to_string().contains("memory.max"),
             "the failing attribute is named: {err}"
@@ -558,6 +596,63 @@ mod tests {
             dir.exists(),
             "the cgroup the unit will not use is left alone"
         );
+    }
+
+    /// An attribute the kernel does not provide at all is a *capability*, not a
+    /// refusal: `cpu.max` needs `CONFIG_CFS_BANDWIDTH`, and a kernel without it
+    /// still has the `cpu` controller. The limit is skipped with a warning, and
+    /// a unit whose limits are all skipped runs unlimited in rinit's own cgroup
+    /// rather than failing to start.
+    #[test]
+    fn an_attribute_the_kernel_does_not_provide_is_skipped_not_fatal() {
+        let h = Hierarchy::new("noattr", "cpu memory pids\n");
+        let cgroup = prepare(false, Some(h.root.clone()));
+        // The controllers are all there, the attribute files are not - which is
+        // what a `cpu.max` on a kernel without `CONFIG_CFS_BANDWIDTH` looks
+        // like from here.
+        let dir = h.with_unit("unbounded.service", "cpu memory pids\n", &[]);
+
+        assert_eq!(
+            cgroup
+                .setup(&unit("unbounded"), &limits())
+                .expect("a kernel that cannot express a limit is not a failed start"),
+            None,
+            "nothing could be applied, so there is nothing to join"
+        );
+        // The unused directory is asked to go back down, but a stand-in whose
+        // attributes are ordinary files cannot be `rmdir`'d - the same
+        // faithfulness limit the cleanup tests note. What is checked here is
+        // that the attempt is not an error and the unit is not placed; the
+        // removal itself is asserted on a real hierarchy by the guest's
+        // `cgrun-gone`/`cglimit-gone` assertions.
+        assert!(
+            dir.exists(),
+            "the stand-in's files keep the directory alive"
+        );
+    }
+
+    /// Partial capability: the controllers the kernel does have are applied, and
+    /// only the ones it cannot express are skipped.
+    #[test]
+    fn only_the_limits_this_kernel_cannot_express_are_skipped() {
+        let h = Hierarchy::new("partial-attr", "cpu memory pids\n");
+        let cgroup = prepare(false, Some(h.root.clone()));
+        let dir = h.with_unit(
+            "partial.service",
+            "cpu memory pids\n",
+            &["memory.max", "memory.high", "pids.max"],
+        );
+
+        let procs = cgroup
+            .setup(&unit("partial"), &limits())
+            .expect("the applicable limits apply")
+            .expect("the unit is placed for the three it has");
+        assert_eq!(procs, dir.join("cgroup.procs"));
+        assert_eq!(
+            h.read(dir.join("memory.max")),
+            (32u64 * 1024 * 1024).to_string()
+        );
+        assert!(!dir.join("cpu.max").exists(), "no `cpu.max` was created");
     }
 
     /// Cleanup keeps a directory the kernel still reports as populated, and says
