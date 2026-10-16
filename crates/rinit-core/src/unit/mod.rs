@@ -13,7 +13,10 @@
 //! - [`dependency`] — dependency DAG, topological order, cycle detection
 //!   (plan §1.3(1)).
 //! - [`sandbox`] — the ordered privilege-drop plan for a service (plan §7.4).
+//! - [`cgroup`] — the cgroup v2 limits a unit asks for, and the files they
+//!   become (plan §7.3).
 
+pub mod cgroup;
 pub mod config;
 pub mod dependency;
 pub mod job;
@@ -28,6 +31,7 @@ use core::fmt;
 
 use crate::CoreError;
 
+pub use cgroup::{CgroupLimits, controllers_to_enable, has_controller};
 pub use config::{
     Cap, CpuQuota, Dependencies, ExecCommand, RestartPolicy, ServiceKind, SizeBytes, UnitConfig,
 };
