@@ -812,6 +812,11 @@ fn describe_unit(manager: &UnitManager, unit: &UnitName) -> Option<String> {
 /// it, so an operator watching the console can see a service come back.
 fn log_outcome(outcome: &Outcome) {
     match outcome {
+        // A `forking` unit did not exit when its main process did: the daemon it
+        // left behind is the unit now (plan §7.10).
+        Outcome::Forked { unit, daemon } => {
+            rlog!("{unit}: main process exited; daemon is pid {daemon}");
+        }
         Outcome::Exited { unit, state } => rlog!("{unit} exited: {state}"),
         Outcome::RestartScheduled { unit, delay } => {
             rlog!("{unit} will restart in {delay:?}");
@@ -881,7 +886,11 @@ async fn start_units(
         let batch = manager::commands_in_level(&plan, level);
         rlog!("starting level {index}: {} service(s)", batch.len());
 
-        let mut oneshots: Vec<(UnitName, libc::pid_t, u64)> = Vec::new();
+        // Units whose *start* is not over when their process is exec'd: a
+        // `oneshot` finishes by exiting, a `forking` unit by its main process
+        // exiting and its daemon being located (plan §7.10). Both are waited for
+        // here, with the kind carried along because only the follow-up differs.
+        let mut pending: Vec<(UnitName, libc::pid_t, u64, ServiceKind)> = Vec::new();
         for entry in batch {
             let name = entry.name;
             // A unit whose hard dependency already failed must not start
@@ -899,12 +908,13 @@ async fn start_units(
                 started_units += 1;
             }
 
-            // `oneshot` is only ready once it has exited 0. `simple` and the
-            // M2 stand-in for `notify` are ready at exec.
+            // `oneshot` and `forking` are only ready once the command has
+            // exited 0; `simple` and the M2 stand-in for `notify` are ready at
+            // exec.
             if readiness::readiness_of(entry.kind) == readiness::Readiness::OnExitSuccess
                 && let Some(pid) = units.get(name).and_then(|rt| rt.pid)
             {
-                oneshots.push((name.clone(), pid, entry.timeout_start_sec));
+                pending.push((name.clone(), pid, entry.timeout_start_sec, entry.kind));
             } else {
                 // `ExecStartPost` runs once the main command is under way. For a
                 // `oneshot` that is after it has exited, so it is run below.
@@ -916,7 +926,7 @@ async fn start_units(
         // depends on them. The wait is a direct `waitpid` per pid rather than
         // the main loop, because boot ordering must not depend on an event loop
         // that has not finished starting.
-        for (name, pid, timeout_sec) in &oneshots {
+        for (name, pid, timeout_sec, kind) in &pending {
             let timeout = if *timeout_sec == 0 {
                 // As above: `0` is "wait forever", spelled as the longest
                 // deadline rinit will compute.
@@ -925,11 +935,27 @@ async fn start_units(
                 std::time::Duration::from_secs(*timeout_sec)
             };
             match readiness::wait_for_exit(*pid, timeout).await {
-                Ok(Some(0)) => {
-                    rlog!("{name} completed (Active(Exited))");
-                    units.mark_oneshot_done(name);
-                    run_start_post(&units, name).await;
-                }
+                Ok(Some(0)) => match kind {
+                    // Plan §7.10: the exit is the middle of a `forking` unit's
+                    // start, so the daemon it left behind is what makes it
+                    // `Active` - and not being able to find it fails the start
+                    // rather than leaving a unit that claims to be running.
+                    ServiceKind::Forking => match units.finish_forking_start(name) {
+                        Ok(daemon) => {
+                            rlog!("{name}: main process exited; daemon is pid {daemon}");
+                            run_start_post(&units, name).await;
+                        }
+                        Err(why) => {
+                            rlog!("error: {name}: cannot locate the daemon: {why}");
+                            fail_unit(&mut units, name);
+                        }
+                    },
+                    _ => {
+                        rlog!("{name} completed (Active(Exited))");
+                        units.mark_oneshot_done(name);
+                        run_start_post(&units, name).await;
+                    }
+                },
                 Ok(Some(code)) => {
                     rlog!("error: {name} exited {code}");
                     fail_unit(&mut units, name);
@@ -941,6 +967,11 @@ async fn start_units(
                 Err(()) => {
                     rlog!("error: {name} did not finish within {timeout_sec}s");
                     let _ = process::kill_process_group(*pid, libc::SIGKILL);
+                    // And whatever the process group cannot reach: a `forking`
+                    // unit that never detached has already started the daemon it
+                    // never named, and abandoning the start must not leave it
+                    // running (plan §7.10).
+                    units.signal_cgroup_members(name, libc::SIGKILL);
                     fail_unit(&mut units, name);
                 }
             }

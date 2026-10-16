@@ -32,6 +32,9 @@ pub enum ServiceKind {
     Oneshot,
     /// Started once it reports `READY=1` over `NOTIFY_SOCKET`.
     Notify,
+    /// A daemon that detaches: started once its main process has exited *and*
+    /// the daemon it left behind has been located (plan §7.10).
+    Forking,
 }
 
 impl ServiceKind {
@@ -41,6 +44,7 @@ impl ServiceKind {
             "simple" => Some(ServiceKind::Simple),
             "oneshot" => Some(ServiceKind::Oneshot),
             "notify" => Some(ServiceKind::Notify),
+            "forking" => Some(ServiceKind::Forking),
             _ => None,
         }
     }
@@ -293,6 +297,18 @@ pub struct UnitConfig {
     pub exec_start_post: Vec<ExecCommand>,
     /// Stop command; empty means `SIGTERM`.
     pub exec_stop: ExecCommand,
+    /// Where a `Type=forking` daemon writes its pid (plan §7.10).
+    ///
+    /// `None` means rinit has to find the daemon itself, which it can only do
+    /// through the unit's own cgroup - so a `forking` unit without this needs a
+    /// `Cgroup*=`, and without either it fails closed rather than guess.
+    ///
+    /// A `String` rather than a `PathBuf`, like [`working_directory`]: this crate
+    /// is `no_std + alloc`, and the path is resolved against the filesystem by
+    /// the runtime that has one.
+    ///
+    /// [`working_directory`]: Self::working_directory
+    pub pid_file: Option<String>,
     /// Restart policy.
     pub restart: RestartPolicy,
     /// Backoff base for restarts; `0` means restart immediately.
@@ -370,6 +386,7 @@ impl UnitConfig {
             environment: Vec::new(),
             environment_file: String::new(),
             working_directory: String::from("/"),
+            pid_file: None,
             health_check: ExecCommand::empty(),
             health_interval_sec: 30,
             health_timeout_sec: 10,
@@ -435,12 +452,11 @@ mod tests {
     }
 
     #[test]
-    fn service_kind_parses_the_three_supported_values() {
+    fn service_kind_parses_the_four_supported_values() {
         assert_eq!(ServiceKind::parse("simple"), Some(ServiceKind::Simple));
         assert_eq!(ServiceKind::parse("oneshot"), Some(ServiceKind::Oneshot));
         assert_eq!(ServiceKind::parse("notify"), Some(ServiceKind::Notify));
-        // `forking` is explicitly deferred to plan §7.10.
-        assert_eq!(ServiceKind::parse("forking"), None);
+        assert_eq!(ServiceKind::parse("forking"), Some(ServiceKind::Forking));
         assert_eq!(ServiceKind::parse(""), None);
     }
 

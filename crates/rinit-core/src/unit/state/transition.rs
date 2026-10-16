@@ -125,7 +125,11 @@ pub fn transition(
         (S::Inactive, Ev::Start) => (S::Starting, E::SpawnProcess),
         (S::Starting, Ev::StartUpComplete) => match kind {
             ServiceKind::Oneshot => (S::ActiveExited, E::None),
-            ServiceKind::Simple | ServiceKind::Notify => (S::Active, E::None),
+            // `forking` reaches `Active` the same way: its main process has
+            // exited and the daemon it left behind is the unit now (plan §7.10).
+            ServiceKind::Simple | ServiceKind::Notify | ServiceKind::Forking => {
+                (S::Active, E::None)
+            }
         },
         // A start that never completed is a plain `StartFailure`. Whether a
         // retry follows is the restart module's decision, taken afterwards;

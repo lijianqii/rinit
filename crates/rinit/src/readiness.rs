@@ -31,7 +31,13 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 pub enum Readiness {
     /// Ready as soon as it was exec'd (`simple`, `notify`, and targets).
     Immediate,
-    /// Ready once the command exits 0 (`oneshot`).
+    /// Ready once the command exits 0.
+    ///
+    /// For a `oneshot` that *is* the end of the start. For a `forking` unit the
+    /// exit is only the middle of it: the daemon it left behind still has to be
+    /// located, which is what `mark_daemon_started` does (plan §7.10). The boot
+    /// loop waits for the exit in both cases and tells them apart by the kind,
+    /// because the wait is the same and only what follows it differs.
     OnExitSuccess,
 }
 
@@ -39,7 +45,7 @@ pub enum Readiness {
 pub const fn readiness_of(kind: ServiceKind) -> Readiness {
     match kind {
         ServiceKind::Simple => Readiness::Immediate,
-        ServiceKind::Oneshot => Readiness::OnExitSuccess,
+        ServiceKind::Oneshot | ServiceKind::Forking => Readiness::OnExitSuccess,
         // M1 has no sd_notify protocol yet, so a `notify` unit is treated as
         // ready on exec. That is a known simplification, not an oversight: the
         // `READY=1` protocol and `TimeoutStartSec` enforcement arrive with the
@@ -99,6 +105,12 @@ mod tests {
         assert_eq!(readiness_of(ServiceKind::Oneshot), Readiness::OnExitSuccess);
         assert_eq!(readiness_of(ServiceKind::Simple), Readiness::Immediate);
         assert_eq!(readiness_of(ServiceKind::Notify), Readiness::Immediate);
+        assert_eq!(
+            readiness_of(ServiceKind::Forking),
+            Readiness::OnExitSuccess,
+            "a forking unit waits for its main process too - and then for the \
+             daemon, which the boot loop does by kind"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

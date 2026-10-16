@@ -214,6 +214,37 @@ impl Cgroup {
         }
     }
 
+    /// Every process in the unit's cgroup, or `None` when the unit has no cgroup
+    /// of its own (plan §7.10 looks a `forking` unit's daemon up through this).
+    ///
+    /// `None` is not "empty": a unit with no limits is not in a cgroup of its
+    /// own at all, and its processes are in rinit's, which is a different answer
+    /// from "the cgroup is empty".
+    pub fn members(&self, unit: &UnitName) -> Option<Vec<libc::pid_t>> {
+        let dir = self.dir(unit)?;
+        cgroup::processes(&dir).ok()
+    }
+
+    /// Put `pid` into the unit's cgroup (plan §7.10's "写入对应 cgroup").
+    ///
+    /// Used for a located daemon that is not already there: being in the cgroup
+    /// is what makes the unit's limits, its stop signalling and its cleanup
+    /// apply to it.
+    ///
+    /// # Errors
+    /// [`RuntimeError`] when the unit has no cgroup of its own, or the kernel
+    /// refuses the write.
+    pub fn place(&self, unit: &UnitName, pid: libc::pid_t) -> Result<(), RuntimeError> {
+        let dir = self.dir(unit).ok_or_else(|| RuntimeError::Io {
+            op: "cgroup place",
+            source: std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("{unit} has no cgroup of its own"),
+            ),
+        })?;
+        cgroup::place_process(&dir, pid).map_err(RuntimeError::from)
+    }
+
     /// Send `signal` to every process in the unit's cgroup (plan §7.3's stop
     /// flow: "向 `cgroup.procs` 中所有 PID 发 `SIGTERM`").
     ///

@@ -1,0 +1,25 @@
+# `Type=forking` acceptance unit (plan §7.10).
+#
+# This is the one unit in the tree that exists to be a *bad* example: a daemon
+# that detaches instead of running in the foreground. rinit starts it, waits for
+# the main process to exit, and then has to work out which process it left
+# behind - which is what `PIDFile=` is for, and why the plan says new services
+# should foreground (`simple`/`notify`) and this type is for legacy ones.
+#
+# The shell backgrounds a `sleep` and exits 0 immediately, which is the shape of
+# a double-fork daemon: the `sleep` is reparented to PID 1, it is *not* the
+# leader of its process group (so a group signal would not reach it - rinit
+# falls back to the pid), and the `PIDFile=` is the only thing that says which
+# process the unit now is.
+#
+# It is started on demand (`rctl start forking.service`) like the other demo
+# units, so the console drives it and the assertions have a known start. There is
+# no `Cgroup*=` on purpose: with a `PIDFile=` the cgroup is not needed to find
+# the daemon, and this keeps the file about the lookup rather than about limits.
+[Unit]
+Description=Type=forking demo (started on demand)
+
+[Service]
+Type=forking
+PIDFile=/run/forking.pid
+ExecStart=/bin/sh -c "/bin/sleep 300 >/dev/null 2>&1 & echo $! > /run/forking.pid; exit 0"

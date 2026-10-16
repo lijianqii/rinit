@@ -8,7 +8,7 @@ README tracks implementation status.
 ## Status: M0–M4 complete, M5 in progress — verified on aarch64
 
 What is in place, and what it is proven by. Every claim below is either a host
-test (`make check`) or a guest assertion (`make test-system`, 69 of them in
+test (`make check`) or a guest assertion (`make test-system`, 74 of them in
 `scripts/system-test.sh`); "proven on the host" always means the fake-runtime or
 `--dev` form of the same code path, and the guest means the real one.
 
@@ -16,10 +16,10 @@ test (`make check`) or a guest assertion (`make test-system`, 69 of them in
 | --------- | ------- | -------- |
 | M0 | PID 1 via `rdinit=`, first-wave mounts (`/run` → `/proc` → `/sys` → `/dev` → `/tmp` → `/sys/fs/cgroup`) with fatal/degradable rules per plan §1.3(9), `SIGCHLD` + `waitpid(-1, WNOHANG)` reaping, panic hook to `/dev/kmsg` | guest: "mounted /run…", "mounted /sys/fs/cgroup", "no rinit panic"; host: `crates/rinit/tests/smoke.rs` |
 | M1 | unit files parsed from `/etc/rinit/units`, dependency graph resolved, units started level by level with each level in parallel | guest: "resolved a boot plan", "startup levels run in dependency order", "no target was exec'd" |
-| M2 | supervision (spawn, track, reap, two-stage stop), restart policy with backoff and a circuit breaker, health probes, `Type=notify` readiness, in-memory log ring | guest: "a crashed service is scheduled for restart", "the breaker tripped on the failing unit"; host: `crates/rinit/tests/m2_lifecycle.rs` (29 tests) |
-| M3 | control socket + `rctl` (`list`, `status`, `start`, `stop`, `restart`, `reset-failed`, `log`), with a documented exit-code contract | guest: "rctl list reached the control socket" and the five assertions after it; host: `crates/rctl/tests/control.rs` (6 tests) |
+| M2 | supervision (spawn, track, reap, two-stage stop), restart policy with backoff and a circuit breaker, health probes, `Type=notify` readiness, in-memory log ring | guest: "a crashed service is scheduled for restart", "the breaker tripped on the failing unit"; host: `crates/rinit/tests/m2_lifecycle.rs` (31 tests) |
+| M3 | control socket + `rctl` (`list`, `status`, `start`, `stop`, `restart`, `reset-failed`, `log`, `reload`), with a documented exit-code contract | guest: "rctl list reached the control socket" and the five assertions after it; host: `crates/rctl/tests/control.rs` (8 tests) |
 | M4 | soak harness for sustained churn (`make soak`), leak and descriptor fixes, `--dev` control-socket peer relaxation | `scripts/soak.sh` (see [Testing](#testing)); `crates/rinit-core/tests/allocations.rs` |
-| M5 (in progress) | **§7.3, §7.4, §7.5 and §7.6 done.** cgroup v2: `CgroupCPUMax=`, `CgroupMemoryMax=`, `CgroupMemoryHigh=`, `CgroupTasksMax=` under `rinit/<unit>`, the process placing itself, stop-flow signalling of the cgroup's members, `rmdir` cleanup, and OOM-kill detection into the restart policy. Sandboxing: `User=`, `Group=`, `NoNewPrivileges=`, `CapabilityBoundingSet=`, `AmbientCapabilities=`. Hardware watchdog: `/dev/watchdog` armed at boot, fed from the supervisor loop's health checkpoint, magic-closed on shutdown. Reload: `rctl reload` re-reads the unit directory, adds, changes, defers and removes, and refuses a directory that does not resolve. **Next**: §7.10 `Type=forking` | guest: "a limited unit was placed in its own cgroup", "the memory hard and soft limits were written in bytes", "a stopped unit's cgroup was removed", "the kernel OOM-killed a process inside the unit's cgroup", "rinit armed the guest's watchdog device", "the driver took the timeout rinit set", "the guest outlived the watchdog timeout with the device armed", "an added unit the boot target does not need was not started", "a changed unit that is running kept it for the next start", "a directory that does not resolve was refused whole", "a de-privileged service ran as nobody:nogroup with NoNewPrivs", "an empty CapabilityBoundingSet left a root service with no capabilities", "ambient capabilities reached a de-privileged service"; host: `crates/rinit/src/cgroup.rs` (19 tests), `crates/rinit-core/src/unit/cgroup.rs` (9), `crates/rinit-runtime/src/syscall/cgroup.rs` (14), `crates/rinit/src/watchdog.rs` (6), `crates/rinit-runtime/src/syscall/watchdog.rs` (6), `crates/rinit/src/unit_manager.rs` (5 for the reload itself, `reload.rs` is policy over them), `crates/rinit/tests/m2_lifecycle.rs` (2, end to end), `crates/rinit/src/sandbox.rs` (14), `crates/rinit-core/src/unit/sandbox.rs` (9), `crates/rinit-runtime/src/syscall/cred.rs` (14) |
+| M5 (in progress) | **§7.3, §7.4, §7.5 and §7.6 done.** cgroup v2: `CgroupCPUMax=`, `CgroupMemoryMax=`, `CgroupMemoryHigh=`, `CgroupTasksMax=` under `rinit/<unit>`, the process placing itself, stop-flow signalling of the cgroup's members, `rmdir` cleanup, and OOM-kill detection into the restart policy. Sandboxing: `User=`, `Group=`, `NoNewPrivileges=`, `CapabilityBoundingSet=`, `AmbientCapabilities=`. Hardware watchdog: `/dev/watchdog` armed at boot, fed from the supervisor loop's health checkpoint, magic-closed on shutdown. Reload: `rctl reload` re-reads the unit directory, adds, changes, defers and removes, and refuses a directory that does not resolve. Legacy daemons: `Type=forking` with `PIDFile=`, located through the file or the unit's own cgroup. **Next**: the P3 items (§7.7 templates, §7.8 `Sockets=`, §7.9 socket activation) | guest: "a limited unit was placed in its own cgroup", "the memory hard and soft limits were written in bytes", "a stopped unit's cgroup was removed", "the kernel OOM-killed a process inside the unit's cgroup", "rinit armed the guest's watchdog device", "the driver took the timeout rinit set", "the guest outlived the watchdog timeout with the device armed", "an added unit the boot target does not need was not started", "a changed unit that is running kept it for the next start", "a directory that does not resolve was refused whole", "the unit is active with the daemon the PIDFile named", "stopping a forking unit stopped the daemon it took over", "a de-privileged service ran as nobody:nogroup with NoNewPrivs", "an empty CapabilityBoundingSet left a root service with no capabilities", "ambient capabilities reached a de-privileged service"; host: `crates/rinit/src/cgroup.rs` (19 tests), `crates/rinit-core/src/unit/cgroup.rs` (9), `crates/rinit-runtime/src/syscall/cgroup.rs` (14), `crates/rinit/src/watchdog.rs` (6), `crates/rinit-runtime/src/syscall/watchdog.rs` (6), `crates/rinit/src/unit_manager.rs` (5 for the reload itself, `reload.rs` is policy over them), `crates/rinit/tests/m2_lifecycle.rs` (4, end to end), `crates/rinit/src/sandbox.rs` (14), `crates/rinit-core/src/unit/sandbox.rs` (9), `crates/rinit-runtime/src/syscall/cred.rs` (14) |
 
 A real boot of the committed tree on the serial console (`…` elides kernel
 noise; the lines below are the ones `make test-system` asserts on). The last
@@ -145,6 +145,44 @@ next start. The last reload still counts `getty.service` as changed, which is
 accurate rather than noisy: the file still differs from what is running, so the
 next start still has something to adopt.
 
+§7.10's `forking` daemon, from the same console. `forking.service` is a shell that
+backgrounds a `sleep` and exits, which is the shape of a double-fork daemon - and
+the one kind of unit whose process is not the process rinit started:
+
+```
+~ # rctl start forking.service
+rinit: started forking.service as pid 122
+rinit: forking.service: main process exited; daemon is pid 123
+~ # rctl status forking.service
+unit: forking.service
+state: active (pid 123)
+~ # rctl stop forking.service
+rinit: stopping forking.service (pid 123)
+rinit: reaped pid 123
+```
+
+Started as pid 122, `Active` with pid 123: the `PIDFile=` is what says which
+process the unit is now, and the unit's limits, its stop signal and its cleanup
+all follow that pid rather than the one that exited. `stopping ... (pid 123)` is
+the half that needed a change - a daemon inherits its process group from whatever
+forked it, so the group signal would have addressed a group that no longer exists,
+and the stop falls back to the pid itself. The guest asserts the daemon is gone
+afterwards, which an untracked daemon would not be.
+
+And the fail-closed boundary, on a unit written at runtime:
+
+```
+~ # rctl start badfork.service
+rinit: error: badfork.service: cannot locate the daemon: cannot read PIDFile /run/not-written.pid: No such file or directory (os error 2)
+rinit: badfork.service exited: failed
+```
+
+`badfork.service` is `Type=forking` with a `PIDFile=` that is never written and
+no `Cgroup*=` to fall back to. Both are reasons not to guess: the unit fails, says
+which file it read, and its dependents are told - which is the plan's "无法定位 →
+Failed" and the reason `forking` is the one type this README recommends against for
+anything new.
+
 ## Layout
 
 ```
@@ -198,7 +236,7 @@ make test-system    # boot aarch64 qemu and assert the acceptance list
 make test           # check + test-system
 ```
 
-`cargo test --offline --workspace` (what `make check` runs last) executes **643
+`cargo test --offline --workspace` (what `make check` runs last) executes **645
 tests** across eleven binaries. The four shapes, and why each is not redundant:
 
 - **unit tests** next to the code (core 303, rinit 171, rinit-runtime 92,
@@ -208,7 +246,7 @@ tests** across eleven binaries. The four shapes, and why each is not redundant:
   *refused* rather than silently skipped - `EPERM` from `setuid(0)`, `setgroups`,
   `PR_CAPBSET_DROP`, `capset` and the ambient raise, each naming the call that
   failed - with the root-only success paths deferred to the guest), the
-  lifecycle end to end in `--dev` mode (`rinit/tests/m2_lifecycle.rs` 29), the
+  lifecycle end to end in `--dev` mode (`rinit/tests/m2_lifecycle.rs` 31), the
   control CLI (`rctl/tests/control.rs` 8), the smoke test that runs the real
   binary (`rinit/tests/smoke.rs` 2), the allocation guard
   (`rinit-core/tests/allocations.rs` 2), and `shipped_units.rs` 4 - every unit in
@@ -221,11 +259,13 @@ tests** across eleven binaries. The four shapes, and why each is not redundant:
   259200'` is the 72-hour acceptance run the plan asks for;
 - **the guest system test** (`scripts/system-test.sh`, plan §4.3): boots the real
   initramfs on aarch64 qemu, types at the console to prove a root shell is
-  reachable, drives `rctl` against the running system, and asserts 69 things -
+  reachable, drives `rctl` against the running system, and asserts 74 things -
   including that levels run in dependency order, that no target is ever exec'd,
   the §7.4 privilege-drop outcomes, the §7.3 limits read back out of the guest's
-  own kernel, §7.5's watchdog on the real device qemu attaches, and §7.6's reload
-  against the guest's own (writable, ramfs) unit directory. Exit codes are
+  own kernel, §7.5's watchdog on the real device qemu attaches, §7.6's reload
+  against the guest's own (writable, ramfs) unit directory, and §7.10's forking
+  daemon - located through its `PIDFile=` and then stopped as the unit's process.
+  Exit codes are
   `0` pass, `1` assertion failed, `2` missing artifacts, `3` qemu could not start.
   Logs land in `build/logs/` (and are deleted on success unless `--keep-log` is
   passed).
@@ -311,6 +351,14 @@ llvm-cov report -instr-profile=target-cov/merged.profdata \
   but `ENOENT`): a directory where the attribute file should be stands in for it,
   because making a real cgroupfs refuse a limit needs a value or a kernel this
   test does not control.
+- **A `forking` unit that never detaches is swept by cgroup, so a unit with no
+  `Cgroup*=` can still leave a daemon behind.** A `Type=forking` unit whose main
+  process never exits is failed by `TimeoutStartSec`, and the sweep kills the
+  process group and then everything in the unit's cgroup (plan §7.3's second
+  stage). A daemon that left *both* - a double-fork that called `setsid`, under a
+  unit that declares no cgroup - has nothing left pointing at it. The happy path
+  needs no cgroup, because `PIDFile=` names the daemon; this is only the timeout
+  path of a unit that is misbehaving.
 - `signals.rs`'s pipe-full path (handler drops a byte) is not forced in a test.
 - RSS-at-boot is not measured yet, so plan §0.1's memory column is still open
   (`/proc/<pid>/status` inside the guest: ≤2 MB idle, ≤6 MB with 20 services),
@@ -495,7 +543,7 @@ until the whole new schedule exists (see `crates/rinit/src/reload.rs`).
 
 ## Design decisions and deliberate deviations from the plan
 
-Nineteen points differ from the written plan or pin down something it leaves
+Twenty points differ from the written plan or pin down something it leaves
 open. All are noted here so they are not mistaken for drift:
 
 1. **Signals use a self-pipe, not `tokio::signal`.** Plan §2.1④ says to unify on
@@ -633,6 +681,23 @@ open. All are noted here so they are not mistaken for drift:
     the runtime has to stay while the stop it asked for is in flight (`SIGKILL`
     deadlines and reaping need it), so it is hidden from every protocol answer at
     once and dropped by the next reload that finds it still gone and now down.
+20. **A `forking` unit's `PIDFile=` is read once, and the daemon has to be in the
+    unit's cgroup - or already there.** The plan says "主进程退出(码 0)且能定位到守护
+    进程 → 进入 `Active`", which rinit takes literally: the file is read the moment
+    the main process is reaped, and a daemon that writes it afterwards fails the
+    start. systemd polls for a few seconds; this does not, so a legacy daemon
+    that has not written its pid by the time its parent exits needs a wrapper
+    that has. The order the plan gives is kept - the file first, the cgroup as the
+    fallback - which is also why a `forking` unit with no `PIDFile=` needs a
+    `Cgroup*=` directive to be locatable at all, and fails closed ("no PIDFile=
+    and no cgroup of its own") rather than guessing from the process table. Two
+    smaller consequences are recorded here because they are what the code does: a
+    pid the file names that is *not* in the unit's cgroup is moved into it (that
+    is the plan's "写入对应 cgroup", and it is what makes the unit's limits, its
+    stop signalling and its cleanup apply to the daemon), and the stop path
+    signals the unit's process *group* and then the pid itself - a daemon
+    inherited its group from whatever forked it, so the group signal can address
+    a group that no longer exists while the daemon is alive.
 
 ## Measurements (plan §0.1 calibration point)
 
@@ -660,8 +725,9 @@ yet; that needs a sampling loop in the guest (the soak harness measures the host
 
 ## Next
 
-The rest of M5: §7.10 `Type=forking`, then the P3 items (templates, `Sockets=`,
-socket activation) if they earn their place.
+The rest of the plan's extension list is P3: §7.7 template units and `%i`, §7.8
+inter-unit socket dependencies, §7.9 socket activation, and §7.11's terminal
+directives - each if it earns its place against §2.2's scope.
 
 Plan §6's acceptance checklist is what comes after, and this README does not
 claim those items yet: RSS-at-boot (≤2 MB idle, ≤6 MB with 20 services), the "20

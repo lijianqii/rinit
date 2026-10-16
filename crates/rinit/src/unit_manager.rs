@@ -21,6 +21,7 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use rinit_runtime::RuntimeError;
+use rinit_runtime::SyscallError;
 use rinit_runtime::syscall::{process, wait};
 
 use crate::cgroup::Cgroup;
@@ -53,6 +54,14 @@ pub enum ConfigChange {
 /// and the variants drifted out of use.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
+    /// A `forking` unit's main process exited and the daemon it left behind was
+    /// found and taken over (plan §7.10).
+    Forked {
+        /// The unit.
+        unit: UnitName,
+        /// The daemon that is now the unit's process.
+        daemon: libc::pid_t,
+    },
     /// A process exited and no restart was due.
     Exited {
         /// The unit it belonged to.
@@ -939,9 +948,61 @@ impl UnitManager {
             ServiceKind::Notify => {
                 rt.start_deadline = deadline(rt.config.timeout_start_sec);
             }
+            // `forking` waits for the main process to exit *and* for the daemon
+            // it leaves behind to be located (plan §7.10), so it is `Starting`
+            // with the same deadline a `notify` unit gets: a daemon that never
+            // detaches is a hung start, not a running service.
+            ServiceKind::Forking => {
+                rt.start_deadline = deadline(rt.config.timeout_start_sec);
+            }
         }
         rlog!("started {unit} as pid {pid}");
         Ok(())
+    }
+
+    /// Become `Active` with `daemon` as the unit's process (plan §7.10).
+    ///
+    /// The boot loop waits for a `forking` unit's main process itself rather than
+    /// through the reaper, so the step that takes over from it has to be callable
+    /// from both paths.
+    pub fn mark_daemon_started(&mut self, unit: &UnitName, daemon: libc::pid_t) {
+        let now = self.now_millis();
+        if let Some(rt) = self.units.get_mut(unit) {
+            rt.pid = Some(daemon);
+            rt.state = UnitState::Active;
+            rt.start_deadline = None;
+            rt.backoff.on_active(now);
+            schedule_health(rt);
+        }
+    }
+
+    /// Send `signal` to everything still in `unit`'s cgroup.
+    ///
+    /// §7.3's second stage, exposed for the one path that abandons a start
+    /// without going through `stop_unit`: boot's wait for a `forking` unit's main
+    /// process, which times out into `fail_unit` and would otherwise leave the
+    /// daemon that unit had already started behind. A unit with no cgroup of its
+    /// own has nothing to sweep.
+    pub fn signal_cgroup_members(&self, unit: &UnitName, signal: libc::c_int) {
+        self.cgroup.signal_members(unit, signal);
+    }
+
+    /// Take over from a `forking` unit's main process (plan §7.10).
+    ///
+    /// The boot loop waits for that process itself - boot ordering cannot depend
+    /// on the reaper's loop - so this is the same step `on_child_exit` takes,
+    /// callable from there. On failure the unit has not been changed: the caller
+    /// fails the start, because "locate the daemon" has no partial success.
+    ///
+    /// # Errors
+    /// The reason the daemon could not be located, for the unit's failure line.
+    pub fn finish_forking_start(&mut self, unit: &UnitName) -> Result<libc::pid_t, String> {
+        let Some(rt) = self.units.get(unit) else {
+            return Err(format!("{unit} is not registered"));
+        };
+        let daemon = find_daemon(&rt.config, &self.cgroup, unit)?;
+        self.mark_daemon_started(unit, daemon);
+        Ok(daemon)
     }
 
     /// Record a notify message for `unit` and act on readiness.
@@ -996,8 +1057,12 @@ impl UnitManager {
                 && at <= now
             {
                 rt.start_deadline = None;
+                // Plan §7.3's first stage reaches whatever the process group
+                // cannot, which for a `forking` unit that never detached is the
+                // daemon it started before hanging (plan §7.10).
+                self.cgroup.signal_members(name, libc::SIGTERM);
                 if let Some(pid) = rt.pid {
-                    match process::kill_process_group(pid, libc::SIGTERM) {
+                    match signal_process(pid, libc::SIGTERM) {
                         Ok(()) => {}
                         Err(e) if e.errno() == libc::ESRCH => {}
                         Err(e) => rlog!("warning: SIGTERM to {name} failed: {e}"),
@@ -1032,7 +1097,7 @@ impl UnitManager {
                 // daemonized straggler is reached in the same pass.
                 self.cgroup.signal_members(name, libc::SIGKILL);
                 if let Some(pid) = rt.pid {
-                    match process::kill_process_group(pid, libc::SIGKILL) {
+                    match signal_process(pid, libc::SIGKILL) {
                         Ok(()) => due.push(name.clone()),
                         Err(e) if e.errno() == libc::ESRCH => {}
                         Err(e) => rlog!("warning: SIGKILL to {name} failed: {e}"),
@@ -1285,11 +1350,11 @@ impl UnitManager {
         let mut stopping = false;
         let stop_cmd = rt.config.exec_stop.argv().to_vec();
         if stop_cmd.is_empty() {
-            match process::kill_process_group(pid, libc::SIGTERM) {
+            match signal_process(pid, libc::SIGTERM) {
                 Ok(()) => {
                     rt.state = UnitState::Deactivating;
                     stopping = true;
-                    rlog!("stopping {unit} (pgid {pid})");
+                    rlog!("stopping {unit} (pid {pid})");
                 }
                 Err(e) if e.errno() == libc::ESRCH => {
                     // Already gone: nothing to signal, so the stop completes
@@ -1383,6 +1448,34 @@ impl UnitManager {
             .iter()
             .find(|(_, rt)| rt.pid == Some(pid))
             .map(|(name, _)| name.clone())?;
+
+        // Plan §7.10: a `forking` unit's main process exiting 0 is the *middle*
+        // of its start, not the end of it - so the daemon it left behind is
+        // located before the ordinary exit handling can settle the unit. It is
+        // done here, before the runtime is borrowed mutably, because locating it
+        // reads the unit's config and its cgroup.
+        let forked = self
+            .units
+            .get(&unit)
+            .filter(|rt| {
+                rt.state == UnitState::Starting
+                    && rt.config.service_kind == ServiceKind::Forking
+                    && matches!(outcome, ExitOutcome::Success)
+            })
+            .map(|rt| find_daemon(&rt.config, &self.cgroup, &unit));
+        if let Some(result) = forked {
+            match result {
+                Ok(daemon) => {
+                    self.mark_daemon_started(&unit, daemon);
+                    return Some(Outcome::Forked { unit, daemon });
+                }
+                Err(why) => {
+                    rlog!("error: {unit}: cannot locate the daemon: {why}");
+                    // And on to the ordinary failed-start handling below, so
+                    // `Restart=` still decides whether to try again.
+                }
+            }
+        }
 
         let now = self.now_millis();
         let rt = self.units.get_mut(&unit)?;
@@ -1564,6 +1657,90 @@ impl Default for UnitManager {
 ///
 /// Returns what each exit meant, in reap order. A pid rinit does not own is
 /// skipped: it was reaped by someone else, or already accounted for.
+/// Send `signal` to a unit's process: its process group, or the pid itself.
+///
+/// Both are needed, and `Type=forking` (plan §7.10) is why: the daemon a forking
+/// unit leaves behind *is* the unit's process, but it inherited its process group
+/// from whatever forked it - usually a shell that has since exited - so the group
+/// signal addresses a group that no longer exists while the daemon is very much
+/// alive. Falling back to the pid costs one syscall on a path that has already
+/// failed, and it is what keeps a unit's own process inside the unit.
+fn signal_process(pid: libc::pid_t, signal: libc::c_int) -> Result<(), SyscallError> {
+    match process::kill_process_group(pid, signal) {
+        Ok(()) => Ok(()),
+        Err(e) if e.errno() == libc::ESRCH => process::kill(pid, signal),
+        Err(e) => Err(e),
+    }
+}
+
+/// Locate the daemon a `Type=forking` unit left behind (plan §7.10).
+///
+/// Two ways, in the plan's order. The `PIDFile=` the daemon wrote is the
+/// primary one; without it, the unit's *own cgroup* is the only thing that
+/// knows, and only if it holds exactly one process - "无法通过 cgroup 唯一确定守护进程
+/// 时,启动判 Failed".
+///
+/// Either way the answer is checked before it is believed: a pid that is not
+/// alive is a stale file rather than a daemon, and one that is not in the unit's
+/// cgroup is *moved* there, because that is what makes the unit's limits, its
+/// stop signalling and its cleanup apply to it.
+///
+/// Every failure is a reason string and the caller fails the start. Guessing -
+/// picking the youngest process, say - would give a unit that claims to be
+/// running with nothing behind it, which is the one outcome the plan's
+/// fail-closed rule exists to prevent.
+fn find_daemon(
+    config: &UnitConfig,
+    cgroup: &Cgroup,
+    unit: &UnitName,
+) -> Result<libc::pid_t, String> {
+    let pid = match &config.pid_file {
+        Some(path) => {
+            let text = std::fs::read_to_string(path)
+                .map_err(|e| format!("cannot read PIDFile {path}: {e}"))?;
+            let text = text.trim();
+            text.parse::<libc::pid_t>()
+                .map_err(|_| format!("PIDFile {path} does not hold a pid ('{text}')"))?
+        }
+        None => {
+            // No `PIDFile=`: the cgroup is all there is, and a unit with no
+            // cgroup of its own has nothing to look at.
+            let members = cgroup.members(unit).ok_or_else(|| {
+                format!(
+                    "{unit} has no PIDFile= and no cgroup of its own; a Type=forking unit \
+                     needs one or the other"
+                )
+            })?;
+            match members.as_slice() {
+                [only] => *only,
+                other => {
+                    return Err(format!(
+                        "its cgroup holds {} process(es), so the daemon is not uniquely \
+                         determined",
+                        other.len()
+                    ));
+                }
+            }
+        }
+    };
+
+    if pid <= 0 {
+        return Err(format!("pid {pid} is not a process"));
+    }
+    // SAFETY: signal 0 only probes whether the pid exists.
+    if unsafe { libc::kill(pid, 0) } != 0 {
+        return Err(format!("pid {pid} is not running"));
+    }
+    if let Some(members) = cgroup.members(unit)
+        && !members.contains(&pid)
+    {
+        cgroup.place(unit, pid).map_err(|e| {
+            format!("pid {pid} is not in the unit's cgroup and cannot be moved: {e}")
+        })?;
+    }
+    Ok(pid)
+}
+
 pub fn reap_into_manager(manager: &mut UnitManager) -> Vec<Outcome> {
     let mut out = Vec::new();
     for ev in wait::reap_children() {

@@ -289,6 +289,40 @@ await_log() {
     await_log 15 'reload rejected' || true
     printf 'cp /tmp/getty.unit /etc/rinit/units/getty.service\n' >&3
 
+    # M5 §7.10: `Type=forking`. `forking.service` is a shell that backgrounds a
+    # `sleep` and exits, which is the shape of a double-fork daemon: the daemon
+    # is reparented to rinit, is *not* the leader of its process group, and the
+    # `PIDFile=` is the only thing that says which process the unit now is.
+    printf 'rctl start forking.service\n' >&3
+    await_log 15 'forking.service: main process exited; daemon is pid' || true
+    printf 'd=$(cat /run/forking.pid); echo forking-daemon=$d\n' >&3
+    await_log 10 'forking-daemon=' || true
+    printf 'rctl status forking.service\n' >&3
+    await_log 10 'state: active' || true
+
+    # And the fail-closed half of the plan's boundary, on a unit written at
+    # runtime: a `forking` unit whose `PIDFile=` is never written does not become
+    # active. `/run/not-written.pid` does not exist, so the file is the reason.
+    printf 'echo "[Service]" > /etc/rinit/units/badfork.service\n' >&3
+    printf 'echo "Type=forking" >> /etc/rinit/units/badfork.service\n' >&3
+    printf 'echo "PIDFile=/run/not-written.pid" >> /etc/rinit/units/badfork.service\n' >&3
+    printf 'echo "ExecStart=/bin/true" >> /etc/rinit/units/badfork.service\n' >&3
+    printf 'rctl reload\n' >&3
+    await_log 15 'registered badfork.service' || true
+    printf 'rctl start badfork.service\n' >&3
+    await_log 15 'cannot locate the daemon' || true
+    printf 's=$(rctl status badfork.service | grep state); echo bf-state=$s\n' >&3
+    await_log 10 'bf-state=' || true
+
+    # Stopping the unit has to stop the *daemon*: it is the unit's process, and
+    # it is not in the process group the stop signal addresses, so this is also
+    # the assertion for the fallback that reaches the pid itself.
+    printf 'rctl stop forking.service\n' >&3
+    await_log 15 'stopped forking.service' || true
+    sleep 1
+    printf 'v=gone; d=$(cat /run/forking.pid); kill -0 $d 2>/dev/null && echo daemon-alive || echo daemon-$v\n' >&3
+    await_log 10 'daemon-gone' || true
+
     # M2: kill the console service and let rinit bring it back. `login` execs
     # the shell, so `$$` *is* the getty process tree; killing it makes rinit
     # reap the exit and, because getty is `Restart=always`, start it again -
@@ -515,6 +549,23 @@ expect "a removed unit was removed" "removed reload.service"
 expect "a removed unit is gone from rctl" "no such unit: reload.service"
 expect "a directory that does not resolve was refused whole" \
     "reload rejected, the running configuration is unchanged"
+
+# M5 §7.10: `Type=forking`, on a daemon that really detaches. The last one is
+# the assertion for the whole feature: the unit's *process* is the daemon, so the
+# pid `rctl status` reports has to be the pid the `PIDFile=` names - and that pid
+# has to be the one the stop reaches, even though it leads no process group.
+expect "a forking unit's main process exited and its daemon was located" \
+    "forking.service: main process exited; daemon is pid"
+daemon="$(grep -oE 'forking-daemon=[0-9]+' "${log_file}" | tail -1 | cut -d= -f2)"
+if [[ -n "${daemon}" ]] && grep -qF "state: active (pid ${daemon})" "${log_file}"; then
+    pass "the unit is active with the daemon the PIDFile named (pid ${daemon})"
+else
+    fail "the unit's process is the daemon the PIDFile named (got: '${daemon:-missing}')"
+fi
+expect "a forking unit whose PIDFile was never written failed its start" \
+    "cannot locate the daemon: cannot read PIDFile /run/not-written.pid"
+expect "and the failed forking unit is not active" "bf-state=state: failed"
+expect "stopping a forking unit stopped the daemon it took over" "daemon-gone"
 
 # A completed oneshot has nothing to restart, so `restart` is a conflict
 # (exit 4). `logdemo` proves it and that the unit is only started once.

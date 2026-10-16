@@ -630,6 +630,11 @@ fn die_reporting_step(report_write: libc::c_int, step: SandboxStep, errno: i32) 
 }
 
 /// Send `signal` to `pid` (a positive PID, not a process group).
+///
+/// This is also the fallback for a process that is *not* a group leader: a
+/// `Type=forking` daemon (plan §7.10) inherits its process group from whatever
+/// forked it, so [`kill_process_group`] can address a group that no longer
+/// exists while the daemon itself is very much alive.
 pub fn kill(pid: libc::pid_t, signal: libc::c_int) -> Result<(), SyscallError> {
     // SAFETY: `kill` has no memory-safety preconditions for a scalar pid/signal.
     let rc = unsafe { libc::kill(pid, signal) };

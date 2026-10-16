@@ -347,7 +347,7 @@ impl Parser {
                         line,
                         key,
                         &declared,
-                        "expected 'simple', 'oneshot' or 'notify'",
+                        "expected 'simple', 'oneshot', 'notify' or 'forking'",
                     )
                 })?;
             }
@@ -445,6 +445,17 @@ impl Parser {
                     let path = joined();
                     require_absolute(line, key, &path)?;
                     self.cfg.working_directory = path;
+                }
+            }
+            (Section::Service, "PIDFile") => {
+                // Plan §7.10: where a `forking` daemon leaves its pid. An empty
+                // value is "unset", like `WorkingDirectory`, which makes the
+                // daemon rinit's own problem to locate - and a `forking` unit
+                // with neither fails closed rather than guess.
+                if !tokens.is_empty() {
+                    let path = joined();
+                    require_absolute(line, key, &path)?;
+                    self.cfg.pid_file = Some(path);
                 }
             }
             (Section::Service, "CgroupMemoryMax") => {
@@ -1264,15 +1275,34 @@ mod tests {
         ));
     }
 
-    /// `forking` is explicitly deferred to plan §7.10.
+    /// Plan §7.10: `forking` is accepted now, and `PIDFile=` comes with it -
+    /// the two are one feature, because without the file rinit has to locate the
+    /// daemon through the unit's cgroup, which a unit may not have.
     #[test]
-    fn the_forking_service_kind_is_not_accepted_yet() {
+    fn the_forking_type_and_its_pid_file_parse_together() {
+        let cfg = ok(
+            "legacy.service",
+            "[Service]\nType=forking\nPIDFile=/run/legacy.pid\nExecStart=/usr/sbin/legacy\n",
+        );
+        assert_eq!(cfg.service_kind, ServiceKind::Forking);
+        assert_eq!(cfg.pid_file.as_deref(), Some("/run/legacy.pid"));
+
+        // An empty value is "unset", not a path of "" - the same rule
+        // `WorkingDirectory` follows.
+        let cfg = ok(
+            "legacy.service",
+            "[Service]\nType=forking\nPIDFile=\nExecStart=/usr/sbin/legacy\n",
+        );
+        assert_eq!(cfg.pid_file, None);
+
+        // A relative path is refused where it is written rather than resolved
+        // against whatever rinit's working directory happens to be.
         assert!(matches!(
             err(
-                "app.service",
-                "[Service]\nType=forking\nExecStart=/bin/true\n"
+                "legacy.service",
+                "[Service]\nType=forking\nPIDFile=run/legacy.pid\nExecStart=/bin/true\n"
             ),
-            ParseError::InvalidValue { line: 2, .. }
+            ParseError::InvalidValue { line: 3, .. }
         ));
     }
 

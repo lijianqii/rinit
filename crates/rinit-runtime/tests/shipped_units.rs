@@ -201,4 +201,23 @@ fn the_cgroup_units_ask_for_what_the_guest_checks() {
         command, "x=a; while :; do x=$x$x; done",
         "the doubling loop has to reach the shell exactly as written, `$` included"
     );
+
+    // §7.10's `forking` unit: the type, the pid file it names, and the `$!` the
+    // shell needs to write it. What the guest asserts is that rinit *finds* the
+    // daemon through that file, so a unit whose `PIDFile=` never survived the
+    // tokeniser would still start a daemon nobody could see.
+    let forking = body("forking.service");
+    assert_eq!(forking.service_kind, ServiceKind::Forking);
+    assert_eq!(
+        forking.pid_file.as_deref(),
+        Some("/run/forking.pid"),
+        "the file rinit reads and the file the command writes have to be one"
+    );
+    let argv = forking.exec_start.argv();
+    assert_eq!(argv.first().map(String::as_str), Some("/bin/sh"));
+    let command = argv.get(2).expect("the shell command is one argument");
+    assert!(
+        command.contains("echo $! > /run/forking.pid"),
+        "the backgrounded daemon's pid has to reach the file, got: {command}"
+    );
 }

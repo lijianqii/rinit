@@ -1420,6 +1420,139 @@ fn dev_mode_does_not_arm_the_default_watchdog_device() {
     );
 }
 
+// --- §7.10: Type=forking --------------------------------------
+
+/// Plan §7.10: a `forking` unit's main process exits and the *daemon* it left
+/// behind is the unit.
+///
+/// The daemon here is a `sleep` backgrounded by a shell that then exits, which
+/// is the same shape as a double-fork: it is reparented to rinit, it is not the
+/// leader of its process group, and nothing but the `PIDFile=` says which process
+/// it is. The two assertions that matter are that the boot target was reached
+/// only *after* the daemon was located, and that stopping the unit stops the
+/// daemon - an untracked daemon would be left running.
+#[test]
+fn a_forking_unit_is_active_once_its_daemon_is_located() {
+    let dir = TempDir::new("forking");
+    dir.write(
+        "all.target",
+        "[Unit]\nType=target\nRequires=legacy.service\n",
+    );
+    let pid_file = std::env::temp_dir().join(format!("rinit-forking-{}.pid", std::process::id()));
+    let _ = fs::remove_file(&pid_file);
+    dir.write(
+        "legacy.service",
+        &format!(
+            "[Unit]\nDescription=legacy daemon\n[Service]\nType=forking\n\
+             PIDFile={}\n\
+             ExecStart=/bin/sh -c \"/bin/sleep 30 & echo $! > {}; exit 0\"\n",
+            pid_file.display(),
+            pid_file.display()
+        ),
+    );
+
+    let (log, (daemon, alive)) =
+        boot_units_inspect(&dir, "all.target", SETTLE, libc::SIGTERM, &[], || {
+            let pid = fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|text| text.trim().parse::<libc::pid_t>().ok())
+                .unwrap_or(-1);
+            // SAFETY: signal 0 only probes whether the pid exists.
+            let alive = pid > 0 && unsafe { libc::kill(pid, 0) } == 0;
+            (pid, alive)
+        });
+
+    assert!(
+        alive,
+        "the daemon the PIDFile names must be running:\n{log}"
+    );
+    assert!(
+        log.contains("legacy.service: main process exited; daemon is pid"),
+        "the unit is active with the *daemon*, not with the process that exited:\n{log}"
+    );
+    assert!(
+        log.contains("reached: all.target active"),
+        "the target is only reached once the daemon has been located:\n{log}"
+    );
+
+    // The unit was stopped with rinit, and its process is the daemon: a daemon
+    // that was only located but not tracked would still be running here.
+    std::thread::sleep(Duration::from_millis(300));
+    // SAFETY: signal 0 only probes whether the pid exists.
+    let still_there = unsafe { libc::kill(daemon, 0) } == 0;
+    let _ = fs::remove_file(&pid_file);
+    assert!(
+        !still_there,
+        "stopping the unit must stop the daemon it took over (pid {daemon})"
+    );
+}
+
+/// Plan §7.10's fail-closed rule: a `forking` unit whose daemon cannot be
+/// located does not become active, and says why.
+///
+/// Two ways to fail are covered here - no `PIDFile=` and no cgroup to look in,
+/// and a `PIDFile=` naming a pid that is not running - because both would
+/// otherwise be a unit that claims to be up with nothing behind it.
+#[test]
+fn a_forking_unit_whose_daemon_cannot_be_located_fails_its_start() {
+    for (tag, unit_body, expected) in [
+        (
+            "no-pidfile",
+            "[Service]\nType=forking\nExecStart=/bin/sh -c \"exit 0\"\n".to_string(),
+            "no PIDFile= and no cgroup of its own",
+        ),
+        (
+            "stale-pidfile",
+            format!(
+                "[Service]\nType=forking\nPIDFile={}\nExecStart=/bin/sh -c \"exit 0\"\n",
+                // A pid that cannot be running: the maximum, and rinit itself
+                // would have to be it.
+                std::env::temp_dir()
+                    .join(format!("rinit-forking-stale-{}.pid", std::process::id()))
+                    .display()
+            ),
+            "is not running",
+        ),
+    ] {
+        let dir = TempDir::new(&format!("forking-fail-{tag}"));
+        dir.write(
+            "all.target",
+            "[Unit]\nType=target\nRequires=legacy.service\n",
+        );
+        dir.write("legacy.service", &unit_body);
+        if tag == "stale-pidfile" {
+            let path = std::env::temp_dir()
+                .join(format!("rinit-forking-stale-{}.pid", std::process::id()));
+            fs::write(&path, "2147483647\n").expect("write the stale pid file");
+        }
+
+        let log = boot_units(&dir, "all.target", SETTLE);
+
+        assert!(
+            log.contains("cannot locate the daemon"),
+            "{tag}: the reason must be named:\n{log}"
+        );
+        assert!(
+            log.contains(expected),
+            "{tag}: expected a mention of '{expected}':\n{log}"
+        );
+        assert!(
+            log.contains("all.target requires legacy.service, which failed"),
+            "{tag}: a unit that never started cannot satisfy its dependents:\n{log}"
+        );
+        assert!(
+            log.contains("boot complete"),
+            "{tag}: and none of that may abort the boot:\n{log}"
+        );
+        if tag == "stale-pidfile" {
+            let _ = fs::remove_file(
+                std::env::temp_dir()
+                    .join(format!("rinit-forking-stale-{}.pid", std::process::id())),
+            );
+        }
+    }
+}
+
 // --- §7.6: reloading the unit directory -----------------------
 
 /// Send one request to a `--dev` rinit and read its reply.
