@@ -100,6 +100,41 @@ pub fn poll_child(pid: libc::pid_t) -> Result<Option<ChildExit>, SyscallError> {
     Ok(decode_status(pid, status))
 }
 
+/// Wait for one specific child to terminate, blocking until it does.
+///
+/// This is [`poll_child`] without `WNOHANG`, for the one caller that has
+/// nothing else to do while it waits: `process::spawn_sandboxed` reaping a child
+/// that failed between `fork` and `exec`. That child has already called
+/// `_exit(127)`, so this returns immediately - and doing it here rather than
+/// leaving the corpse to the main loop is what keeps a failed spawn from
+/// leaving a zombie behind for as long as the loop takes to notice.
+///
+/// `EINTR` is retried (there is no other work to interleave), and a status that
+/// reports neither exit nor death - a stop, which rinit never asks for - keeps
+/// waiting rather than inventing an outcome.
+///
+/// # Errors
+/// The `errno` from `waitpid`; `ECHILD` means the child was already reaped.
+pub fn wait_child(pid: libc::pid_t) -> Result<ChildExit, SyscallError> {
+    loop {
+        let mut status: libc::c_int = 0;
+        // SAFETY: `status` is a valid out-pointer; a blocking waitpid writes it
+        // only when it returns a positive pid.
+        let rc = unsafe { libc::waitpid(pid, &mut status, 0) };
+        if rc == pid {
+            if let Some(exit) = decode_status(pid, status) {
+                return Ok(exit);
+            }
+            continue;
+        }
+        let err = SyscallError::last_os_error("waitpid");
+        if err.errno() == libc::EINTR {
+            continue;
+        }
+        return Err(err);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::CString;

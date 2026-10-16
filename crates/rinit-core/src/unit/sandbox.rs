@@ -206,7 +206,10 @@ mod tests {
             .expect("SetUser must be in the plan");
         assert_eq!(user, steps.len() - 1, "setuid must be the last step");
         for other in [SandboxStep::SetGroup, SandboxStep::SetGroups] {
-            let at = steps.iter().position(|s| *s == other).expect("step present");
+            let at = steps
+                .iter()
+                .position(|s| *s == other)
+                .expect("step present");
             assert!(at < user, "{other:?} must precede setuid");
         }
         assert_eq!(steps.first(), Some(&SandboxStep::NoNewPrivileges));

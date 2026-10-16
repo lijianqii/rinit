@@ -5,10 +5,12 @@
 //! and would fail in an unprivileged CI/container.
 
 use std::ffi::CString;
+use std::os::fd::AsRawFd;
 use std::sync::Mutex;
 
+use rinit_core::unit::sandbox::Sandbox;
 use rinit_runtime::syscall::wait::ChildExit;
-use rinit_runtime::syscall::{process, wait};
+use rinit_runtime::syscall::{fs, process, wait};
 
 /// `wait::reap_children()` drains *all* children, so tests that rely on it must
 /// not run concurrently with each other (libtest runs tests in parallel).
@@ -316,4 +318,224 @@ fn poll_child_on_a_reaped_child_is_echild() {
 
     let err = wait::poll_child(pid).expect_err("the child is already reaped");
     assert_eq!(err.errno(), libc::ECHILD);
+}
+
+/// `wait_child` blocks for the one child it was given, and says `ECHILD` for
+/// one that was already reaped - the difference between "gone" and "never was".
+#[test]
+fn wait_child_blocks_for_its_child_and_reports_echild_afterwards() {
+    let _guard = REAP_LOCK.lock().unwrap();
+    let argv = [cs("sh"), cs("-c"), cs("sleep 0.05; exit 4")];
+    let pid = process::posix_spawn(c"/bin/sh", &argv, &[]).expect("posix_spawn");
+
+    assert_eq!(
+        wait::wait_child(pid).expect("wait"),
+        ChildExit::Exited { pid, code: 4 }
+    );
+    let err = wait::wait_child(pid).expect_err("the child is already reaped");
+    assert_eq!(err.errno(), libc::ECHILD);
+}
+
+// --- §7.4: the privilege drop ---------------------------------------------
+//
+// The host can only prove part of this: an unprivileged test process may not
+// become another user, so "a service really runs as nobody" is asserted in the
+// guest instead (`scripts/system-test.sh`). What *is* provable here is the
+// machinery around the drop: that a sandboxed child runs, that
+// `NoNewPrivileges=` reaches it, that the working directory is applied before
+// `exec`, and - the part that matters most - that a step which cannot be
+// applied fails the spawn closed, by name, leaving no zombie behind.
+
+/// Run `command` through `/bin/sh -c` under `sandbox`, with its stdout
+/// captured, and return `(output, exit code)`.
+fn run_captured(
+    command: &str,
+    sandbox: &Sandbox,
+    working_directory: Option<&str>,
+) -> (String, i32) {
+    let (read_end, write_end) = fs::pipe().expect("pipe");
+    let argv = [cs("sh"), cs("-c"), cs(command)];
+    let directory = working_directory.map(cs);
+    let pid = process::spawn_sandboxed(
+        c"/bin/sh",
+        &argv,
+        &[],
+        process::SpawnOptions::default().with_stdio(write_end.as_raw_fd()),
+        directory.as_deref(),
+        sandbox,
+    )
+    .expect("sandboxed spawn");
+
+    // rinit's own copy of the write end has to go, or the read below waits for
+    // an end-of-file that can never arrive.
+    drop(write_end);
+
+    let mut output = Vec::new();
+    let mut buf = [0u8; 256];
+    loop {
+        match fs::read(read_end.as_raw_fd(), &mut buf) {
+            Ok(0) => break,
+            Ok(n) => output.extend_from_slice(&buf[..n]),
+            Err(e) => panic!("reading the child's output failed: {e}"),
+        }
+    }
+
+    let code = match wait::wait_child(pid).expect("wait for the child") {
+        ChildExit::Exited { code, .. } => code,
+        other => panic!("expected an exit, got {other:?}"),
+    };
+    (String::from_utf8_lossy(&output).into_owned(), code)
+}
+
+/// The whole point of the `fork`+`exec` path: it runs the command, and the
+/// child's exit status comes back the way any other child's does.
+#[test]
+fn a_sandboxed_spawn_runs_the_command() {
+    let _guard = REAP_LOCK.lock().unwrap();
+    let (output, code) = run_captured("echo hello; exit 9", &Sandbox::inherit(), None);
+    assert_eq!(output, "hello\n");
+    assert_eq!(code, 9);
+}
+
+/// `NoNewPrivileges=true` is only useful if it is actually set in the child,
+/// and a child that was not asked for it must not have it - otherwise the
+/// assertion below would pass for the wrong reason.
+#[test]
+fn no_new_privileges_reaches_the_child() {
+    let _guard = REAP_LOCK.lock().unwrap();
+    let probe = "test \"$(grep ^NoNewPrivs: /proc/self/status | cut -f2)\" = 1";
+
+    let (_, with_flag) = run_captured(
+        probe,
+        &Sandbox {
+            no_new_privileges: true,
+            ..Sandbox::inherit()
+        },
+        None,
+    );
+    assert_eq!(with_flag, 0, "the child should report NoNewPrivs: 1");
+
+    // The baseline is the test process's own flag, not a hardcoded 0: a test
+    // runner that already denies privilege escalation would otherwise make this
+    // assertion about the runner rather than about rinit.
+    let runner_has_it = std::fs::read_to_string("/proc/self/status").is_ok_and(|status| {
+        status
+            .lines()
+            .any(|l| l.starts_with("NoNewPrivs:") && l.ends_with('1'))
+    });
+    let (_, without_flag) = run_captured(probe, &Sandbox::inherit(), None);
+    assert_eq!(
+        without_flag == 0,
+        runner_has_it,
+        "the child must inherit the flag only when the sandbox does not set it"
+    );
+}
+
+/// A sandboxed child ends up as the user it was given. On the host this can only
+/// be the user we already are - which still exercises `setgid`/`setuid` in the
+/// child - and the guest test covers the case that needs root.
+#[test]
+fn a_sandboxed_child_runs_as_the_user_it_was_given() {
+    let _guard = REAP_LOCK.lock().unwrap();
+    let uid = process::geteuid();
+    let command = format!("test \"$(grep ^Uid: /proc/self/status | cut -f2)\" = {uid}");
+    let (_, code) = run_captured(
+        &command,
+        &Sandbox {
+            uid,
+            gid: unsafe { libc::getgid() },
+            ..Sandbox::inherit()
+        },
+        None,
+    );
+    assert_eq!(code, 0, "the child should report uid {uid}");
+}
+
+/// `WorkingDirectory=` is applied in the child, before `exec`.
+#[test]
+fn the_working_directory_is_applied_before_exec() {
+    let _guard = REAP_LOCK.lock().unwrap();
+    let (output, code) = run_captured("pwd", &Sandbox::inherit(), Some("/etc"));
+    assert_eq!(code, 0);
+    assert_eq!(output.trim_end(), "/etc");
+}
+
+/// A working directory that does not exist must not start the service somewhere
+/// else: plan §7.4 makes it fatal.
+#[test]
+fn a_missing_working_directory_fails_the_spawn_closed() {
+    let _guard = REAP_LOCK.lock().unwrap();
+    let argv = [cs("sh"), cs("-c"), cs("true")];
+    let err = process::spawn_sandboxed(
+        c"/bin/sh",
+        &argv,
+        &[],
+        process::SpawnOptions::default(),
+        Some(c"/rinit-there-is-no-such-directory"),
+        &Sandbox::inherit(),
+    )
+    .expect_err("a missing WorkingDirectory must not spawn");
+    assert_eq!(err.op(), "chdir");
+    assert_eq!(err.errno(), libc::ENOENT);
+    assert!(
+        wait::reap_children().is_empty(),
+        "the child that could not start must have been reaped"
+    );
+}
+
+/// A command that does not exist is reported as `execve`'s `ENOENT`, which is
+/// the failure plan §1.1 contracts as "start failed" rather than as a silent
+/// short-lived process.
+#[test]
+fn a_missing_command_is_reported_as_execve_enoent() {
+    let _guard = REAP_LOCK.lock().unwrap();
+    let argv = [cs("rinit-no-such-binary")];
+    let err = process::spawn_sandboxed(
+        c"/rinit-no-such-binary",
+        &argv,
+        &[],
+        process::SpawnOptions::default(),
+        None,
+        &Sandbox::inherit(),
+    )
+    .expect_err("a missing command must not spawn");
+    assert_eq!(err.op(), "execve");
+    assert_eq!(err.errno(), libc::ENOENT);
+    assert!(
+        wait::reap_children().is_empty(),
+        "the child that could not be exec'd must have been reaped"
+    );
+}
+
+/// A step rinit is not allowed to carry out fails the spawn, and names the step.
+///
+/// As an unprivileged process, `setgroups` is the reachable one (`EPERM`): this
+/// is the fail-closed rule of plan §7.4 verified from the outside. As root there
+/// is no step an unprivileged test could be refused, so the case is asserted in
+/// the guest instead.
+#[test]
+fn a_step_that_cannot_be_applied_fails_the_spawn_closed() {
+    let _guard = REAP_LOCK.lock().unwrap();
+    if process::geteuid() == 0 {
+        return;
+    }
+    let argv = [cs("sh"), cs("-c"), cs("true")];
+    let err = process::spawn_sandboxed(
+        c"/bin/sh",
+        &argv,
+        &[],
+        process::SpawnOptions::default(),
+        None,
+        &Sandbox {
+            groups: Some(Vec::new()),
+            ..Sandbox::inherit()
+        },
+    )
+    .expect_err("an unprivileged rinit cannot set the group list");
+    assert_eq!(err.op(), "setgroups");
+    assert_eq!(err.errno(), libc::EPERM);
+    assert!(
+        wait::reap_children().is_empty(),
+        "the child that could not drop privileges must have been reaped"
+    );
 }

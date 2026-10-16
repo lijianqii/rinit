@@ -5,8 +5,12 @@
 //! obey the single-threaded-fork constraint documented in plan §2.1⑤.
 
 use std::ffi::{CStr, CString};
+use std::os::fd::AsRawFd;
+
+use rinit_core::unit::sandbox::{Sandbox, SandboxStep};
 
 use crate::error::SyscallError;
+use crate::syscall::{cred, fs, wait};
 
 /// The attributes a spawned service gets.
 ///
@@ -247,6 +251,322 @@ fn fail_file_actions(
     Err(SyscallError::new(op, rc))
 }
 
+/// Spawn `path` with a privilege drop applied between `fork` and `exec`
+/// (plan §7.4).
+///
+/// `posix_spawn` cannot express this, and that is the whole reason the plan
+/// routes any unit that needs it through a controlled `fork`+`exec` (§2.3):
+/// there is no way to run `setuid`, `setgroups` or `prctl` in the child, after
+/// the `fork` and before the `exec`, through the `posix_spawn` interface.
+///
+/// rinit is single-threaded by design (plan §2.1⑤), so the child inherits no
+/// other thread's locks; it still calls only `libc` and allocates nothing,
+/// because between `fork` and `exec` nothing else is safe to assume. Everything
+/// the child needs - the argument vectors, the working directory, the sandbox -
+/// is built in the parent and lives in the address space the child is sharing.
+///
+/// A step that fails in the child is reported back over a close-on-exec pipe,
+/// so the caller gets a [`SyscallError`] naming the step (`setuid failed:
+/// EPERM`) instead of a pid that dies a moment later for reasons nobody can
+/// see. The child is reaped here in that case, so a failed spawn leaves no
+/// zombie behind.
+///
+/// # Errors
+/// `fork` itself failing; a `setsid`/`dup2`/`chdir` failure in the child; a
+/// sandbox step failing in the child; `execve` failing (e.g. `ENOENT` for a
+/// command that does not exist, which plan §1.1 contracts as a start failure).
+pub fn spawn_sandboxed(
+    path: &CStr,
+    argv: &[CString],
+    envp: &[CString],
+    options: SpawnOptions,
+    working_directory: Option<&CStr>,
+    sandbox: &Sandbox,
+) -> Result<libc::pid_t, SyscallError> {
+    let setup = ChildSetup {
+        path,
+        argv: null_terminated(argv),
+        envp: null_terminated(envp),
+        options,
+        working_directory,
+        sandbox,
+    };
+
+    // Close-on-exec, which is what makes "empty read" mean "the child exec'd":
+    // the child's copy of the write end disappears the moment `execve`
+    // succeeds, and until then a failure can be reported through it.
+    let (report_read, report_write) = fs::pipe()?;
+
+    // SAFETY: `fork` takes no arguments. The child only calls `libc` directly
+    // (see `child_exec`) and never returns, so no destructor of this frame runs
+    // in it.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Err(SyscallError::last_os_error("fork"));
+    }
+    if pid == 0 {
+        child_exec(&setup, report_read.as_raw_fd(), report_write.as_raw_fd());
+    }
+
+    // The parent's copy of the write end has to go, or the read below would
+    // block until every copy is closed - which, for a child that exec'd, would
+    // be never.
+    drop(report_write);
+
+    let report = read_report(report_read.as_raw_fd());
+    match report {
+        // End-of-file with nothing written: the child reached `execve`.
+        Ok(None) => Ok(pid),
+        Ok(Some((step, errno))) => {
+            reap_failed_spawn(pid);
+            Err(SyscallError::new(step.op(), errno))
+        }
+        Err(err) => {
+            reap_failed_spawn(pid);
+            Err(err)
+        }
+    }
+}
+
+/// Everything the work of a child needs, prepared in the parent before the
+/// `fork`.
+///
+/// The child allocates nothing, so the argument vectors and the pointer arrays
+/// built from them have to exist before it starts: this struct is that, and it
+/// lives in the stack frame the child borrows a copy of.
+struct ChildSetup<'a> {
+    path: &'a CStr,
+    argv: Vec<*const libc::c_char>,
+    envp: Vec<*const libc::c_char>,
+    options: SpawnOptions,
+    working_directory: Option<&'a CStr>,
+    sandbox: &'a Sandbox,
+}
+
+/// The work of a child created by [`spawn_sandboxed`], which never returns.
+///
+/// Every failure ends in `_exit(127)` (plan §1.1's contract for a command that
+/// could not be executed) after reporting the failing step to the parent.
+fn child_exec(setup: &ChildSetup<'_>, report_read: libc::c_int, report_write: libc::c_int) -> ! {
+    // Only the write end has anything to do in the child; holding the read end
+    // open would not hurt, but there is no reason to.
+    // SAFETY: both descriptors are valid, and this one is not used again.
+    unsafe { libc::close(report_read) };
+
+    if setup.options.new_session {
+        // SAFETY: `setsid` takes no arguments. The child is not a process-group
+        // leader (its group is the parent's), so this cannot fail with `EPERM`.
+        if unsafe { libc::setsid() } < 0 {
+            die(report_write, ChildStep::Setsid);
+        }
+    }
+
+    if let Some(fd) = setup.options.stdio {
+        // `dup2` clears `O_CLOEXEC` on the new descriptor, so the child keeps a
+        // usable stdout/stderr while rinit's own copy stays close-on-exec.
+        for target in [libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+            // SAFETY: both descriptors are valid; `dup2` closes `target` first.
+            if unsafe { libc::dup2(fd, target) } < 0 {
+                die(report_write, ChildStep::Dup2);
+            }
+        }
+    }
+
+    if let Some(directory) = setup.working_directory {
+        // Before the drop, deliberately: a directory the service's own user
+        // cannot enter is still the directory it was configured to start in,
+        // and plan §7.4 only requires that failing to get there is fatal.
+        // SAFETY: `directory` is a valid, NUL-terminated path.
+        if unsafe { libc::chdir(directory.as_ptr()) } < 0 {
+            die(report_write, ChildStep::Chdir);
+        }
+    }
+
+    // Plan §7.4's order, from the plan that `rinit_core::unit::sandbox`
+    // produced: the steps are already in it.
+    for step in setup.sandbox.steps() {
+        let outcome = match step {
+            SandboxStep::NoNewPrivileges => cred::set_no_new_privs(),
+            SandboxStep::SetGroup => cred::set_gid(setup.sandbox.gid),
+            SandboxStep::SetGroups => {
+                cred::set_groups(setup.sandbox.groups.as_deref().unwrap_or(&[]))
+            }
+            SandboxStep::SetUser => cred::set_uid(setup.sandbox.uid),
+        };
+        if let Err(err) = outcome {
+            die_reporting_step(report_write, step, err.errno());
+        }
+    }
+
+    // SAFETY: `path` and both arrays are valid, NUL-terminated, and live in the
+    // memory this child inherited from the parent. `execve` does not return on
+    // success.
+    unsafe {
+        libc::execve(
+            setup.path.as_ptr(),
+            setup.argv.as_ptr(),
+            setup.envp.as_ptr(),
+        )
+    };
+    die(report_write, ChildStep::Exec);
+}
+
+/// Report the current `errno` for `step` and exit with 127.
+fn die(report_write: libc::c_int, step: ChildStep) -> ! {
+    // SAFETY: nothing was called since the failing call but `errno` readers.
+    let errno = std::io::Error::last_os_error()
+        .raw_os_error()
+        .unwrap_or(libc::EIO);
+    die_reporting(report_write, step, errno)
+}
+
+/// Report an explicit `errno` for `step` and exit with 127.
+fn die_reporting(report_write: libc::c_int, step: ChildStep, errno: i32) -> ! {
+    let report = u64::from(step as u8) | (u64::from(errno as u32) << 8);
+    let bytes = report.to_le_bytes();
+    // SAFETY: `bytes` is a valid 8-byte buffer. A pipe write of this size is
+    // atomic and cannot come up short; if it fails (the parent is gone), the
+    // `_exit` below still ends the child, and the parent sees end-of-file.
+    unsafe { libc::write(report_write, bytes.as_ptr().cast(), bytes.len()) };
+    // SAFETY: `_exit` never returns and runs no destructors and no `atexit`
+    // handlers - which is exactly what a process that exists only between
+    // `fork` and `exec` needs: it must not touch what it shares with its parent
+    // beyond what it already did.
+    unsafe { libc::_exit(127) }
+}
+
+/// Read a child's failure report: `Ok(None)` is end-of-file, which means the
+/// child `exec`'d.
+///
+/// A short read means the child died while reporting - a signal between the
+/// `write` and the `_exit` - and is reported as a child that never reached
+/// `exec`, with `EIO` standing in for an `errno` the child never sent.
+fn read_report(fd: libc::c_int) -> Result<Option<(ChildStep, i32)>, SyscallError> {
+    let mut buf = [0u8; REPORT_LEN];
+    let mut filled = 0usize;
+    while filled < REPORT_LEN {
+        let Some(destination) = buf.get_mut(filled..) else {
+            break;
+        };
+        // SAFETY: `destination` is a valid writable slice of the given length.
+        let rc = unsafe { libc::read(fd, destination.as_mut_ptr().cast(), destination.len()) };
+        if rc < 0 {
+            let err = SyscallError::last_os_error("read");
+            if err.errno() == libc::EINTR {
+                continue;
+            }
+            return Err(err);
+        }
+        if rc == 0 {
+            break;
+        }
+        filled += rc as usize;
+    }
+
+    if filled == 0 {
+        return Ok(None);
+    }
+    if filled < REPORT_LEN {
+        return Ok(Some((ChildStep::Exec, libc::EIO)));
+    }
+    let report = u64::from_le_bytes(buf);
+    let code = (report & 0xff) as u8;
+    let errno = ((report >> 8) & 0xffff_ffff) as u32 as i32;
+    Ok(Some((ChildStep::from_code(code), errno)))
+}
+
+/// Reap a child that failed before `exec`.
+///
+/// It has already `_exit`ed, so this is not a wait in any meaningful sense; the
+/// point is that the caller's error does not leave a corpse behind for the main
+/// loop's reaper to find later.
+fn reap_failed_spawn(pid: libc::pid_t) {
+    // ECHILD here would mean the main loop's reaper got there first, which is
+    // the outcome this is trying to produce anyway.
+    let _ = wait::wait_child(pid);
+}
+
+/// The NULL-terminated `char *` array `execve` wants.
+///
+/// Built in the parent on purpose: between `fork` and `exec` the child
+/// allocates nothing, so every pointer it uses must already be in the address
+/// space it inherited.
+fn null_terminated(strings: &[CString]) -> Vec<*const libc::c_char> {
+    let mut pointers: Vec<*const libc::c_char> = strings.iter().map(|s| s.as_ptr()).collect();
+    pointers.push(std::ptr::null());
+    pointers
+}
+
+/// The number of bytes in a failure report: a step code and an `errno`.
+const REPORT_LEN: usize = 8;
+
+/// What a child was doing when it failed, as sent to the parent.
+///
+/// The discriminants travel over the report pipe, so they are part of the
+/// parent/child wire and must not be renumbered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum ChildStep {
+    Chdir = 0,
+    Setsid = 1,
+    Dup2 = 2,
+    Exec = 3,
+    NoNewPrivileges = 4,
+    SetGroup = 5,
+    SetGroups = 6,
+    SetUser = 7,
+}
+
+impl ChildStep {
+    /// The `op` name the parent's [`SyscallError`] carries.
+    const fn op(self) -> &'static str {
+        match self {
+            ChildStep::Chdir => "chdir",
+            ChildStep::Setsid => "setsid",
+            ChildStep::Dup2 => "dup2",
+            ChildStep::Exec => "execve",
+            ChildStep::NoNewPrivileges => "prctl(PR_SET_NO_NEW_PRIVS)",
+            ChildStep::SetGroup => "setgid",
+            ChildStep::SetGroups => "setgroups",
+            ChildStep::SetUser => "setuid",
+        }
+    }
+
+    /// The step a report's code names, in the plan's terms.
+    const fn from_step(step: SandboxStep) -> Self {
+        match step {
+            SandboxStep::NoNewPrivileges => ChildStep::NoNewPrivileges,
+            SandboxStep::SetGroup => ChildStep::SetGroup,
+            SandboxStep::SetGroups => ChildStep::SetGroups,
+            SandboxStep::SetUser => ChildStep::SetUser,
+        }
+    }
+
+    /// The step a report code names, or `Exec` for a code this build does not
+    /// know - which can only be a child from a different build, and is best
+    /// reported as a command that did not start.
+    const fn from_code(code: u8) -> Self {
+        match code {
+            0 => ChildStep::Chdir,
+            1 => ChildStep::Setsid,
+            2 => ChildStep::Dup2,
+            4 => ChildStep::NoNewPrivileges,
+            5 => ChildStep::SetGroup,
+            6 => ChildStep::SetGroups,
+            7 => ChildStep::SetUser,
+            _ => ChildStep::Exec,
+        }
+    }
+}
+
+/// Bring the failure of a *sandbox step* back to [`ChildStep`].
+///
+/// The two enums exist for different reasons - one is the plan's vocabulary,
+/// the other is the wire format - and this is the one place they meet.
+fn die_reporting_step(report_write: libc::c_int, step: SandboxStep, errno: i32) -> ! {
+    die_reporting(report_write, ChildStep::from_step(step), errno)
+}
+
 /// Send `signal` to `pid` (a positive PID, not a process group).
 pub fn kill(pid: libc::pid_t, signal: libc::c_int) -> Result<(), SyscallError> {
     // SAFETY: `kill` has no memory-safety preconditions for a scalar pid/signal.
@@ -258,7 +578,7 @@ pub fn kill(pid: libc::pid_t, signal: libc::c_int) -> Result<(), SyscallError> {
     }
 }
 
-/// Send `signal` to every process in `pid`'s process group.///
+/// Send `signal` to every process in `pid`'s process group.
 /// `pid` is expected to lead its own process group, as created by
 /// [`SpawnOptions::with_session`]. This is how a stop reaches services
 /// that fork their own children (plan §1.3(6)): signalling the group delivers
