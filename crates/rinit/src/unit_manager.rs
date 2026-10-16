@@ -371,6 +371,10 @@ impl UnitManager {
         // The file is back (or never left): the unit is a unit again.
         rt.retired = false;
         if rt.config == config {
+            // The directory now says what the unit is already running, so a
+            // definition an earlier reload deferred is *withdrawn* - leaving it
+            // pending would let a withdrawn change take over at the next start.
+            rt.pending_config = None;
             return ConfigChange::Unchanged;
         }
         if rt.is_up() {
@@ -2739,6 +2743,37 @@ mod tests {
         m.adopt_pending_config(&unit);
         assert_eq!(m.get(&unit).unwrap().config.description, "second");
         assert!(m.get(&unit).unwrap().pending_config.is_none());
+    }
+
+    /// Putting the file back the way the running unit has it withdraws a
+    /// deferred definition: the next start must not adopt a change that no
+    /// longer exists on disk.
+    #[test]
+    fn reverting_a_deferred_definition_withdraws_it() {
+        let _guard = crate::test_support::children_lock();
+        let mut m = UnitManager::new();
+        let unit = UnitName::parse("app.service").unwrap();
+        let running = config("app.service", RestartPolicy::No);
+        m.add(running.clone());
+        m.spawn_unit_with_output(&unit, &[], None).expect("spawn");
+
+        let mut changed = running.clone();
+        changed.description = "withdrawn".to_string();
+        assert_eq!(m.add(changed), ConfigChange::Deferred);
+        assert!(m.get(&unit).unwrap().pending_config.is_some());
+
+        // The operator puts the file back.
+        assert_eq!(m.add(running), ConfigChange::Unchanged);
+        assert!(
+            m.get(&unit).unwrap().pending_config.is_none(),
+            "a change that is no longer on disk must not be waiting to take over"
+        );
+
+        let pid = m.get(&unit).unwrap().pid.expect("spawned");
+        let _ = process::kill_process_group(pid, libc::SIGKILL);
+        let _ = m.on_child_exit(pid, ExitOutcome::Signalled(libc::SIGKILL));
+        m.adopt_pending_config(&unit);
+        assert!(m.get(&unit).unwrap().config.description.is_empty());
     }
 
     /// A removed unit is hidden from the protocol immediately, but the runtime
