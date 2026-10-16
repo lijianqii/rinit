@@ -22,6 +22,7 @@
 
 mod args;
 mod boot;
+mod cgroup;
 mod control;
 mod deadline;
 mod log;

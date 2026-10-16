@@ -39,6 +39,13 @@ pub struct Config {
     pub unit_dir: PathBuf,
     /// Which target to boot (M1; plan §7.2 default target).
     pub default_target: String,
+    /// The mounted cgroup v2 hierarchy (plan §7.3), or `None` for the default.
+    ///
+    /// `--cgroup-root <DIR>` names where the hierarchy is, for a system that
+    /// mounts it somewhere other than `/sys/fs/cgroup` - and for the host
+    /// integration tests, which drive the whole limit path against a directory
+    /// of ordinary files without needing root or cgroups.
+    pub cgroup_root: Option<PathBuf>,
 }
 
 /// Parse arguments (excluding `argv[0]`), honouring [`ENV_TEST_SERVICE`].
@@ -89,6 +96,7 @@ fn parse_with_default<I: IntoIterator<Item = OsString>>(
         service_argv: default_service_argv,
         unit_dir: PathBuf::from(rinit_runtime::DEFAULT_UNIT_DIR),
         default_target: rinit_runtime::DEFAULT_TARGET.to_string(),
+        cgroup_root: None,
     };
 
     let mut iter = args.into_iter();
@@ -110,6 +118,12 @@ fn parse_with_default<I: IntoIterator<Item = OsString>>(
                     .ok_or_else(|| "--default requires a target unit".to_string())?;
                 cfg.default_target = value.to_string_lossy().into_owned();
                 validate_target(&cfg.default_target)?;
+            }
+            "--cgroup-root" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--cgroup-root requires a directory".to_string())?;
+                cfg.cgroup_root = Some(PathBuf::from(value.to_string_lossy().into_owned()));
             }
             "--" => {
                 // Everything after `--` is the service command and its args.
@@ -137,6 +151,8 @@ fn parse_with_default<I: IntoIterator<Item = OsString>>(
                 } else if let Some(value) = other.strip_prefix("--default=") {
                     cfg.default_target = value.to_string();
                     validate_target(&cfg.default_target)?;
+                } else if let Some(value) = other.strip_prefix("--cgroup-root=") {
+                    cfg.cgroup_root = Some(PathBuf::from(value));
                 } else if other.starts_with('-') {
                     return Err(format!("unknown argument: {other}"));
                 } else {
@@ -189,6 +205,8 @@ Options:
                              commands from the invoking user
       --units <DIR>          Unit directory (default: /etc/rinit/units)
       --default <TARGET>     Boot target (default: multi-user.target)
+      --cgroup-root <DIR>    Mounted cgroup v2 hierarchy for unit limits
+                             (default: /sys/fs/cgroup)
       --test-service <CMD>   Launch this instead of the unit directory
       -- <SERVICE> [ARGS]    Service as an argv (kernel-cmdline form)
 
@@ -500,10 +518,36 @@ mod tests {
             "--dev",
             "--units",
             "--default",
+            "--cgroup-root",
             "--test-service",
             ENV_TEST_SERVICE,
         ] {
             assert!(USAGE.contains(flag), "usage is missing {flag}");
         }
+    }
+
+    /// `--cgroup-root` is an optional override in both the separated and the
+    /// `=` form, and its absence leaves the plan's own default in place.
+    #[test]
+    fn cgroup_root_is_parsed_in_both_forms_and_defaults_to_none() {
+        assert_eq!(parse_args(&[]).unwrap().cgroup_root, None);
+        assert_eq!(
+            parse_args(&["--cgroup-root", "/tmp/cg"])
+                .unwrap()
+                .cgroup_root,
+            Some(PathBuf::from("/tmp/cg"))
+        );
+        assert_eq!(
+            parse_args(&["--cgroup-root=/tmp/cg"]).unwrap().cgroup_root,
+            Some(PathBuf::from("/tmp/cg"))
+        );
+    }
+
+    /// A flag that promises a value and gets none must say so rather than
+    /// silently booting with the default.
+    #[test]
+    fn cgroup_root_without_a_value_is_an_error() {
+        let err = parse_args(&["--cgroup-root"]).expect_err("must fail");
+        assert!(err.contains("--cgroup-root"), "got: {err}");
     }
 }

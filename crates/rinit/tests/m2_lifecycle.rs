@@ -50,6 +50,38 @@ fn boot_units_with_signal(
     settle: Duration,
     signal: libc::c_int,
 ) -> String {
+    boot_units_extra(units, target, settle, signal, &[])
+}
+
+/// As [`boot_units_with_signal`], with extra command-line arguments.
+///
+/// The extra arguments exist for `--cgroup-root` (plan §7.3): it is how the
+/// host tests point the whole limit path at a directory of ordinary files.
+fn boot_units_extra(
+    units: &TempDir,
+    target: &str,
+    settle: Duration,
+    signal: libc::c_int,
+    extra: &[&str],
+) -> String {
+    boot_units_inspect(units, target, settle, signal, extra, || ()).0
+}
+
+/// Boot a unit directory, look at it while it is up, then shut it down.
+///
+/// `inspect` runs after the boot has settled and before the shutdown signal, so
+/// a test can read state that only exists while the boot is running - a service
+/// pid that is still alive, or the cgroup files it wrote. It must not panic:
+/// panicking there would leave rinit running, so assertions belong after the
+/// pair is returned.
+fn boot_units_inspect<T>(
+    units: &TempDir,
+    target: &str,
+    settle: Duration,
+    signal: libc::c_int,
+    extra: &[&str],
+    inspect: impl FnOnce() -> T,
+) -> (String, T) {
     let bin = env!("CARGO_BIN_EXE_rinit");
     let child = Command::new(bin)
         .arg("--dev")
@@ -57,6 +89,7 @@ fn boot_units_with_signal(
         .arg(&units.0)
         .arg("--default")
         .arg(target)
+        .args(extra)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -65,6 +98,7 @@ fn boot_units_with_signal(
 
     // Let the unit directory boot and any restart/breaker activity happen.
     std::thread::sleep(settle);
+    let inspected = inspect();
     // SAFETY: signalling our own child.
     unsafe { libc::kill(child.id() as libc::pid_t, signal) };
 
@@ -76,7 +110,7 @@ fn boot_units_with_signal(
         "rinit should exit cleanly on the shutdown signal, got {:?}:\n{log}",
         out.status
     );
-    log
+    (log, inspected)
 }
 
 /// A unit that fails immediately, with `Restart=always`, must be retried and
@@ -821,5 +855,238 @@ fn a_capability_drop_that_cannot_be_applied_fails_the_unit_closed() {
     assert!(
         log.contains("boot complete"),
         "a failed capability drop must not abort the rest of the boot:\n{log}"
+    );
+}
+
+// --- §7.3: cgroup v2 limits, end to end -----------------------------------
+//
+// cgroupfs provides its own files, so there is nothing to mount and no root
+// needed to exercise the limit path: `--cgroup-root` points rinit at a
+// directory the test fills in the shape cgroupfs would have. What that stand-in
+// cannot do is *remove* a cgroup directory - its attributes are ordinary files,
+// so the directory is never empty - which is why the removal side of cleanup is
+// asserted in `scripts/system-test.sh`, against a real hierarchy.
+//
+// Booting the real binary is the point: these prove the directives reach a real
+// cgroup's files, that the service's own pid ends up in its `cgroup.procs`, and
+// that a limit which cannot be applied fails the unit instead of leaving it
+// running unbounded.
+
+/// A throwaway directory standing in for a mounted cgroup v2 hierarchy.
+struct FakeCgroup(PathBuf);
+
+impl FakeCgroup {
+    /// A directory that [`rinit::cgroup::prepare`]'s probe accepts: the
+    /// controllers file is the test for a v2 hierarchy, and `subtree_control`
+    /// files exist wherever cgroupfs has them.
+    fn new(tag: &str, controllers: &str) -> Self {
+        // Deliberately outside the `rinit-m2-*` namespace the unit directories
+        // use: a tag that collided with one would delete the unit directory out
+        // from under the test.
+        let root = std::env::temp_dir().join(format!("rinit-cghier-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("rinit")).expect("create fake hierarchy");
+        for dir in [&root, &root.join("rinit")] {
+            fs::write(dir.join("cgroup.controllers"), controllers).expect("controllers");
+            fs::write(dir.join("cgroup.subtree_control"), "").expect("subtree_control");
+        }
+        FakeCgroup(root)
+    }
+
+    /// The attributes the kernel would provide for a unit's cgroup, created
+    /// before rinit runs so its writes find them.
+    fn unit(&self, unit: &str, controllers: &str, files: &[&str]) {
+        let dir = self.0.join("rinit").join(unit);
+        fs::create_dir_all(&dir).expect("create unit cgroup");
+        fs::write(dir.join("cgroup.controllers"), controllers).expect("unit controllers");
+        for file in files {
+            fs::write(dir.join(file), "").expect("attribute");
+        }
+    }
+
+    fn path(&self) -> &str {
+        self.0.to_str().expect("temp dir is UTF-8")
+    }
+}
+
+impl Drop for FakeCgroup {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// The whole §7.3 path: the unit's cgroup is created, every directive lands in
+/// its own kernel attribute, and the service put *itself* in it before it could
+/// fork anything.
+#[test]
+fn a_unit_with_limits_is_bounded_in_its_own_cgroup() {
+    let dir = TempDir::new("units-limits");
+    dir.write(
+        "all.target",
+        "[Unit]\nType=target\nRequires=worker.service\n",
+    );
+    dir.write(
+        "worker.service",
+        "[Service]\nType=simple\nExecStart=/bin/sleep 30\n\
+         CgroupCPUMax=50%\nCgroupMemoryMax=32M\nCgroupMemoryHigh=24M\nCgroupTasksMax=64\n",
+    );
+    let cg = FakeCgroup::new("limits", "cpuset cpu io memory pids\n");
+    cg.unit(
+        "worker.service",
+        "cpu memory pids\n",
+        &[
+            "cpu.max",
+            "memory.max",
+            "memory.high",
+            "pids.max",
+            "cgroup.procs",
+            "cgroup.events",
+        ],
+    );
+    fs::write(
+        cg.0.join("rinit/worker.service/cgroup.events"),
+        "populated 0\n",
+    )
+    .unwrap();
+
+    // Read while the service is up: that is the only moment the attributes
+    // describe a *running* unit, and the only moment its pid can be probed.
+    let (log, (cpu, memory_max, memory_high, pids, pid, alive)) = boot_units_inspect(
+        &dir,
+        "all.target",
+        SETTLE,
+        libc::SIGTERM,
+        &["--cgroup-root", cg.path()],
+        || {
+            let read = |rel: &str| fs::read_to_string(cg.0.join(rel)).unwrap_or_default();
+            let procs = read("rinit/worker.service/cgroup.procs");
+            let pid: libc::pid_t = procs.trim().parse().unwrap_or(-1);
+            // SAFETY: signal 0 only probes whether the pid exists.
+            let alive = pid > 0 && unsafe { libc::kill(pid, 0) } == 0;
+            (
+                read("rinit/worker.service/cpu.max"),
+                read("rinit/worker.service/memory.max"),
+                read("rinit/worker.service/memory.high"),
+                read("rinit/worker.service/pids.max"),
+                pid,
+                alive,
+            )
+        },
+    );
+
+    assert!(
+        log.contains("cgroup v2 ready at"),
+        "the hierarchy must be recognised:\n{log}"
+    );
+    assert!(
+        log.contains("started worker.service"),
+        "the service must start:\n{log}"
+    );
+    assert_eq!(
+        cpu, "50000 100000",
+        "50% is a quota against the kernel's own 100000us period"
+    );
+    assert_eq!(
+        memory_max,
+        (32u64 * 1024 * 1024).to_string(),
+        "CgroupMemoryMax= must be written in bytes"
+    );
+    assert_eq!(memory_high, (24u64 * 1024 * 1024).to_string());
+    assert_eq!(pids, "64");
+
+    // The placement is the child's own write (see the README's deviation note):
+    // the pid in the file has to be the service's, and a live one.
+    assert!(pid > 0, "the service must have written its real pid: {pid}");
+    assert!(
+        alive,
+        "the placed pid must still be alive while the service runs"
+    );
+}
+
+/// A hierarchy that is not there is plan §7.3's degrade case: warn, run every
+/// unit unlimited, and finish the boot anyway.
+#[test]
+fn a_missing_hierarchy_warns_and_still_boots() {
+    let dir = TempDir::new("units-degrade");
+    dir.write(
+        "all.target",
+        "[Unit]\nType=target\nRequires=worker.service\n",
+    );
+    dir.write(
+        "worker.service",
+        "[Service]\nType=simple\nExecStart=/bin/sleep 30\nCgroupMemoryMax=32M\n",
+    );
+    // A directory with no `cgroup.controllers`: not a v2 hierarchy.
+    let not_a_hierarchy = TempDir::new("not-a-hierarchy");
+
+    let log = boot_units_extra(
+        &dir,
+        "all.target",
+        SETTLE,
+        libc::SIGTERM,
+        &["--cgroup-root", not_a_hierarchy.0.to_str().unwrap()],
+    );
+
+    assert!(
+        log.contains("no cgroup v2 hierarchy"),
+        "the degrade must be reported:\n{log}"
+    );
+    assert!(
+        log.contains("started worker.service"),
+        "a unit asking for limits must still start when they cannot be applied:\n{log}"
+    );
+    assert!(
+        log.contains("boot complete"),
+        "a missing hierarchy is not a failed boot:\n{log}"
+    );
+}
+
+/// A limit that *cannot* be written fails the unit, and the service does not
+/// run: starting it anyway would leave it unbounded while its unit file claims
+/// otherwise.
+#[test]
+fn a_limit_that_cannot_be_written_fails_the_start() {
+    let dir = TempDir::new("units-fail-closed");
+    let probe = dir.0.join("ran.txt");
+    dir.write(
+        "all.target",
+        "[Unit]\nType=target\nRequires=worker.service\n",
+    );
+    dir.write(
+        "worker.service",
+        &format!(
+            "[Service]\nType=oneshot\nCgroupMemoryMax=32M\n\
+             ExecStart=/bin/sh -c \"echo RAN > {}\"\n",
+            probe.display()
+        ),
+    );
+    // The controller is available, but the attribute is not: exactly what a
+    // failed write looks like from the caller's side.
+    let cg = FakeCgroup::new("fail-closed", "cpu memory pids\n");
+    cg.unit("worker.service", "cpu memory pids\n", &[]);
+
+    let log = boot_units_extra(
+        &dir,
+        "all.target",
+        SETTLE,
+        libc::SIGTERM,
+        &["--cgroup-root", cg.path()],
+    );
+
+    assert!(
+        log.contains("cannot start"),
+        "the failed start must be reported:\n{log}"
+    );
+    assert!(
+        log.contains("cpu.max") || log.contains("memory.max"),
+        "the failing attribute must be named:\n{log}"
+    );
+    assert!(
+        !probe.exists(),
+        "a service whose limits could not be applied must not run at all"
+    );
+    assert!(
+        log.contains("boot complete"),
+        "a failed limit write must not abort the rest of the boot:\n{log}"
     );
 }

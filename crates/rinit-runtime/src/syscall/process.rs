@@ -1,8 +1,9 @@
 //! Process creation and signalling (plan §2.3).
 //!
 //! M0 uses `posix_spawn` for the hardcoded test service. The controlled
-//! `fork`+`exec` path (for `User=`, capabilities, etc.) arrives in M5 and must
-//! obey the single-threaded-fork constraint documented in plan §2.1⑤.
+//! `fork`+`exec` path (for `User=`, capabilities, `WorkingDirectory=` and
+//! cgroup limits) arrives in M5 and must obey the single-threaded-fork
+//! constraint documented in plan §2.1⑤.
 
 use std::ffi::{CStr, CString};
 use std::os::fd::AsRawFd;
@@ -251,19 +252,25 @@ fn fail_file_actions(
     Err(SyscallError::new(op, rc))
 }
 
-/// Spawn `path` with a privilege drop applied between `fork` and `exec`
-/// (plan §7.4).
+/// Spawn `path` with a cgroup join and a privilege drop applied between `fork`
+/// and `exec` (plan §7.3, §7.4).
 ///
 /// `posix_spawn` cannot express this, and that is the whole reason the plan
 /// routes any unit that needs it through a controlled `fork`+`exec` (§2.3):
-/// there is no way to run `setuid`, `setgroups` or `prctl` in the child, after
-/// the `fork` and before the `exec`, through the `posix_spawn` interface.
+/// there is no way to run `setuid`, `setgroups`, `prctl` or a write to the
+/// unit's `cgroup.procs` in the child, after the `fork` and before the `exec`,
+/// through the `posix_spawn` interface.
+///
+/// `cgroup_procs` is the path of the unit's `cgroup.procs` (`None` for a unit
+/// with no limits), and the child joins it *before* the identity steps below -
+/// see [`cgroup::join_from_child`] for why the child is the side that writes it.
 ///
 /// rinit is single-threaded by design (plan §2.1⑤), so the child inherits no
 /// other thread's locks; it still calls only `libc` and allocates nothing,
 /// because between `fork` and `exec` nothing else is safe to assume. Everything
-/// the child needs - the argument vectors, the working directory, the sandbox -
-/// is built in the parent and lives in the address space the child is sharing.
+/// the child needs - the argument vectors, the working directory, the sandbox,
+/// the cgroup path - is built in the parent and lives in the address space the
+/// child is sharing.
 ///
 /// A step that fails in the child is reported back over a close-on-exec pipe,
 /// so the caller gets a [`SyscallError`] naming the step (`setuid failed:
@@ -273,8 +280,9 @@ fn fail_file_actions(
 ///
 /// # Errors
 /// `fork` itself failing; a `setsid`/`dup2`/`chdir` failure in the child; a
-/// sandbox step failing in the child; `execve` failing (e.g. `ENOENT` for a
-/// command that does not exist, which plan §1.1 contracts as a start failure).
+/// cgroup join or sandbox step failing in the child; `execve` failing (e.g.
+/// `ENOENT` for a command that does not exist, which plan §1.1 contracts as a
+/// start failure).
 pub fn spawn_sandboxed(
     path: &CStr,
     argv: &[CString],
@@ -282,6 +290,7 @@ pub fn spawn_sandboxed(
     options: SpawnOptions,
     working_directory: Option<&CStr>,
     sandbox: &Sandbox,
+    cgroup_procs: Option<&CStr>,
 ) -> Result<libc::pid_t, SyscallError> {
     let setup = ChildSetup {
         path,
@@ -290,6 +299,7 @@ pub fn spawn_sandboxed(
         options,
         working_directory,
         sandbox,
+        cgroup_procs,
     };
 
     // Close-on-exec, which is what makes "empty read" mean "the child exec'd":
@@ -341,6 +351,9 @@ struct ChildSetup<'a> {
     options: SpawnOptions,
     working_directory: Option<&'a CStr>,
     sandbox: &'a Sandbox,
+    /// The unit's `cgroup.procs`, when the unit asked for cgroup limits
+    /// (plan §7.3).
+    cgroup_procs: Option<&'a CStr>,
 }
 
 /// The work of a child created by [`spawn_sandboxed`], which never returns.
@@ -379,6 +392,20 @@ fn child_exec(setup: &ChildSetup<'_>, report_read: libc::c_int, report_write: li
         // SAFETY: `directory` is a valid, NUL-terminated path.
         if unsafe { libc::chdir(directory.as_ptr()) } < 0 {
             die(report_write, ChildStep::Chdir);
+        }
+    }
+
+    // Plan §7.3: join the unit's cgroup first, and before the identity steps
+    // below in particular - `cgroup.procs` is root-owned, so a child that had
+    // already become the service's user could no longer write it. Doing it here
+    // is also what makes the placement exact: nothing the service does (and
+    // nothing it forks) can happen before this, since the child does not reach
+    // `execve` until this returns.
+    if let Some(procs) = setup.cgroup_procs {
+        // SAFETY: `getpid` takes no arguments and never fails.
+        let pid = unsafe { libc::getpid() };
+        if let Err(errno) = crate::syscall::cgroup::join_from_child(procs, pid) {
+            die_reporting(report_write, ChildStep::JoinCgroup, errno);
         }
     }
 
@@ -533,6 +560,9 @@ enum ChildStep {
     SetInheritable = 9,
     SetBoundingSet = 10,
     RaiseAmbient = 11,
+    /// Plan §7.3's placement step: the child writes its own pid into the unit's
+    /// `cgroup.procs`.
+    JoinCgroup = 12,
 }
 
 impl ChildStep {
@@ -551,6 +581,7 @@ impl ChildStep {
             ChildStep::SetInheritable => "capset",
             ChildStep::SetBoundingSet => "prctl(PR_CAPBSET_DROP)",
             ChildStep::RaiseAmbient => "prctl(PR_CAP_AMBIENT)",
+            ChildStep::JoinCgroup => "cgroup.procs",
         }
     }
 
@@ -584,6 +615,7 @@ impl ChildStep {
             9 => ChildStep::SetInheritable,
             10 => ChildStep::SetBoundingSet,
             11 => ChildStep::RaiseAmbient,
+            12 => ChildStep::JoinCgroup,
             _ => ChildStep::Exec,
         }
     }

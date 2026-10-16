@@ -120,6 +120,82 @@ pub fn processes(dir: &Path) -> Result<Vec<libc::pid_t>, SyscallError> {
         .collect())
 }
 
+/// How many bytes a pid needs as decimal text (`i32::MIN` is 11 characters).
+const PID_TEXT_MAX: usize = 11;
+
+/// Put *this* process into the cgroup whose `cgroup.procs` is `procs`.
+///
+/// This is [`place_process`] from the other side, and it exists because of when
+/// it runs: in the child, between `fork` and `exec` (plan §7.3's "fork first,
+/// place the pid, and only then drop privileges"). The child is the process
+/// that has to do it, because after the `setuid` in plan §7.4 it no longer owns
+/// anything in `/sys/fs/cgroup` and could not write this file - and doing it
+/// here is what closes the window a parent-side write cannot: the parent only
+/// learns the spawn succeeded once the child has `exec`'d, by which time the
+/// service could already have forked something that escaped the limits.
+///
+/// It is deliberately not `place_process`: a process that exists only between
+/// `fork` and `exec` must not allocate, and `std::fs` builds a `PathBuf`, an
+/// `io::Error` and a formatted `String` on the way. This is one `open`, one
+/// `write` and one `close`, with the pid rendered into a stack buffer.
+///
+/// # Errors
+/// The raw errno, which the caller reports to the parent the same way it
+/// reports a failed `setuid`.
+pub fn join_from_child(procs: &std::ffi::CStr, pid: libc::pid_t) -> Result<(), i32> {
+    let mut text = [0u8; PID_TEXT_MAX];
+    let len = decimal(pid, &mut text);
+
+    // SAFETY: `procs` is a valid NUL-terminated path, and `O_WRONLY` with no
+    // `O_CREAT` opens the attribute the parent created (see the module docs).
+    let fd = unsafe { libc::open(procs.as_ptr(), libc::O_WRONLY) };
+    if fd < 0 {
+        return Err(last_errno());
+    }
+    // SAFETY: `fd` is open for writing and `text[..len]` is initialised.
+    let written = unsafe { libc::write(fd, text.as_ptr().cast(), len) };
+    let mut errno = if written < 0 { last_errno() } else { 0 };
+    if errno == 0 && written as usize != len {
+        // A partial write would place a different pid.
+        errno = libc::EIO;
+    }
+    // SAFETY: `fd` was opened above and is not used again; without this the
+    // service would inherit an open descriptor to its own `cgroup.procs`.
+    unsafe { libc::close(fd) };
+
+    if errno == 0 { Ok(()) } else { Err(errno) }
+}
+
+/// Render `pid` as decimal text into the front of `buf`, returning its length.
+///
+/// Hand-rolled because the caller cannot allocate; `snprintf` would work but
+/// drags locale machinery into a process that must stay predictable between
+/// `fork` and `exec`. The digits are written from the back of the buffer
+/// forwards, which needs no index arithmetic and cannot run out: a `pid_t` is at
+/// most ten digits, and `buf` holds eleven.
+fn decimal(pid: libc::pid_t, buf: &mut [u8; PID_TEXT_MAX]) -> usize {
+    let mut value = u64::from(pid.unsigned_abs());
+    let mut written = 0usize;
+    for slot in buf.iter_mut().rev() {
+        *slot = b'0' + (value % 10) as u8;
+        value /= 10;
+        written += 1;
+        if value == 0 {
+            break;
+        }
+    }
+    let start = buf.len() - written;
+    buf.copy_within(start.., 0);
+    written
+}
+
+/// The current `errno`, defaulting to `EIO` if the platform reports none.
+fn last_errno() -> i32 {
+    std::io::Error::last_os_error()
+        .raw_os_error()
+        .unwrap_or(libc::EIO)
+}
+
 /// Whether `dir` still has members, from `cgroup.events`.
 ///
 /// # Errors
@@ -386,5 +462,58 @@ mod tests {
             full.exists(),
             "the directory is kept, as plan §7.3 requires"
         );
+    }
+
+    /// The two halves of placement, end to end: the child writes its own pid
+    /// (`join_from_child`), and the list the parent reads sees it. This is
+    /// plan §7.3's "把 fork 出的 PID 写入 cgroup.procs", with the writing done
+    /// from the side that still owns the file.
+    #[test]
+    fn joining_from_the_child_writes_our_pid() {
+        let scratch = Scratch::new("join");
+        let dir = scratch.subdir("rinit");
+        std::fs::write(dir.join(PROCS), "").unwrap();
+        let procs = std::ffi::CString::new(dir.join(PROCS).to_str().unwrap()).unwrap();
+
+        // SAFETY: `getpid` takes no arguments and never fails.
+        let pid = unsafe { libc::getpid() };
+        join_from_child(&procs, pid).expect("join");
+        assert_eq!(processes(&dir).unwrap(), vec![pid]);
+    }
+
+    /// A failed join must come back as the real errno: a service that silently
+    /// did not join would run unbounded while its unit file says otherwise.
+    #[test]
+    fn joining_from_the_child_reports_a_missing_attribute() {
+        let scratch = Scratch::new("join-missing");
+        let procs = scratch.path().join("rinit/x.service").join(PROCS);
+        let procs = std::ffi::CString::new(procs.to_str().unwrap()).unwrap();
+
+        assert_eq!(
+            join_from_child(&procs, 1).expect_err("must fail"),
+            libc::ENOENT
+        );
+    }
+
+    /// The rendering has to be plain decimal with no sign, padding or newline,
+    /// since the kernel parses this file as a number.
+    #[test]
+    fn pids_render_as_plain_decimal() {
+        for (pid, expected) in [
+            (0i32, "0"),
+            (1, "1"),
+            (9, "9"),
+            (10, "10"),
+            (4321, "4321"),
+            (i32::MAX, "2147483647"),
+        ] {
+            let mut buf = [0u8; PID_TEXT_MAX];
+            let len = decimal(pid, &mut buf);
+            assert_eq!(
+                std::str::from_utf8(&buf[..len]).unwrap(),
+                expected,
+                "pid {pid}"
+            );
+        }
     }
 }

@@ -363,6 +363,7 @@ fn run_captured(
         process::SpawnOptions::default().with_stdio(write_end.as_raw_fd()),
         directory.as_deref(),
         sandbox,
+        None,
     )
     .expect("sandboxed spawn");
 
@@ -473,6 +474,7 @@ fn a_missing_working_directory_fails_the_spawn_closed() {
         process::SpawnOptions::default(),
         Some(c"/rinit-there-is-no-such-directory"),
         &Sandbox::inherit(),
+        None,
     )
     .expect_err("a missing WorkingDirectory must not spawn");
     assert_eq!(err.op(), "chdir");
@@ -497,6 +499,7 @@ fn a_missing_command_is_reported_as_execve_enoent() {
         process::SpawnOptions::default(),
         None,
         &Sandbox::inherit(),
+        None,
     )
     .expect_err("a missing command must not spawn");
     assert_eq!(err.op(), "execve");
@@ -530,6 +533,7 @@ fn a_step_that_cannot_be_applied_fails_the_spawn_closed() {
             groups: Some(Vec::new()),
             ..Sandbox::inherit()
         },
+        None,
     )
     .expect_err("an unprivileged rinit cannot set the group list");
     assert_eq!(err.op(), "setgroups");

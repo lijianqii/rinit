@@ -6,6 +6,8 @@
 //! [`ServiceSet`] is the only thing that knows about PIDs.
 
 use std::ffi::CString;
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 
 use rinit_core::unit::sandbox::Sandbox;
 use rinit_runtime::RuntimeError;
@@ -75,7 +77,9 @@ impl ServiceSet {
 /// A sandbox that asks for nothing stays on `posix_spawn`, which is the cheaper
 /// path and the common case; one that asks for anything gets the controlled
 /// `fork`+`exec` of plan §2.3, since `posix_spawn` has no seam for those steps
-/// (see [`process::spawn_sandboxed`]).
+/// (see [`process::spawn_sandboxed`]). A unit with cgroup limits takes the same
+/// path for the same reason, and `cgroup_procs` is its placement target
+/// (plan §7.3).
 ///
 /// # Errors
 /// `argv` must be non-empty and contain no interior NUL bytes, and the spawn
@@ -86,6 +90,7 @@ pub fn spawn_service_in_group(
     working_directory: Option<&str>,
     output: Option<libc::c_int>,
     sandbox: &Sandbox,
+    cgroup_procs: Option<&Path>,
 ) -> Result<libc::pid_t, RuntimeError> {
     let Prepared { argv, envp, cwd } = prepare(argv, env, working_directory)?;
     let Some(path) = argv.first().map(CString::as_c_str) else {
@@ -100,13 +105,34 @@ pub fn spawn_service_in_group(
     if let Some(fd) = output {
         options = options.with_stdio(fd);
     }
-    if sandbox.is_inherited() {
+    let procs = cgroup_procs.map(cpath).transpose()?;
+    if sandbox.is_inherited() && procs.is_none() {
         process::posix_spawn_full(path, &argv, &envp, options, cwd.as_deref())
             .map_err(RuntimeError::from)
     } else {
-        process::spawn_sandboxed(path, &argv, &envp, options, cwd.as_deref(), sandbox)
-            .map_err(RuntimeError::from)
+        process::spawn_sandboxed(
+            path,
+            &argv,
+            &envp,
+            options,
+            cwd.as_deref(),
+            sandbox,
+            procs.as_deref(),
+        )
+        .map_err(RuntimeError::from)
     }
+}
+
+/// Turn a path into the C form the child needs.
+///
+/// The path is the one rinit built out of the cgroup root and the unit name,
+/// so an interior NUL means the root was passed with one - reported rather than
+/// panicked on, since a panic in PID 1 is a reboot loop.
+fn cpath(path: &Path) -> Result<CString, RuntimeError> {
+    CString::new(path.as_os_str().as_bytes()).map_err(|_| RuntimeError::Io {
+        op: "cgroup.procs path",
+        source: std::io::Error::new(std::io::ErrorKind::InvalidInput, "interior NUL byte"),
+    })
 }
 
 /// Launch `argv` with [`SERVICE_ENV`] in rinit's own process group.

@@ -76,6 +76,11 @@ pub async fn run(cfg: Config) -> Result<(), RuntimeError> {
         report_mounts().await?;
     }
 
+    // Plan §7.3: the hierarchy is brought up once, here, before any unit can
+    // start - and after the mount that provides it. An unusable hierarchy is a
+    // warning inside `prepare`, never a reason not to boot.
+    let cgroup = crate::cgroup::prepare(cfg.skip_mounts, cfg.cgroup_root.clone());
+
     // Install signal handlers BEFORE starting anything so no SIGCHLD is lost,
     // and make the ignore set explicit (plan §7.1).
     for &signal in IGNORED_SIGNALS {
@@ -91,7 +96,7 @@ pub async fn run(cfg: Config) -> Result<(), RuntimeError> {
         let mut notify = NotifyHub::new();
         // One shared log ring for the whole boot (plan §1.3(7)).
         let logs = ServiceLogs::new();
-        let mut manager = start_units(&cfg, &mut notify, &logs).await?;
+        let mut manager = start_units(&cfg, &mut notify, &logs, cgroup).await?;
         // The control socket is bound after the mounts, so `/run` exists
         // (plan §1.3(10)); a failure to bind it is only a warning.
         let mut control = ControlServer::bind(cfg.skip_mounts);
@@ -419,7 +424,10 @@ async fn run_aux_command(
         }
     };
 
-    let pid = match spawn_service_in_group(&argv, &env, Some(&cwd), None, &sandbox) {
+    // An `ExecStartPre=`/`ExecStartPost=` command runs outside the unit's
+    // cgroup: preparation is not the service, and these run before the cgroup
+    // is arranged (or while the service itself already fills it).
+    let pid = match spawn_service_in_group(&argv, &env, Some(&cwd), None, &sandbox, None) {
         Ok(pid) => pid,
         Err(e) => {
             rlog!("error: {unit}: cannot start '{}': {e}", argv.join(" "));
@@ -779,9 +787,12 @@ async fn start_units(
     cfg: &Config,
     notify: &mut NotifyHub,
     logs: &ServiceLogs,
+    cgroup: crate::cgroup::Cgroup,
 ) -> Result<UnitManager, RuntimeError> {
     let plan = manager::announce_plan(&cfg.unit_dir, &cfg.default_target)?;
     let mut units = UnitManager::new();
+    // Before any unit starts: limits must be in place from the first fork.
+    units.set_cgroup(cgroup);
     for cfg in &plan.configs {
         units.add(cfg.clone());
     }

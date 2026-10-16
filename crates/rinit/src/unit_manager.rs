@@ -11,6 +11,7 @@
 //! covered by the 200 tests there, while this file is the thin layer that acts
 //! on their answers.
 
+use rinit_core::unit::cgroup::CgroupLimits;
 use rinit_core::unit::config::{RestartPolicy, ServiceKind};
 use rinit_core::unit::dependency::spawns_process;
 use rinit_core::unit::restart::BackoffState;
@@ -22,6 +23,7 @@ use std::time::{Duration, Instant};
 use rinit_runtime::RuntimeError;
 use rinit_runtime::syscall::{process, wait};
 
+use crate::cgroup::Cgroup;
 use crate::log::rlog;
 use crate::service::spawn_service_in_group;
 
@@ -251,6 +253,9 @@ pub struct UnitManager {
     shutdown_order: Vec<UnitName>,
     /// Monotonic origin for the Job queue's timestamps.
     origin: Instant,
+    /// Where units' cgroup limits are applied (plan §7.3); disabled unless the
+    /// boot sequence brought a hierarchy up.
+    cgroup: Cgroup,
 }
 
 impl UnitManager {
@@ -262,7 +267,17 @@ impl UnitManager {
             queued_starts: BTreeSet::new(),
             shutdown_order: Vec::new(),
             origin: Instant::now(),
+            cgroup: Cgroup::disabled(),
         }
+    }
+
+    /// Give the manager the cgroup side of the boot (plan §7.3).
+    ///
+    /// Separate from [`new`](Self::new) so a manager without one - every unit
+    /// test that does not care about limits - behaves exactly as it did before
+    /// cgroups existed, rather than reaching for the host's own hierarchy.
+    pub fn set_cgroup(&mut self, cgroup: Cgroup) {
+        self.cgroup = cgroup;
     }
 
     /// Milliseconds since the manager was created.
@@ -659,7 +674,7 @@ impl UnitManager {
 
         // Everything the spawn needs, read through an immutable borrow so the
         // `EnvironmentFile=` read below cannot race the state update.
-        let (argv, env, cwd, kind, sandbox) = {
+        let (argv, env, cwd, kind, sandbox, limits) = {
             let Some(rt) = self.units.get(unit) else {
                 return Ok(());
             };
@@ -683,11 +698,39 @@ impl UnitManager {
                 // forked: running the service as root instead would be the one
                 // outcome worse than not starting it.
                 crate::sandbox::resolve(&rt.config)?,
+                // The cgroup limits the unit asked for (plan §7.3).
+                CgroupLimits::from_config(&rt.config),
             )
         };
 
+        // Plan §7.3: the cgroup and its limits are in place *before* the fork,
+        // so the service is bounded from its first instruction rather than some
+        // time after it started working. Only a failed limit write fails the
+        // start; an unusable hierarchy degrades to a warning inside `setup`.
+        let cgroup_procs = if self.cgroup.is_enabled() && !limits.is_empty() {
+            match self.cgroup.setup(unit, &limits) {
+                Ok(procs) => procs,
+                Err(e) => {
+                    // Nothing was spawned, so nothing can be in the cgroup: take
+                    // the half-configured directory back down rather than leave
+                    // it for a unit that never started.
+                    self.cgroup.cleanup(unit);
+                    return Err(e);
+                }
+            }
+        } else {
+            None
+        };
+
         // A fresh process group, so a stop reaches the whole tree (plan §1.3(6)).
-        let pid = spawn_service_in_group(&argv, &env, Some(&cwd), output, &sandbox)?;
+        let pid = spawn_service_in_group(
+            &argv,
+            &env,
+            Some(&cwd),
+            output,
+            &sandbox,
+            cgroup_procs.as_deref(),
+        )?;
 
         let Some(rt) = self.units.get_mut(unit) else {
             return Ok(());
@@ -799,6 +842,11 @@ impl UnitManager {
                 if let Some(stop_pid) = rt.exec_stop_pid.take() {
                     let _ = process::kill_process_group(stop_pid, libc::SIGKILL);
                 }
+                // Plan §7.3's second stage: whatever the group signal missed,
+                // the cgroup still names, and this is the point where it is no
+                // longer asked politely. Sent before the group kill so a
+                // daemonized straggler is reached in the same pass.
+                self.cgroup.signal_members(name, libc::SIGKILL);
                 if let Some(pid) = rt.pid {
                     match process::kill_process_group(pid, libc::SIGKILL) {
                         Ok(()) => due.push(name.clone()),
@@ -870,7 +918,12 @@ impl UnitManager {
                     continue;
                 }
             };
-            match spawn_service_in_group(&argv, &env, Some(&cwd), None, &sandbox) {
+            // A probe runs *outside* the unit's cgroup, so `cgroup_procs` is
+            // `None`. It is a separate process whose pid rinit tracks itself
+            // (`probe_pid`), and having it join would keep the unit's cgroup
+            // populated across the probe - which is exactly the state plan §7.3
+            // reads as "still running, do not remove this directory".
+            match spawn_service_in_group(&argv, &env, Some(&cwd), None, &sandbox, None) {
                 Ok(pid) => {
                     rt.probe_pid = Some(pid);
                     rt.probe_deadline = deadline(rt.config.health_timeout_sec);
@@ -983,6 +1036,10 @@ impl UnitManager {
                     // here twice.
                     rt.state = UnitState::Inactive;
                     rt.pid = None;
+                    // Its exit will not come back through `on_child_exit` (the
+                    // pid is cleared here), so this is the last chance to take
+                    // its cgroup down.
+                    self.cgroup.cleanup(unit);
                 }
                 Err(e) => {
                     rlog!("warning: SIGTERM to {unit} failed: {e}");
@@ -1005,6 +1062,13 @@ impl UnitManager {
     /// `0`) and [`due_kills`](Self::due_kills) fires it. Without that, a service
     /// that ignores the stop would never be killed.
     pub fn stop_unit(&mut self, unit: &UnitName) {
+        // Plan §7.3's stop flow starts here: `SIGTERM` to every pid in the
+        // unit's cgroup, not only to its process group. A service that called
+        // `setsid` itself is out of the group but still in the cgroup, and the
+        // process-group signal below would miss it. Safe to do before the state
+        // update: signalling cannot reorder the manager's own bookkeeping.
+        self.cgroup.signal_members(unit, libc::SIGTERM);
+
         let Some(rt) = self.units.get_mut(unit) else {
             return;
         };
@@ -1027,6 +1091,10 @@ impl UnitManager {
             // both land straight in Inactive (plan §1.3(3) skips Deactivating
             // when there is nothing to signal).
             rt.state = UnitState::Inactive;
+            // Plan §7.3's cleanup. There is no process left to have put anything
+            // in the cgroup, but a stray process from an earlier stop can be
+            // there, and `cleanup` keeps the directory if so.
+            self.cgroup.cleanup(unit);
             return;
         };
 
@@ -1045,6 +1113,7 @@ impl UnitManager {
                     // been consumed.
                     rt.pid = None;
                     rt.state = UnitState::Inactive;
+                    self.cgroup.cleanup(unit);
                 }
                 Err(e) => rlog!("warning: SIGTERM to {unit} failed: {e}"),
             }
@@ -1055,7 +1124,13 @@ impl UnitManager {
             // cannot be resolved, this falls back to the signal below like any
             // other ExecStop that cannot start.
             let started = match crate::sandbox::resolve(&rt.config) {
-                Ok(sandbox) => spawn_service_in_group(&stop_cmd, &env, Some(&cwd), None, &sandbox),
+                // `cgroup_procs` is `None` for the same reason as a health
+                // probe: a stop command joining the unit's cgroup would make the
+                // directory look populated for as long as it runs, and plan
+                // §7.3 reads a populated directory as a reason to keep it.
+                Ok(sandbox) => {
+                    spawn_service_in_group(&stop_cmd, &env, Some(&cwd), None, &sandbox, None)
+                }
                 Err(e) => Err(e),
             };
             match started {
@@ -1077,6 +1152,7 @@ impl UnitManager {
                         Err(e) if e.errno() == libc::ESRCH => {
                             rt.pid = None;
                             rt.state = UnitState::Inactive;
+                            self.cgroup.cleanup(unit);
                         }
                         Err(e) => rlog!("warning: SIGTERM to {unit} failed: {e}"),
                     }
@@ -1143,6 +1219,9 @@ impl UnitManager {
                 return Some(self.schedule_restart(&unit, now));
             }
             rt.state = UnitState::Inactive;
+            // The stop is complete, so plan §7.3's cleanup runs now: an empty
+            // directory goes, one that still holds a stray process is kept.
+            self.cgroup.cleanup(&unit);
             return Some(Outcome::Exited {
                 unit,
                 state: UnitState::Inactive,
@@ -1173,6 +1252,7 @@ impl UnitManager {
                 // twice. Land on Inactive rather than guessing a state the
                 // unit could never legitimately reach.
                 rt.state = UnitState::Inactive;
+                self.cgroup.cleanup(&unit);
                 return Some(Outcome::Exited {
                     unit,
                     state: UnitState::Inactive,
@@ -1184,6 +1264,8 @@ impl UnitManager {
         // already moved it to Active(Exited).
         if starting && oneshot && matches!(outcome, ExitOutcome::Success) {
             rlog!("{unit} completed (Active(Exited))");
+            // A completed oneshot is done, so its cgroup has no reason to stay.
+            self.cgroup.cleanup(&unit);
             return Some(Outcome::Exited {
                 unit,
                 state: UnitState::ActiveExited,
@@ -1192,6 +1274,8 @@ impl UnitManager {
 
         if !rt.policy().wants_restart(outcome) {
             let state = rt.state;
+            // No restart is coming, so this is where the unit came to rest.
+            self.cgroup.cleanup(&unit);
             return Some(Outcome::Exited { unit, state });
         }
         Some(self.schedule_restart(&unit, now))
