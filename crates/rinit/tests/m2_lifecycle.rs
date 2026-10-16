@@ -756,3 +756,70 @@ fn a_drop_that_cannot_be_applied_fails_the_unit_closed() {
         "a failed drop must not abort the rest of the boot:\n{log}"
     );
 }
+
+/// A capability name this build does not know fails the unit, like an unknown
+/// `User=` does: a service that quietly lost the capability its unit file asked
+/// it to keep would fail much later, at `bind()` or worse.
+#[test]
+fn a_unit_with_an_unknown_capability_is_failed_rather_than_started() {
+    let dir = TempDir::new("bad-cap");
+    let probe = dir.0.join("ran.txt");
+    dir.write("all.target", "[Unit]\nType=target\nRequires=bad.service\n");
+    dir.write(
+        "bad.service",
+        &format!(
+            "[Service]\nType=oneshot\nCapabilityBoundingSet=RINIT_NO_SUCH_CAPABILITY\n\
+             ExecStart=/bin/sh -c \"echo RAN > {}\"\n",
+            probe.display()
+        ),
+    );
+
+    let log = boot_units(&dir, "all.target", SETTLE);
+
+    assert!(
+        log.contains("CapabilityBoundingSet= failed"),
+        "the failure must name the directive that could not be resolved:\n{log}"
+    );
+    assert!(
+        !probe.exists(),
+        "a service with an unresolvable capability must not run"
+    );
+}
+
+/// The same fail-closed rule for the capability steps themselves. `--dev` runs
+/// rinit unprivileged, so dropping the bounding set is refused (`CAP_SETPCAP`);
+/// the unit must stop there rather than carry on with the capabilities it was
+/// asked to give up. The guest, where rinit is root, proves the other outcome.
+#[test]
+fn a_capability_drop_that_cannot_be_applied_fails_the_unit_closed() {
+    if unsafe { libc::geteuid() } == 0 {
+        // As root there is nothing to refuse; the guest covers the success path.
+        return;
+    }
+    let dir = TempDir::new("cannot-drop-caps");
+    let probe = dir.0.join("ran.txt");
+    dir.write("all.target", "[Unit]\nType=target\nRequires=caps.service\n");
+    dir.write(
+        "caps.service",
+        &format!(
+            "[Service]\nType=oneshot\nCapabilityBoundingSet=\n\
+             ExecStart=/bin/sh -c \"echo RAN > {}\"\n",
+            probe.display()
+        ),
+    );
+
+    let log = boot_units(&dir, "all.target", SETTLE);
+
+    assert!(
+        log.contains("prctl(PR_CAPBSET_DROP) failed"),
+        "the failing step must be named:\n{log}"
+    );
+    assert!(
+        !probe.exists(),
+        "a service that could not drop its capabilities must not run at all"
+    );
+    assert!(
+        log.contains("boot complete"),
+        "a failed capability drop must not abort the rest of the boot:\n{log}"
+    );
+}

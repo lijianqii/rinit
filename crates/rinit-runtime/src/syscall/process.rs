@@ -387,11 +387,25 @@ fn child_exec(setup: &ChildSetup<'_>, report_read: libc::c_int, report_write: li
     for step in setup.sandbox.steps() {
         let outcome = match step {
             SandboxStep::NoNewPrivileges => cred::set_no_new_privs(),
+            SandboxStep::KeepCapabilities => cred::keep_capabilities(),
+            // `steps` only emits these when the field behind them is `Some`, and
+            // the fallback is the strict reading on purpose: a capability
+            // request that somehow went missing drops capabilities rather than
+            // keeping them.
+            SandboxStep::SetInheritable => {
+                cred::set_inheritable(setup.sandbox.ambient.as_deref().unwrap_or(&[]))
+            }
+            SandboxStep::SetBoundingSet => {
+                cred::set_bounding_set(setup.sandbox.bounding_set.as_deref().unwrap_or(&[]))
+            }
             SandboxStep::SetGroup => cred::set_gid(setup.sandbox.gid),
             SandboxStep::SetGroups => {
                 cred::set_groups(setup.sandbox.groups.as_deref().unwrap_or(&[]))
             }
             SandboxStep::SetUser => cred::set_uid(setup.sandbox.uid),
+            SandboxStep::RaiseAmbient => {
+                cred::set_ambient(setup.sandbox.ambient.as_deref().unwrap_or(&[]))
+            }
         };
         if let Err(err) = outcome {
             die_reporting_step(report_write, step, err.errno());
@@ -515,6 +529,10 @@ enum ChildStep {
     SetGroup = 5,
     SetGroups = 6,
     SetUser = 7,
+    KeepCapabilities = 8,
+    SetInheritable = 9,
+    SetBoundingSet = 10,
+    RaiseAmbient = 11,
 }
 
 impl ChildStep {
@@ -529,6 +547,10 @@ impl ChildStep {
             ChildStep::SetGroup => "setgid",
             ChildStep::SetGroups => "setgroups",
             ChildStep::SetUser => "setuid",
+            ChildStep::KeepCapabilities => "prctl(PR_SET_KEEPCAPS)",
+            ChildStep::SetInheritable => "capset",
+            ChildStep::SetBoundingSet => "prctl(PR_CAPBSET_DROP)",
+            ChildStep::RaiseAmbient => "prctl(PR_CAP_AMBIENT)",
         }
     }
 
@@ -536,9 +558,13 @@ impl ChildStep {
     const fn from_step(step: SandboxStep) -> Self {
         match step {
             SandboxStep::NoNewPrivileges => ChildStep::NoNewPrivileges,
+            SandboxStep::KeepCapabilities => ChildStep::KeepCapabilities,
+            SandboxStep::SetInheritable => ChildStep::SetInheritable,
+            SandboxStep::SetBoundingSet => ChildStep::SetBoundingSet,
             SandboxStep::SetGroup => ChildStep::SetGroup,
             SandboxStep::SetGroups => ChildStep::SetGroups,
             SandboxStep::SetUser => ChildStep::SetUser,
+            SandboxStep::RaiseAmbient => ChildStep::RaiseAmbient,
         }
     }
 
@@ -554,6 +580,10 @@ impl ChildStep {
             5 => ChildStep::SetGroup,
             6 => ChildStep::SetGroups,
             7 => ChildStep::SetUser,
+            8 => ChildStep::KeepCapabilities,
+            9 => ChildStep::SetInheritable,
+            10 => ChildStep::SetBoundingSet,
+            11 => ChildStep::RaiseAmbient,
             _ => ChildStep::Exec,
         }
     }

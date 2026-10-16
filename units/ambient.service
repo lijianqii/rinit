@@ -1,0 +1,33 @@
+# Ambient capability acceptance unit (plan §7.4).
+#
+# The §7.4 example in one unit: drop to `nobody`, keep exactly one capability,
+# and deny privilege escalation - the least-privilege shape the section is for.
+#
+# It is the case the bounding set alone cannot express. A non-root process gets
+# no capabilities at `exec` unless they are *ambient*: the kernel clears
+# permitted first thing (`get_file_caps`) and rebuilds it from file
+# capabilities, the ambient set, and - for root - the bounding set. So the only
+# way `nobody` ends up able to `bind()` a privileged port is an ambient
+# capability, which is why `NET_BIND_SERVICE` is expected in `amb`, `eff` and
+# `bnd` alike: `bnd` from `CapabilityBoundingSet=` (what it may ever hold), the
+# other two raised by `AmbientCapabilities=`.
+#
+# `NoNewPrivileges=true` is part of the same shape and is checked here too: it
+# denies escalation to children without taking away what the service was
+# explicitly granted. Note that it also forbids every other path to privilege -
+# a unit that needs a setuid helper cannot ask for this.
+#
+# Note `bin/cut`: the applet is at /usr/bin/cut in the initramfs, which is on
+# the `PATH` rinit gives a service, and `cut -f2` splits the tab that
+# `/proc/self/status` uses between the field name and its value.
+[Unit]
+Description=Ambient capability demo (started on demand)
+
+[Service]
+Type=oneshot
+User=nobody
+Group=nogroup
+NoNewPrivileges=true
+CapabilityBoundingSet=NET_BIND_SERVICE
+AmbientCapabilities=NET_BIND_SERVICE
+ExecStart=/bin/sh -c "echo uid=$(id -u) amb=$(grep ^CapAmb /proc/self/status | cut -f2) eff=$(grep ^CapEff /proc/self/status | cut -f2) bnd=$(grep ^CapBnd /proc/self/status | cut -f2)"

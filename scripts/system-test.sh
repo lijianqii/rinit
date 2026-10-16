@@ -165,6 +165,20 @@ await_log() {
     printf 'rctl log priv.service\n' >&3
     await_log 10 'uid=65534 gid=65534 nnp=1' || true
 
+    # M5 §7.4: capabilities. `caps.service` stays root and empties its bounding
+    # set; `ambient.service` runs as nobody and keeps exactly NET_BIND_SERVICE.
+    # Both print the masks from their own /proc/self/status, so what is asserted
+    # is the kernel's view of the service, not what rinit meant to do.
+    printf 'rctl start caps.service\n' >&3
+    await_log 10 'started caps.service' || true
+    printf 'rctl start ambient.service\n' >&3
+    await_log 10 'started ambient.service' || true
+    sleep 1
+    printf 'rctl log caps.service\n' >&3
+    await_log 10 'bnd=0000000000000000' || true
+    printf 'rctl log ambient.service\n' >&3
+    await_log 10 'amb=0000000000000400' || true
+
     # M2: kill the console service and let rinit bring it back. `login` execs
     # the shell, so `$$` *is* the getty process tree; killing it makes rinit
     # reap the exit and, because getty is `Restart=always`, start it again -
@@ -292,6 +306,21 @@ expect "rctl reset-failed cleared the failed unit" "fault.service: cleared"
 # this is the case the host cannot test at all.
 expect "a de-privileged service ran as nobody:nogroup with NoNewPrivs" \
     "uid=65534 gid=65534 nnp=1"
+
+# M5 §7.4 acceptance: capabilities. This is the strictest setting in the plan
+# (an empty `CapabilityBoundingSet=`) on the hardest subject: a service that is
+# still **root**. A root process is normally handed every capability at `exec` -
+# the kernel builds that set as `bset | inheritable` - so `eff=0` here is only
+# possible because rinit dropped the bounding set before the exec.
+expect "an empty CapabilityBoundingSet left a root service with no capabilities" \
+    "uid=0 bnd=0000000000000000 eff=0000000000000000"
+
+# The other half of the capability story: the one capability asked for is the
+# one present, in all three sets. NET_BIND_SERVICE is bit 10, so 0x400.
+# `amb`/`eff` are what a non-root service cannot get any other way, and `nobody`
+# holding exactly one bit is the least-privilege shape §7.4 is for.
+expect "ambient capabilities reached a de-privileged service" \
+    "uid=65534 amb=0000000000000400 eff=0000000000000400 bnd=0000000000000400"
 # A completed oneshot has nothing to restart, so `restart` is a conflict
 # (exit 4). `logdemo` proves it and that the unit is only started once.
 if grep -qF "logdemo.service has no process to restart" "${log_file}"; then

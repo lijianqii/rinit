@@ -1,0 +1,22 @@
+# Capability bounding-set acceptance unit (plan §7.4).
+#
+# Like the other demo units this is outside `multi-user.target`'s closure and is
+# started on demand by `rctl`.
+#
+# It stays **root** on purpose. An empty `CapabilityBoundingSet=` is the
+# strictest setting §7.4 offers, and what makes it strict is not obvious: a root
+# process is normally given every capability on `exec`, and the kernel builds
+# that set as `bset | inheritable` (`handle_privileged_root` in
+# `security/commoncap.c`). Dropping the bounding set is therefore what makes a
+# root service capability-free - the printed `bnd` and `eff` are both expected
+# to be zero, for a process whose `uid` is still 0.
+#
+# If rinit parsed the directive without applying it, this line would read
+# `bnd=000001ffffffffff eff=000001ffffffffff`: root with everything.
+[Unit]
+Description=Capability bounding-set demo (started on demand)
+
+[Service]
+Type=oneshot
+CapabilityBoundingSet=
+ExecStart=/bin/sh -c "echo uid=$(id -u) bnd=$(grep ^CapBnd /proc/self/status | cut -f2) eff=$(grep ^CapEff /proc/self/status | cut -f2)"

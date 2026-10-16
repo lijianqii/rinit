@@ -59,3 +59,45 @@ fn the_priv_drop_unit_asks_for_everything_the_guest_checks() {
         "the whole quoted command must survive tokenisation, got: {command:?}"
     );
 }
+
+/// The capability units the guest asserts on (plan §7.4). What matters is the
+/// empty list staying distinguishable from an absent one - `CapabilityBoundingSet=`
+/// is the *strictest* setting, and a parser that collapsed it into "unset" would
+/// turn the assertion below into a service running as root with everything.
+#[test]
+fn the_capability_units_ask_for_what_the_guest_checks() {
+    let (files, _) = load_unit_files(&units_dir()).expect("load units/");
+    let body = |name: &str| {
+        let file = files
+            .iter()
+            .find(|f| f.name.canonical() == name)
+            .unwrap_or_else(|| panic!("{name} is shipped"));
+        (
+            file.name.clone(),
+            file.contents.clone(),
+            file.path.display().to_string(),
+        )
+    };
+
+    let (name, contents, path) = body("caps.service");
+    let caps = parse(&name, &contents).unwrap_or_else(|e| panic!("{path} does not parse: {e}"));
+    assert_eq!(
+        caps.capability_bounding_set,
+        Some(Vec::new()),
+        "an empty CapabilityBoundingSet= drops every capability"
+    );
+    assert!(caps.ambient_capabilities.is_none());
+    assert_eq!(caps.user, "", "this one stays root on purpose");
+
+    let (name, contents, path) = body("ambient.service");
+    let ambient = parse(&name, &contents).unwrap_or_else(|e| panic!("{path} does not parse: {e}"));
+    assert_eq!(ambient.user, "nobody");
+    assert!(ambient.no_new_privileges);
+    for caps in [
+        ambient.capability_bounding_set.clone().expect("set"),
+        ambient.ambient_capabilities.clone().expect("set"),
+    ] {
+        assert_eq!(caps.len(), 1);
+        assert_eq!(caps[0].as_str(), "net_bind_service");
+    }
+}
