@@ -50,6 +50,15 @@ fi
 work="$(mktemp -d)"
 trap 'rm -rf "${work}"' EXIT
 
+# The work directory *is* the image's root directory, and `mktemp -d` creates it
+# as `0700`. That is invisible while everything in the guest runs as root - root
+# has `CAP_DAC_OVERRIDE` and never notices - but it is the whole image's
+# traversal bit: a service that drops privileges (plan §7.4) cannot so much as
+# `execve("/bin/sh")` through a root directory it may not search, and fails with
+# `EACCES` that looks like a missing binary. Everything else in the layout is
+# already world-readable; this is the one entry that is not.
+chmod 0755 "${work}"
+
 # Directory layout (plan §4.3). No /init symlink: we boot with rdinit=.
 install -d "${work}"/{sbin,bin,etc/rinit/units,proc,sys,dev,run,tmp,root}
 
@@ -101,8 +110,13 @@ if [[ -n "${busybox_src}" ]]; then
     # This is safe only because the serial port is the sole access path and the
     # image is a development initramfs; anyone who can reach it already has the
     # machine. See units/shell.service.
-    printf 'root::0:0:root:/root:/bin/sh\n' >"${work}/etc/passwd"
-    printf 'root:x:0:\n' >"${work}/etc/group"
+    #
+    # `nobody`/`nogroup` are here for the §7.4 acceptance test: a unit that sets
+    # `User=`/`Group=` has to be seen dropping to a user that is *not* root, and
+    # 65534 is the conventional id for that user. It is a name rather than a
+    # number so the test exercises the `/etc/passwd`/`/etc/group` lookup too.
+    printf 'root::0:0:root:/root:/bin/sh\nnobody:x:65534:65534:nobody:/nonexistent:/sbin/nologin\n' >"${work}/etc/passwd"
+    printf 'root:x:0:\nnogroup:x:65534:\n' >"${work}/etc/group"
 fi
 
 "${here}/mkinitramfs.sh" "${work}" "${output}"
