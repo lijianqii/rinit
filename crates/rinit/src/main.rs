@@ -6,6 +6,7 @@
 
 mod args;
 mod boot;
+mod control;
 mod log;
 mod manager;
 mod notify;

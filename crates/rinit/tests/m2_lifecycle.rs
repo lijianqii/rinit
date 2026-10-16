@@ -372,6 +372,87 @@ TimeoutStopSec=1
     );
 }
 
+/// The control socket's security rules (plan §1.3(10)).
+///
+/// The guest runs rinit as root, so the *allowed* path is exercised by the
+/// system test; here the test process is an ordinary user, which is exactly the
+/// case that must be refused before any command byte is read.
+#[test]
+fn the_control_socket_is_root_only_and_mode_0600() {
+    use std::io::{Read, Write};
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new("control");
+    dir.write("all.target", "[Unit]\nType=target\nRequires=app.service\n");
+    dir.write(
+        "app.service",
+        "[Service]\nType=simple\nExecStart=/bin/sleep 30\n",
+    );
+    let control_dir = dir.0.join("control");
+
+    let bin = env!("CARGO_BIN_EXE_rinit");
+    let child = Command::new(bin)
+        .arg("--dev")
+        .arg("--units")
+        .arg(&dir.0)
+        .arg("--default")
+        .arg("all.target")
+        .env("RINIT_CONTROL_DIR", &control_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn rinit");
+
+    let socket = control_dir.join("control.sock");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !socket.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "rinit must bind the control socket"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // The socket is 0600: only root may even connect.
+    let mode = std::fs::metadata(&socket).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "got {mode:o}");
+    let dir_mode = std::fs::metadata(&control_dir)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(dir_mode, 0o700, "the control directory must be 0700");
+
+    // Ask it something. A non-root client must be refused, and refused with a
+    // reply rather than by silence.
+    let mut stream = std::os::unix::net::UnixStream::connect(&socket).expect("connect");
+    let body = rinit_core::encode_request(&rinit_core::Request::List);
+    stream.write_all(&rinit_core::frame(&body)).expect("write");
+    let mut prefix = [0u8; rinit_core::LENGTH_PREFIX_BYTES];
+    stream.read_exact(&mut prefix).expect("read prefix");
+    let len = rinit_core::frame_len(prefix).expect("length");
+    let mut reply = vec![0u8; len];
+    stream.read_exact(&mut reply).expect("read body");
+    let (status, text) = rinit_core::decode_response(&reply).expect("decode");
+
+    let is_root = unsafe { libc::geteuid() } == 0;
+    if is_root {
+        assert_eq!(status, rinit_core::Status::Ok, "{text}");
+    } else {
+        assert_ne!(
+            status,
+            rinit_core::Status::Ok,
+            "a non-root client must be refused"
+        );
+        assert!(text.contains("root"), "got: {text}");
+    }
+
+    // SAFETY: signalling our own child.
+    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+    let _ = child.wait_with_output();
+}
+
 /// Plan §1.3(12): a `Type=notify` unit is not `Active` until it reports
 /// readiness, and the whole path - socket creation, `NOTIFY_SOCKET`, the
 /// datagram, the state transition - has to work for a real child.

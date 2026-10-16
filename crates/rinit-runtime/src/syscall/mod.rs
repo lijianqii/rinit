@@ -13,6 +13,7 @@ pub mod mount;
 pub mod process;
 pub mod reboot;
 pub mod signal;
+pub mod socket;
 pub mod wait;
 
 /// Convert `s` into a `CString` for a syscall argument.

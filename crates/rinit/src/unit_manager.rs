@@ -11,14 +11,13 @@
 //! covered by the 200 tests there, while this file is the thin layer that acts
 //! on their answers.
 
-use std::collections::BTreeMap;
-use std::time::{Duration, Instant};
-
 use rinit_core::unit::config::{RestartPolicy, ServiceKind};
 use rinit_core::unit::dependency::spawns_process;
 use rinit_core::unit::restart::BackoffState;
 use rinit_core::{Effect, Event, ExitOutcome, FailedReason, NotifyMessage, UnitState, transition};
 use rinit_core::{Job, JobQueue, JobTarget, RequestSource, UnitConfig, UnitName};
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::{Duration, Instant};
 
 use rinit_runtime::RuntimeError;
 use rinit_runtime::syscall::{process, wait};
@@ -26,8 +25,7 @@ use rinit_runtime::syscall::{process, wait};
 use crate::log::rlog;
 use crate::service::spawn_service_in_group;
 
-/// What happened to a unit when a child was reaped.
-///
+/// What happened to a unit when a child was reaped.///
 /// The manager applies the change itself - it owns the state, the backoff and
 /// the restart timer - so this is a *report* for logging and tests, not an
 /// instruction. An earlier version returned an `Action` for the caller to
@@ -56,6 +54,18 @@ pub enum Outcome {
         /// How many failures fell inside the window.
         failures: usize,
     },
+}
+
+/// How a restart request was carried out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartPlan {
+    /// The unit was stopped and a start follows once the exit is reaped.
+    Stopping,
+    /// Nothing was running, so it can simply be started.
+    Start,
+    /// The unit has no process to restart and restarting it is meaningless
+    /// (plan §3 M3's exit code 4, e.g. `Active(Exited)`).
+    NotApplicable,
 }
 
 /// Everything rinit knows about one running unit.
@@ -235,6 +245,8 @@ pub struct UnitManager {
     /// is where the unit actually is. Keeping them apart is what lets two
     /// sources race without producing two decisions (plan §1.3(13)).
     jobs: JobQueue,
+    /// Units whose start was queued behind a stop in progress (plan §1.3(13)).
+    queued_starts: BTreeSet<UnitName>,
     /// Startup order (levels flattened), reversed for shutdown (plan §1.3(8)).
     shutdown_order: Vec<UnitName>,
     /// Monotonic origin for the Job queue's timestamps.
@@ -247,6 +259,7 @@ impl UnitManager {
         UnitManager {
             units: BTreeMap::new(),
             jobs: JobQueue::new(),
+            queued_starts: BTreeSet::new(),
             shutdown_order: Vec::new(),
             origin: Instant::now(),
         }
@@ -301,7 +314,84 @@ impl UnitManager {
         }
         let at = self.now_millis();
         self.jobs.submit(Job::new(unit.clone(), target, source, at));
-        self.effect_for(unit)
+        let effect = self.effect_for(unit);
+
+        match target {
+            // Plan §1.3(13): a start against a stop in progress waits for it.
+            // That is only knowable here, so remember it; `due_queued_starts`
+            // picks it up once the stop finishes.
+            JobTarget::Started => {
+                if effect.is_none() && self.is_deactivating(unit) {
+                    self.queued_starts.insert(unit.clone());
+                }
+            }
+            // An explicit stop beats a start that was still queued.
+            JobTarget::Stopped => {
+                self.queued_starts.remove(unit);
+            }
+        }
+        effect
+    }
+
+    fn is_deactivating(&self, unit: &UnitName) -> bool {
+        self.units
+            .get(unit)
+            .is_some_and(|rt| rt.state == UnitState::Deactivating)
+    }
+
+    /// Starts that were queued behind a stop which has since finished.
+    ///
+    /// Plan §1.3(13): the start is not applied to a unit that is still tearing
+    /// down, so it is applied here, on the first pass after the stop completes.
+    pub fn due_queued_starts(&mut self) -> Vec<UnitName> {
+        let queued: Vec<UnitName> = self.queued_starts.iter().cloned().collect();
+        let mut ready = Vec::new();
+        for unit in queued {
+            // Still stopping: leave it queued.
+            if self.is_deactivating(&unit) {
+                continue;
+            }
+            self.queued_starts.remove(&unit);
+            if self.effect_for(&unit) == Some(Effect::SpawnProcess) {
+                ready.push(unit);
+            }
+        }
+        ready
+    }
+
+    /// Restart `unit`: stop it if it is running, then start it again.
+    ///
+    /// A running unit is stopped with `restart_after_stop` set, which is the
+    /// same mechanism a health-triggered restart uses: the reaped exit
+    /// re-enters the backoff path instead of ending the unit (plan §1.3(3)).
+    pub fn restart_unit(&mut self, unit: &UnitName) -> RestartPlan {
+        let Some(rt) = self.units.get(unit) else {
+            return RestartPlan::NotApplicable;
+        };
+        match rt.state {
+            // There is no process and no work to redo: plan §3 M3 calls this a
+            // conflict rather than silently doing nothing.
+            UnitState::ActiveExited => return RestartPlan::NotApplicable,
+            UnitState::Active
+            | UnitState::Starting
+            | UnitState::RestartWait
+            | UnitState::Deactivating => {}
+            // Already down: a restart is just a start.
+            UnitState::Inactive | UnitState::Failed(_) => return RestartPlan::Start,
+        }
+
+        self.stop_unit(unit);
+        let Some(rt) = self.units.get_mut(unit) else {
+            return RestartPlan::NotApplicable;
+        };
+        if rt.state == UnitState::Deactivating {
+            rt.restart_after_stop = true;
+            RestartPlan::Stopping
+        } else {
+            // `stop_unit` found nothing to signal (the process was already
+            // gone), so there is nothing to wait for.
+            RestartPlan::Start
+        }
     }
 
     /// The action the merged target implies for `unit` right now.
@@ -315,6 +405,24 @@ impl UnitManager {
         self.jobs
             .reconcile(unit, actual)
             .map(|(effect, _to)| effect)
+    }
+
+    /// The merged target for `unit`, if a request set one.
+    pub fn target_of(&self, unit: &UnitName) -> Option<JobTarget> {
+        self.jobs.target_of(unit).map(|merged| merged.target)
+    }
+
+    /// Clear a unit's failure state and breaker without starting it.
+    ///
+    /// Plan §1.3(13)'s `reset-failed` escape hatch: unlike a manual start, this
+    /// does not immediately bring the unit back up.
+    pub fn reset_failed(&mut self, unit: &UnitName) {
+        if let Some(rt) = self.units.get_mut(unit) {
+            rt.backoff.reset();
+            if matches!(rt.state, UnitState::Failed(_)) {
+                rt.state = UnitState::Inactive;
+            }
+        }
     }
 
     /// Units the queue still wants running, in name order.
@@ -2045,5 +2153,125 @@ mod tests {
         );
 
         cleanup(&mut m, &unit);
+    }
+
+    // --- control-plane pieces (plan §3 M3) ------------------------------
+
+    /// Plan §1.3(13): a start that arrives while the unit is stopping is
+    /// queued, then applied once the stop completes.
+    #[test]
+    fn a_start_during_deactivation_is_queued_then_applied() {
+        let _guard = crate::test_support::children_lock();
+        let mut m = manager_with("a.service", RestartPolicy::No);
+        let unit = UnitName::parse("a.service").unwrap();
+        m.request_start(&unit, RequestSource::Dependency);
+        let pid = spawn_pid(&mut m, &unit);
+
+        // A stop that did not come from a request, so the `Started` target
+        // stands while the unit tears down.
+        m.stop_unit(&unit);
+        assert_eq!(m.get(&unit).unwrap().state, UnitState::Deactivating);
+
+        assert_eq!(
+            m.request_start(&unit, RequestSource::UserStart),
+            None,
+            "the start waits for the stop"
+        );
+        assert!(m.due_queued_starts().is_empty(), "still stopping");
+
+        // The stop completes.
+        let _ = process::kill_process_group(pid, libc::SIGKILL);
+        let outcome = m
+            .on_child_exit(pid, ExitOutcome::Signalled(libc::SIGKILL))
+            .expect("handled");
+        assert!(matches!(outcome, Outcome::Exited { .. }));
+        assert_eq!(m.get(&unit).unwrap().state, UnitState::Inactive);
+
+        assert_eq!(
+            m.due_queued_starts(),
+            std::slice::from_ref(&unit),
+            "the queued start is applied once the stop is done"
+        );
+        assert!(m.due_queued_starts().is_empty(), "and only once");
+
+        // `on_child_exit` is the manager's bookkeeping, not a `waitpid`: the
+        // real child is still a zombie until this reaps it. A test that left
+        // one behind would be reaped by whatever test ran next.
+        cleanup(&mut m, &unit);
+    }
+
+    /// An explicit stop cancels a queued start.
+    #[test]
+    fn a_stop_cancels_a_queued_start() {
+        let _guard = crate::test_support::children_lock();
+        let mut m = manager_with("a.service", RestartPolicy::No);
+        let unit = UnitName::parse("a.service").unwrap();
+        m.request_start(&unit, RequestSource::Dependency);
+        spawn_pid(&mut m, &unit);
+        m.stop_unit(&unit);
+        m.request_start(&unit, RequestSource::UserStart);
+
+        m.request_stop(&unit, RequestSource::UserStop);
+        assert!(m.due_queued_starts().is_empty(), "the stop wins");
+
+        cleanup(&mut m, &unit);
+    }
+
+    /// `restart` of a running unit stops it and marks the stop as a restart.
+    #[test]
+    fn restarting_a_running_unit_stops_it_for_a_restart() {
+        let _guard = crate::test_support::children_lock();
+        let mut m = manager_with("a.service", RestartPolicy::Always);
+        let unit = UnitName::parse("a.service").unwrap();
+        m.request_start(&unit, RequestSource::Dependency);
+        spawn_pid(&mut m, &unit);
+
+        assert_eq!(m.restart_unit(&unit), RestartPlan::Stopping);
+        let rt = m.get(&unit).unwrap();
+        assert_eq!(rt.state, UnitState::Deactivating);
+        assert!(
+            rt.restart_after_stop,
+            "the exit must re-enter the restart path"
+        );
+
+        cleanup(&mut m, &unit);
+    }
+
+    /// `restart` of a unit that is already down is just a start.
+    #[test]
+    fn restarting_a_stopped_unit_is_a_start() {
+        let mut m = manager_with("a.service", RestartPolicy::No);
+        let unit = UnitName::parse("a.service").unwrap();
+        assert_eq!(m.restart_unit(&unit), RestartPlan::Start);
+    }
+
+    /// `reset-failed` clears the failure without starting the unit.
+    #[test]
+    fn reset_failed_clears_the_state_but_does_not_start() {
+        let mut m = manager_with("a.service", RestartPolicy::Always);
+        let unit = UnitName::parse("a.service").unwrap();
+        m.fail_start(&unit);
+        m.units.get_mut(&unit).unwrap().backoff.on_failure(0);
+        assert!(m.is_failed(&unit));
+
+        m.reset_failed(&unit);
+
+        let rt = m.get(&unit).unwrap();
+        assert_eq!(rt.state, UnitState::Inactive);
+        assert!(rt.pid.is_none(), "it must not be started");
+        assert_eq!(rt.backoff.failures_in_window(), 0);
+    }
+
+    /// `target_of` reports what the queue is asking for, which is what
+    /// `rctl status` shows.
+    #[test]
+    fn target_of_reports_the_merged_target() {
+        let mut m = manager_with("a.service", RestartPolicy::No);
+        let unit = UnitName::parse("a.service").unwrap();
+        assert_eq!(m.target_of(&unit), None, "nothing asked yet");
+        m.request_start(&unit, RequestSource::Dependency);
+        assert_eq!(m.target_of(&unit), Some(JobTarget::Started));
+        m.request_stop(&unit, RequestSource::UserStop);
+        assert_eq!(m.target_of(&unit), Some(JobTarget::Stopped));
     }
 }

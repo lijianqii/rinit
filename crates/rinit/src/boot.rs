@@ -9,17 +9,22 @@
 //! unit directory, resolves the dependency graph, and starts each *level* of
 //! the schedule in parallel before moving on (plan §3 M1).
 
-use rinit_core::{Effect, ExitOutcome, RequestSource, ServiceKind, UnitName};
+use rinit_core::{
+    Effect, ExitOutcome, JobTarget, Request, RequestSource, ServiceKind, Status, UnitName,
+};
 use rinit_runtime::syscall::{process, reboot, signal};
 use rinit_runtime::{RuntimeError, Signal, SignalSet};
 
 use crate::args::Config;
+use crate::control::ControlServer;
 use crate::log::rlog;
 use crate::manager;
 use crate::notify::NotifyHub;
 use crate::readiness;
 use crate::service::{ServiceSet, reap_and_log, shutdown, spawn_service_in_group};
-use crate::unit_manager::{Outcome, UnitManager, build_service_env, reap_into_manager};
+use crate::unit_manager::{
+    Outcome, RestartPlan, UnitManager, build_service_env, reap_into_manager,
+};
 
 /// How often the shutdown loop wakes to reap children and check `SIGKILL`
 /// deadlines. Small enough that a quick exit is noticed promptly.
@@ -81,7 +86,11 @@ pub async fn run(cfg: Config) -> Result<(), RuntimeError> {
     if cfg.service_argv.is_empty() {
         let mut notify = NotifyHub::new();
         let mut manager = start_units(&cfg, &mut notify).await?;
-        supervise(&mut signals, &mut manager, &mut notify).await;
+        // The control socket is bound after the mounts, so `/run` exists
+        // (plan §1.3(10)); a failure to bind it is only a warning.
+        let mut control = ControlServer::bind();
+        supervise(&mut signals, &mut manager, &mut notify, &mut control).await;
+        control.disarm();
         // A dev-mode boot (`--dev`) is a host smoke test, not PID 1: returning
         // lets the test process exit instead of spinning in `reboot_now`,
         // where `reboot(2)` would fail without `CAP_SYS_BOOT`.
@@ -123,7 +132,12 @@ pub async fn run(cfg: Config) -> Result<(), RuntimeError> {
 /// kill), or a signal arrived. The timers are what make this a loop rather than
 /// a plain `recv()` - without them a service scheduled to restart in two
 /// seconds would sit there until some unrelated signal arrived.
-async fn supervise(signals: &mut SignalSet, manager: &mut UnitManager, notify: &mut NotifyHub) {
+async fn supervise(
+    signals: &mut SignalSet,
+    manager: &mut UnitManager,
+    notify: &mut NotifyHub,
+    control: &mut ControlServer,
+) {
     // Set when the shutdown was triggered by power failure, which runs under a
     // much smaller budget (plan §7.1).
     let mut fast = false;
@@ -135,6 +149,14 @@ async fn supervise(signals: &mut SignalSet, manager: &mut UnitManager, notify: &
                 Ok(true) => run_start_post(manager, &unit).await,
                 Ok(false) => {}
                 Err(e) => rlog!("error: restart of {unit} failed: {e}"),
+            }
+        }
+        // A start that arrived while its unit was stopping (plan §1.3(13)).
+        for unit in manager.due_queued_starts() {
+            match start_unit(manager, notify, &unit).await {
+                Ok(true) => run_start_post(manager, &unit).await,
+                Ok(false) => {}
+                Err(e) => rlog!("error: queued start of {unit} failed: {e}"),
             }
         }
         for unit in manager.due_start_timeouts() {
@@ -180,6 +202,16 @@ async fn supervise(signals: &mut SignalSet, manager: &mut UnitManager, notify: &
                 if manager.on_notify(&unit, &message) {
                     rlog!("{unit} is ready");
                 }
+            }
+            Some((request, reply)) = control.recv() => {
+                let (status, text) = handle_control(manager, notify, &request).await;
+                if status == Status::Ok {
+                    rlog!("control: {} ok", request.describe());
+                } else {
+                    rlog!("control: {} -> {status:?}", request.describe());
+                }
+                // The client may have hung up; that is not rinit's problem.
+                let _ = reply.send((status, text));
             }
             _ = tokio::time::sleep(wait) => {}
         }
@@ -488,8 +520,144 @@ async fn apply_effect(
     }
 }
 
-/// Report what a reaped exit meant to a unit.
+/// Carry out a control request and describe the result (plan §3 M3).
 ///
+/// This is where a request stops being bytes and starts being a change to the
+/// running system, so it lives with the manager and the notify hub rather than
+/// with the socket that delivered it.
+async fn handle_control(
+    manager: &mut UnitManager,
+    notify: &mut NotifyHub,
+    request: &Request,
+) -> (Status, String) {
+    match request {
+        Request::List | Request::Status { unit: None, .. } => {
+            (Status::Ok, manager.summary().join("\n"))
+        }
+        Request::Status {
+            unit: Some(unit), ..
+        } => match describe_unit(manager, unit) {
+            Some(text) => (Status::Ok, text),
+            None => (Status::NoSuchUnit, format!("no such unit: {unit}")),
+        },
+        Request::Start(unit) => control_start(manager, notify, unit).await,
+        Request::Stop(unit) => control_stop(manager, notify, unit).await,
+        Request::Restart(unit) => control_restart(manager, notify, unit).await,
+        Request::ResetFailed(unit) => {
+            if manager.get(unit).is_none() {
+                return (Status::NoSuchUnit, format!("no such unit: {unit}"));
+            }
+            manager.reset_failed(unit);
+            (Status::Ok, format!("{unit}: cleared"))
+        }
+        Request::Log { .. } => (
+            Status::Error,
+            "log capture arrives with the ring buffer (M3, in progress)".to_string(),
+        ),
+    }
+}
+
+/// `rctl start`: plan §1.3(13)'s action-derivation for a user request.
+async fn control_start(
+    manager: &mut UnitManager,
+    notify: &mut NotifyHub,
+    unit: &UnitName,
+) -> (Status, String) {
+    if manager.get(unit).is_none() {
+        return (Status::NoSuchUnit, format!("no such unit: {unit}"));
+    }
+    let effect = manager.request_start(unit, RequestSource::UserStart);
+    match effect {
+        Some(Effect::None) => (Status::Ok, format!("{unit} is already active")),
+        // Queued behind a stop in progress; the main loop will finish it.
+        None => (
+            Status::Ok,
+            format!("{unit} is stopping; it will start afterwards"),
+        ),
+        Some(effect) => match apply_effect(manager, notify, unit, Some(effect)).await {
+            Ok(_) => (Status::Ok, format!("started {unit}")),
+            Err(e) => (Status::Error, format!("cannot start {unit}: {e}")),
+        },
+    }
+}
+
+/// `rctl stop`.
+async fn control_stop(
+    manager: &mut UnitManager,
+    notify: &mut NotifyHub,
+    unit: &UnitName,
+) -> (Status, String) {
+    if manager.get(unit).is_none() {
+        return (Status::NoSuchUnit, format!("no such unit: {unit}"));
+    }
+    let effect = manager.request_stop(unit, RequestSource::UserStop);
+    match effect {
+        Some(Effect::None) => (Status::Ok, format!("{unit} is already stopped")),
+        None => (Status::Ok, format!("{unit} is already stopping")),
+        Some(effect) => match apply_effect(manager, notify, unit, Some(effect)).await {
+            Ok(_) => (Status::Ok, format!("stopped {unit}")),
+            Err(e) => (Status::Error, format!("cannot stop {unit}: {e}")),
+        },
+    }
+}
+
+/// `rctl restart`: stop if running, otherwise start.
+///
+/// A unit that has no process to restart and nothing to redo is a conflict
+/// (plan §3 M3's exit code 4).
+async fn control_restart(
+    manager: &mut UnitManager,
+    notify: &mut NotifyHub,
+    unit: &UnitName,
+) -> (Status, String) {
+    if manager.get(unit).is_none() {
+        return (Status::NoSuchUnit, format!("no such unit: {unit}"));
+    }
+    match manager.restart_unit(unit) {
+        RestartPlan::Stopping => {
+            rlog!("restarting {unit}");
+            (Status::Ok, format!("restarting {unit}"))
+        }
+        RestartPlan::Start => control_start(manager, notify, unit).await,
+        RestartPlan::NotApplicable => (
+            Status::Conflict,
+            format!("{unit} has no process to restart"),
+        ),
+    }
+}
+
+/// A unit's detail block for `rctl status UNIT`.
+fn describe_unit(manager: &UnitManager, unit: &UnitName) -> Option<String> {
+    let rt = manager.get(unit)?;
+    let mut out = String::new();
+    out.push_str(&format!("unit: {unit}\n"));
+    if !rt.config.description.is_empty() {
+        out.push_str(&format!("description: {}\n", rt.config.description));
+    }
+    match rt.pid {
+        Some(pid) => out.push_str(&format!("state: {} (pid {pid})\n", rt.state)),
+        None => out.push_str(&format!("state: {}\n", rt.state)),
+    }
+    let target = match manager.target_of(unit) {
+        Some(JobTarget::Started) => "started",
+        Some(JobTarget::Stopped) => "stopped",
+        None => "none",
+    };
+    out.push_str(&format!("target: {target}\n"));
+    out.push_str(&format!(
+        "restarts: {}\n",
+        rt.backoff.consecutive_restarts()
+    ));
+    if let Some(status) = &rt.status {
+        out.push_str(&format!("status: {status}\n"));
+    }
+    if let Some(healthy) = rt.healthy {
+        out.push_str(&format!("healthy: {healthy}\n"));
+    }
+    Some(out)
+}
+
+/// Report what a reaped exit meant to a unit.///
 /// The manager applies the state change itself as it reaps; this only narrates
 /// it, so an operator watching the console can see a service come back.
 fn log_outcome(outcome: &Outcome) {
@@ -723,6 +891,10 @@ pub fn fatal_with(err: &RuntimeError, reboot: Reboofer) -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::unit_manager::RestartPlan;
+    use rinit_core::UnitConfig;
+    use rinit_core::UnitState;
+    use rinit_core::unit::config::RestartPolicy;
 
     /// Plan §1.3(9): a fatal early-boot error must *reset the machine*, not
     /// return or hang - the abort path that a failed first-wave mount takes.
@@ -734,5 +906,167 @@ mod tests {
             source: std::io::Error::other("mount /proc failed"),
         };
         fatal_with(&err, || panic!("reboot was invoked"));
+    }
+
+    // --- control dispatch (plan §3 M3) ----------------------------------
+
+    fn unit(name: &str) -> UnitName {
+        UnitName::parse(name).expect("valid name")
+    }
+
+    fn manager_with(name: &str) -> UnitManager {
+        let mut cfg = UnitConfig::new(unit(name));
+        cfg.exec_start =
+            rinit_core::ExecCommand::new(vec!["/bin/sleep".to_string(), "30".to_string()]);
+        cfg.restart = RestartPolicy::No;
+        let mut m = UnitManager::new();
+        m.add(cfg);
+        m
+    }
+
+    /// A hub with its own scratch directory: these tests never touch `/run`.
+    fn test_hub(tag: &str) -> NotifyHub {
+        let dir = std::env::temp_dir().join(format!("rinit-control-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        NotifyHub::new_at(dir)
+    }
+
+    fn status_request(unit: &UnitName) -> Request {
+        Request::Status {
+            unit: Some(unit.clone()),
+            tail: 0,
+        }
+    }
+
+    /// A request naming a unit rinit does not know is `NoSuchUnit` (exit 3),
+    /// not a generic error.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_unknown_unit_is_no_such_unit() {
+        let _guard = crate::test_support::children_lock_async().await;
+        let mut manager = UnitManager::new();
+        let mut notify = test_hub("unknown");
+
+        let ghost = unit("ghost.service");
+        for request in [
+            status_request(&ghost),
+            Request::Start(ghost.clone()),
+            Request::Stop(ghost.clone()),
+            Request::Restart(ghost.clone()),
+            Request::ResetFailed(ghost.clone()),
+        ] {
+            let (status, text) = handle_control(&mut manager, &mut notify, &request).await;
+            assert_eq!(status, Status::NoSuchUnit, "{}: {text}", request.describe());
+        }
+    }
+
+    /// The full `start` -> `status` -> `stop` path, and the state each reports.
+    #[tokio::test(flavor = "current_thread")]
+    async fn start_status_and_stop_drive_the_unit() {
+        let _guard = crate::test_support::children_lock_async().await;
+        let mut manager = manager_with("app.service");
+        let mut notify = test_hub("startstop");
+        let app = unit("app.service");
+
+        let (status, _) =
+            handle_control(&mut manager, &mut notify, &Request::Start(app.clone())).await;
+        assert_eq!(status, Status::Ok);
+        assert!(
+            manager.get(&app).unwrap().pid.is_some(),
+            "the unit must run"
+        );
+
+        let (status, text) = handle_control(&mut manager, &mut notify, &status_request(&app)).await;
+        assert_eq!(status, Status::Ok);
+        assert!(text.contains("app.service"), "{text}");
+        assert!(text.contains("active"), "{text}");
+        assert!(text.contains("target: started"), "{text}");
+
+        let (status, text) = handle_control(&mut manager, &mut notify, &Request::List).await;
+        assert_eq!(status, Status::Ok);
+        assert!(text.contains("app.service"), "{text}");
+
+        let (status, _) =
+            handle_control(&mut manager, &mut notify, &Request::Stop(app.clone())).await;
+        assert_eq!(status, Status::Ok);
+        assert_eq!(manager.get(&app).unwrap().state, UnitState::Deactivating);
+
+        // Leave nothing running.
+        let pid = manager.get(&app).unwrap().pid.expect("pid");
+        let _ = process::kill_process_group(pid, libc::SIGKILL);
+        let _ = rinit_runtime::syscall::wait::reap_children();
+    }
+
+    /// A second `start` is satisfied, not an error.
+    #[tokio::test(flavor = "current_thread")]
+    async fn starting_an_active_unit_is_satisfied() {
+        let _guard = crate::test_support::children_lock_async().await;
+        let mut manager = manager_with("app.service");
+        let mut notify = test_hub("already");
+        let app = unit("app.service");
+
+        handle_control(&mut manager, &mut notify, &Request::Start(app.clone())).await;
+        let (status, text) =
+            handle_control(&mut manager, &mut notify, &Request::Start(app.clone())).await;
+        assert_eq!(status, Status::Ok);
+        assert!(text.contains("already active"), "{text}");
+
+        let pid = manager.get(&app).unwrap().pid.expect("pid");
+        let _ = process::kill_process_group(pid, libc::SIGKILL);
+        let _ = rinit_runtime::syscall::wait::reap_children();
+    }
+
+    /// Plan §3 M3: `restart` of a unit with no process to restart is a
+    /// conflict (exit 4).
+    #[tokio::test(flavor = "current_thread")]
+    async fn restart_of_a_completed_oneshot_is_a_conflict() {
+        let _guard = crate::test_support::children_lock_async().await;
+        let mut cfg = UnitConfig::new(unit("once.service"));
+        cfg.service_kind = ServiceKind::Oneshot;
+        cfg.exec_start = rinit_core::ExecCommand::new(vec!["/bin/true".to_string()]);
+        let mut manager = UnitManager::new();
+        manager.add(cfg);
+        let mut notify = test_hub("conflict");
+
+        // A completed oneshot has no process and nothing to redo.
+        manager.mark_oneshot_done(&unit("once.service"));
+        assert_eq!(
+            manager.restart_unit(&unit("once.service")),
+            RestartPlan::NotApplicable
+        );
+
+        let (status, text) = handle_control(
+            &mut manager,
+            &mut notify,
+            &Request::Restart(unit("once.service")),
+        )
+        .await;
+        assert_eq!(status, Status::Conflict);
+        assert_eq!(status.exit_code(), 4);
+        assert!(text.contains("no process to restart"), "{text}");
+    }
+
+    /// `reset-failed` clears the failure without starting the unit
+    /// (plan §1.3(13)).
+    #[tokio::test(flavor = "current_thread")]
+    async fn reset_failed_clears_without_starting() {
+        let _guard = crate::test_support::children_lock_async().await;
+        let mut manager = manager_with("app.service");
+        let mut notify = test_hub("reset");
+        let app = unit("app.service");
+        manager.fail_start(&app);
+        assert!(manager.is_failed(&app));
+
+        let (status, _) = handle_control(
+            &mut manager,
+            &mut notify,
+            &Request::ResetFailed(app.clone()),
+        )
+        .await;
+        assert_eq!(status, Status::Ok);
+        assert_eq!(manager.get(&app).unwrap().state, UnitState::Inactive);
+        assert!(
+            manager.get(&app).unwrap().pid.is_none(),
+            "it must not start"
+        );
     }
 }
