@@ -328,6 +328,13 @@ await_log() {
     printf 'rctl start tty.service\n' >&3
     await_log 15 'ioctl(TIOCSCTTY)' || true
 
+    # Plan §1.3(7): the log file. The guest boots with the default path, so this
+    # checks the plan's own setting rather than a flag the test invented - and the
+    # directory it names does not exist in the initramfs, so rinit having created
+    # it is part of what is being asserted.
+    printf 'v=$(grep -c rinit-log-marker /var/log/rinit/log); echo logfile-marker=$v\n' >&3
+    await_log 10 'logfile-marker=' || true
+
     # Stopping the unit has to stop the *daemon*: it is the unit's process, and
     # it is not in the process group the stop signal addresses, so this is also
     # the assertion for the fallback that reaches the pid itself.
@@ -629,6 +636,14 @@ expect "stopping a forking unit stopped the daemon it took over" "daemon-gone"
 # M5 §7.11: a `TTYPath=` that is not a terminal is a failed start, not a service
 # that believes it owns a terminal.
 expect "a TTYPath that is not a terminal fails the start" "ioctl(TIOCSCTTY) failed"
+
+# Plan §1.3(7): the default log file exists and holds what a service wrote.
+log_lines="$(grep -oE 'logfile-marker=[0-9]+' "${log_file}" | tail -1 | cut -d= -f2)"
+if [[ -n "${log_lines}" && "${log_lines}" -ge 1 ]]; then
+    pass "the default log file has a service's output (${log_lines} line(s))"
+else
+    fail "the default log file has a service's output (got: '${log_lines:-missing}')"
+fi
 
 # A completed oneshot has nothing to restart, so `restart` is a conflict
 # (exit 4). `logdemo` proves it and that the unit is only started once.

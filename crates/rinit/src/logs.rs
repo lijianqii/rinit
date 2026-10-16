@@ -9,7 +9,9 @@
 //! end the child inherits stays *blocking*: a service that fills the pipe must
 //! block, not lose output or get an error it does not expect.
 
+use std::io::Write;
 use std::os::fd::{AsRawFd, OwnedFd};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use rinit_core::{LogBuffer, LogLine, UnitName};
@@ -22,16 +24,154 @@ use crate::log::rlog;
 /// How much of a read is buffered before splitting into lines.
 const READ_CHUNK: usize = 4096;
 
+/// How large the persisted log file may grow before it is truncated
+/// (plan §1.3(7)).
+///
+/// The plan asks for persistence without asking for a format or a size; a
+/// megabyte is the same order as the ring's own bound, and the policy is the
+/// same one the ring uses - past the bound, the *oldest* lines are the ones that
+/// go.
+const LOG_FILE_MAX_BYTES: u64 = 1024 * 1024;
+
 /// The shared log ring and the tasks filling it.
 pub struct ServiceLogs {
-    buffer: Arc<Mutex<LogBuffer>>,
+    /// The ring, and the file it is mirrored to if there is one. One lock, so a
+    /// line reaches both in the same order it was produced.
+    sink: Arc<Mutex<Sink>>,
+}
+
+/// Where captured lines go: the ring always, a file when one was configured.
+struct Sink {
+    buffer: LogBuffer,
+    file: Option<LogFile>,
+}
+
+impl Sink {
+    /// The one place a line enters the log, in either direction.
+    fn push(&mut self, unit: &UnitName, line: &str) {
+        self.buffer.push(unit, line);
+        if let Some(file) = self.file.as_mut() {
+            file.append(unit, line);
+        }
+    }
+}
+
+/// An append-only mirror of the ring (plan §1.3(7)).
+///
+/// Written with a plain `write_all` and no user-space buffer, deliberately: the
+/// point of the file is a log someone can read after the fact, and a line still
+/// sitting in a `BufWriter` when the machine goes down is a line nobody has. The
+/// ring is the fast path; this is the durable one.
+struct LogFile {
+    file: std::fs::File,
+    path: PathBuf,
+    /// Bytes written so far, so the bound costs no `stat` per line.
+    written: u64,
+    /// The bound; `LOG_FILE_MAX_BYTES` in production, smaller in tests.
+    max_bytes: u64,
+    /// Set once, so a filesystem that fails on every write warns once.
+    warned: bool,
+}
+
+impl LogFile {
+    /// Open (or create) `path`, appending to whatever is there.
+    ///
+    /// # Errors
+    /// Whatever the directory creation or the open returns - a read-only rootfs,
+    /// a path with no parent rinit may create. The caller degrades: no file, and
+    /// the ring still works.
+    fn open(path: &Path, max_bytes: u64) -> std::io::Result<Self> {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            // `/var/log/rinit` is rinit's to create: the plan's path names a
+            // directory, and an init that refused to make one would only push
+            // the problem onto whoever runs it.
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        let written = file.metadata().map(|meta| meta.len()).unwrap_or(0);
+        Ok(LogFile {
+            file,
+            path: path.to_path_buf(),
+            written,
+            max_bytes: max_bytes.max(1),
+            warned: false,
+        })
+    }
+
+    /// Append one line, truncating first if that would pass the bound.
+    fn append(&mut self, unit: &UnitName, line: &str) {
+        if self.written >= self.max_bytes {
+            self.truncate();
+        }
+        let text = format!("{unit}: {line}\n");
+        match self.file.write_all(text.as_bytes()) {
+            Ok(()) => {
+                self.written += text.len() as u64;
+                self.warned = false;
+            }
+            // A log is diagnostic: a full disk must not take the system with it,
+            // and it must not fill the console either - hence once.
+            Err(e) => {
+                if !self.warned {
+                    rlog!(
+                        "warning: cannot write the log file {}: {e}",
+                        self.path.display()
+                    );
+                    self.warned = true;
+                }
+            }
+        }
+    }
+
+    /// Drop what is there and start again.
+    ///
+    /// Truncate rather than rotate to a second file: the ring drops its oldest
+    /// lines past its bound, and a file that behaves the same way is one fewer
+    /// thing to watch on a rootfs. `O_APPEND` is what makes this safe without
+    /// seeking - every write goes to the end of the file as it is *now*.
+    fn truncate(&mut self) {
+        if self.file.set_len(0).is_ok() {
+            self.written = 0;
+            let _ = self
+                .file
+                .write_all(b"log truncated: the previous contents were dropped\n");
+        }
+    }
 }
 
 impl ServiceLogs {
-    /// A logs store with the default buffer bounds.
+    /// A logs store with the default buffer bounds and no file.
     pub fn new() -> Self {
         ServiceLogs {
-            buffer: Arc::new(Mutex::new(LogBuffer::with_defaults())),
+            sink: Arc::new(Mutex::new(Sink {
+                buffer: LogBuffer::with_defaults(),
+                file: None,
+            })),
+        }
+    }
+
+    /// Mirror every captured line into `path` (plan §1.3(7)).
+    ///
+    /// Best effort by design: a board whose rootfs is read-only, or whose
+    /// `/var/log` cannot be created, boots with the ring and a warning - the same
+    /// degradation every other optional facility here has.
+    pub fn persist_to(&self, path: &Path) {
+        match LogFile::open(path, LOG_FILE_MAX_BYTES) {
+            Ok(file) => {
+                lock(&self.sink).file = Some(file);
+                rlog!("logging to {}", path.display());
+            }
+            Err(e) => {
+                rlog!(
+                    "warning: cannot persist logs to {}: {e}; keeping them in memory only",
+                    path.display()
+                );
+            }
         }
     }
 
@@ -47,11 +187,11 @@ impl ServiceLogs {
         let (reader, writer) = fs::pipe()?;
         fs::set_nonblocking(reader.as_raw_fd(), true)?;
 
-        let buffer = Arc::clone(&self.buffer);
+        let sink = Arc::clone(&self.sink);
         let unit = unit.clone();
         // Spawning here is safe: `capture` is only called from the async boot
         // path, which runs inside the runtime.
-        tokio::spawn(async move { pump(reader, unit, buffer).await });
+        tokio::spawn(async move { pump(reader, unit, sink).await });
         Ok(writer)
     }
 
@@ -59,11 +199,11 @@ impl ServiceLogs {
     ///
     /// `count == 0` means "everything buffered".
     pub fn tail(&self, unit: Option<&UnitName>, count: usize) -> Vec<LogLine> {
-        let buffer = lock(&self.buffer);
+        let sink = lock(&self.sink);
         let count = if count == 0 { usize::MAX } else { count };
         match unit {
-            Some(unit) => buffer.tail_for(unit, count),
-            None => buffer.tail(count),
+            Some(unit) => sink.buffer.tail_for(unit, count),
+            None => sink.buffer.tail(count),
         }
     }
 }
@@ -79,14 +219,12 @@ impl Default for ServiceLogs {
 /// A panic *while holding this lock* would mean a bug in `LogBuffer`, and the
 /// data behind it is plain text: recovering is strictly better than turning
 /// logs into a crash.
-fn lock(buffer: &Arc<Mutex<LogBuffer>>) -> std::sync::MutexGuard<'_, LogBuffer> {
-    buffer
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+fn lock(sink: &Arc<Mutex<Sink>>) -> std::sync::MutexGuard<'_, Sink> {
+    sink.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Read `reader` until end-of-file, appending whole lines to `buffer`.
-async fn pump(reader: OwnedFd, unit: UnitName, buffer: Arc<Mutex<LogBuffer>>) {
+async fn pump(reader: OwnedFd, unit: UnitName, sink: Arc<Mutex<Sink>>) {
     // SAFETY: this is the one `unsafe` left in the binary, and it is deliberate.
     // `reader` is an `OwnedFd`, so this call owns a valid descriptor and never
     // closes or replaces it while the `AsyncFd` lives; that is exactly the
@@ -127,9 +265,9 @@ async fn pump(reader: OwnedFd, unit: UnitName, buffer: Arc<Mutex<LogBuffer>>) {
                     lines.push(trim_line(&line));
                 }
                 if !lines.is_empty() {
-                    let mut buffer = lock(&buffer);
+                    let mut sink = lock(&sink);
                     for line in lines {
-                        buffer.push(&unit, &line);
+                        sink.push(&unit, &line);
                     }
                 }
             }
@@ -147,7 +285,7 @@ async fn pump(reader: OwnedFd, unit: UnitName, buffer: Arc<Mutex<LogBuffer>>) {
     // A final partial line with no trailing newline still belongs in the log.
     if !pending.is_empty() {
         let line = trim_line(&pending);
-        lock(&buffer).push(&unit, &line);
+        lock(&sink).push(&unit, &line);
     }
 }
 
@@ -193,6 +331,54 @@ mod tests {
             .map(|line| line.text.clone())
             .collect();
         assert_eq!(lines, ["first", "second", "third"]);
+    }
+
+    /// Plan §1.3(7): with a file configured, a captured line reaches the ring
+    /// *and* the file - including the directory the plan's path implies, which
+    /// rinit has to create itself.
+    #[test]
+    fn a_configured_file_gets_the_same_lines_as_the_ring() {
+        let dir = std::env::temp_dir().join(format!("rinit-logs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("nested/rinit.log");
+
+        let logs = ServiceLogs::new();
+        logs.persist_to(&path);
+        let app = unit("app.service");
+        lock(&logs.sink).push(&app, "first");
+        lock(&logs.sink).push(&app, "second");
+
+        assert_eq!(logs.tail(Some(&app), 0).len(), 2, "the ring still has them");
+        let written = std::fs::read_to_string(&path).expect("the log file");
+        assert_eq!(written, "app.service: first\napp.service: second\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Past its bound the file drops what it had - the ring's own policy, for the
+    /// same reason: a rootfs with room for a megabyte does not have room for
+    /// whatever a churning service prints overnight.
+    #[test]
+    fn the_log_file_truncates_at_its_bound() {
+        let path = std::env::temp_dir().join(format!("rinit-logs-cap-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut file = LogFile::open(&path, 64).expect("open");
+        let app = unit("app.service");
+        for _ in 0..20 {
+            file.append(&app, "0123456789");
+        }
+
+        let written = std::fs::read_to_string(&path).expect("read back");
+        assert!(
+            written.len() <= 128,
+            "the bound has to hold, got {} bytes",
+            written.len()
+        );
+        assert!(written.contains("log truncated"), "and say so: {written}");
+        assert!(
+            written.ends_with("app.service: 0123456789\n"),
+            "keeping the newest lines, not the oldest: {written}"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     /// A line left without a trailing newline is still logged.

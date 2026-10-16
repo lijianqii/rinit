@@ -57,7 +57,17 @@ pub struct Config {
     ///
     /// `--watchdog-timeout <SECONDS>`; the feed interval is half of it.
     pub watchdog_timeout_sec: u64,
+    /// Where to mirror captured service output (plan §1.3(7)).
+    ///
+    /// `--log-file <PATH>`; `None` keeps it in memory only, which an empty value
+    /// or the word `none` selects. The default is the plan's own path - and it
+    /// is a *mirror* of the ring, not a replacement, so `rctl log` does not
+    /// depend on it.
+    pub log_file: Option<PathBuf>,
 }
+
+/// Where captured service output is persisted by default (plan §1.3(7)).
+pub const DEFAULT_LOG_FILE: &str = "/var/log/rinit/log";
 
 /// Parse arguments (excluding `argv[0]`), honouring [`ENV_TEST_SERVICE`].
 ///
@@ -110,6 +120,7 @@ fn parse_with_default<I: IntoIterator<Item = OsString>>(
         cgroup_root: None,
         watchdog_device: None,
         watchdog_timeout_sec: rinit_runtime::syscall::watchdog::DEFAULT_TIMEOUT_SEC,
+        log_file: Some(PathBuf::from(DEFAULT_LOG_FILE)),
     };
 
     let mut iter = args.into_iter();
@@ -143,6 +154,12 @@ fn parse_with_default<I: IntoIterator<Item = OsString>>(
                     .next()
                     .ok_or_else(|| "--watchdog requires a device path".to_string())?;
                 cfg.watchdog_device = Some(PathBuf::from(value.to_string_lossy().into_owned()));
+            }
+            "--log-file" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--log-file requires a path".to_string())?;
+                cfg.log_file = log_file_path(&value.to_string_lossy());
             }
             "--watchdog-timeout" => {
                 let value = iter
@@ -178,6 +195,8 @@ fn parse_with_default<I: IntoIterator<Item = OsString>>(
                     validate_target(&cfg.default_target)?;
                 } else if let Some(value) = other.strip_prefix("--cgroup-root=") {
                     cfg.cgroup_root = Some(PathBuf::from(value));
+                } else if let Some(value) = other.strip_prefix("--log-file=") {
+                    cfg.log_file = log_file_path(value);
                 } else if let Some(value) = other.strip_prefix("--watchdog=") {
                     cfg.watchdog_device = Some(PathBuf::from(value));
                 } else if let Some(value) = other.strip_prefix("--watchdog-timeout=") {
@@ -206,6 +225,20 @@ fn parse_with_default<I: IntoIterator<Item = OsString>>(
         rinit_core::UnitName::parse(target)
             .map(|_| ())
             .map_err(|e| format!("--default: {e}"))
+    }
+
+    /// The path `--log-file` names, or `None` for "do not persist".
+    ///
+    /// `none` is spelled out rather than only accepting an empty value because a
+    /// kernel command line cannot easily carry an empty argument - and the two
+    /// spellings meaning the same thing is one fewer difference between a boot
+    /// and a `make run`.
+    fn log_file_path(value: &str) -> Option<PathBuf> {
+        let value = value.trim();
+        if value.is_empty() || value.eq_ignore_ascii_case("none") {
+            return None;
+        }
+        Some(PathBuf::from(value))
     }
 
     /// A whole number of seconds, for `--watchdog-timeout`.
@@ -267,6 +300,8 @@ Options:
                              (default: /dev/watchdog; not opened in --dev)
       --watchdog-timeout <S> Hardware timeout in seconds; fed every half
                              (default: 30)
+      --log-file <PATH>      Mirror captured service output to this file
+                             (default: /var/log/rinit/log; 'none' disables)
       --test-service <CMD>   Launch this instead of the unit directory
       -- <SERVICE> [ARGS]    Service as an argv (kernel-cmdline form)
 
@@ -609,6 +644,37 @@ mod tests {
     fn cgroup_root_without_a_value_is_an_error() {
         let err = parse_args(&["--cgroup-root"]).expect_err("must fail");
         assert!(err.contains("--cgroup-root"), "got: {err}");
+    }
+
+    // --- the log file (plan §1.3(7)) ----------------------------------
+
+    /// The file defaults to the plan's path, both flag forms name another, and
+    /// the two spellings of "off" mean off.
+    #[test]
+    fn the_log_file_defaults_to_the_plans_path_and_can_be_turned_off() {
+        assert_eq!(
+            parse_args(&[]).unwrap().log_file,
+            Some(PathBuf::from(DEFAULT_LOG_FILE))
+        );
+        assert_eq!(
+            parse_args(&["--log-file", "/tmp/rinit.log"])
+                .unwrap()
+                .log_file,
+            Some(PathBuf::from("/tmp/rinit.log"))
+        );
+        assert_eq!(
+            parse_args(&["--log-file=/tmp/rinit.log"]).unwrap().log_file,
+            Some(PathBuf::from("/tmp/rinit.log"))
+        );
+        for off in ["none", "NONE", ""] {
+            assert_eq!(
+                parse_args(&["--log-file", off]).unwrap().log_file,
+                None,
+                "'{off}' means do not persist"
+            );
+        }
+        let missing = parse_args(&["--log-file"]).expect_err("must fail");
+        assert!(missing.contains("--log-file"), "got: {missing}");
     }
 
     // --- the watchdog (plan §7.5) -------------------------------------

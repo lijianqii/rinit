@@ -89,6 +89,8 @@ rinit [OPTIONS]
   --cgroup-root <DIR>    where the cgroup v2 hierarchy is mounted
   --watchdog <DEVICE>    hardware watchdog (default /dev/watchdog)
   --watchdog-timeout <S> hardware timeout; fed every half (default 30)
+  --log-file <PATH>      mirror service output to a file
+                         (default /var/log/rinit/log; 'none' disables)
 ```
 
 `--dev` is for developers, not for a target: it skips the mounts, does not
@@ -122,8 +124,10 @@ instead of silently losing a setting. The common ones:
   `reset-failed`, `log`, `reload`. There is no `daemon-reload` equivalent
   mid-start: `rctl reload` is atomic (the whole directory resolves or nothing
   changes).
-- No journal: `rctl log` reads a bounded in-memory ring, and it is lost when
-  rinit restarts. Shipping a log file is the target's job.
+- No journal: `rctl log` reads a bounded in-memory ring. `--log-file` mirrors it
+  to a file (the plan's `/var/log/rinit/log` by default, truncated at 1 MiB), but
+  that is a file rather than a service - shipping, rotation beyond the one
+  truncation and per-unit retention are the target's job.
 - `rctl reload` is the only live reconfiguration: there is no per-unit
   `daemon-reload` to call while a unit is being edited, and a running unit keeps
   the definition it was started with until its next start (by design).

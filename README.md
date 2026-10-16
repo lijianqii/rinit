@@ -16,7 +16,7 @@ test (`make check`) or a guest assertion (`make test-system`, 74 of them in
 | --------- | ------- | -------- |
 | M0 | PID 1 via `rdinit=`, first-wave mounts (`/run` → `/proc` → `/sys` → `/dev` → `/tmp` → `/sys/fs/cgroup`) with fatal/degradable rules per plan §1.3(9), `SIGCHLD` + `waitpid(-1, WNOHANG)` reaping, panic hook to `/dev/kmsg` | guest: "mounted /run…", "mounted /sys/fs/cgroup", "no rinit panic"; host: `crates/rinit/tests/smoke.rs` |
 | M1 | unit files parsed from `/etc/rinit/units`, dependency graph resolved, units started level by level with each level in parallel | guest: "resolved a boot plan", "startup levels run in dependency order", "no target was exec'd" |
-| M2 | supervision (spawn, track, reap, two-stage stop), restart policy with backoff and a circuit breaker, health probes, `Type=notify` readiness, in-memory log ring | guest: "a crashed service is scheduled for restart", "the breaker tripped on the failing unit"; host: `crates/rinit/tests/m2_lifecycle.rs` (33 tests) |
+| M2 | supervision (spawn, track, reap, two-stage stop), restart policy with backoff and a circuit breaker, health probes, `Type=notify` readiness, the in-memory log ring and its optional file mirror (plan §1.3(7)) | guest: "a crashed service is scheduled for restart", "the breaker tripped on the failing unit"; host: `crates/rinit/tests/m2_lifecycle.rs` (33 tests) |
 | M3 | control socket + `rctl` (`list`, `status`, `start`, `stop`, `restart`, `reset-failed`, `log`, `reload`), with a documented exit-code contract | guest: "rctl list reached the control socket" and the five assertions after it; host: `crates/rctl/tests/control.rs` (8 tests) |
 | M4 | soak harness for sustained churn (`make soak`), leak and descriptor fixes, `--dev` control-socket peer relaxation | `scripts/soak.sh` (see [Testing](#testing)); `crates/rinit-core/tests/allocations.rs` |
 | M5 (in progress) | **§7.3–§7.6, §7.10 and §7.11 done.** cgroup v2: `CgroupCPUMax=`, `CgroupMemoryMax=`, `CgroupMemoryHigh=`, `CgroupTasksMax=` under `rinit/<unit>`, the process placing itself, stop-flow signalling of the cgroup's members, `rmdir` cleanup, and OOM-kill detection into the restart policy. Sandboxing: `User=`, `Group=`, `NoNewPrivileges=`, `CapabilityBoundingSet=`, `AmbientCapabilities=`. Hardware watchdog: `/dev/watchdog` armed at boot, fed from the supervisor loop's health checkpoint, magic-closed on shutdown. Reload: `rctl reload` re-reads the unit directory, adds, changes, defers and removes, and refuses a directory that does not resolve. Legacy daemons: `Type=forking` with `PIDFile=`, located through the file or the unit's own cgroup. Terminals: `TTYPath=`/`TTYReset=` give a service a controlling terminal (plan §7.11). **Next**: the P3 items (§7.7 templates, §7.8 `Sockets=`, §7.9 socket activation) | guest: "a limited unit was placed in its own cgroup", "the memory hard and soft limits were written in bytes", "a stopped unit's cgroup was removed", "the kernel OOM-killed a process inside the unit's cgroup", "rinit armed the guest's watchdog device", "the driver took the timeout rinit set", "the guest outlived the watchdog timeout with the device armed", "an added unit the boot target does not need was not started", "a changed unit that is running kept it for the next start", "a directory that does not resolve was refused whole", "the unit is active with the daemon the PIDFile named", "stopping a forking unit stopped the daemon it took over", "a TTYPath that is not a terminal fails the start", "a de-privileged service ran as nobody:nogroup with NoNewPrivs", "an empty CapabilityBoundingSet left a root service with no capabilities", "ambient capabilities reached a de-privileged service"; host: `crates/rinit/src/cgroup.rs` (19 tests), `crates/rinit-core/src/unit/cgroup.rs` (9), `crates/rinit-runtime/src/syscall/cgroup.rs` (14), `crates/rinit/src/watchdog.rs` (6), `crates/rinit-runtime/src/syscall/watchdog.rs` (6), `crates/rinit/src/unit_manager.rs` (5 for the reload itself, `reload.rs` is policy over them), `crates/rinit/tests/m2_lifecycle.rs` (6, end to end), `crates/rinit/src/sandbox.rs` (14), `crates/rinit-core/src/unit/sandbox.rs` (9), `crates/rinit-runtime/src/syscall/cred.rs` (14) |
@@ -236,17 +236,17 @@ make test-system    # boot aarch64 qemu and assert the acceptance list
 make test           # check + test-system
 ```
 
-`cargo test --offline --workspace` (what `make check` runs last) executes **649
+`cargo test --offline --workspace` (what `make check` runs last) executes **654
 tests** across eleven binaries. The four shapes, and why each is not redundant:
 
-- **unit tests** next to the code (core 304, rinit 171, rinit-runtime 92,
+- **unit tests** next to the code (core 304, rinit 174, rinit-runtime 92,
   rctl 11), including `proptest` properties over the parser;
 - **integration tests** in `crates/*/tests/`: the syscall layer against the real
   kernel (`rinit-runtime` 21: run unprivileged, they assert that each drop is
   *refused* rather than silently skipped - `EPERM` from `setuid(0)`, `setgroups`,
   `PR_CAPBSET_DROP`, `capset` and the ambient raise, each naming the call that
   failed - with the root-only success paths deferred to the guest), the
-  lifecycle end to end in `--dev` mode (`rinit/tests/m2_lifecycle.rs` 33), the
+  lifecycle end to end in `--dev` mode (`rinit/tests/m2_lifecycle.rs` 35), the
   control CLI (`rctl/tests/control.rs` 8), the smoke test that runs the real
   binary (`rinit/tests/smoke.rs` 2), the allocation guard
   (`rinit-core/tests/allocations.rs` 2), and `shipped_units.rs` 4 - every unit in
@@ -295,17 +295,17 @@ and a kernel built with its driver are part of the test rig rather than an
 optional extra: without them the guest could only ever exercise the
 "no watchdog hardware" path.
 
-`cargo llvm-cov --offline --workspace --summary-only`, measured at the §7.10
+`cargo llvm-cov --offline --workspace --summary-only`, measured at the §1.3(7)
 commit. The plan's checklist asks for ≥80% overall and ≥90% in the core, so these
 are the numbers that answer it rather than a shape:
 
 | crate            | line coverage | functions |
 | ---------------- | ------------- | --------- |
-| `rinit-core`     | **96.71%**    | 526/538   |
-| `rinit-runtime`  | 86.47%        | 253/288   |
-| `rinit`          | 91.49%        | 527/570   |
+| `rinit-core`     | **96.71%**    | 527/539   |
+| `rinit-runtime`  | 85.53%        | 253/290   |
+| `rinit`          | 91.57%        | 540/583   |
 | `rctl`           | 96.08%        | 27/32     |
-| **total**        | **92.46%**    | 1333/1428 |
+| **total**        | **92.31%**    | 1347/1444 |
 
 The low outliers are the ones that *cannot* run on a host, which is why the guest
 tests exist rather than an omission: `syscall/reboot.rs` (0% - it would reboot the
@@ -324,8 +324,13 @@ cargo llvm-cov --offline --workspace --html                  # target/llvm-cov/h
 
 **Known gaps**, tracked rather than hidden:
 
-- **Log persistence is not implemented** (plan §1.3(7)): `rctl log` reads an
-  in-memory ring, so a restart of rinit loses everything.
+- **The log *file* is a mirror, not a journal.** Plan §1.3(7)'s optional
+  persistence is implemented (`--log-file`, `/var/log/rinit/log` by default,
+  truncated at 1 MiB), but it is a copy of the ring's latest lines written with
+  plain `write_all` - no per-unit files, no `journalctl` query over the file, and
+  no syslog protocol. `rctl log` reads the ring, so a line is only in the file for
+  as long as the file is; whether that outlives a reboot is the filesystem's
+  business (tmpfs does not, a disk does).
 - **`--dev` cannot de-privilege to another user, or drop a bounding set.** An
   unprivileged rinit gets `EPERM` from `setgid`, `setgroups` and
   `PR_CAPBSET_DROP`, so those units fail rather than run with the drop skipped -
@@ -377,14 +382,14 @@ repository or a measurement in this README:
 
 | plan §6 | where it stands |
 | ------- | --------------- |
-| boots as PID 1 in qemu (128M) with no kernel panic | `make test-system`: 78 assertions, including "no rinit panic" and four kernel-log checks |
+| boots as PID 1 in qemu (128M) with no kernel panic | `make test-system`: 79 assertions, including "no rinit panic" and four kernel-log checks |
 | 20 services in parallel, visibly faster than serial | **19.2x**: `make parallel` - 20 `oneshot` services that each sleep 1 s finish in 1065 ms together and 20 424 ms chained |
 | crash-restart, breaker, health checks | `make test-system` ("a crashed service is scheduled for restart", "the breaker tripped on the failing unit") and `crates/rinit/tests/m2_lifecycle.rs` |
 | `rctl` can start, stop, query and read logs | `make test-system`'s M3 block and `crates/rctl/tests/control.rs` |
 | graceful shutdown, no zombies, no fd leak | `make soak` samples descriptors, threads and zombie children through restart churn, and asserts each comes back to its baseline |
 | 72 h soak with stable RSS | **not run here.** `make soak` is the harness and `make soak SOAK_ARGS='--seconds 259200'` is the run; what has been run is a five-minute one - 149778 restart cycles, RSS 4668 kB → 4672 kB (+4 kB) across the second half, descriptors 21 → 23, zero zombie children |
 | binaries ≤2 MB dynamic / ≤4 MB static | [Measurements](#measurements-plan-01-calibration-point): 1.45 MiB, static aarch64 |
-| unit test coverage ≥80% overall, ≥90% in the core | **92.46%** and **96.71%** (llvm-cov, [above](#testing)) |
+| unit test coverage ≥80% overall, ≥90% in the core | **92.31%** and **96.71%** (llvm-cov, [above](#testing)) |
 | documentation: architecture, unit format, `rctl`, porting | this README (architecture, status, measurements), [`docs/units.md`](docs/units.md) (every directive, its value syntax and its default), [`docs/porting.md`](docs/porting.md) (kernel, userspace, build, differences from systemd), and `rinit-开发计划.md` |
 
 One number the checklist does not ask for, but plan §0.1's design goals do: rinit's
@@ -511,6 +516,8 @@ rinit [OPTIONS] [-- <SERVICE> [ARGS...]]
                              (default: /dev/watchdog; not opened in --dev)
       --watchdog-timeout <S> Hardware timeout in seconds; fed every half
                              (default: 30)
+      --log-file <PATH>      Mirror captured service output to this file
+                             (default: /var/log/rinit/log; 'none' disables)
       --test-service <CMD>   Launch this instead of the unit directory
       -- <SERVICE> [ARGS]    Service as an argv (kernel-cmdline form)
 ```

@@ -95,8 +95,13 @@ pub async fn run(cfg: Config) -> Result<(), RuntimeError> {
     // bring-up and smoke-test path, not how a real system boots.
     if cfg.service_argv.is_empty() {
         let mut notify = NotifyHub::new();
-        // One shared log ring for the whole boot (plan §1.3(7)).
+        // One shared log ring for the whole boot (plan §1.3(7)), mirrored to a
+        // file if the boot asked for one. Before `start_units`, so the first
+        // service's output is captured like every other line.
         let logs = ServiceLogs::new();
+        if let Some(path) = &cfg.log_file {
+            logs.persist_to(path);
+        }
         let mut manager = start_units(&cfg, &mut notify, &logs, cgroup).await?;
         // The control socket is bound after the mounts, so `/run` exists
         // (plan §1.3(10)); a failure to bind it is only a warning.

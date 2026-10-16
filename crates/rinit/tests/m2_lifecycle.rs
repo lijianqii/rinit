@@ -1553,6 +1553,89 @@ fn a_forking_unit_whose_daemon_cannot_be_located_fails_its_start() {
     }
 }
 
+// --- §1.3(7): the log file ------------------------------------
+
+/// Plan §1.3(7): the ring can be mirrored to a file, which is what makes a log
+/// readable after the process that wrote it is gone.
+#[test]
+fn the_log_file_mirrors_what_a_service_wrote() {
+    let dir = TempDir::new("log-file");
+    let path = std::env::temp_dir().join(format!("rinit-m2-log-{}.log", std::process::id()));
+    let _ = fs::remove_file(&path);
+    dir.write(
+        "all.target",
+        "[Unit]
+Type=target
+Requires=app.service
+",
+    );
+    dir.write(
+        "app.service",
+        "[Service]
+Type=oneshot
+ExecStart=/bin/echo persisted-marker
+",
+    );
+
+    let log = boot_units_extra(
+        &dir,
+        "all.target",
+        SETTLE,
+        libc::SIGTERM,
+        &["--log-file", path.to_str().expect("UTF-8 path")],
+    );
+    let written = fs::read_to_string(&path).unwrap_or_default();
+    let _ = fs::remove_file(&path);
+
+    assert!(
+        log.contains("logging to"),
+        "the boot says where it is writing:\n{log}"
+    );
+    assert!(
+        written.contains("app.service: persisted-marker"),
+        "the service's own output has to be in the file, got: {written:?}"
+    );
+}
+
+/// And a path that cannot be opened is a warning rather than a failed boot: the
+/// plan calls persistence optional, and an init that refused to start because
+/// `/var/log` was read-only would be worse than one with logs only in memory.
+#[test]
+fn a_log_file_that_cannot_be_opened_is_a_warning_not_a_failure() {
+    let dir = TempDir::new("log-file-bad");
+    dir.write(
+        "all.target",
+        "[Unit]
+Type=target
+Requires=app.service
+",
+    );
+    dir.write(
+        "app.service",
+        "[Service]
+Type=oneshot
+ExecStart=/bin/echo still-runs\n",
+    );
+
+    // Inside `/proc`, where `create_dir_all` can only fail.
+    let log = boot_units_extra(
+        &dir,
+        "all.target",
+        SETTLE,
+        libc::SIGTERM,
+        &["--log-file", "/proc/rinit-cannot-create-this/log"],
+    );
+
+    assert!(
+        log.contains("cannot persist logs"),
+        "the degradation has to be named:\n{log}"
+    );
+    assert!(
+        log.contains("boot complete"),
+        "and the boot has to carry on:\n{log}"
+    );
+}
+
 // --- §7.11: a controlling terminal ----------------------------
 
 /// A pty pair: the master end stays with the test, and the slave's path is what
