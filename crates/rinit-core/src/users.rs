@@ -1,4 +1,5 @@
-//! Name-to-id lookup from `/etc/passwd` and `/etc/group` (plan §1.3(12)).
+//! Name-to-id lookup from `/etc/passwd` and `/etc/group` (plan §1.3(12), used
+//! again by the privilege drop in §7.4).
 //!
 //! rinit is built with `crt-static` (`.cargo/config.toml`), and a *static*
 //! glibc `getpwnam` still needs the NSS `libnss_files.so` at run time: it is
@@ -15,11 +16,74 @@
 //! be tested without a system user database - the "files" backend of every
 //! NSS configuration, reduced to what an initramfs actually ships.
 
+use alloc::vec::Vec;
+
 /// The uid of `name` in an `/etc/passwd` body, if present.
 ///
 /// A row is `name:passwd:uid:gid:gecos:home:shell`.
 pub fn passwd_uid(contents: &str, name: &str) -> Option<u32> {
-    id_of(contents, name)
+    passwd_ids(contents, name).map(|(uid, _)| uid)
+}
+
+/// The uid and primary gid of `name` in an `/etc/passwd` body, if present.
+///
+/// The primary gid is what a service runs under when it sets `User=` but no
+/// `Group=` (plan §7.4), so both ids come out of one pass over the file rather
+/// than two.
+pub fn passwd_ids(contents: &str, name: &str) -> Option<(u32, u32)> {
+    if name.is_empty() {
+        return None;
+    }
+    contents.lines().find_map(|line| {
+        let mut fields = line.split(':');
+        if fields.next() != Some(name) {
+            return None;
+        }
+        // Skip the password field, then read the uid and gid. `trim` also
+        // strips the `\r` of a CRLF file and any stray padding.
+        let _password = fields.next()?;
+        let uid = fields.next()?.trim().parse().ok()?;
+        let gid = fields.next()?.trim().parse().ok()?;
+        Some((uid, gid))
+    })
+}
+
+/// The gids of every group in an `/etc/group` body that lists `name` as a
+/// member, in file order and without repeats.
+///
+/// A row is `name:passwd:gid:members`, where `members` is a comma-separated
+/// list. This is the set `initgroups(3)` would compute, parsed here because
+/// `initgroups` is as NSS-backed as `getpwnam` and would need
+/// `libnss_files.so` at run time - the same reason [`passwd_uid`] does not call
+/// `getpwnam` (see this module's header). The rows are not the whole answer:
+/// the primary gid belongs in the child's group list too, and the caller adds
+/// it.
+///
+/// Membership is matched on the whole field, so `harry` does not pick up
+/// `harrison`'s groups. A malformed row is skipped rather than ending the
+/// search.
+pub fn supplementary_gids(contents: &str, name: &str) -> Vec<u32> {
+    let mut gids = Vec::new();
+    if name.is_empty() {
+        return gids;
+    }
+    for line in contents.lines() {
+        let mut fields = line.split(':');
+        // The group's own name is not what matters here - membership is - but
+        // the two fields before the id still have to be skipped.
+        if fields.next().is_none() {
+            continue;
+        }
+        let _password = fields.next();
+        let Some(gid) = fields.next().and_then(|f| f.trim().parse::<u32>().ok()) else {
+            continue;
+        };
+        let members = fields.next().unwrap_or("");
+        if members.split(',').any(|member| member.trim() == name) && !gids.contains(&gid) {
+            gids.push(gid);
+        }
+    }
+    gids
 }
 
 /// The gid of `name` in an `/etc/group` body, if present.
@@ -54,6 +118,8 @@ fn id_of(contents: &str, name: &str) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+
     use super::*;
 
     const PASSWD: &str = "\
@@ -137,5 +203,64 @@ harrison:x:1000:1000:Harrison:/home/harrison:/bin/bash
             passwd_uid("dup:x:1:1::/:/b\ndup:x:2:2::/:/b\n", "dup"),
             Some(1)
         );
+    }
+
+    /// `User=` without `Group=` runs the service under the user's *primary*
+    /// group, so the gid field of the passwd row has to be readable.
+    #[test]
+    fn the_primary_gid_comes_from_the_passwd_row() {
+        assert_eq!(passwd_ids(PASSWD, "harrison"), Some((1000, 1000)));
+        assert_eq!(passwd_ids("u:x:7:9:g:/h:/s\n", "u"), Some((7, 9)));
+    }
+
+    #[test]
+    fn an_unknown_user_has_no_ids() {
+        assert_eq!(passwd_ids(PASSWD, "nobody"), None);
+    }
+
+    /// A row that stops before the gid cannot supply one, and must not be
+    /// mistaken for a user whose group is `0`.
+    #[test]
+    fn a_row_without_a_gid_is_not_a_match() {
+        assert_eq!(passwd_ids("u:x:7::/h:/s\n", "u"), None);
+        assert_eq!(passwd_uid("u:x:7::/h:/s\n", "u"), None);
+    }
+
+    /// Supplementary group membership: every group that lists the user.
+    #[test]
+    fn supplementary_groups_are_the_ones_listing_the_user() {
+        let body = "root:x:0:\nwheel:x:10:harrison\naudio:x:63:harrison,dave\n";
+        assert_eq!(supplementary_gids(body, "harrison"), vec![10, 63]);
+    }
+
+    /// Membership is matched on the whole name, so `harry` is not a member of
+    /// `harrison`'s groups.
+    #[test]
+    fn a_member_prefix_does_not_count() {
+        let body = "wheel:x:10:harrison\n";
+        assert_eq!(supplementary_gids(body, "harry"), Vec::<u32>::new());
+        assert_eq!(supplementary_gids(body, "harrison"), vec![10]);
+    }
+
+    /// A group listed twice is one entry, and a membership list padded with
+    /// spaces still matches (`wheel:x:10: a, harrison `).
+    #[test]
+    fn members_are_read_once_each_and_trimmed() {
+        let body = "a:x:1:harrison\nb:x:1:harrison\nc:x:2: a, harrison \n";
+        assert_eq!(supplementary_gids(body, "harrison"), vec![1, 2]);
+    }
+
+    #[test]
+    fn an_unknown_user_has_no_supplementary_groups() {
+        assert_eq!(supplementary_gids(GROUP, "nobody"), Vec::<u32>::new());
+        assert_eq!(supplementary_gids(GROUP, ""), Vec::<u32>::new());
+    }
+
+    /// A group with an empty member list, or a malformed row, contributes
+    /// nothing - and neither hides the valid rows.
+    #[test]
+    fn malformed_group_rows_are_skipped() {
+        let body = "broken\nno-id:x::harrison\nok:x:5:harrison\n";
+        assert_eq!(supplementary_gids(body, "harrison"), vec![5]);
     }
 }

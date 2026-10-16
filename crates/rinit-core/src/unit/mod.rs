@@ -12,6 +12,7 @@
 //!   (plan §1.0 grammar).
 //! - [`dependency`] — dependency DAG, topological order, cycle detection
 //!   (plan §1.3(1)).
+//! - [`sandbox`] — the ordered privilege-drop plan for a service (plan §7.4).
 
 pub mod config;
 pub mod dependency;
@@ -19,6 +20,7 @@ pub mod job;
 pub mod notify;
 pub mod parser;
 pub mod restart;
+pub mod sandbox;
 pub mod state;
 
 use alloc::string::{String, ToString};
@@ -34,6 +36,7 @@ pub use job::{Job, JobQueue, JobTarget, RequestSource};
 pub use notify::{NotifyError, NotifyMessage, parse as parse_notify};
 pub use parser::{ParseError, parse as parse_unit_file, parse_environment_file};
 pub use restart::{BackoffState, Jitter};
+pub use sandbox::{Sandbox, SandboxStep};
 pub use state::{Effect, Event, ExitOutcome, FailedReason, TransitionError, UnitState, transition};
 
 /// The kind of a unit (plan §1.1 `[Unit] Type`).
