@@ -77,6 +77,8 @@ of that). `After` alone orders without pulling in, exactly as in systemd.
 | `ExecStartPost` | command | none | Run after the main command is under way (after exit, for `oneshot`). Repeatable. |
 | `ExecStop` | command | empty | The stop action. **Empty means `SIGTERM`** to the process group and to every process in the unit's cgroup. |
 | `PIDFile` | absolute path | none | Where a `Type=forking` daemon writes its pid (plan §7.10). |
+| `Sockets` | absolute path (repeatable) | none | A socket path this unit creates (plan §7.8). rinit creates nothing - this is the declaration that lets another unit's `NeedsSocket=` resolve to *this* unit. |
+| `NeedsSocket` | absolute path (repeatable) | none | A socket path this unit needs before it starts (plan §7.8). The unit waits for the path, bounded by `TimeoutStartSec`, and fails its start if it never appears. |
 | `TTYPath` | absolute path | none | A controlling terminal for the service (plan §7.11): the child opens it after `setsid`, takes it with `TIOCSCTTY` and uses it as stdin/stdout/stderr. |
 | `TTYReset` | `true`/`false` | `true` | Hang the terminal up when taking it over, so a respawned console service starts on a clean one rather than on the last session's leftovers. Best effort: a device that does not implement it is still used. |
 | `WorkingDirectory` | absolute path | `/` | The child's working directory. Empty keeps the default. |
@@ -95,6 +97,44 @@ of that). `After` alone orders without pulling in, exactly as in systemd.
   set - through the unit's own cgroup, and only when that cgroup holds exactly one
   process. Anything else fails the start, naming the reason, rather than guessing
   (plan §7.10).
+
+### Sockets as dependencies
+
+`Sockets=` and `NeedsSocket=` express "this unit creates that socket, and that one
+waits for it" as a dependency rather than as a start order (plan §7.8):
+
+```ini
+# api.service
+[Service]
+Type=simple
+Sockets=/run/api.sock
+ExecStart=/usr/bin/api
+```
+
+```ini
+# client.service
+[Service]
+Type=simple
+NeedsSocket=/run/api.sock
+ExecStart=/usr/bin/client
+```
+
+Three rules make it work:
+
+- **One provider per path.** Two units declaring the same `Sockets=` is a
+  boot-time error, because a `NeedsSocket=` resolves *to* a unit and two
+  candidates are an ambiguity nothing later can settle.
+- **The edge is hard.** A `NeedsSocket=` whose path some unit declares becomes a
+  `Requires=` and an `After=` on that unit, so the consumer is in a later level.
+- **The wait is on the path, not on the state.** `Type=simple` is `Active` at
+  exec, which is long before a daemon has bound its socket - so a consumer waits
+  for the *file* to exist, bounded by its own `TimeoutStartSec`, and fails its
+  start (naming the path) if it never does. rinit checks that the path exists, not
+  that it is a socket: what to create is the unit's business.
+
+A `NeedsSocket=` that **no** unit declares is not an error - the plan degrades it
+to a weak dependency - and the wait still happens, which is the property that
+matters. It is reported as a warning at boot so it can be found.
 
 `TTYPath=` is what a `getty`-like service needs before it can run a login shell.
 Two consequences are worth knowing: the terminal replaces the log ring for that

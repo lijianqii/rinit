@@ -1,0 +1,20 @@
+# `Sockets=` acceptance unit, the provider half (plan §7.8).
+#
+# It declares the path it creates so that `sockc.service`'s `NeedsSocket=` can
+# resolve to *it* - the declaration is what turns "something will make this
+# socket" into a dependency edge on a named unit. rinit does not create the
+# socket: the process below does, one second after it was exec'd.
+#
+# That delay is the point. `Type=simple` means this unit is `Active` the moment it
+# is exec'd, so a consumer that merely waited for it to be active would start
+# against an empty path - which is exactly the race `NeedsSocket=` removes by
+# waiting for the *path* instead.
+#
+# Started on demand (`rctl start sockd.service`) so the console can drive the pair.
+[Unit]
+Description=socket provider demo (started on demand)
+
+[Service]
+Type=simple
+Sockets=/run/sockd.sock
+ExecStart=/bin/sh -c "sleep 1; touch /run/sockd.sock; sleep 300"

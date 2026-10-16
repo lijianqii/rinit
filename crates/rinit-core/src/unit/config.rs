@@ -297,6 +297,19 @@ pub struct UnitConfig {
     pub exec_start_post: Vec<ExecCommand>,
     /// Stop command; empty means `SIGTERM`.
     pub exec_stop: ExecCommand,
+    /// Socket paths this unit creates (plan §7.8's `Sockets=`).
+    ///
+    /// rinit creates nothing here - the unit's own process binds the socket. The
+    /// declaration is what lets another unit's `NeedsSocket=` find the unit it has
+    /// to wait for, which is the whole point: a dependency expressed as "the path
+    /// exists" rather than as a start order.
+    pub sockets: Vec<String>,
+    /// Socket paths this unit needs before it starts (plan §7.8's `NeedsSocket=`).
+    ///
+    /// The unit waits for each path, bounded by `TimeoutStartSec`, and fails if it
+    /// never appears. Waiting for the *path* rather than for the providing unit's
+    /// `Active` state is what closes the race a start order leaves open.
+    pub needs_socket: Vec<String>,
     /// A controlling terminal for the unit (plan §7.11).
     ///
     /// `None` means the service inherits rinit's own descriptors and no
@@ -405,6 +418,8 @@ impl UnitConfig {
             tty_path: None,
             tty_reset: true,
             pid_file: None,
+            sockets: Vec::new(),
+            needs_socket: Vec::new(),
             health_check: ExecCommand::empty(),
             health_interval_sec: 30,
             health_timeout_sec: 10,

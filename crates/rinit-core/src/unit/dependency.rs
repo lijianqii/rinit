@@ -29,6 +29,7 @@
 // any of this runs (see `build`), so the graph is always well formed.
 #![allow(clippy::indexing_slicing)]
 
+use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec;
@@ -58,6 +59,19 @@ pub enum DependencyError {
     UnknownDefaultTarget {
         /// The requested target.
         target: UnitName,
+    },
+    /// Two units declare the same `Sockets=` path (plan §7.8).
+    ///
+    /// The path is what a `NeedsSocket=` resolves *to*, so two candidates for it
+    /// means the declaration is ambiguous - and ambiguity there is a boot-time
+    /// error rather than a guess about which unit to wait for.
+    DuplicateSocket {
+        /// The path that two units claimed.
+        path: String,
+        /// The first unit to claim it.
+        first: UnitName,
+        /// The second.
+        second: UnitName,
     },
     /// Two inputs defined the same unit.
     ///
@@ -95,6 +109,14 @@ impl core::fmt::Display for DependencyError {
             DependencyError::UnknownDefaultTarget { target } => {
                 write!(f, "boot target {target} not found in the unit directory")
             }
+            DependencyError::DuplicateSocket {
+                path,
+                first,
+                second,
+            } => write!(
+                f,
+                "{first} and {second} both declare Sockets={path}; a socket path has to have one provider"
+            ),
             DependencyError::DuplicateUnit { unit } => {
                 write!(f, "{unit} is defined more than once")
             }
@@ -149,6 +171,63 @@ pub struct DependencyGraph {
     activations: Vec<Vec<usize>>,
     /// Soft references that could not be resolved, reported as warnings.
     pub warnings: Vec<String>,
+}
+
+/// Turn `Sockets=`/`NeedsSocket=` declarations into dependency edges
+/// (plan §7.8).
+///
+/// Each path may be declared by exactly one unit; a `NeedsSocket=` with a
+/// provider becomes a hard `Requires=` *and* an `After=` on it, because the
+/// consumer cannot work before the provider is up. A `NeedsSocket=` with no
+/// provider is not an error: the plan degrades it ("按 `Wants` 弱依赖降级处理"), and
+/// the property that matters is kept anyway, since the consumer still waits for
+/// the path itself before it starts. Those are returned as warnings, for the boot
+/// log to say out loud.
+///
+/// # Errors
+/// [`DependencyError::DuplicateSocket`] when two units claim one path.
+pub fn resolve_sockets(configs: &mut [UnitConfig]) -> Result<Vec<String>, DependencyError> {
+    // Owned copies rather than borrows: the loop below mutates the configs, and a
+    // map of references into them would make that impossible.
+    let mut providers: BTreeMap<String, UnitName> = BTreeMap::new();
+    for config in configs.iter() {
+        for path in &config.sockets {
+            if let Some(first) = providers.insert(path.clone(), config.name.clone()) {
+                return Err(DependencyError::DuplicateSocket {
+                    path: path.clone(),
+                    first,
+                    second: config.name.clone(),
+                });
+            }
+        }
+    }
+
+    let mut warnings = Vec::new();
+    for config in configs.iter_mut() {
+        let mut requires: Vec<UnitName> = Vec::new();
+        for path in &config.needs_socket {
+            match providers.get(path) {
+                // A unit cannot declare its own socket as a prerequisite of
+                // itself: that would be a self-loop, and the graph would reject
+                // the boot for a unit file that reads harmlessly.
+                Some(provider) if provider != &config.name => requires.push(provider.clone()),
+                Some(_) => {}
+                None => warnings.push(format!(
+                    "{}: NeedsSocket={path} has no unit declaring it; waiting for the path anyway",
+                    config.name
+                )),
+            }
+        }
+        for provider in requires {
+            if !config.deps.requires.contains(&provider) {
+                config.deps.requires.push(provider.clone());
+            }
+            if !config.deps.after.contains(&provider) {
+                config.deps.after.push(provider);
+            }
+        }
+    }
+    Ok(warnings)
 }
 
 impl DependencyGraph {
@@ -516,6 +595,102 @@ mod tests {
                 UnitType::Service,
             ),
         ]
+    }
+
+    /// A config with the two socket directives, and nothing else.
+    fn socket_unit(n: &str, sockets: &[&str], needs: &[&str]) -> UnitConfig {
+        let mut cfg = UnitConfig::new(name(n));
+        cfg.sockets = sockets.iter().map(|s| String::from(*s)).collect();
+        cfg.needs_socket = needs.iter().map(|s| String::from(*s)).collect();
+        cfg
+    }
+
+    /// Plan §7.8: a `NeedsSocket=` becomes a hard dependency on the unit that
+    /// declared the path - so the consumer waits for its provider - and one with
+    /// no provider is a warning rather than a failure, because the consumer waits
+    /// for the *path* either way.
+    #[test]
+    fn needs_socket_resolves_to_its_provider() {
+        let mut configs = vec![
+            socket_unit("api.service", &["/run/api.sock"], &[]),
+            socket_unit("client.service", &[], &["/run/api.sock"]),
+            socket_unit("orphan.service", &[], &["/run/nowhere.sock"]),
+        ];
+
+        let warnings = resolve_sockets(&mut configs).expect("one provider per path");
+        assert_eq!(warnings.len(), 1, "only the orphan warns: {warnings:?}");
+        assert!(warnings[0].contains("/run/nowhere.sock"), "{warnings:?}");
+
+        let by_name = |n: &str| {
+            configs
+                .iter()
+                .find(|c| c.name.canonical() == n)
+                .unwrap()
+                .clone()
+        };
+        let client = by_name("client.service");
+        assert_eq!(client.deps.requires, [name("api.service")]);
+        assert_eq!(
+            client.deps.after,
+            [name("api.service")],
+            "and the ordering edge comes with it"
+        );
+        assert!(
+            by_name("api.service").deps.requires.is_empty(),
+            "the provider does not depend on its consumer"
+        );
+
+        // And the graph puts the provider first, which is the point of the edge.
+        let graph = DependencyGraph::build(&configs).unwrap();
+        let levels = graph.levels().unwrap();
+        let level_of = |n: &str| {
+            levels
+                .iter()
+                .position(|level| level.iter().any(|u| u == &name(n)))
+                .expect("scheduled")
+        };
+        assert!(level_of("api.service") < level_of("client.service"));
+    }
+
+    /// Two units claiming one path is a boot-time error: a `NeedsSocket=`
+    /// resolves *to* a provider, so two candidates for one path is an ambiguity
+    /// nobody can resolve later.
+    #[test]
+    fn two_units_declaring_one_socket_is_an_error() {
+        let mut configs = vec![
+            socket_unit("api.service", &["/run/api.sock"], &[]),
+            socket_unit("other.service", &["/run/api.sock"], &[]),
+        ];
+        match resolve_sockets(&mut configs) {
+            Err(DependencyError::DuplicateSocket {
+                path,
+                first,
+                second,
+            }) => {
+                assert_eq!(path, "/run/api.sock");
+                assert_eq!(
+                    (first.canonical(), second.canonical()),
+                    ("api.service", "other.service")
+                );
+            }
+            other => panic!("expected a duplicate-socket error, got {other:?}"),
+        }
+    }
+
+    /// A unit that declares its own socket and needs it is not turned into a
+    /// self-loop: the declaration reads harmlessly, and the graph would refuse
+    /// the boot for it.
+    #[test]
+    fn a_unit_that_needs_its_own_socket_is_left_alone() {
+        let mut configs = vec![socket_unit(
+            "api.service",
+            &["/run/api.sock"],
+            &["/run/api.sock"],
+        )];
+        let warnings = resolve_sockets(&mut configs).expect("no duplicate");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(configs[0].deps.requires.is_empty());
+        assert!(DependencyGraph::build(&configs).is_ok(), "no cycle to find");
     }
 
     #[test]

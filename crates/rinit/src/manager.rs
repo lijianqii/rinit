@@ -56,7 +56,7 @@ pub struct BootPlan {
 /// starts, and a boot that silently skipped half its units would be worse than
 /// one that refuses to start.
 pub fn plan_boot(unit_dir: &Path, default_target: &str) -> Result<BootPlan, RuntimeError> {
-    let (files, warnings) = load_unit_files(unit_dir)?;
+    let (files, mut warnings) = load_unit_files(unit_dir)?;
 
     let mut configs: Vec<UnitConfig> = Vec::with_capacity(files.len());
     let mut templates: BTreeMap<String, String> = BTreeMap::new();
@@ -76,11 +76,18 @@ pub fn plan_boot(unit_dir: &Path, default_target: &str) -> Result<BootPlan, Runt
         configs.push(cfg);
     }
 
+    // Plan §7.8: `Sockets=`/`NeedsSocket=` become dependency edges *before* the
+    // graph is built, so a consumer waits for its provider like any other
+    // dependency - and an ambiguous path is a boot error rather than a guess.
+    warnings.extend(
+        rinit_core::unit::dependency::resolve_sockets(&mut configs)
+            .map_err(|e| RuntimeError::Core(e.into()))?,
+    );
+
     let target = UnitName::parse(default_target).map_err(RuntimeError::Core)?;
 
     let by_ref: Vec<&UnitConfig> = configs.iter().collect();
     let graph = DependencyGraph::build(by_ref).map_err(|e| RuntimeError::Core(e.into()))?;
-    let mut warnings = warnings;
     warnings.extend(graph.warnings.iter().cloned());
 
     if !graph.units().contains(&target) {

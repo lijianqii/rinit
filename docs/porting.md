@@ -116,8 +116,11 @@ instead of silently losing a setting. The common ones:
   *unit file* cannot name an instance (`Requires=worker@1.service` is rejected
   when the directory is loaded) - instances are started by name. systemd gets the
   first from `[Install]` symlinks and the second from the same.
-- `Sockets=` and socket activation, `Type=idle`/`dbus`, `$MAINPID`, cgroup v1:
-  not implemented (plan §7.8-§7.9, P3).
+- `Sockets=`/`NeedsSocket=` work as a *dependency* (plan §7.8): the provider
+  declares the path, the consumer waits for it. What is not implemented is socket
+  *activation* (plan §7.9) - rinit never binds a socket on a unit's behalf, so an
+  idle service is resident rather than started on demand.
+- `Type=idle`/`dbus`, `$MAINPID`, cgroup v1: not implemented.
 - `PermissionsStartOnly=` and the `+`/`-`/`!` prefixes: every `Exec*` runs as the
   unit's `User=`.
 - `Type=forking` works, but the `PIDFile=` has to have been written by the time

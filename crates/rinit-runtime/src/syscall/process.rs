@@ -35,6 +35,7 @@ pub const TIOCSCTTY: libc::c_ulong = 0x540E;
 /// `_IO('T', 0x37)`, same header, same reason as [`TIOCSCTTY`].
 pub const TIOCVHANGUP: libc::c_ulong = 0x5437;
 
+
 /// A controlling terminal to hand a child (plan §7.11).
 ///
 /// `TTYPath=` plus `TTYReset=`: the device to open, and whether to hang it up

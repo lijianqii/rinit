@@ -35,6 +35,13 @@ use crate::watchdog::Watchdog;
 /// deadlines. Small enough that a quick exit is noticed promptly.
 const SHUTDOWN_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
+/// How often a `NeedsSocket=` wait looks for the path (plan §7.8).
+///
+/// A directory lookup, not a syscall on the socket: frequent enough that a
+/// provider which creates it a moment later is not a visible delay, cheap enough
+/// that the wait costs nothing while it is happening.
+const SOCKET_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
 /// Per-unit stop timeout under power failure (plan §7.1): essentially no time
 /// to be graceful, so the budget is capped hard.
 const FAST_STOP_SECS: u64 = 2;
@@ -405,6 +412,17 @@ async fn start_unit(
     // definition.
     manager.adopt_pending_config(unit);
 
+    // Plan §7.8: wait for the sockets this unit declared it needs, *before* it
+    // starts. The dependency edge already ordered it after the provider; what
+    // this adds is the part a start order cannot give - a daemon is not done
+    // being ready merely because it was exec'd, and its socket is the thing the
+    // consumer actually needs.
+    if let Err(path) = wait_for_sockets(manager, unit).await {
+        rlog!("error: {unit}: NeedsSocket={path} did not appear in time");
+        fail_unit(manager, unit);
+        return Ok(false);
+    }
+
     // `Conflicts=` first: the other unit must be gone before this one starts
     // (plan §1.1).
     stop_conflicts(manager, unit).await;
@@ -721,7 +739,17 @@ async fn control_start(
             format!("{unit} is stopping; it will start afterwards"),
         ),
         Some(effect) => match apply_effect(manager, notify, logs, unit, Some(effect)).await {
-            Ok(_) => (Status::Ok, format!("started {unit}")),
+            Ok(_) => {
+                // A start can fail synchronously - a failed `ExecStartPre=`, a
+                // `NeedsSocket=` that never appeared - and the unit's state is the
+                // truth about that. Saying "started" would be the one answer an
+                // operator cannot check.
+                if manager.is_failed(unit) {
+                    (Status::Error, format!("{unit} failed to start"))
+                } else {
+                    (Status::Ok, format!("started {unit}"))
+                }
+            }
             Err(e) => (Status::Error, format!("cannot start {unit}: {e}")),
         },
     }
@@ -825,6 +853,42 @@ fn describe_unit(manager: &UnitManager, unit: &UnitName) -> Option<String> {
         out.push_str(&format!("healthy: {healthy}\n"));
     }
     Some(out)
+}
+
+/// Wait for the paths a unit's `NeedsSocket=` names (plan §7.8).
+///
+/// Returns the path that never appeared when the unit's start timeout runs out,
+/// which the caller turns into a failed start: a client that came up against a
+/// missing socket is the race this directive exists to remove.
+///
+/// Waiting polls the filesystem: the plan's readiness signal is the *path*, and
+/// there is nothing to wait on otherwise - the provider is a process rinit may
+/// not even track, since the socket could be created by a service that is still
+/// starting or by something it forked.
+async fn wait_for_sockets(manager: &UnitManager, unit: &UnitName) -> Result<(), String> {
+    let Some(rt) = manager.get(unit) else {
+        return Ok(());
+    };
+    let paths = rt.config.needs_socket.clone();
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let timeout = if rt.config.timeout_start_sec == 0 {
+        crate::deadline::MAX_TIMEOUT
+    } else {
+        std::time::Duration::from_secs(rt.config.timeout_start_sec)
+    };
+
+    let deadline = crate::deadline::after(timeout);
+    for path in paths {
+        while !std::path::Path::new(&path).exists() {
+            if std::time::Instant::now() >= deadline {
+                return Err(path);
+            }
+            tokio::time::sleep(SOCKET_POLL).await;
+        }
+    }
+    Ok(())
 }
 
 /// Report what a reaped exit meant to a unit.

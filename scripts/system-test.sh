@@ -32,7 +32,7 @@ set -euo pipefail
 arch="aarch64"
 kernel=""
 initrd=""
-timeout_s=60
+timeout_s=90
 log_file=""
 keep_log=0
 # No --service by default: from M1 the guest boots the unit directory, and
@@ -328,6 +328,31 @@ await_log() {
     printf 'rctl start tty.service\n' >&3
     await_log 15 'ioctl(TIOCSCTTY)' || true
 
+    # M5 §7.8: sockets as dependencies. The provider creates its socket a second
+    # after it is exec'd, so the consumer's start has to *wait for the path* - and
+    # `rctl start sockc.service` blocks until it appears, which is why the reply
+    # itself is part of the evidence.
+    printf 'rctl start sockd.service\n' >&3
+    await_log 15 'started sockd.service' || true
+    printf 'rctl start sockc.service\n' >&3
+    await_log 20 'started sockc.service' || true
+    sleep 1
+    printf 'rctl log sockc.service\n' >&3
+    await_log 15 'socket-present' || true
+
+    # And the other half: a path that never appears fails the start, naming it.
+    # No unit declares `/run/never.sock`, which is also the plan's weak-dependency
+    # degradation - no boot error, but the wait still happens.
+    printf 'echo "[Service]" > /etc/rinit/units/waitsock.service\n' >&3
+    printf 'echo "Type=oneshot" >> /etc/rinit/units/waitsock.service\n' >&3
+    printf 'echo "NeedsSocket=/run/never.sock" >> /etc/rinit/units/waitsock.service\n' >&3
+    printf 'echo "TimeoutStartSec=1" >> /etc/rinit/units/waitsock.service\n' >&3
+    printf 'echo "ExecStart=/bin/sh -c \"echo should-not-run\"" >> /etc/rinit/units/waitsock.service\n' >&3
+    printf 'rctl reload\n' >&3
+    await_log 15 'registered waitsock.service' || true
+    printf 'rctl start waitsock.service\n' >&3
+    await_log 20 'NeedsSocket=/run/never.sock did not appear in time' || true
+
     # M5 §7.7: a template unit. `worker@.service` is not a unit - it cannot be
     # started - and the instance the console asks for is created out of it with
     # the specifiers already expanded.
@@ -391,6 +416,12 @@ feeder_pid=$!
 
 # The guest never exits on its own (rinit stays PID 1), so a bounded `timeout`
 # is the expected outcome. `timeout` returns 124 when it had to stop qemu.
+#
+# Ninety seconds, not sixty: the feeder types a lot more than it used to (every
+# §7.x acceptance step), and the last assertion waits for a *restart* that follows
+# the console work. Sixty was enough until §7.8's socket wait pushed the boot's
+# tail - "getty.service will restart in 2.157s" was scheduled and then qemu was
+# killed before it happened.
 set +e
 timeout -k 5 "${timeout_s}" \
     "${repo_root}/scripts/run-qemu.sh" \
@@ -647,6 +678,14 @@ expect "stopping a forking unit stopped the daemon it took over" "daemon-gone"
 # M5 §7.11: a `TTYPath=` that is not a terminal is a failed start, not a service
 # that believes it owns a terminal.
 expect "a TTYPath that is not a terminal fails the start" "ioctl(TIOCSCTTY) failed"
+
+# M5 §7.8: the socket directives. The consumer could only say `socket-present`
+# after waiting for the path, and the unit whose path never appears fails its
+# start rather than running against nothing.
+expect "a socket consumer waited for the path before starting" "socket-present"
+expect "a socket that never appears fails the start, naming it" \
+    "NeedsSocket=/run/never.sock did not appear in time"
+expect "and that failed start is reported as one" "waitsock.service failed to start"
 
 # M5 §7.7: a template is a name to instantiate, and an instance is a unit with
 # the specifiers expanded into the command it runs.

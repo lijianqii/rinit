@@ -214,6 +214,8 @@ struct Parser {
 /// exists to prevent.
 const REPEATABLE: &[&str] = &[
     "Environment",
+    "Sockets",
+    "NeedsSocket",
     "Requires",
     "Wants",
     "After",
@@ -446,6 +448,16 @@ impl Parser {
                     require_absolute(line, key, &path)?;
                     self.cfg.working_directory = path;
                 }
+            }
+            (Section::Service, "Sockets") => {
+                let path = joined();
+                require_absolute(line, key, &path)?;
+                self.cfg.sockets.push(path);
+            }
+            (Section::Service, "NeedsSocket") => {
+                let path = joined();
+                require_absolute(line, key, &path)?;
+                self.cfg.needs_socket.push(path);
             }
             (Section::Service, "TTYPath") => {
                 // Plan §7.11. An empty value is "unset", like
@@ -1285,6 +1297,35 @@ mod tests {
                 "[Unit]\nType=widget\n[Service]\nExecStart=/bin/true\n"
             ),
             ParseError::InvalidValue { line: 2, .. }
+        ));
+    }
+
+    /// Plan §7.8: the two socket directives, repeatable and absolute like every
+    /// other path rinit is asked about.
+    #[test]
+    fn the_socket_directives_parse() {
+        let cfg = ok(
+            "api.service",
+            "[Service]\nExecStart=/bin/true\nSockets=/run/api.sock\n\
+             NeedsSocket=/run/db.sock\nNeedsSocket=/run/cache.sock\n",
+        );
+        assert_eq!(cfg.sockets, ["/run/api.sock"]);
+        assert_eq!(cfg.needs_socket, ["/run/db.sock", "/run/cache.sock"]);
+        assert!(cfg.sockets.len() == 1 && cfg.needs_socket.len() == 2);
+
+        assert!(matches!(
+            err(
+                "api.service",
+                "[Service]\nExecStart=/bin/true\nSockets=run/api.sock\n"
+            ),
+            ParseError::InvalidValue { line: 3, .. }
+        ));
+        assert!(matches!(
+            err(
+                "api.service",
+                "[Service]\nExecStart=/bin/true\nNeedsSocket=db.sock\n"
+            ),
+            ParseError::InvalidValue { line: 3, .. }
         ));
     }
 

@@ -1553,6 +1553,118 @@ fn a_forking_unit_whose_daemon_cannot_be_located_fails_its_start() {
     }
 }
 
+// --- §7.8: sockets as dependencies ----------------------------
+
+/// Plan §7.8: a `NeedsSocket=` unit waits for the *path*, not for the providing
+/// unit's state.
+///
+/// The provider is `Type=simple`, so it is `Active` the moment it is exec'd -
+/// long before it creates the socket, which is the window the directive exists to
+/// close. The consumer says what it found, so the assertion is about the file the
+/// kernel has rather than about intent.
+#[test]
+fn a_needs_socket_unit_waits_for_the_path() {
+    let dir = TempDir::new("socket-dep");
+    let path = std::env::temp_dir().join(format!("rinit-socket-dep-{}.sock", std::process::id()));
+    // A service's stdout goes to the log ring, not to the console this test
+    // reads, so the consumer reports what it found by writing a *file* - the
+    // same probe the §7.4 tests use.
+    let found = std::env::temp_dir().join(format!("rinit-socket-found-{}", std::process::id()));
+    let missing = std::env::temp_dir().join(format!("rinit-socket-missing-{}", std::process::id()));
+    for stale in [&path, &found, &missing] {
+        let _ = fs::remove_file(stale);
+    }
+    dir.write(
+        "all.target",
+        "[Unit]\nType=target\nRequires=sockd.service sockc.service\n",
+    );
+    dir.write(
+        "sockd.service",
+        &format!(
+            "[Service]\nType=simple\nSockets={}\n\
+             ExecStart=/bin/sh -c \"sleep 1; touch {}; sleep 30\"\n",
+            path.display(),
+            path.display()
+        ),
+    );
+    dir.write(
+        "sockc.service",
+        &format!(
+            "[Service]\nType=oneshot\nNeedsSocket={}\n\
+             ExecStart=/bin/sh -c \"test -f {} && touch {} || touch {}\"\n",
+            path.display(),
+            path.display(),
+            found.display(),
+            missing.display()
+        ),
+    );
+
+    let log = boot_units(&dir, "all.target", SETTLE);
+    let found_it = found.exists();
+    for stale in [&path, &found, &missing] {
+        let _ = fs::remove_file(stale);
+    }
+
+    assert!(
+        found_it && !missing.exists(),
+        "the consumer must not start before the socket exists (found: {found_it}):\n{log}"
+    );
+    // The declaration also puts the consumer in a later *level*, which is what
+    // the `Requires=`/`After=` edge the resolution adds is for.
+    let provider = log
+        .find("plan 0: sockd.service")
+        .expect("provider scheduled");
+    let consumer = log
+        .find("plan 1: sockc.service")
+        .expect("consumer scheduled later");
+    assert!(
+        provider < consumer,
+        "the socket declaration has to order the consumer after its provider:\n{log}"
+    );
+}
+
+/// And one that never appears fails the start, naming the path: a client that
+/// came up against a missing socket is the race the directive exists to remove.
+#[test]
+fn a_needs_socket_that_never_appears_fails_the_start() {
+    let dir = TempDir::new("socket-dep-missing");
+    let path = std::env::temp_dir().join(format!("rinit-socket-never-{}.sock", std::process::id()));
+    let _ = fs::remove_file(&path);
+    dir.write(
+        "all.target",
+        "[Unit]\nType=target\nRequires=sockd.service sockc.service\n",
+    );
+    dir.write(
+        "sockd.service",
+        &format!(
+            "[Service]\nType=simple\nSockets={}\nExecStart=/bin/sleep 30\n",
+            path.display()
+        ),
+    );
+    dir.write(
+        "sockc.service",
+        &format!(
+            "[Service]\nType=oneshot\nNeedsSocket={}\nTimeoutStartSec=1\n\
+             ExecStart=/bin/sh -c \"echo should-not-run\"\n",
+            path.display()
+        ),
+    );
+
+    let log = boot_units(&dir, "all.target", SETTLE);
+
+    assert!(
+        log.contains(&format!(
+            "NeedsSocket={} did not appear in time",
+            path.display()
+        )),
+        "the path has to be named:\n{log}"
+    );
+    assert!(
+        log.contains("all.target requires sockc.service, which failed"),
+        "and the unit must not be treated as up:\n{log}"
+    );
+}
+
 // --- §7.7: template units -------------------------------------
 
 /// Plan §7.7: the specifiers are expanded *before the parser sees the command*,
