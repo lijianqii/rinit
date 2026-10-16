@@ -384,11 +384,17 @@ TimeoutStopSec=1
 
 /// The control socket's security rules (plan §1.3(10)).
 ///
-/// The guest runs rinit as root, so the *allowed* path is exercised by the
-/// system test; here the test process is an ordinary user, which is exactly the
-/// case that must be refused before any command byte is read.
+/// The socket is `0600` inside a `0700` directory, and the *allowed* path is
+/// exercised end to end: in `--dev` the rule is "the user rinit runs as", so an
+/// ordinary user can drive a socket under `RINIT_CONTROL_DIR`. That is why M3
+/// introduced the variable at all - without it the real dispatch path would
+/// only ever be reachable from the guest.
+///
+/// The stricter production rule (root only, whatever `--dev` says) is asserted
+/// as a unit test in `src/control.rs`, where it can be checked for every uid
+/// combination rather than for whichever one this process happens to run as.
 #[test]
-fn the_control_socket_is_root_only_and_mode_0600() {
+fn the_control_socket_is_owner_only_and_mode_0600() {
     use std::io::{Read, Write};
     use std::os::unix::fs::PermissionsExt;
 
@@ -424,7 +430,7 @@ fn the_control_socket_is_root_only_and_mode_0600() {
         std::thread::sleep(Duration::from_millis(20));
     }
 
-    // The socket is 0600: only root may even connect.
+    // The socket is 0600: only the owner may even connect.
     let mode = std::fs::metadata(&socket).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600, "got {mode:o}");
     let dir_mode = std::fs::metadata(&control_dir)
@@ -434,8 +440,8 @@ fn the_control_socket_is_root_only_and_mode_0600() {
         & 0o777;
     assert_eq!(dir_mode, 0o700, "the control directory must be 0700");
 
-    // Ask it something. A non-root client must be refused, and refused with a
-    // reply rather than by silence.
+    // Ask it something. `--dev` admits the user rinit runs as, so this client -
+    // a separate process, but the same user - must be answered.
     let mut stream = std::os::unix::net::UnixStream::connect(&socket).expect("connect");
     let body = rinit_core::encode_request(&rinit_core::Request::List);
     stream.write_all(&rinit_core::frame(&body)).expect("write");
@@ -446,17 +452,15 @@ fn the_control_socket_is_root_only_and_mode_0600() {
     stream.read_exact(&mut reply).expect("read body");
     let (status, text) = rinit_core::decode_response(&reply).expect("decode");
 
-    let is_root = unsafe { libc::geteuid() } == 0;
-    if is_root {
-        assert_eq!(status, rinit_core::Status::Ok, "{text}");
-    } else {
-        assert_ne!(
-            status,
-            rinit_core::Status::Ok,
-            "a non-root client must be refused"
-        );
-        assert!(text.contains("root"), "got: {text}");
-    }
+    assert_eq!(
+        status,
+        rinit_core::Status::Ok,
+        "the invoking user must be admitted in --dev: {text}"
+    );
+    assert!(
+        text.contains("app.service"),
+        "the reply must list the running unit, got: {text}"
+    );
 
     // SAFETY: signalling our own child.
     unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };

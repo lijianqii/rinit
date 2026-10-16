@@ -94,7 +94,7 @@ pub async fn run(cfg: Config) -> Result<(), RuntimeError> {
         let mut manager = start_units(&cfg, &mut notify, &logs).await?;
         // The control socket is bound after the mounts, so `/run` exists
         // (plan §1.3(10)); a failure to bind it is only a warning.
-        let mut control = ControlServer::bind();
+        let mut control = ControlServer::bind(cfg.skip_mounts);
         supervise(&mut signals, &mut manager, &mut notify, &mut control, &logs).await;
         control.disarm();
         // A dev-mode boot (`--dev`) is a host smoke test, not PID 1: returning

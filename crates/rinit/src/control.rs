@@ -14,6 +14,8 @@
 //!   restricting access;
 //! - `SO_PEERCRED` decides who the client is, and anything but root is refused.
 //!   The client cannot lie about this: the kernel fills it in at connect time.
+//!   `--dev` narrows this to "the user rinit runs as" (see [`peer_allowed`]),
+//!   which is what makes `RINIT_CONTROL_DIR` usable without root.
 
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::DirBuilderExt;
@@ -26,6 +28,7 @@ use rinit_core::{
 };
 use rinit_runtime::RuntimeError;
 use rinit_runtime::syscall::fs;
+use rinit_runtime::syscall::process;
 use rinit_runtime::syscall::socket::peer_credentials;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -63,8 +66,10 @@ impl ControlServer {
     ///
     /// Binding is best effort on purpose: a system where `/run` is not writable
     /// must still boot, it just cannot be controlled live.
-    pub fn bind() -> Self {
-        match Self::try_bind() {
+    /// `dev` relaxes the peer rule to "the user rinit runs as" (see
+    /// [`peer_allowed`]); production calls this with `false`.
+    pub fn bind(dev: bool) -> Self {
+        match Self::try_bind(dev) {
             Ok(server) => server,
             Err(e) => {
                 rlog!("warning: control socket unavailable: {e}");
@@ -84,7 +89,7 @@ impl ControlServer {
         }
     }
 
-    fn try_bind() -> Result<Self, RuntimeError> {
+    fn try_bind(dev: bool) -> Result<Self, RuntimeError> {
         let dir = control_dir();
         std::fs::DirBuilder::new()
             .recursive(true)
@@ -115,7 +120,7 @@ impl ControlServer {
 
         let (sender, receiver) = mpsc::unbounded_channel();
         let task_sender = sender.clone();
-        let accept = tokio::spawn(accept_loop(listener, task_sender));
+        let accept = tokio::spawn(accept_loop(listener, task_sender, dev));
 
         Ok(ControlServer {
             receiver,
@@ -146,13 +151,13 @@ fn control_dir() -> PathBuf {
 }
 
 /// Accept connections forever, one task each.
-async fn accept_loop(listener: UnixListener, sender: mpsc::UnboundedSender<Incoming>) {
+async fn accept_loop(listener: UnixListener, sender: mpsc::UnboundedSender<Incoming>, dev: bool) {
     loop {
         match listener.accept().await {
             Ok((stream, _addr)) => {
                 let sender = sender.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = serve(stream, sender).await {
+                    if let Err(e) = serve(stream, sender, dev).await {
                         // A client hanging up mid-request is normal, not worth
                         // more than a line.
                         rlog!("control: connection ended: {e}");
@@ -169,13 +174,27 @@ async fn accept_loop(listener: UnixListener, sender: mpsc::UnboundedSender<Incom
     }
 }
 
+/// Whether a peer with `peer_uid` may use the control socket.
+///
+/// Root only (plan §1.3(10)) - with one exception: in `--dev` rinit is not PID 1
+/// and the socket lives wherever `RINIT_CONTROL_DIR` says, so the rule becomes
+/// "only the user rinit itself runs as". Without that, `RINIT_CONTROL_DIR` buys
+/// a non-root developer a socket that refuses every command, and the whole
+/// dispatch path becomes untestable outside the guest. The production rule is
+/// untouched, and the property that matters - only the owner may talk - holds
+/// either way.
+fn peer_allowed(dev: bool, peer_uid: u32, our_uid: u32) -> bool {
+    peer_uid == 0 || (dev && peer_uid == our_uid)
+}
+
 /// Authenticate, read one framed request, dispatch it, write one framed reply.
 async fn serve(
     mut stream: UnixStream,
     sender: mpsc::UnboundedSender<Incoming>,
+    dev: bool,
 ) -> std::io::Result<()> {
     // Authentication first: no command byte is read until the peer is known to
-    // be root (plan §1.3(10)).
+    // be allowed (plan §1.3(10)).
     let cred = match peer_credentials(stream.as_raw_fd()) {
         Ok(cred) => cred,
         Err(e) => {
@@ -187,7 +206,7 @@ async fn serve(
             .await;
         }
     };
-    if !cred.is_root() {
+    if !peer_allowed(dev, cred.uid, process::geteuid()) {
         rlog!(
             "warning: refusing control connection from uid {} (pid {})",
             cred.uid,
@@ -286,4 +305,40 @@ async fn write_response(
     // The client reads to EOF; half-close so it does not wait for us.
     let _ = stream.shutdown().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The production rule: root, and only root.
+    #[test]
+    fn only_root_may_use_the_socket_in_production() {
+        assert!(peer_allowed(false, 0, 0));
+        assert!(peer_allowed(false, 0, 1000));
+        assert!(!peer_allowed(false, 1000, 0));
+        assert!(
+            !peer_allowed(false, 1000, 1000),
+            "--dev is what relaxes this; without it, rinit's own user is refused too"
+        );
+    }
+
+    /// `--dev` narrows the rule to "the user rinit runs as", so a socket under
+    /// `RINIT_CONTROL_DIR` can actually be used by the developer who started it.
+    #[test]
+    fn dev_mode_admits_the_invoking_user_only() {
+        assert!(peer_allowed(true, 1000, 1000), "the owner may talk");
+        assert!(
+            !peer_allowed(true, 1000, 4242),
+            "another user still may not"
+        );
+        assert!(!peer_allowed(true, 4242, 1000));
+    }
+
+    /// Root is admitted by the first clause in both modes, so a root `rctl`
+    /// keeps working against a `--dev` rinit.
+    #[test]
+    fn root_is_admitted_even_in_dev_mode() {
+        assert!(peer_allowed(true, 0, 1000));
+    }
 }

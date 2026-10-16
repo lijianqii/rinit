@@ -185,7 +185,8 @@ A lightweight PID 1 init and service manager.
 Options:
   -h, --help                 Show this help and exit
   -V, --version              Show version and exit
-      --dev                  Skip mounts and do not reboot (dev/smoke testing)
+      --dev                  Skip mounts, do not reboot, and accept control
+                             commands from the invoking user
       --units <DIR>          Unit directory (default: /etc/rinit/units)
       --default <TARGET>     Boot target (default: multi-user.target)
       --test-service <CMD>   Launch this instead of the unit directory

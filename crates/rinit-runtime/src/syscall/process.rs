@@ -284,6 +284,15 @@ pub fn getpid() -> libc::pid_t {
     unsafe { libc::getpid() }
 }
 
+/// Return the effective user ID.
+///
+/// Used to tell who "the owner" of the control socket is when rinit runs
+/// without privileges (`--dev`), where root is not the answer.
+pub fn geteuid() -> u32 {
+    // SAFETY: `geteuid` takes no arguments and cannot fail.
+    unsafe { libc::geteuid() }
+}
+
 /// Return `pid`'s process group, if it is alive.
 ///
 /// # Errors
