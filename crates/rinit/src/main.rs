@@ -8,6 +8,7 @@ mod args;
 mod boot;
 mod control;
 mod log;
+mod logs;
 mod manager;
 mod notify;
 mod readiness;

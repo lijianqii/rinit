@@ -19,6 +19,12 @@ use crate::error::SyscallError;
 pub struct SpawnOptions {
     /// Start the child in a new *session* (`setsid`).
     pub new_session: bool,
+    /// Redirect the child's `stdout` and `stderr` onto this descriptor.
+    ///
+    /// Used to capture service output for `rctl log` (plan §1.3(7)). `None`
+    /// leaves both inherited, which is what the tests and the auxiliary
+    /// commands use.
+    pub stdio: Option<libc::c_int>,
 }
 
 impl SpawnOptions {
@@ -33,7 +39,16 @@ impl SpawnOptions {
     /// a bare `setpgid` would make it. As a session leader, `getty`'s own
     /// `setsid()` fails harmlessly and it carries on.
     pub const fn with_session() -> Self {
-        SpawnOptions { new_session: true }
+        SpawnOptions {
+            new_session: true,
+            stdio: None,
+        }
+    }
+
+    /// Redirect the child's output onto `fd`.
+    pub const fn with_stdio(mut self, fd: libc::c_int) -> Self {
+        self.stdio = Some(fd);
+        self
     }
 }
 
@@ -127,10 +142,10 @@ pub fn posix_spawn_full(
     };
 
     let mut file_actions: libc::posix_spawn_file_actions_t = unsafe { std::mem::zeroed() };
-    let use_file_actions = working_directory.is_some();
-    if let Some(cwd) = working_directory {
+    let use_file_actions = working_directory.is_some() || options.stdio.is_some();
+    if use_file_actions {
         // SAFETY: a zeroed file-actions struct is the documented starting point
-        // for `posix_spawn_file_actions_init`; `cwd` is a valid C string.
+        // for `posix_spawn_file_actions_init`.
         if unsafe { libc::posix_spawn_file_actions_init(&mut file_actions) } != 0 {
             if use_attrs {
                 // SAFETY: `attrs` was initialised above.
@@ -138,20 +153,38 @@ pub fn posix_spawn_full(
             }
             return Err(SyscallError::last_os_error("posix_spawn_file_actions_init"));
         }
-        let rc =
-            unsafe { libc::posix_spawn_file_actions_addchdir_np(&mut file_actions, cwd.as_ptr()) };
-        if rc != 0 {
-            // SAFETY: both structs were initialised above.
-            unsafe {
-                libc::posix_spawn_file_actions_destroy(&mut file_actions);
-                if use_attrs {
-                    libc::posix_spawnattr_destroy(&mut attrs);
+        if let Some(cwd) = working_directory {
+            let rc = unsafe {
+                libc::posix_spawn_file_actions_addchdir_np(&mut file_actions, cwd.as_ptr())
+            };
+            if rc != 0 {
+                return fail_file_actions(
+                    &mut file_actions,
+                    use_attrs,
+                    &mut attrs,
+                    "posix_spawn_file_actions_addchdir_np",
+                    rc,
+                );
+            }
+        }
+        // `dup2` clears O_CLOEXEC on the *new* descriptor, so the child gets a
+        // usable stdout/stderr while rinit's own copy of the pipe stays
+        // close-on-exec.
+        if let Some(fd) = options.stdio {
+            for target in [libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+                let rc = unsafe {
+                    libc::posix_spawn_file_actions_adddup2(&mut file_actions, fd, target)
+                };
+                if rc != 0 {
+                    return fail_file_actions(
+                        &mut file_actions,
+                        use_attrs,
+                        &mut attrs,
+                        "posix_spawn_file_actions_adddup2",
+                        rc,
+                    );
                 }
             }
-            return Err(SyscallError::new(
-                "posix_spawn_file_actions_addchdir_np",
-                rc,
-            ));
         }
     }
     let file_actions_ptr = if use_file_actions {
@@ -190,6 +223,28 @@ pub fn posix_spawn_full(
     } else {
         Err(SyscallError::new("posix_spawn", rc))
     }
+}
+
+/// Tear down the spawn attribute/action structs and report why.
+///
+/// Shared by every failure inside the file-actions setup, so a partial setup
+/// never leaks an initialised `posix_spawn_file_actions_t`.
+fn fail_file_actions(
+    file_actions: &mut libc::posix_spawn_file_actions_t,
+    use_attrs: bool,
+    attrs: &mut libc::posix_spawnattr_t,
+    op: &'static str,
+    rc: libc::c_int,
+) -> Result<libc::pid_t, SyscallError> {
+    // SAFETY: both structs were initialised by the caller before any of the
+    // calls that can land here.
+    unsafe {
+        libc::posix_spawn_file_actions_destroy(file_actions);
+        if use_attrs {
+            libc::posix_spawnattr_destroy(attrs);
+        }
+    }
+    Err(SyscallError::new(op, rc))
 }
 
 /// Send `signal` to `pid` (a positive PID, not a process group).

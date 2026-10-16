@@ -625,10 +625,11 @@ impl UnitManager {
     ///
     /// # Errors
     /// Propagates a spawn failure; the caller decides whether that is fatal.
-    pub fn spawn_unit_with_env(
+    pub fn spawn_unit_with_output(
         &mut self,
         unit: &UnitName,
         extra_env: &[String],
+        output: Option<libc::c_int>,
     ) -> Result<(), RuntimeError> {
         let now = self.now_millis();
 
@@ -657,7 +658,7 @@ impl UnitManager {
         };
 
         // A fresh process group, so a stop reaches the whole tree (plan §1.3(6)).
-        let pid = spawn_service_in_group(&argv, &env, Some(&cwd))?;
+        let pid = spawn_service_in_group(&argv, &env, Some(&cwd), output)?;
 
         let Some(rt) = self.units.get_mut(unit) else {
             return Ok(());
@@ -829,7 +830,7 @@ impl UnitManager {
             // working directory (plan §7.4).
             let env = build_service_env(&rt.config, &[]);
             let cwd = rt.config.working_directory.clone();
-            match spawn_service_in_group(&argv, &env, Some(&cwd)) {
+            match spawn_service_in_group(&argv, &env, Some(&cwd), None) {
                 Ok(pid) => {
                     rt.probe_pid = Some(pid);
                     rt.probe_deadline = deadline(rt.config.health_timeout_sec);
@@ -1009,7 +1010,7 @@ impl UnitManager {
         } else {
             let env = build_service_env(&rt.config, &[]);
             let cwd = rt.config.working_directory.clone();
-            match spawn_service_in_group(&stop_cmd, &env, Some(&cwd)) {
+            match spawn_service_in_group(&stop_cmd, &env, Some(&cwd), None) {
                 Ok(stop_pid) => {
                     rt.exec_stop_pid = Some(stop_pid);
                     rt.state = UnitState::Deactivating;
@@ -1278,7 +1279,7 @@ mod tests {
         let _guard = crate::test_support::children_lock();
         let mut m = manager_with("a.service", RestartPolicy::No);
         let unit = UnitName::parse("a.service").unwrap();
-        m.spawn_unit_with_env(&unit, &[]).expect("spawn");
+        m.spawn_unit_with_output(&unit, &[], None).expect("spawn");
         let rt = m.get(&unit).unwrap();
         assert!(rt.pid.is_some(), "the pid must be tracked");
         assert_eq!(rt.state, UnitState::Active, "Type=simple is active at exec");
@@ -1301,7 +1302,7 @@ mod tests {
         let mut m = UnitManager::new();
         m.add(cfg);
         let unit = UnitName::parse("t.target").unwrap();
-        m.spawn_unit_with_env(&unit, &[]).expect("start");
+        m.spawn_unit_with_output(&unit, &[], None).expect("start");
         let rt = m.get(&unit).unwrap();
         assert_eq!(rt.state, UnitState::Active);
         assert!(rt.pid.is_none(), "a target must not spawn anything");
@@ -1313,7 +1314,7 @@ mod tests {
         let _guard = crate::test_support::children_lock();
         let mut m = manager_with("a.service", RestartPolicy::Always);
         let unit = UnitName::parse("a.service").unwrap();
-        m.spawn_unit_with_env(&unit, &[]).expect("spawn");
+        m.spawn_unit_with_output(&unit, &[], None).expect("spawn");
         let pid = m.get(&unit).unwrap().pid.expect("pid");
         let _ = process::kill(pid, libc::SIGKILL);
 
@@ -1338,7 +1339,7 @@ mod tests {
         let _guard = crate::test_support::children_lock();
         let mut m = manager_with("a.service", RestartPolicy::No);
         let unit = UnitName::parse("a.service").unwrap();
-        m.spawn_unit_with_env(&unit, &[]).expect("spawn");
+        m.spawn_unit_with_output(&unit, &[], None).expect("spawn");
         let pid = m.get(&unit).unwrap().pid.expect("pid");
 
         let outcome = m
@@ -1407,7 +1408,7 @@ mod tests {
         let _guard = crate::test_support::children_lock();
         let mut m = manager_with("a.service", RestartPolicy::Always);
         let unit = UnitName::parse("a.service").unwrap();
-        m.spawn_unit_with_env(&unit, &[]).expect("spawn");
+        m.spawn_unit_with_output(&unit, &[], None).expect("spawn");
         let pid = m.get(&unit).unwrap().pid.expect("pid");
 
         m.stop_unit(&unit);
@@ -1460,7 +1461,7 @@ mod tests {
 
     /// Spawn `unit` and return the pid the manager tracked for it.
     fn spawn_pid(m: &mut UnitManager, unit: &UnitName) -> libc::pid_t {
-        m.spawn_unit_with_env(unit, &[]).expect("spawn");
+        m.spawn_unit_with_output(unit, &[], None).expect("spawn");
         m.get(unit).and_then(|rt| rt.pid).expect("a tracked pid")
     }
 
@@ -1503,7 +1504,7 @@ mod tests {
         let mut m = UnitManager::new();
         m.add(cfg);
         let unit = UnitName::parse(name).unwrap();
-        m.spawn_unit_with_env(&unit, &[]).expect("spawn");
+        m.spawn_unit_with_output(&unit, &[], None).expect("spawn");
         (m, unit)
     }
 
@@ -1629,7 +1630,7 @@ mod tests {
         let mut m = UnitManager::new();
         m.add(cfg);
         let unit = UnitName::parse(name).unwrap();
-        m.spawn_unit_with_env(&unit, &[]).expect("spawn");
+        m.spawn_unit_with_output(&unit, &[], None).expect("spawn");
         (m, unit)
     }
 
@@ -1737,7 +1738,7 @@ mod tests {
         let _guard = crate::test_support::children_lock();
         let mut m = manager_with("a.service", RestartPolicy::No);
         let unit = UnitName::parse("a.service").unwrap();
-        m.spawn_unit_with_env(&unit, &[]).expect("spawn");
+        m.spawn_unit_with_output(&unit, &[], None).expect("spawn");
 
         assert!(m.due_health_probes().is_empty());
         assert!(m.get(&unit).unwrap().health_at.is_none());

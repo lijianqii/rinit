@@ -137,34 +137,39 @@ fn environment_and_working_directory_reach_the_service() {
     let env_file = dir.0.join("env.conf");
     std::fs::write(&env_file, "ENVFILE=from-file\nOVERRIDE=from-file\n").expect("env file");
 
+    // The service's stdout is captured for `rctl log`, so the probe is written
+    // to a file the test reads back rather than grepped out of rinit's log.
+    let probe = dir.0.join("probe.txt");
     let unit = format!(
         "[Service]\nType=oneshot\n\
-         ExecStart=/bin/sh -c \"echo PROBE MARK=$MARK ENVFILE=$ENVFILE OVERRIDE=$OVERRIDE CWD=$(pwd)\"\n\
+         ExecStart=/bin/sh -c \"echo PROBE MARK=$MARK ENVFILE=$ENVFILE OVERRIDE=$OVERRIDE CWD=$(pwd) >> {}\"\n\
          Environment=MARK=hello OVERRIDE=from-unit\n\
          EnvironmentFile={}\n\
          WorkingDirectory=/tmp\n",
+        probe.display(),
         env_file.display()
     );
     dir.write("env.service", &unit);
 
     let log = boot_units(&dir, "all.target", Duration::from_millis(800));
+    let text = std::fs::read_to_string(&probe).unwrap_or_else(|e| panic!("no probe: {e}\n{log}"));
 
-    assert!(log.contains("PROBE"), "the service must run:\n{log}");
+    assert!(text.contains("PROBE"), "the service must run:\n{text}");
     assert!(
-        log.contains("MARK=hello"),
-        "Environment= must be exported:\n{log}"
+        text.contains("MARK=hello"),
+        "Environment= must be exported:\n{text}"
     );
     assert!(
-        log.contains("ENVFILE=from-file"),
-        "EnvironmentFile= must be read:\n{log}"
+        text.contains("ENVFILE=from-file"),
+        "EnvironmentFile= must be read:\n{text}"
     );
     assert!(
-        log.contains("OVERRIDE=from-unit"),
-        "Environment= must win over the file:\n{log}"
+        text.contains("OVERRIDE=from-unit"),
+        "Environment= must win over the file:\n{text}"
     );
     assert!(
-        log.contains("CWD=/tmp"),
-        "WorkingDirectory= must be applied:\n{log}"
+        text.contains("CWD=/tmp"),
+        "WorkingDirectory= must be applied:\n{text}"
     );
 }
 
@@ -173,22 +178,25 @@ fn environment_and_working_directory_reach_the_service() {
 fn exec_start_pre_and_post_run_around_the_main_command() {
     let dir = TempDir::new("prepost");
     dir.write("all.target", "[Unit]\nType=target\nRequires=app.service\n");
-    let app = r#"[Service]
-Type=oneshot
-ExecStartPre=/bin/sh -c "echo MARK_PRE"
-ExecStart=/bin/sh -c "echo MARK_MAIN"
-ExecStartPost=/bin/sh -c "echo MARK_POST"
-"#;
-    dir.write("app.service", app);
+    // Each command appends to one file, so the order is the file's order: the
+    // service's own output goes to the log buffer now, not to rinit's console.
+    let order = dir.0.join("order.txt");
+    let app = format!(
+        "[Service]\nType=oneshot\n\
+         ExecStartPre=/bin/sh -c \"echo PRE >> {m}\"\n\
+         ExecStart=/bin/sh -c \"echo MAIN >> {m}\"\n\
+         ExecStartPost=/bin/sh -c \"echo POST >> {m}\"\n",
+        m = order.display()
+    );
+    dir.write("app.service", &app);
 
     let log = boot_units(&dir, "all.target", Duration::from_millis(900));
-
-    let pre = log.find("MARK_PRE").expect("ExecStartPre must run");
-    let main = log.find("MARK_MAIN").expect("ExecStart must run");
-    let post = log.find("MARK_POST").expect("ExecStartPost must run");
-    assert!(
-        pre < main && main < post,
-        "the commands must run in order:\n{log}"
+    let text = std::fs::read_to_string(&order).unwrap_or_else(|e| panic!("no marker: {e}\n{log}"));
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(
+        lines,
+        ["PRE", "MAIN", "POST"],
+        "the commands must run in order"
     );
 }
 
@@ -198,12 +206,13 @@ ExecStartPost=/bin/sh -c "echo MARK_POST"
 fn a_failing_exec_start_pre_prevents_the_start() {
     let dir = TempDir::new("pre-fail");
     dir.write("all.target", "[Unit]\nType=target\nRequires=app.service\n");
-    let app = r#"[Service]
-Type=oneshot
-ExecStartPre=/bin/false
-ExecStart=/bin/sh -c "echo MARK_SHOULD_NOT_RUN"
-"#;
-    dir.write("app.service", app);
+    let ran = dir.0.join("ran.txt");
+    let app = format!(
+        "[Service]\nType=oneshot\nExecStartPre=/bin/false\n\
+         ExecStart=/bin/sh -c \"echo ran >> {}\"\n",
+        ran.display()
+    );
+    dir.write("app.service", &app);
 
     let log = boot_units(&dir, "all.target", Duration::from_millis(700));
 
@@ -212,8 +221,8 @@ ExecStart=/bin/sh -c "echo MARK_SHOULD_NOT_RUN"
         "the failure must be logged:\n{log}"
     );
     assert!(
-        !log.contains("MARK_SHOULD_NOT_RUN"),
-        "ExecStart must not run after a failed ExecStartPre:\n{log}"
+        !ran.exists(),
+        "ExecStart must not run after a failed ExecStartPre"
     );
 }
 
@@ -230,10 +239,14 @@ fn a_unit_that_cannot_start_fails_its_required_dependents() {
         "app.service",
         "[Service]\nType=simple\nExecStart=/nonexistent/rinit-test-binary\n",
     );
+    let ran = dir.0.join("dependent.txt");
     dir.write(
         "dependent.service",
-        "[Unit]\nRequires=app.service\n\
-         [Service]\nType=simple\nExecStart=/bin/sh -c \"echo MARK_DEPENDENT_RAN; sleep 30\"\n",
+        &format!(
+            "[Unit]\nRequires=app.service\n\
+             [Service]\nType=simple\nExecStart=/bin/sh -c \"echo ran >> {}; sleep 30\"\n",
+            ran.display()
+        ),
     );
 
     let log = boot_units(&dir, "all.target", Duration::from_millis(800));
@@ -242,10 +255,7 @@ fn a_unit_that_cannot_start_fails_its_required_dependents() {
         log.contains("cannot start"),
         "the broken unit must be reported:\n{log}"
     );
-    assert!(
-        !log.contains("MARK_DEPENDENT_RAN"),
-        "a dependent of a failed unit must not start:\n{log}"
-    );
+    assert!(!ran.exists(), "a dependent of a failed unit must not start");
 }
 
 /// Plan §1.3(8): shutdown stops dependents before their dependencies.

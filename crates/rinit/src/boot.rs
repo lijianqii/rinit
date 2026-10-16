@@ -9,6 +9,8 @@
 //! unit directory, resolves the dependency graph, and starts each *level* of
 //! the schedule in parallel before moving on (plan §3 M1).
 
+use std::os::fd::AsRawFd;
+
 use rinit_core::{
     Effect, ExitOutcome, JobTarget, Request, RequestSource, ServiceKind, Status, UnitName,
 };
@@ -18,6 +20,7 @@ use rinit_runtime::{RuntimeError, Signal, SignalSet};
 use crate::args::Config;
 use crate::control::ControlServer;
 use crate::log::rlog;
+use crate::logs::ServiceLogs;
 use crate::manager;
 use crate::notify::NotifyHub;
 use crate::readiness;
@@ -85,11 +88,13 @@ pub async fn run(cfg: Config) -> Result<(), RuntimeError> {
     // bring-up and smoke-test path, not how a real system boots.
     if cfg.service_argv.is_empty() {
         let mut notify = NotifyHub::new();
-        let mut manager = start_units(&cfg, &mut notify).await?;
+        // One shared log ring for the whole boot (plan §1.3(7)).
+        let logs = ServiceLogs::new();
+        let mut manager = start_units(&cfg, &mut notify, &logs).await?;
         // The control socket is bound after the mounts, so `/run` exists
         // (plan §1.3(10)); a failure to bind it is only a warning.
         let mut control = ControlServer::bind();
-        supervise(&mut signals, &mut manager, &mut notify, &mut control).await;
+        supervise(&mut signals, &mut manager, &mut notify, &mut control, &logs).await;
         control.disarm();
         // A dev-mode boot (`--dev`) is a host smoke test, not PID 1: returning
         // lets the test process exit instead of spinning in `reboot_now`,
@@ -137,6 +142,7 @@ async fn supervise(
     manager: &mut UnitManager,
     notify: &mut NotifyHub,
     control: &mut ControlServer,
+    logs: &ServiceLogs,
 ) {
     // Set when the shutdown was triggered by power failure, which runs under a
     // much smaller budget (plan §7.1).
@@ -145,7 +151,7 @@ async fn supervise(
         // Service anything already due before blocking, so a zero-length timer
         // does not wait for the next unrelated wake-up.
         for unit in manager.due_restarts() {
-            match start_unit(manager, notify, &unit).await {
+            match start_unit(manager, notify, logs, &unit).await {
                 Ok(true) => run_start_post(manager, &unit).await,
                 Ok(false) => {}
                 Err(e) => rlog!("error: restart of {unit} failed: {e}"),
@@ -153,7 +159,7 @@ async fn supervise(
         }
         // A start that arrived while its unit was stopping (plan §1.3(13)).
         for unit in manager.due_queued_starts() {
-            match start_unit(manager, notify, &unit).await {
+            match start_unit(manager, notify, logs, &unit).await {
                 Ok(true) => run_start_post(manager, &unit).await,
                 Ok(false) => {}
                 Err(e) => rlog!("error: queued start of {unit} failed: {e}"),
@@ -204,7 +210,7 @@ async fn supervise(
                 }
             }
             Some((request, reply)) = control.recv() => {
-                let (status, text) = handle_control(manager, notify, &request).await;
+                let (status, text) = handle_control(manager, notify, logs, &request).await;
                 if status == Status::Ok {
                     rlog!("control: {} ok", request.describe());
                 } else {
@@ -230,7 +236,7 @@ async fn supervise(
     }
     for unit in manager.shutdown_order() {
         let effect = manager.request_stop(&unit, RequestSource::ShutdownStop);
-        if let Err(e) = apply_effect(manager, notify, &unit, effect).await {
+        if let Err(e) = apply_effect(manager, notify, logs, &unit, effect).await {
             rlog!("warning: stopping {unit} failed: {e}");
         }
     }
@@ -304,6 +310,7 @@ async fn stop_and_reap(manager: &mut UnitManager, budget: Option<std::time::Dura
 fn spawn_unit(
     manager: &mut UnitManager,
     notify: &mut NotifyHub,
+    logs: &ServiceLogs,
     unit: &UnitName,
 ) -> Result<bool, RuntimeError> {
     let config = manager.get(unit).map(|rt| rt.config.clone());
@@ -314,7 +321,23 @@ fn spawn_unit(
         }
         _ => Vec::new(),
     };
-    manager.spawn_unit_with_env(unit, &env)?;
+
+    // Capture the service's output for `rctl log` (plan §1.3(7)). Losing the
+    // log is not a reason to refuse to start the service, so a failure here is
+    // a warning.
+    let output = match logs.capture(unit) {
+        Ok(fd) => Some(fd),
+        Err(e) => {
+            rlog!("warning: cannot capture {unit} output: {e}");
+            None
+        }
+    };
+    let spawned =
+        manager.spawn_unit_with_output(unit, &env, output.as_ref().map(|fd| fd.as_raw_fd()));
+    // Close rinit's copy of the write end: as long as it is open the reader
+    // never sees end-of-file, and the pump task would live forever.
+    drop(output);
+    spawned?;
     Ok(manager.get(unit).is_some_and(|rt| rt.pid.is_some()))
 }
 
@@ -330,6 +353,7 @@ fn spawn_unit(
 async fn start_unit(
     manager: &mut UnitManager,
     notify: &mut NotifyHub,
+    logs: &ServiceLogs,
     unit: &UnitName,
 ) -> Result<bool, RuntimeError> {
     // `Conflicts=` first: the other unit must be gone before this one starts
@@ -351,7 +375,7 @@ async fn start_unit(
         }
     }
 
-    match spawn_unit(manager, notify, unit) {
+    match spawn_unit(manager, notify, logs, unit) {
         Ok(spawned) => Ok(spawned),
         Err(e) => {
             // A spawn failure (missing binary, bad WorkingDirectory, ...) is a
@@ -385,7 +409,7 @@ async fn run_aux_command(
     let timeout = rt.config.timeout_start_sec;
     let argv = cmd.argv().to_vec();
 
-    let pid = match spawn_service_in_group(&argv, &env, Some(&cwd)) {
+    let pid = match spawn_service_in_group(&argv, &env, Some(&cwd), None) {
         Ok(pid) => pid,
         Err(e) => {
             rlog!("error: {unit}: cannot start '{}': {e}", argv.join(" "));
@@ -491,6 +515,7 @@ fn exec_start_of(manager: &UnitManager, unit: &UnitName) -> String {
 async fn apply_effect(
     manager: &mut UnitManager,
     notify: &mut NotifyHub,
+    logs: &ServiceLogs,
     unit: &UnitName,
     effect: Option<Effect>,
 ) -> Result<bool, RuntimeError> {
@@ -499,11 +524,11 @@ async fn apply_effect(
         // `CancelBackoffAndStart` needs no extra step: taking the unit back to
         // `Starting` clears `restart_at` on its way through.
         Some(Effect::SpawnProcess | Effect::CancelBackoffAndStart) => {
-            start_unit(manager, notify, unit).await
+            start_unit(manager, notify, logs, unit).await
         }
         Some(Effect::ClearStartLimitAndStart) => {
             manager.clear_start_limit(unit);
-            start_unit(manager, notify, unit).await
+            start_unit(manager, notify, logs, unit).await
         }
         // `stop_unit` cancels a pending restart too, so a stop is a stop.
         Some(Effect::SendStopSignal | Effect::CancelBackoffAndStop) => {
@@ -528,6 +553,7 @@ async fn apply_effect(
 async fn handle_control(
     manager: &mut UnitManager,
     notify: &mut NotifyHub,
+    logs: &ServiceLogs,
     request: &Request,
 ) -> (Status, String) {
     match request {
@@ -535,14 +561,27 @@ async fn handle_control(
             (Status::Ok, manager.summary().join("\n"))
         }
         Request::Status {
-            unit: Some(unit), ..
+            unit: Some(unit),
+            tail,
         } => match describe_unit(manager, unit) {
-            Some(text) => (Status::Ok, text),
+            Some(mut text) => {
+                // `status UNIT --tail` appends the unit's recent log
+                // (plan §1.3(7)).
+                if *tail > 0 {
+                    let logs_text = render_logs(logs, Some(unit), *tail);
+                    if !logs_text.is_empty() {
+                        text.push_str("log:\n");
+                        text.push_str(&logs_text);
+                        text.push('\n');
+                    }
+                }
+                (Status::Ok, text)
+            }
             None => (Status::NoSuchUnit, format!("no such unit: {unit}")),
         },
-        Request::Start(unit) => control_start(manager, notify, unit).await,
-        Request::Stop(unit) => control_stop(manager, notify, unit).await,
-        Request::Restart(unit) => control_restart(manager, notify, unit).await,
+        Request::Start(unit) => control_start(manager, notify, logs, unit).await,
+        Request::Stop(unit) => control_stop(manager, notify, logs, unit).await,
+        Request::Restart(unit) => control_restart(manager, notify, logs, unit).await,
         Request::ResetFailed(unit) => {
             if manager.get(unit).is_none() {
                 return (Status::NoSuchUnit, format!("no such unit: {unit}"));
@@ -550,10 +589,7 @@ async fn handle_control(
             manager.reset_failed(unit);
             (Status::Ok, format!("{unit}: cleared"))
         }
-        Request::Log { .. } => (
-            Status::Error,
-            "log capture arrives with the ring buffer (M3, in progress)".to_string(),
-        ),
+        Request::Log { unit, tail } => (Status::Ok, render_logs(logs, unit.as_ref(), *tail)),
     }
 }
 
@@ -561,6 +597,7 @@ async fn handle_control(
 async fn control_start(
     manager: &mut UnitManager,
     notify: &mut NotifyHub,
+    logs: &ServiceLogs,
     unit: &UnitName,
 ) -> (Status, String) {
     if manager.get(unit).is_none() {
@@ -574,7 +611,7 @@ async fn control_start(
             Status::Ok,
             format!("{unit} is stopping; it will start afterwards"),
         ),
-        Some(effect) => match apply_effect(manager, notify, unit, Some(effect)).await {
+        Some(effect) => match apply_effect(manager, notify, logs, unit, Some(effect)).await {
             Ok(_) => (Status::Ok, format!("started {unit}")),
             Err(e) => (Status::Error, format!("cannot start {unit}: {e}")),
         },
@@ -585,6 +622,7 @@ async fn control_start(
 async fn control_stop(
     manager: &mut UnitManager,
     notify: &mut NotifyHub,
+    logs: &ServiceLogs,
     unit: &UnitName,
 ) -> (Status, String) {
     if manager.get(unit).is_none() {
@@ -594,7 +632,7 @@ async fn control_stop(
     match effect {
         Some(Effect::None) => (Status::Ok, format!("{unit} is already stopped")),
         None => (Status::Ok, format!("{unit} is already stopping")),
-        Some(effect) => match apply_effect(manager, notify, unit, Some(effect)).await {
+        Some(effect) => match apply_effect(manager, notify, logs, unit, Some(effect)).await {
             Ok(_) => (Status::Ok, format!("stopped {unit}")),
             Err(e) => (Status::Error, format!("cannot stop {unit}: {e}")),
         },
@@ -608,6 +646,7 @@ async fn control_stop(
 async fn control_restart(
     manager: &mut UnitManager,
     notify: &mut NotifyHub,
+    logs: &ServiceLogs,
     unit: &UnitName,
 ) -> (Status, String) {
     if manager.get(unit).is_none() {
@@ -618,12 +657,21 @@ async fn control_restart(
             rlog!("restarting {unit}");
             (Status::Ok, format!("restarting {unit}"))
         }
-        RestartPlan::Start => control_start(manager, notify, unit).await,
+        RestartPlan::Start => control_start(manager, notify, logs, unit).await,
         RestartPlan::NotApplicable => (
             Status::Conflict,
             format!("{unit} has no process to restart"),
         ),
     }
+}
+
+/// Render buffered log lines for a `log` or `status --tail` reply.
+fn render_logs(logs: &ServiceLogs, unit: Option<&UnitName>, tail: u32) -> String {
+    logs.tail(unit, tail as usize)
+        .iter()
+        .map(|line| format!("{}: {}", line.unit, line.text))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// A unit's detail block for `rctl status UNIT`.
@@ -709,7 +757,11 @@ fn next_deadline(manager: &UnitManager) -> std::time::Duration {
 /// # Errors
 /// Returns a [`RuntimeError`] for a parse/dependency failure or an
 /// infrastructure error (a notify socket that cannot be created).
-async fn start_units(cfg: &Config, notify: &mut NotifyHub) -> Result<UnitManager, RuntimeError> {
+async fn start_units(
+    cfg: &Config,
+    notify: &mut NotifyHub,
+    logs: &ServiceLogs,
+) -> Result<UnitManager, RuntimeError> {
     let plan = manager::announce_plan(&cfg.unit_dir, &cfg.default_target)?;
     let mut units = UnitManager::new();
     for cfg in &plan.configs {
@@ -737,7 +789,7 @@ async fn start_units(cfg: &Config, notify: &mut NotifyHub) -> Result<UnitManager
             // The boot schedule is a set of `Dependency` start requests, so a
             // unit pulled in twice is started once (plan §1.3(11)).
             let effect = units.request_start(name, RequestSource::Dependency);
-            let spawned = apply_effect(&mut units, notify, name, effect).await?;
+            let spawned = apply_effect(&mut units, notify, logs, name, effect).await?;
             if spawned {
                 started_units += 1;
             }
@@ -945,6 +997,7 @@ mod tests {
         let _guard = crate::test_support::children_lock_async().await;
         let mut manager = UnitManager::new();
         let mut notify = test_hub("unknown");
+        let logs = ServiceLogs::new();
 
         let ghost = unit("ghost.service");
         for request in [
@@ -954,7 +1007,7 @@ mod tests {
             Request::Restart(ghost.clone()),
             Request::ResetFailed(ghost.clone()),
         ] {
-            let (status, text) = handle_control(&mut manager, &mut notify, &request).await;
+            let (status, text) = handle_control(&mut manager, &mut notify, &logs, &request).await;
             assert_eq!(status, Status::NoSuchUnit, "{}: {text}", request.describe());
         }
     }
@@ -965,28 +1018,40 @@ mod tests {
         let _guard = crate::test_support::children_lock_async().await;
         let mut manager = manager_with("app.service");
         let mut notify = test_hub("startstop");
+        let logs = ServiceLogs::new();
         let app = unit("app.service");
 
-        let (status, _) =
-            handle_control(&mut manager, &mut notify, &Request::Start(app.clone())).await;
+        let (status, _) = handle_control(
+            &mut manager,
+            &mut notify,
+            &logs,
+            &Request::Start(app.clone()),
+        )
+        .await;
         assert_eq!(status, Status::Ok);
         assert!(
             manager.get(&app).unwrap().pid.is_some(),
             "the unit must run"
         );
 
-        let (status, text) = handle_control(&mut manager, &mut notify, &status_request(&app)).await;
+        let (status, text) =
+            handle_control(&mut manager, &mut notify, &logs, &status_request(&app)).await;
         assert_eq!(status, Status::Ok);
         assert!(text.contains("app.service"), "{text}");
         assert!(text.contains("active"), "{text}");
         assert!(text.contains("target: started"), "{text}");
 
-        let (status, text) = handle_control(&mut manager, &mut notify, &Request::List).await;
+        let (status, text) = handle_control(&mut manager, &mut notify, &logs, &Request::List).await;
         assert_eq!(status, Status::Ok);
         assert!(text.contains("app.service"), "{text}");
 
-        let (status, _) =
-            handle_control(&mut manager, &mut notify, &Request::Stop(app.clone())).await;
+        let (status, _) = handle_control(
+            &mut manager,
+            &mut notify,
+            &logs,
+            &Request::Stop(app.clone()),
+        )
+        .await;
         assert_eq!(status, Status::Ok);
         assert_eq!(manager.get(&app).unwrap().state, UnitState::Deactivating);
 
@@ -1002,11 +1067,23 @@ mod tests {
         let _guard = crate::test_support::children_lock_async().await;
         let mut manager = manager_with("app.service");
         let mut notify = test_hub("already");
+        let logs = ServiceLogs::new();
         let app = unit("app.service");
 
-        handle_control(&mut manager, &mut notify, &Request::Start(app.clone())).await;
-        let (status, text) =
-            handle_control(&mut manager, &mut notify, &Request::Start(app.clone())).await;
+        handle_control(
+            &mut manager,
+            &mut notify,
+            &logs,
+            &Request::Start(app.clone()),
+        )
+        .await;
+        let (status, text) = handle_control(
+            &mut manager,
+            &mut notify,
+            &logs,
+            &Request::Start(app.clone()),
+        )
+        .await;
         assert_eq!(status, Status::Ok);
         assert!(text.contains("already active"), "{text}");
 
@@ -1026,6 +1103,7 @@ mod tests {
         let mut manager = UnitManager::new();
         manager.add(cfg);
         let mut notify = test_hub("conflict");
+        let logs = ServiceLogs::new();
 
         // A completed oneshot has no process and nothing to redo.
         manager.mark_oneshot_done(&unit("once.service"));
@@ -1037,12 +1115,53 @@ mod tests {
         let (status, text) = handle_control(
             &mut manager,
             &mut notify,
+            &logs,
             &Request::Restart(unit("once.service")),
         )
         .await;
         assert_eq!(status, Status::Conflict);
         assert_eq!(status.exit_code(), 4);
         assert!(text.contains("no process to restart"), "{text}");
+    }
+
+    /// `rctl log` renders what was captured for a unit (plan §1.3(7)).
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_log_command_renders_captured_output() {
+        let _guard = crate::test_support::children_lock_async().await;
+        let mut manager = UnitManager::new();
+        let mut notify = test_hub("logcmd");
+        let logs = ServiceLogs::new();
+        let app = unit("app.service");
+
+        // Capture and write, exactly as a spawned service's stdout would.
+        let writer = logs.capture(&app).expect("capture");
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::from(writer);
+            file.write_all(b"hello from the unit\n").expect("write");
+        }
+        for _ in 0..100 {
+            if !logs.tail(Some(&app), 0).is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let (status, text) = handle_control(
+            &mut manager,
+            &mut notify,
+            &logs,
+            &Request::Log {
+                unit: None,
+                tail: 10,
+            },
+        )
+        .await;
+        assert_eq!(status, Status::Ok);
+        assert!(
+            text.contains("app.service: hello from the unit"),
+            "got: {text}"
+        );
     }
 
     /// `reset-failed` clears the failure without starting the unit
@@ -1052,6 +1171,7 @@ mod tests {
         let _guard = crate::test_support::children_lock_async().await;
         let mut manager = manager_with("app.service");
         let mut notify = test_hub("reset");
+        let logs = ServiceLogs::new();
         let app = unit("app.service");
         manager.fail_start(&app);
         assert!(manager.is_failed(&app));
@@ -1059,6 +1179,7 @@ mod tests {
         let (status, _) = handle_control(
             &mut manager,
             &mut notify,
+            &logs,
             &Request::ResetFailed(app.clone()),
         )
         .await;

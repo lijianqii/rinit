@@ -227,7 +227,7 @@ mod tests {
         m: &mut crate::unit_manager::UnitManager,
         unit: &rinit_core::UnitName,
     ) -> libc::pid_t {
-        m.spawn_unit_with_env(unit, &[]).expect("spawn");
+        m.spawn_unit_with_output(unit, &[], None).expect("spawn");
         m.get(unit).and_then(|rt| rt.pid).expect("a tracked pid")
     }
 }

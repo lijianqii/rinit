@@ -1,9 +1,11 @@
 //! Filesystem and credential wrappers the notify socket needs (plan §1.3(12)).
 //!
 //! Only the pieces with no safe `std` equivalent live here: `umask(2)`,
-//! `chmod(2)`, `chown(2)`, and the lookups that turn a unit's `User=`/`Group=`
-//! into ids. Directory creation and unlinking use the safe `std::fs` API at the
-//! call site.
+//! `chmod(2)`, `chown(2)`, `pipe2(2)`, `fcntl(2)` and the lookups that turn a
+//! unit's `User=`/`Group=` into ids. Directory creation and unlinking use the
+//! safe `std::fs` API at the call site.
+
+use std::os::fd::{FromRawFd, OwnedFd};
 
 use rinit_core::users;
 
@@ -24,6 +26,61 @@ const GROUP: &str = "/etc/group";
 pub fn umask(mask: libc::mode_t) -> libc::mode_t {
     // SAFETY: `umask` takes a scalar and has no failure mode.
     unsafe { libc::umask(mask) }
+}
+
+/// Set or clear `O_NONBLOCK` on a descriptor.
+///
+/// A pipe needs its *read* end non-blocking for the async reactor while the
+/// *write* end stays blocking, so a child that fills the pipe blocks instead of
+/// silently losing output. `pipe2` sets flags on both ends, hence this.
+pub fn set_nonblocking(fd: libc::c_int, nonblocking: bool) -> Result<(), SyscallError> {
+    // SAFETY: `fcntl` with F_GETFL/F_SETFL reads and writes the descriptor's
+    // status flags; both calls take only scalars.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(SyscallError::last_os_error("fcntl(F_GETFL)"));
+    }
+    let updated = if nonblocking {
+        flags | libc::O_NONBLOCK
+    } else {
+        flags & !libc::O_NONBLOCK
+    };
+    // SAFETY: as above.
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, updated) } < 0 {
+        return Err(SyscallError::last_os_error("fcntl(F_SETFL)"));
+    }
+    Ok(())
+}
+
+/// Create a pipe, returning `(read, write)`, with `O_CLOEXEC` on both ends.
+///
+/// `O_CLOEXEC` matters: the ends are `dup2`'d onto the child's `stdout`/
+/// `stderr` (which clears the flag on *those* descriptors), and rinit must not
+/// leak its own copies into any other service it starts.
+pub fn pipe() -> Result<(OwnedFd, OwnedFd), SyscallError> {
+    let mut fds = [0i32; 2];
+    // SAFETY: `fds` is a valid 2-element out-buffer.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(SyscallError::last_os_error("pipe2"));
+    }
+    // SAFETY: both descriptors are fresh from `pipe2` and are now owned by the
+    // `OwnedFd`s, which close them on drop.
+    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
+}
+
+/// `read(2)` into `buf`, returning the byte count (`0` means end-of-file).
+///
+/// A blocking read on a blocking descriptor, or an `EAGAIN` on a non-blocking
+/// one; the caller decides which it wants. Used by the log pump, which reads
+/// service output from a non-blocking pipe.
+pub fn read(fd: libc::c_int, buf: &mut [u8]) -> Result<usize, SyscallError> {
+    // SAFETY: `buf` is a valid writable slice of the length passed in.
+    let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+    if n < 0 {
+        Err(SyscallError::last_os_error("read"))
+    } else {
+        Ok(n as usize)
+    }
 }
 
 /// `chmod(2)` on a path.
