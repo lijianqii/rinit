@@ -13,7 +13,7 @@ answers plan §6's checklist line by line, with one exception - the 72 h soak, w
 is a deployment-time run of `make soak` rather than a feature.
 
 What is in place, and what it is proven by. Every claim below is either a host
-test (`make check`) or a guest assertion (`make test-system`, 92 of them in
+test (`make check`) or a guest assertion (`make test-system`, 93 of them in
 `scripts/system-test.sh`); "proven on the host" always means the fake-runtime or
 `--dev` form of the same code path, and the guest means the real one.
 
@@ -32,7 +32,7 @@ three lines are M2 working: `fault.service` exists to fail, is restarted, and
 then stops being restarted when the breaker trips:
 
 ```
-[    2.939522] Run /sbin/rinit as init process
+[    4.481903] Run /sbin/rinit as init process
 rinit: rinit 0.1.0 starting (pid 1)
 rinit: mounted /run
 rinit: mounted /proc
@@ -40,13 +40,15 @@ rinit: mounted /sys
 rinit: mounted /dev
 rinit: mounted /tmp
 rinit: mounted /sys/fs/cgroup
-rinit: cgroup v2 ready at /sys/fs/cgroup
 rinit: mounted /data (fstab)
+rinit: cgroup v2 ready at /sys/fs/cgroup
+rinit: logging to /var/log/rinit/log
 rinit: boot plan for 'multi-user.target': 17 unit(s) in 3 level(s)
 rinit: plan 0: rinit-init.target (target)
 rinit: plan 1: fault.service (service)
 rinit: plan 1: getty.service (service)
 rinit: plan 2: multi-user.target (target)
+rinit: api.service: listening on /run/api.sock
 rinit: starting level 0: 0 service(s)
 rinit: level 0 reached: rinit-init.target active
 rinit: starting level 1: 2 service(s)
@@ -55,6 +57,7 @@ rinit: started getty.service as pid 49
 rinit: starting level 2: 0 service(s)
 rinit: level 2 reached: multi-user.target active
 rinit: boot complete: 2 unit(s) started from 'multi-user.target' (2 still running)
+rinit: boot timing: first service at 4840ms of kernel uptime (rinit's own boot: 484ms)
 rinit: watchdog /dev/watchdog armed: 10s timeout, feeding every 5s
 rinit: reaped pid 48
 rinit: fault.service will restart in 1.195s
@@ -63,6 +66,14 @@ rinit: fault.service will restart in 1.195s
 rinit: reaped pid 50
 rinit: error: fault.service hit its start limit (2 failures); not restarting
 ```
+Two lines in that boot are measurements rather than steps. `mounted /data (fstab)`
+is plan §1.3(9)'s second wave - an `/etc/fstab` entry, mounted after the first
+wave - and `boot timing: first service at 4840ms of kernel uptime (rinit's own
+boot: 484ms)` is plan §4.3's number, on the kernel's own clock so it covers the
+kernel's boot as well. Both figures come from a run whose *host* was also running
+the 72 h soak, and they move from boot to boot (a later one under the same load
+read 5020 ms and 572 ms); the guest asserts the measurement is the kernel's clock,
+not that it hit a number.
 
 Note that the plan resolves **17 units** and starts **2**: everything in `units/`
 is parsed and ordered, and only the boot target's closure is started. The demo
@@ -293,10 +304,10 @@ make test-system    # boot aarch64 qemu and assert the acceptance list
 make test           # check + test-system
 ```
 
-`cargo test --offline --workspace` (what `make check` runs last) executes **682
+`cargo test --offline --workspace` (what `make check` runs last) executes **684
 tests** across eleven binaries. The four shapes, and why each is not redundant:
 
-- **unit tests** next to the code (core 320, rinit 180, rinit-runtime 92,
+- **unit tests** next to the code (core 322, rinit 180, rinit-runtime 92,
   rctl 11), including `proptest` properties over the parser;
 - **integration tests** in `crates/*/tests/`: the syscall layer against the real
   kernel (`rinit-runtime` 21: run unprivileged, they assert that each drop is
@@ -316,10 +327,11 @@ tests** across eleven binaries. The four shapes, and why each is not redundant:
   259200'` is the 72-hour acceptance run the plan asks for;
 - **the guest system test** (`scripts/system-test.sh`, plan §4.3): boots the real
   initramfs on aarch64 qemu, types at the console to prove a root shell is
-  reachable, drives `rctl` against the running system, and asserts 92 things -
+  reachable, drives `rctl` against the running system, and asserts 93 things -
   including that levels run in dependency order, that no target is ever exec'd,
   the §7.4 privilege-drop outcomes, the §7.3 limits read back out of the guest's
-  own kernel, §7.5's watchdog on the real device qemu attaches, §7.6's reload
+  own kernel, §4.3's boot timing read off the kernel's clock, §7.5's watchdog on
+  the real device qemu attaches, §7.6's reload
   against the guest's own (writable, ramfs) unit directory, and §7.10's forking
   daemon - located through its `PIDFile=` and then stopped as the unit's process.
   Exit codes are
@@ -438,8 +450,19 @@ cargo llvm-cov --offline --workspace --html                  # target/llvm-cov/h
   (`/proc/<pid>/status` inside the guest: ≤2 MB idle, ≤6 MB with 20 services),
   as is the "20 services in parallel, faster than serial" comparison. The size
   numbers below are binary sizes, not a memory measurement.
-- No `valgrind`, `miri` (stable only) or `cargo-fuzz` in this environment, so
-  leaks are caught by the soak harness's sampled curve rather than by tooling.
+- **`miri`, `valgrind` and `cargo-fuzz` cannot run in this environment**, and what
+  stands in for each is worth naming rather than implying nothing checks:
+  `miri` needs a *nightly* toolchain (only stable is installed, `cargo miri` says
+  so, and the environment is offline), so what it would look for in `rinit-core` -
+  leaks and UB - is covered directly instead: `crates/rinit-core/tests/allocations.rs`
+  drives every allocation-owning path through a counting global allocator and
+  asserts the live bytes do not grow between two identical batches (10,000
+  iterations turn one leaked byte into 10 KB, so per-iteration leaks show above the
+  harness's own noise), and the crate is `#![forbid(unsafe_code)]`, so there is no
+  unsafe code in it for `miri` to find UB in. `cargo-fuzz`'s decoders are
+  property-tested (`proptest` over the parser, the control codec and the job
+  queue), and the runtime-side equivalent of `valgrind` is the soak harness's
+  sampled RSS/descriptor/zombie curve.
 
 ## Acceptance: plan §6's checklist
 
@@ -448,7 +471,7 @@ repository or a measurement in this README:
 
 | plan §6 | where it stands |
 | ------- | --------------- |
-| boots as PID 1 in qemu (128M) with no kernel panic | `make test-system`: 92 assertions, including "no rinit panic" and four kernel-log checks |
+| boots as PID 1 in qemu (128M) with no kernel panic | `make test-system`: 93 assertions, including "no rinit panic" and four kernel-log checks |
 | 20 services in parallel, visibly faster than serial | **19.2x**: `make parallel` - 20 `oneshot` services that each sleep 1 s finish in 1065 ms together and 20 424 ms chained |
 | crash-restart, breaker, health checks | `make test-system` ("a crashed service is scheduled for restart", "the breaker tripped on the failing unit") and `crates/rinit/tests/m2_lifecycle.rs` |
 | `rctl` can start, stop, query and read logs | `make test-system`'s M3 block and `crates/rctl/tests/control.rs` |

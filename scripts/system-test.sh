@@ -492,7 +492,22 @@ expect "rinit mounted an /etc/fstab entry" "rinit: mounted /data (fstab)"
 expect "and the kernel has a filesystem on it" "fstab-tmpfs /data tmpfs"
 
 # M1: a real boot comes from the unit directory, not a hardcoded service.
-expect "resolved a boot plan" "boot plan for 'multi-user.target'"
+# Plan §4.3: how long the boot took, measured on the kernel's own clock - the
+# same one the `[...] Run /sbin/rinit as init process` line is printed on, which
+# is what makes "kernel start to first service" a number rather than a feeling.
+expect "rinit reported the boot timing" "rinit: boot timing: first service at"
+timing="$(grep -oE 'first service at [0-9]+ms' "${log_file}" | tail -1 | grep -oE '[0-9]+')"
+rinit_ms="$(grep -oE "rinit's own boot: [0-9]+ms" "${log_file}" | tail -1 | grep -oE '[0-9]+')"
+# A sanity check on the measurement, not a performance target: the plan names no
+# budget, and a guest under whatever load the host is carrying is the wrong place
+# to invent one. What this does catch is a clock that is not the kernel's - the
+# first service cannot have started before rinit itself did - and a number several
+# orders of magnitude out.
+if [[ -n "${timing}" && -n "${rinit_ms}" && "${timing}" -ge "${rinit_ms}" && "${timing}" -lt 30000 ]]; then
+    pass "the boot timing is the kernel's own clock (first service at ${timing}ms, ${rinit_ms}ms of it rinit's)"
+else
+    fail "the boot timing is the kernel's own clock (first '${timing:-missing}'ms, rinit '${rinit_ms:-missing}'ms)"
+fi
 expect "the init anchor is scheduled" "plan 0: rinit-init.target"
 expect "the console getty is scheduled" "getty.service"
 

@@ -78,6 +78,13 @@ pub async fn run(cfg: Config) -> Result<(), RuntimeError> {
         env!("CARGO_PKG_VERSION"),
         std::process::id()
     );
+    // Plan §4.3's boot measurement, in two clocks that turn out to be one:
+    // `Instant` is `CLOCK_MONOTONIC`, and so is `/proc/uptime` - the difference is
+    // that this one can be read *here*, before `/proc` exists, and the file cannot
+    // be read until the first wave has mounted it. Taking both gives the kernel's
+    // uptime when the first service started (the number the plan asks for) and
+    // rinit's own share of it.
+    let started = std::time::Instant::now();
 
     if cfg.skip_mounts {
         rlog!("dev mode: skipping first-wave mounts");
@@ -117,7 +124,8 @@ pub async fn run(cfg: Config) -> Result<(), RuntimeError> {
         // Plan §7.9: the sockets rinit holds for units that asked to be started
         // by a connection rather than at boot.
         let mut activation = Activated::disabled();
-        let mut manager = start_units(&cfg, &mut notify, &logs, cgroup, &mut activation).await?;
+        let mut manager =
+            start_units(&cfg, &mut notify, &logs, cgroup, &mut activation, started).await?;
         // The control socket is bound after the mounts, so `/run` exists
         // (plan §1.3(10)); a failure to bind it is only a warning.
         let mut control = ControlServer::bind(cfg.skip_mounts);
@@ -1030,6 +1038,7 @@ async fn start_units(
     logs: &ServiceLogs,
     cgroup: crate::cgroup::Cgroup,
     activation: &mut Activated,
+    started: std::time::Instant,
 ) -> Result<UnitManager, RuntimeError> {
     let plan = manager::announce_plan(&cfg.unit_dir, &cfg.default_target)?;
     let mut units = UnitManager::new();
@@ -1076,6 +1085,9 @@ async fn start_units(
     units.set_shutdown_order(plan.levels.iter().flatten().cloned().collect());
 
     let mut started_units = 0usize;
+    // Plan §4.3: when the first service was pulled up, which is the number the
+    // acceptance list asks for.
+    let mut first_service_uptime_ms: Option<u64> = None;
     for (index, level) in plan.levels.iter().enumerate() {
         let batch = manager::commands_in_level(&plan, level);
         rlog!("starting level {index}: {} service(s)", batch.len());
@@ -1106,6 +1118,9 @@ async fn start_units(
             let spawned = apply_effect(&mut units, notify, logs, name, effect).await?;
             if spawned {
                 started_units += 1;
+                if first_service_uptime_ms.is_none() {
+                    first_service_uptime_ms = rinit_runtime::time::uptime_ms();
+                }
             }
 
             // `oneshot` and `forking` are only ready once the command has
@@ -1194,6 +1209,17 @@ async fn start_units(
         plan.default_target,
         units.running_count()
     );
+    // Plan §4.3's number, and rinit's share of it. `first_service_uptime_ms` is
+    // the kernel's clock, so it covers the kernel's own boot too; the elapsed time
+    // is the same clock read from a different corner, and the difference is what
+    // rinit spent.
+    let rinit_ms = started.elapsed().as_millis() as u64;
+    match first_service_uptime_ms {
+        Some(first) => rlog!(
+            "boot timing: first service at {first}ms of kernel uptime (rinit's own boot: {rinit_ms}ms)"
+        ),
+        None => rlog!("boot timing: rinit's own boot took {rinit_ms}ms (kernel uptime unreadable)"),
+    }
     Ok(units)
 }
 

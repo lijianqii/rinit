@@ -158,6 +158,15 @@ make soak          # restart churn, watching RSS, descriptors and zombies
 make test-system   # boots the guest and asserts plan §6's list
 ```
 
+A note on the tools that are *not* in the list, because the plan asks for them and
+this environment cannot run them: `miri` (nightly-only; the core is
+`#![forbid(unsafe_code)]` and its leak checking is
+`crates/rinit-core/tests/allocations.rs`, a counting-allocator balance test),
+`valgrind` (the soak harness's sampled RSS/descriptor/zombie curve is the
+equivalent) and `cargo-fuzz` (the parser, the control codec and the job queue are
+`proptest`-tested). On a machine with a nightly, `cargo +nightly miri test -p
+rinit-core` is the plan's §4.4 command.
+
 `make test-system` is the one that matters for a port: it boots the real image on
 the real kernel and asserts the acceptance list from plan §6 (see the README's
 Acceptance section). For a new board, point `scripts/run-qemu.sh` at it - or run

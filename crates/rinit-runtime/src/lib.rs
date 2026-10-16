@@ -28,6 +28,7 @@ pub mod fstab;
 pub mod mounts;
 pub mod signals;
 pub mod syscall;
+pub mod time;
 pub mod units;
 
 pub use error::{RuntimeError, SyscallError};
