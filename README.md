@@ -295,28 +295,31 @@ and a kernel built with its driver are part of the test rig rather than an
 optional extra: without them the guest could only ever exercise the
 "no watchdog hardware" path.
 
-Measured with `llvm-cov` **at M1**; not re-measured since, and treated as a
-shape rather than a current score. Reproduce with the commands below before
-quoting any number.
+`cargo llvm-cov --offline --workspace --summary-only`, measured at the §7.10
+commit. The plan's checklist asks for ≥80% overall and ≥90% in the core, so these
+are the numbers that answer it rather than a shape:
 
-| area                                   | region coverage (M1) |
-| -------------------------------------- | -------------------- |
-| `rinit-core` unit naming + errors      | 100%                 |
-| `rinit/src/args.rs` (CLI parsing)      | 100%                 |
-| `rinit/src/service.rs` (supervision)   | ~95%                 |
-| `rinit-runtime/src/error.rs`           | 99%                  |
-| `rinit-runtime/src/mounts.rs`          | ~90%                 |
-| `rinit-runtime/src/signals.rs`         | ~85%                 |
-| `rinit-runtime` syscall wrappers       | 94–98%               |
-| `rinit/src/boot.rs` (orchestration)    | ~65%                 |
+| crate            | line coverage | functions |
+| ---------------- | ------------- | --------- |
+| `rinit-core`     | **96.71%**    | 526/538   |
+| `rinit-runtime`  | 86.47%        | 253/288   |
+| `rinit`          | 91.49%        | 527/570   |
+| `rctl`           | 96.08%        | 27/32     |
+| **total**        | **92.46%**    | 1333/1428 |
+
+The low outliers are the ones that *cannot* run on a host, which is why the guest
+tests exist rather than an omission: `syscall/reboot.rs` (0% - it would reboot the
+machine), `syscall/mount.rs` (50% - needs `CAP_SYS_ADMIN`), `syscall/process.rs`
+(58% - the child-side drop paths, which a host run refuses by design),
+`src/main.rs` (48% - the entry point) and `src/control.rs` (76% - the socket
+server, which the guest drives and the host reaches only through
+`RINIT_CONTROL_DIR`). `rinit-testservice` is 0% because nothing runs it any more:
+it was M0's bring-up helper, and the smoke test drives the real binary and the
+real unit path instead.
 
 ```bash
-RUSTFLAGS="-C instrument-coverage" CARGO_TARGET_DIR=target-cov \
-    cargo test --offline --workspace
-llvm-profdata merge -sparse $(find . -name '*.profraw') -o target-cov/merged.profdata
-llvm-cov report -instr-profile=target-cov/merged.profdata \
-    --ignore-filename-regex='/\.cargo/|/rustc/' \
-    -object target-cov/debug/deps/<each-test-binary>
+cargo llvm-cov --offline --workspace --summary-only          # the table above
+cargo llvm-cov --offline --workspace --html                  # target/llvm-cov/html
 ```
 
 **Known gaps**, tracked rather than hidden:
@@ -366,6 +369,29 @@ llvm-cov report -instr-profile=target-cov/merged.profdata \
   numbers below are binary sizes, not a memory measurement.
 - No `valgrind`, `miri` (stable only) or `cargo-fuzz` in this environment, so
   leaks are caught by the soak harness's sampled curve rather than by tooling.
+
+## Acceptance: plan §6's checklist
+
+Plan §6 is the definition of done. Every line of it is either a command in this
+repository or a measurement in this README:
+
+| plan §6 | where it stands |
+| ------- | --------------- |
+| boots as PID 1 in qemu (128M) with no kernel panic | `make test-system`: 77 assertions, including "no rinit panic" and four kernel-log checks |
+| 20 services in parallel, visibly faster than serial | **19.2x**: `make parallel` - 20 `oneshot` services that each sleep 1 s finish in 1065 ms together and 20 424 ms chained |
+| crash-restart, breaker, health checks | `make test-system` ("a crashed service is scheduled for restart", "the breaker tripped on the failing unit") and `crates/rinit/tests/m2_lifecycle.rs` |
+| `rctl` can start, stop, query and read logs | `make test-system`'s M3 block and `crates/rctl/tests/control.rs` |
+| graceful shutdown, no zombies, no fd leak | `make soak` samples descriptors, threads and zombie children through restart churn, and asserts each comes back to its baseline |
+| 72 h soak with stable RSS | **not run here.** `make soak` is the harness and `make soak SOAK_ARGS='--seconds 259200'` is the run; what has been run is a five-minute one - 149778 restart cycles, RSS 4668 kB → 4672 kB (+4 kB) across the second half, descriptors 21 → 23, zero zombie children |
+| binaries ≤2 MB dynamic / ≤4 MB static | [Measurements](#measurements-plan-01-calibration-point): 1.45 MiB, static aarch64 |
+| unit test coverage ≥80% overall, ≥90% in the core | **92.46%** and **96.71%** (llvm-cov, [above](#testing)) |
+| documentation: architecture, unit format, `rctl`, porting | this README (architecture, status, measurements), [`docs/units.md`](docs/units.md) (every directive, its value syntax and its default), [`docs/porting.md`](docs/porting.md) (kernel, userspace, build, differences from systemd), and `rinit-开发计划.md` |
+
+One number the checklist does not ask for, but plan §0.1's design goals do: rinit's
+RSS, measured *in the guest* out of `/proc/1/status` rather than on the host -
+**1532 kB idle** and **1720 kB with 20 services running**, against §0.1's 2 MB and
+6 MB. The growth is the interesting part: twenty more units cost under 200 kB,
+because a unit is a config, a state and a few timers rather than a thread.
 
 ## Running: `make run` (aarch64, full pipeline)
 
@@ -729,9 +755,7 @@ The rest of the plan's extension list is P3: §7.7 template units and `%i`, §7.
 inter-unit socket dependencies, §7.9 socket activation, and §7.11's terminal
 directives - each if it earns its place against §2.2's scope.
 
-Plan §6's acceptance checklist is what comes after, and this README does not
-claim those items yet: RSS-at-boot (≤2 MB idle, ≤6 MB with 20 services), the "20
-services in parallel, faster than serial" comparison, a 72 h soak (the harness
-runs and is resumable, but the long run has not been made), a fresh coverage
-measurement (the table above is still the M1 one), and the unit-format and
-porting guides.
+Plan §6's checklist is now answered item by item in the [Acceptance
+section](#acceptance-plan-6s-checklist), with one exception: the 72 h soak, where
+the harness is what this repository has and the long run is a deployment-time
+exercise.

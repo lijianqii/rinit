@@ -139,6 +139,12 @@ await_log() {
     printf 'id\n' >&3
     await_log 10 'uid=0\(root\)' || true
 
+    # Plan §0.1's memory column: rinit's own RSS at boot, read out of the kernel
+    # rather than out of rinit. This is the *idle* number, so it is measured here,
+    # before anything on this console starts another unit.
+    printf 'v=$(grep VmRSS /proc/1/status); echo idle-$v\n' >&3
+    await_log 10 'idle-VmRSS:' || true
+
     # M3: drive rinit from the guest console. Each step waits for output that
     # only that command can produce, so a failure surfaces as a timeout rather
     # than as a race.
@@ -322,6 +328,29 @@ await_log() {
     sleep 1
     printf 'v=gone; d=$(cat /run/forking.pid); kill -0 $d 2>/dev/null && echo daemon-alive || echo daemon-$v\n' >&3
     await_log 10 'daemon-gone' || true
+
+    # Plan §0.1's other half: RSS with 20 services running. They are written and
+    # registered through the reload from §7.6, then started one at a time -
+    # serial is fine here, because what is being measured is what 20 live units
+    # cost rinit, not how fast they start (that comparison is
+    # `scripts/parallel-boot.sh`).
+    printf 'i=0; while [ $i -lt 20 ]; do printf "[Service]\\nType=simple\\nExecStart=/bin/sleep 300\\n" > /etc/rinit/units/load${i}.service; i=$((i+1)); done\n' >&3
+    sleep 1
+    printf 'rctl reload\n' >&3
+    await_log 15 '20 added' || true
+    # One line per unit, each awaited: the console is a serial line, and twenty
+    # commands written back to back overrun what the guest's tty buffers - ten of
+    # the twenty used to arrive, which the "all 20 were running" assertion below
+    # is what caught.
+    for i in $(seq 0 19); do
+        # The same names the loop above wrote: `load0`..`load19`, unpadded.
+        name="$(printf 'load%d.service' "$i")"
+        printf 'rctl start %s\n' "${name}" >&3
+        await_log 10 "started ${name}" || true
+    done
+    sleep 2
+    printf 'v=$(grep VmRSS /proc/1/status); echo load-$v\n' >&3
+    await_log 10 'load-VmRSS:' || true
 
     # M2: kill the console service and let rinit bring it back. `login` execs
     # the shell, so `$$` *is* the getty process tree; killing it makes rinit
@@ -549,6 +578,28 @@ expect "a removed unit was removed" "removed reload.service"
 expect "a removed unit is gone from rctl" "no such unit: reload.service"
 expect "a directory that does not resolve was refused whole" \
     "reload rejected, the running configuration is unchanged"
+
+# Plan §0.1's memory column, measured in the guest rather than in a host
+# `--dev` run: `VmRSS` out of `/proc/1/status`, at boot and with 20 services.
+rss_kb() { grep -oE "$1-VmRSS: *[0-9]+" "${log_file}" | tail -1 | grep -oE '[0-9]+' || true; }
+idle_rss="$(rss_kb idle)"
+load_rss="$(rss_kb load)"
+if [[ -n "${idle_rss}" && "${idle_rss}" -le 2048 ]]; then
+    pass "rinit's RSS at boot is within 2 MB (${idle_rss} kB)"
+else
+    fail "rinit's RSS at boot is within 2 MB (got: '${idle_rss:-missing}' kB)"
+fi
+if [[ -n "${load_rss}" && "${load_rss}" -le 6144 ]]; then
+    pass "rinit's RSS with 20 services is within 6 MB (${load_rss} kB)"
+else
+    fail "rinit's RSS with 20 services is within 6 MB (got: '${load_rss:-missing}' kB)"
+fi
+par_units="$(grep -c -E 'started load[0-9]+\.service as pid' "${log_file}" || true)"
+if [[ "${par_units}" -eq 20 ]]; then
+    pass "all 20 services were running when the second number was taken"
+else
+    fail "only ${par_units} of the 20 services started"
+fi
 
 # M5 §7.10: `Type=forking`, on a daemon that really detaches. The last one is
 # the assertion for the whole feature: the unit's *process* is the daemon, so the

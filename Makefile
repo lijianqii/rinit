@@ -11,6 +11,7 @@
 #   make test        check + the qemu system test
 #   make test-system boot the guest and assert the M0/M1 acceptance list
 #   make soak        long-run leak check: restart churn while watching RSS/fds
+#   make parallel    20 services in parallel vs chained: measures the speedup
 #   make help        show this help
 #   make clean       remove build outputs (keeps downloads)
 #   make distclean   remove everything, including downloads
@@ -61,7 +62,7 @@ MAKE_BUSYBOX     := $(MAKE) -C $(BUSYBOX_SRC) ARCH=$(BUSYBOX_ARCH) CROSS_COMPILE
 
 .DEFAULT_GOAL    := run
 .PHONY: run kernel kernel-config-check busybox rinit initramfs qemu help clean \
-        distclean check test test-system soak
+        distclean check test test-system soak parallel
 
 help:
 	@sed -n '2,/^# ====/p' $(MAKEFILE_LIST) | sed '$$d' | sed 's/^# \{0,1\}//'
@@ -209,6 +210,18 @@ test-system: $(KERNEL_IMAGE) $(INITRAMFS)
 SOAK_ARGS ?= --seconds 60
 soak:
 	$(SCRIPTS)/soak.sh $(SOAK_ARGS)
+
+# --- parallel startup measurement (plan §6 acceptance) --------------------
+# Runs the *host* rinit in `--dev` mode, so it needs no cross toolchain and no
+# qemu: what is measured is the scheduler (the boot plan, the level walk, the
+# spawn path), and the guest asserts the derived property instead.
+HOST_RINIT := target/debug/rinit
+
+$(HOST_RINIT): $(RINIT_SRCS)
+	cargo build --offline
+
+parallel: $(HOST_RINIT)
+	$(SCRIPTS)/parallel-boot.sh --rinit $(HOST_RINIT) $(PARALLEL_ARGS)
 
 # --- housekeeping ---------------------------------------------------------
 clean:
