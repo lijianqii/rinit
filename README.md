@@ -8,7 +8,7 @@ README tracks implementation status.
 ## Status: M0–M4 complete, M5 in progress — verified on aarch64
 
 What is in place, and what it is proven by. Every claim below is either a host
-test (`make check`) or a guest assertion (`make test-system`, 54 of them in
+test (`make check`) or a guest assertion (`make test-system`, 60 of them in
 `scripts/system-test.sh`); "proven on the host" always means the fake-runtime or
 `--dev` form of the same code path, and the guest means the real one.
 
@@ -16,10 +16,10 @@ test (`make check`) or a guest assertion (`make test-system`, 54 of them in
 | --------- | ------- | -------- |
 | M0 | PID 1 via `rdinit=`, first-wave mounts (`/run` → `/proc` → `/sys` → `/dev` → `/tmp` → `/sys/fs/cgroup`) with fatal/degradable rules per plan §1.3(9), `SIGCHLD` + `waitpid(-1, WNOHANG)` reaping, panic hook to `/dev/kmsg` | guest: "mounted /run…", "mounted /sys/fs/cgroup", "no rinit panic"; host: `crates/rinit/tests/smoke.rs` |
 | M1 | unit files parsed from `/etc/rinit/units`, dependency graph resolved, units started level by level with each level in parallel | guest: "resolved a boot plan", "startup levels run in dependency order", "no target was exec'd" |
-| M2 | supervision (spawn, track, reap, two-stage stop), restart policy with backoff and a circuit breaker, health probes, `Type=notify` readiness, in-memory log ring | guest: "a crashed service is scheduled for restart", "the breaker tripped on the failing unit"; host: `crates/rinit/tests/m2_lifecycle.rs` (25 tests) |
+| M2 | supervision (spawn, track, reap, two-stage stop), restart policy with backoff and a circuit breaker, health probes, `Type=notify` readiness, in-memory log ring | guest: "a crashed service is scheduled for restart", "the breaker tripped on the failing unit"; host: `crates/rinit/tests/m2_lifecycle.rs` (27 tests) |
 | M3 | control socket + `rctl` (`list`, `status`, `start`, `stop`, `restart`, `reset-failed`, `log`), with a documented exit-code contract | guest: "rctl list reached the control socket" and the five assertions after it; host: `crates/rctl/tests/control.rs` (6 tests) |
 | M4 | soak harness for sustained churn (`make soak`), leak and descriptor fixes, `--dev` control-socket peer relaxation | `scripts/soak.sh` (see [Testing](#testing)); `crates/rinit-core/tests/allocations.rs` |
-| M5 (in progress) | **§7.3 and §7.4 done.** cgroup v2: `CgroupCPUMax=`, `CgroupMemoryMax=`, `CgroupMemoryHigh=`, `CgroupTasksMax=` under `rinit/<unit>`, the process placing itself, stop-flow signalling of the cgroup's members, `rmdir` cleanup, and OOM-kill detection into the restart policy. Sandboxing: `User=`, `Group=`, `NoNewPrivileges=`, `CapabilityBoundingSet=`, `AmbientCapabilities=`. **Next**: §7.5 watchdog | guest: "a limited unit was placed in its own cgroup", "the memory hard and soft limits were written in bytes", "a stopped unit's cgroup was removed", "the kernel OOM-killed a process inside the unit's cgroup", "a de-privileged service ran as nobody:nogroup with NoNewPrivs", "an empty CapabilityBoundingSet left a root service with no capabilities", "ambient capabilities reached a de-privileged service"; host: `crates/rinit/src/cgroup.rs` (19 tests), `crates/rinit-core/src/unit/cgroup.rs` (9), `crates/rinit-runtime/src/syscall/cgroup.rs` (14), `crates/rinit/src/sandbox.rs` (14), `crates/rinit-core/src/unit/sandbox.rs` (9), `crates/rinit-runtime/src/syscall/cred.rs` (14) |
+| M5 (in progress) | **§7.3, §7.4 and §7.5 done.** cgroup v2: `CgroupCPUMax=`, `CgroupMemoryMax=`, `CgroupMemoryHigh=`, `CgroupTasksMax=` under `rinit/<unit>`, the process placing itself, stop-flow signalling of the cgroup's members, `rmdir` cleanup, and OOM-kill detection into the restart policy. Sandboxing: `User=`, `Group=`, `NoNewPrivileges=`, `CapabilityBoundingSet=`, `AmbientCapabilities=`. Hardware watchdog: `/dev/watchdog` armed at boot, fed from the supervisor loop's health checkpoint, magic-closed on shutdown. **Next**: §7.6 `rctl reload`, §7.10 `Type=forking` | guest: "a limited unit was placed in its own cgroup", "the memory hard and soft limits were written in bytes", "a stopped unit's cgroup was removed", "the kernel OOM-killed a process inside the unit's cgroup", "rinit armed the guest's watchdog device", "the driver took the timeout rinit set", "the guest outlived the watchdog timeout with the device armed", "a de-privileged service ran as nobody:nogroup with NoNewPrivs", "an empty CapabilityBoundingSet left a root service with no capabilities", "ambient capabilities reached a de-privileged service"; host: `crates/rinit/src/cgroup.rs` (19 tests), `crates/rinit-core/src/unit/cgroup.rs` (9), `crates/rinit-runtime/src/syscall/cgroup.rs` (14), `crates/rinit/src/watchdog.rs` (6), `crates/rinit-runtime/src/syscall/watchdog.rs` (6), `crates/rinit/src/sandbox.rs` (14), `crates/rinit-core/src/unit/sandbox.rs` (9), `crates/rinit-runtime/src/syscall/cred.rs` (14) |
 
 A real boot of the committed tree on the serial console (`…` elides kernel
 noise; the lines below are the ones `make test-system` asserts on). The last
@@ -49,6 +49,7 @@ rinit: started getty.service as pid 49
 rinit: starting level 2: 0 service(s)
 rinit: level 2 reached: multi-user.target active
 rinit: boot complete: 2 unit(s) started from 'multi-user.target' (2 still running)
+rinit: watchdog /dev/watchdog armed: 10s timeout, feeding every 5s
 rinit: reaped pid 48
 rinit: fault.service will restart in 1.195s
 
@@ -60,7 +61,10 @@ rinit: error: fault.service hit its start limit (2 failures); not restarting
 Note that the plan resolves **12 units** and starts **2**: everything in `units/`
 is parsed and ordered, and only the boot target's closure is started. The demo
 units (`priv`, `caps`, `ambient`, `logdemo`, `cglimit`, `cgrun`, `oom`) are
-outside it on purpose and are driven by `rctl` in the system test.
+outside it on purpose and are driven by `rctl` in the system test. The watchdog's
+`10s` is `make test-system`'s own shortening of the 30 s default (see the CLI
+section above); the arm line itself is what the committed binary prints, and
+`make run` shows `30s ... every 15s` for the same boot.
 
 The two halves of §7.3, from the same console. First the limits as the *service*
 reads them back - its own `/proc/<pid>/cgroup`, its own attribute files - and
@@ -86,6 +90,26 @@ doubles a string past its own `memory.max`, so the kill comes from the *cgroup's
 OOM killer; rinit then names the limit behind the `SIGKILL` and the unit's
 `Restart=on-failure` brings it back (once; the second kill trips the breaker).
 
+§7.5's watchdog, from the same console. The device is real - `run-qemu.sh`
+attaches qemu's `i6300esb` and the kernel is built with its driver - so the
+timeout below is that driver's answer to rinit's `WDIOC_SETTIMEOUT`, not a
+stand-in file's. The uptime is the part that matters: the device was armed with a
+10 s timeout within seconds of boot, so a machine still running long after that
+is a machine whose supervisor loop is feeding it.
+
+```
+~ # d=/sys/class/watchdog/watchdog0; echo wd-ident=$(cat $d/identity) wd-state=$(cat $d/state) wd-timeout=$(cat $d/timeout)
+wd-ident=i6300ESB timer wd-state=active wd-timeout=10
+~ # u=$(cut -d" " -f1 /proc/uptime); echo wd-uptime=$u
+wd-uptime=18.64
+```
+
+The commands are written that way on purpose: the console echoes what is typed
+and those lines land in the same log the assertions read, so the markers are
+built from a variable (`v=populated; ... echo cgrun-$v` above, `$d/identity`
+here) rather than appearing literally in the input - an assertion that its own
+echo satisfies proves nothing.
+
 ## Layout
 
 ```
@@ -98,13 +122,15 @@ crates/
     tests/allocations.rs
   rinit-runtime/      # syscall layer, mounts, signals, reaping (std/libc/tokio)
     src/syscall/      # process.rs, wait.rs, cred.rs (ids + capabilities), fs.rs,
-                      # mount.rs, socket.rs, signal.rs, reboot.rs, cgroup.rs
+                      # mount.rs, socket.rs, signal.rs, reboot.rs, cgroup.rs,
+                      # watchdog.rs (the feed/disarm protocol)
     tests/syscall.rs, tests/shipped_units.rs
   rinit/              # PID 1 binary
     src/boot.rs       # boot sequence + main loop (orchestration only)
     src/unit_manager.rs, service.rs, control.rs, logs.rs, log.rs
     src/sandbox.rs    # `User=`/`Group=`/capabilities -> Sandbox (one resolver)
     src/cgroup.rs     # §7.3: where limits are applied, and the failure taxonomy
+    src/watchdog.rs   # §7.5: whether this boot has one, and the feed cadence
     src/notify.rs, readiness.rs, deadline.rs, args.rs, manager.rs
     tests/m2_lifecycle.rs, tests/smoke.rs
   rctl/               # control CLI (main.rs, parse.rs, client.rs) + tests
@@ -136,17 +162,17 @@ make test-system    # boot aarch64 qemu and assert the acceptance list
 make test           # check + test-system
 ```
 
-`cargo test --offline --workspace` (what `make check` runs last) executes **615
+`cargo test --offline --workspace` (what `make check` runs last) executes **632
 tests** across eleven binaries. The four shapes, and why each is not redundant:
 
-- **unit tests** next to the code (core 302, rinit 157, rinit-runtime 86,
+- **unit tests** next to the code (core 302, rinit 166, rinit-runtime 92,
   rctl 10), including `proptest` properties over the parser;
 - **integration tests** in `crates/*/tests/`: the syscall layer against the real
   kernel (`rinit-runtime` 21: run unprivileged, they assert that each drop is
   *refused* rather than silently skipped - `EPERM` from `setuid(0)`, `setgroups`,
   `PR_CAPBSET_DROP`, `capset` and the ambient raise, each naming the call that
   failed - with the root-only success paths deferred to the guest), the
-  lifecycle end to end in `--dev` mode (`rinit/tests/m2_lifecycle.rs` 25), the
+  lifecycle end to end in `--dev` mode (`rinit/tests/m2_lifecycle.rs` 27), the
   control CLI (`rctl/tests/control.rs` 6), the smoke test that runs the real
   binary (`rinit/tests/smoke.rs` 2), the allocation guard
   (`rinit-core/tests/allocations.rs` 2), and `shipped_units.rs` 4 - every unit in
@@ -159,12 +185,13 @@ tests** across eleven binaries. The four shapes, and why each is not redundant:
   259200'` is the 72-hour acceptance run the plan asks for;
 - **the guest system test** (`scripts/system-test.sh`, plan §4.3): boots the real
   initramfs on aarch64 qemu, types at the console to prove a root shell is
-  reachable, drives `rctl` against the running system, and asserts 54 things -
+  reachable, drives `rctl` against the running system, and asserts 60 things -
   including that levels run in dependency order, that no target is ever exec'd,
-  the §7.4 privilege-drop outcomes, and the §7.3 limits read back out of the
-  guest's own kernel. Exit codes are `0` pass, `1` assertion failed, `2` missing
-  artifacts, `3` qemu could not start. Logs land in `build/logs/` (and are
-  deleted on success unless `--keep-log` is passed).
+  the §7.4 privilege-drop outcomes, the §7.3 limits read back out of the guest's
+  own kernel, and §7.5's watchdog on the real device qemu attaches. Exit codes are
+  `0` pass, `1` assertion failed, `2` missing artifacts, `3` qemu could not start.
+  Logs land in `build/logs/` (and are deleted on success unless `--keep-log` is
+  passed).
 
 The mount policy (plan §1.3(9)) is covered through the `MountOps` trait, so the
 fatal-vs-degradable rules are tested without `CAP_SYS_ADMIN` - the "fake
@@ -181,6 +208,15 @@ real path - create, write, place, read back, clean up - in `--dev` on the host,
 no root and no `/sys`. What that stand-in cannot do is `rmdir` a directory full
 of stand-in attribute files, which is why the removal and the live `cgroup.procs`
 checks are asserted in the guest, against a real cgroupfs.
+
+§7.5 is the same shape with the polarity reversed. The watchdog's *protocol* is
+bytes on a descriptor, so the host tests point `--watchdog` at a file and read
+the feed bytes and the magic close back out of it - which is also the only safe
+way to test the code on a machine that has its own `/dev/watchdog`. The *ioctl*
+and the hardware only exist in the guest, which is why qemu's `i6300esb` device
+and a kernel built with its driver are part of the test rig rather than an
+optional extra: without them the guest could only ever exercise the
+"no watchdog hardware" path.
 
 Measured with `llvm-cov` **at M1**; not re-measured since, and treated as a
 shape rather than a current score. Reproduce with the commands below before
@@ -215,8 +251,21 @@ llvm-cov report -instr-profile=target-cov/merged.profdata \
   `PR_CAPBSET_DROP`, so those units fail rather than run with the drop skipped -
   fail-closed by design, and the reason the §7.4 *success* paths are only ever
   proven in the guest, where rinit is root. The host tests prove the refusals.
-- `boot.rs`'s reboot/halt paths are only exercised in the guest; on the host they
-  must not run (they would reboot the machine).
+- **The shutdown path - `reboot(2)`, the SysRq fallback, the watchdog's magic
+  close - is not covered by the automated tests.** On the host it must not run
+  (it would reboot the machine), and the system test kills qemu rather than
+  asking the guest to shut down, so sending `SIGTERM` to PID 1 in the guest is
+  the manual check. The magic close is the one piece of it with automated
+  evidence: asserted against a stand-in device in `m2_lifecycle.rs`, where the
+  file shows the `V` after the feed bytes. In the guest the kernel also stops the
+  device on a reboot (`watchdog_stop_on_reboot`), so a graceful shutdown has two
+  independent reasons not to reset the machine.
+- **What a watchdog is *for* cannot be tested without hanging rinit.** The reset
+  itself is not exercised: proving it means deliberately wedging PID 1 until the
+  hardware fires, which would end the run being validated. What is proven is
+  everything short of it - the device is opened and reported, the timeout reaches
+  a real driver, the supervisor loop feeds it (the guest outlives a timeout it
+  would not survive unfed), and the guest boots exactly once.
 - **A cgroup limit is only proven against the controllers the running kernel
   has.** The guest's kernel is built with all four the plan's directives need
   (the Makefile checks that), so the *skip* branches - no `pids` controller, no
@@ -254,12 +303,16 @@ What it does, in order (see [Makefile](Makefile)):
 3. Fetch `busybox-1.36.1.tar.bz2` and build a **static** busybox with the
    applets the initramfs needs.
 4. Assemble `build/out/initramfs-<target>.cpio.gz` (busybox + rinit + units).
-5. Boot it in `qemu-system-aarch64 -machine virt -cpu cortex-a57 -m 128M`.
+5. Boot it in `qemu-system-aarch64 -machine virt -cpu cortex-a57 -m 128M` with
+   `-device i6300esb`, the watchdog rinit arms (plan §7.5).
 
 There is nothing to configure: `make run` always builds whatever is out of date
 and boots the unit directory. Re-running it does no downloading and no
 compiling — the file targets below already encode that, which is why there is no
-"skip the build" switch.
+"skip the build" switch. One exception proves the rule: `kernel-config-check`
+runs on every `make kernel`, because a kernel built from a config without the
+symbols §7.3 and §7.5 need is a guest where a limit or the watchdog silently
+does not exist.
 
 ```bash
 make run            # build if needed, boot → interactive root shell
@@ -343,6 +396,10 @@ rinit [OPTIONS] [-- <SERVICE> [ARGS...]]
       --default <TARGET>     Boot target (default: multi-user.target)
       --cgroup-root <DIR>    cgroup v2 hierarchy for unit limits
                              (default: /sys/fs/cgroup)
+      --watchdog <DEVICE>    Hardware watchdog to arm and feed
+                             (default: /dev/watchdog; not opened in --dev)
+      --watchdog-timeout <S> Hardware timeout in seconds; fed every half
+                             (default: 30)
       --test-service <CMD>   Launch this instead of the unit directory
       -- <SERVICE> [ARGS]    Service as an argv (kernel-cmdline form)
 ```
@@ -358,6 +415,15 @@ root, without `CAP_SYS_ADMIN` and without `/sys`. `--dev` does not touch the
 machine's own hierarchy: with the mounts skipped, the limits are skipped too
 (with a log line), because a developer host's `/sys/fs/cgroup` is not rinit's
 to carve up. An explicit `--cgroup-root` wins over that.
+
+`--watchdog` and `--watchdog-timeout` are §7.5, and `--dev` refuses the default
+device for a sharper reason than convenience: opening `/dev/watchdog` starts a
+hardware timer, and a host running `make check` is not going to feed it. A
+device named explicitly is still honoured, which is how the host tests drive the
+byte protocol against a file. On a kernel command line the two flags go in their
+space-separated form - the kernel hands a `-flag=value` token to init as an
+*environment* entry, not an argument (`init/main.c`), so `--watchdog-timeout 10`
+reaches rinit and `--watchdog-timeout=10` does not.
 
 ### rctl
 
@@ -383,7 +449,7 @@ a length prefix - on either side - from becoming an unbounded allocation.
 
 ## Design decisions and deliberate deviations from the plan
 
-Fifteen points differ from the written plan or pin down something it leaves
+Eighteen points differ from the written plan or pin down something it leaves
 open. All are noted here so they are not mistaken for drift:
 
 1. **Signals use a self-pipe, not `tokio::signal`.** Plan §2.1④ says to unify on
@@ -483,6 +549,33 @@ open. All are noted here so they are not mistaken for drift:
     preparation step cannot quietly run as root: `run_aux_command` resolves the
     same sandbox the service gets. Work that genuinely needs root belongs in a
     system oneshot (`rinit-init.service`), not in an `ExecStartPre=`.
+16. **The watchdog is configured by flags, not by `/etc/rinit.conf`.** §7.5
+    offers "编译期或 `/etc/rinit.conf` 全局开关" and shows a `[Global]` section.
+    rinit has no global config file, and every other boot knob is a flag, so
+    `--watchdog`/`--watchdog-timeout` carry the same two values
+    (`WatchdogDevice=`, `WatchdogTimeoutSec=`) through the mechanism that
+    already exists. A config file would add a parser, a second boot-time failure
+    mode, and a second place to look for one setting.
+17. **The watchdog is armed when the supervisor loop starts, not at the top of
+    the boot.** §7.5 says "启动时打开" and then requires the feed to happen at the
+    main loop's health checkpoint. Arming it earlier would mean feeding from the
+    boot sequence as well, and a level that legitimately takes longer than the
+    timeout - a service with a long `TimeoutStartSec=`, a slow filesystem -
+    would reset a machine that is booting correctly. The window that is left
+    uncovered (mounts, unit loading, the first start) is bounded by the start
+    timeouts; the loop that follows is where an init silently wedges. A
+    `--test-service` boot, which is a bring-up path rather than a system boot,
+    arms nothing.
+18. **The guest is *given* a watchdog, because the target qemu machine has
+    none.** `-device i6300esb` in `scripts/run-qemu.sh` plus
+    `CONFIG_I6300ESB_WDT=y` in the kernel the Makefile builds is what makes
+    `/dev/watchdog` a real device behind a real driver, so the timeout the guest
+    reads back out of `/sys/class/watchdog/watchdog0/timeout` is the driver's
+    answer to rinit's ioctl rather than a stand-in file's. `CONFIG_WATCHDOG_SYSFS`
+    is on for the same reason: without it there is no attribute to read the
+    answer from. The x86_64 qemu path boots the host's `vmlinuz`, whose watchdog
+    driver is a module that is not in that initramfs, so it has no device and
+    rinit reports nothing - correct behaviour, but not evidence.
 
 ## Measurements (plan §0.1 calibration point)
 
@@ -510,12 +603,12 @@ yet; that needs a sampling loop in the guest (the soak harness measures the host
 
 ## Next
 
-The rest of M5: §7.5's hardware watchdog (`/dev/watchdog`), then §7.6 reload,
-§7.10 `Type=forking`, and the P3 items (templates, `Sockets=`, socket
-activation) if they earn their place, then the docs/examples/acceptance
-checklist.
+The rest of M5: §7.6 `rctl reload`, §7.10 `Type=forking`, then the P3 items
+(templates, `Sockets=`, socket activation) if they earn their place.
 
-Two things plan §0.1 leaves open and this README does not claim: RSS-at-boot
-(≤2 MB idle, ≤6 MB with 20 services) and the "20 services in parallel, faster
-than serial" comparison. Both need a sampling loop inside the guest; the soak
-harness measures the host `--dev` process instead.
+Plan §6's acceptance checklist is what comes after, and this README does not
+claim those items yet: RSS-at-boot (≤2 MB idle, ≤6 MB with 20 services), the "20
+services in parallel, faster than serial" comparison, a 72 h soak (the harness
+runs and is resumable, but the long run has not been made), a fresh coverage
+measurement (the table above is still the M1 one), and the unit-format and
+porting guides.
