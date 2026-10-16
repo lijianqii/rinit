@@ -35,6 +35,7 @@ mod service;
 #[cfg(test)]
 mod test_support;
 mod unit_manager;
+mod watchdog;
 
 use std::io::Write;
 use std::process::ExitCode;

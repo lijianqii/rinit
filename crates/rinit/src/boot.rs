@@ -29,6 +29,7 @@ use crate::service::{ServiceSet, reap_and_log, shutdown, spawn_service_in_group}
 use crate::unit_manager::{
     Outcome, RestartPlan, UnitManager, build_service_env, reap_into_manager,
 };
+use crate::watchdog::Watchdog;
 
 /// How often the shutdown loop wakes to reap children and check `SIGKILL`
 /// deadlines. Small enough that a quick exit is noticed promptly.
@@ -100,7 +101,28 @@ pub async fn run(cfg: Config) -> Result<(), RuntimeError> {
         // The control socket is bound after the mounts, so `/run` exists
         // (plan §1.3(10)); a failure to bind it is only a warning.
         let mut control = ControlServer::bind(cfg.skip_mounts);
-        supervise(&mut signals, &mut manager, &mut notify, &mut control, &logs).await;
+        // Plan §7.5: armed once the boot is up and the loop below owns the
+        // system, and fed from that loop's health checkpoint (see `supervise`).
+        // Arming it earlier would mean feeding it from the boot sequence too, and
+        // a slow level - a service with a long `TimeoutStartSec=` - would then be
+        // able to reset a machine that is booting perfectly well.
+        let mut watchdog = Watchdog::prepare(
+            cfg.skip_mounts,
+            cfg.watchdog_device.clone(),
+            cfg.watchdog_timeout_sec,
+        );
+        supervise(
+            &mut signals,
+            &mut manager,
+            &mut notify,
+            &mut control,
+            &logs,
+            &mut watchdog,
+        )
+        .await;
+        // Graceful shutdown disarms the hardware (plan §7.5's magic close). A
+        // hung loop never gets here, and that is the mechanism.
+        watchdog.disarm();
         control.disarm();
         // A dev-mode boot (`--dev`) is a host smoke test, not PID 1: returning
         // lets the test process exit instead of spinning in `reboot_now`,
@@ -149,11 +171,17 @@ async fn supervise(
     notify: &mut NotifyHub,
     control: &mut ControlServer,
     logs: &ServiceLogs,
+    watchdog: &mut Watchdog,
 ) {
     // Set when the shutdown was triggered by power failure, which runs under a
     // much smaller budget (plan §7.1).
     let mut fast = false;
     loop {
+        // Plan §7.5's health checkpoint: the feed happens here, in the loop that
+        // starts services, reaps children and answers `rctl` - so a loop that
+        // stops iterating stops feeding, and the hardware resets the machine. A
+        // timer thread would keep feeding a wedged init.
+        watchdog.feed_if_due();
         // Service anything already due before blocking, so a zero-length timer
         // does not wait for the next unrelated wake-up.
         for unit in manager.due_restarts() {
@@ -184,8 +212,10 @@ async fn supervise(
             rlog!("warning: {unit}: health probe timed out");
         }
 
-        // Never block past the earliest pending deadline.
-        let wait = next_deadline(manager);
+        // Never block past the earliest pending deadline - which includes the
+        // next watchdog feed, or a pending feed would be slept through and the
+        // hardware would reset a perfectly healthy init.
+        let wait = next_deadline(manager).min(watchdog.next_feed_in());
         tokio::select! {
             signal = signals.recv() => match signal {
                 Signal::Child => {

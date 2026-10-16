@@ -1290,3 +1290,132 @@ fn a_sigkill_the_cgroup_did_not_make_is_not_reported_as_an_oom_kill() {
         "the unit still follows its restart policy:\n{log}"
     );
 }
+
+// --- §7.5: the hardware watchdog, end to end ------------------
+
+/// A stand-in watchdog device: an ordinary file, never the real one.
+///
+/// This machine *has* a `/dev/watchdog` (a `misc` device and a `watchdog0`), and
+/// opening it would start a hardware timer under whichever developer or CI job
+/// ran the test. `--watchdog` exists so the protocol can be pointed somewhere
+/// harmless, which is what makes the feed bytes and the magic close observable
+/// at all.
+struct WatchdogFile(PathBuf);
+
+impl WatchdogFile {
+    fn new(tag: &str) -> Self {
+        let path =
+            std::env::temp_dir().join(format!("rinit-m2-watchdog-{}-{tag}", std::process::id()));
+        fs::write(&path, b"").expect("create the stand-in device");
+        WatchdogFile(path)
+    }
+
+    fn arg(&self) -> &str {
+        self.0.to_str().expect("the temp path is UTF-8")
+    }
+
+    fn bytes(&self) -> Vec<u8> {
+        fs::read(&self.0).unwrap_or_default()
+    }
+}
+
+impl Drop for WatchdogFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+/// Plan §7.5's main loop half: the supervisor loop feeds the device as it
+/// iterates, and a graceful shutdown writes the magic close.
+///
+/// The ioctl is refused by a stand-in device (`ENOTTY`), which is also the case
+/// the policy layer has to survive: the device stays armed and the feeds use the
+/// timeout that was configured, because that is the only number the stand-in
+/// will agree to.
+#[test]
+fn the_supervisor_loop_feeds_the_watchdog_and_shutdown_disarms_it() {
+    let dir = TempDir::new("units-watchdog");
+    dir.write(
+        "all.target",
+        "[Unit]\nType=target\nRequires=worker.service\n",
+    );
+    dir.write(
+        "worker.service",
+        "[Service]\nType=simple\nExecStart=/bin/sleep 30\n",
+    );
+    let device = WatchdogFile::new("fed");
+
+    let log = boot_units_extra(
+        &dir,
+        "all.target",
+        SETTLE,
+        libc::SIGTERM,
+        &[
+            "--watchdog",
+            device.arg(),
+            // Half of this is the feed interval: one second, so a 1.5 s boot
+            // cannot come out with zero feeds and no flake either.
+            "--watchdog-timeout",
+            "2",
+        ],
+    );
+    let bytes = device.bytes();
+
+    assert!(
+        !log.contains("not touching the watchdog device"),
+        "an explicit device is honoured even in --dev:\n{log}"
+    );
+    assert!(
+        log.contains("armed: 2s timeout, feeding every 1s"),
+        "the arm line states the cadence the loop will use:\n{log}"
+    );
+    assert!(
+        bytes.len() >= 2,
+        "the loop fed the device at least once before shutdown, then disarmed: {bytes:?}"
+    );
+    assert_eq!(
+        bytes.last(),
+        Some(&b'V'),
+        "the graceful path writes the magic close: {bytes:?}"
+    );
+    assert_eq!(
+        bytes.iter().filter(|b| **b == b'V').count(),
+        1,
+        "and only one: {bytes:?}"
+    );
+    assert!(
+        bytes[..bytes.len() - 1].iter().all(|b| *b == b'0'),
+        "everything before the magic close is a feed: {bytes:?}"
+    );
+    assert!(log.contains("watchdog disarmed"), "and says so:\n{log}");
+}
+
+/// The decision that keeps a developer host off the hardware timer: `--dev`
+/// without `--watchdog` must not open the default device at all.
+///
+/// The assertion is on the decision, not on the file: this machine's
+/// `/dev/watchdog` is not writable by the test user, so "nothing was opened"
+/// would otherwise be true for the wrong reason.
+#[test]
+fn dev_mode_does_not_arm_the_default_watchdog_device() {
+    let dir = TempDir::new("units-no-watchdog");
+    dir.write(
+        "all.target",
+        "[Unit]\nType=target\nRequires=worker.service\n",
+    );
+    dir.write(
+        "worker.service",
+        "[Service]\nType=simple\nExecStart=/bin/sleep 30\n",
+    );
+
+    let log = boot_units_extra(&dir, "all.target", SETTLE, libc::SIGTERM, &[]);
+
+    assert!(
+        log.contains("dev mode: not touching the watchdog device"),
+        "the skip is stated rather than implicit:\n{log}"
+    );
+    assert!(
+        !log.contains("armed:") && !log.contains("watchdog disarmed"),
+        "nothing was armed, so nothing is disarmed either:\n{log}"
+    );
+}

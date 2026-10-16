@@ -39,6 +39,11 @@ keep_log=0
 # passing a service on the kernel cmdline would override it and skip exactly
 # the behaviour this test exists to check.
 service=""
+# Extra kernel cmdline tokens. The only one needed is the watchdog timeout
+# (plan §7.5): the default is 30 s, and the test wants a window short enough for
+# the guest to outlive it and *prove* the supervisor loop is feeding the device.
+# Rinit's own default is what `make run` boots with.
+kernel_args="--watchdog-timeout 10"
 
 usage() { sed -n '2,22p' "$0"; }
 
@@ -193,19 +198,25 @@ await_log() {
     # kernel directly: `cgroup.procs` is a live view (and st_size 0, so `test -s`
     # would be answered by `stat` rather than by the processes in it), and
     # `test -d` after the stop is the cleanup.
+    #
+    # `v=populated` is not decoration: the console *echoes* what is typed, and
+    # those echo lines are in the same log the assertions read, so a command
+    # written as `echo cgrun-populated` would satisfy its own assertion. Building
+    # the marker from a variable keeps the literal string out of the input, which
+    # is what makes the assertion about the shell's output.
     printf 'rctl start cgrun.service\n' >&3
     await_log 10 'started cgrun.service' || true
     sleep 1
-    printf 'p=$(cat /sys/fs/cgroup/rinit/cgrun.service/cgroup.procs); test -n "$p" && echo cgrun-populated || echo cgrun-empty\n' >&3
+    printf 'v=populated; p=$(cat /sys/fs/cgroup/rinit/cgrun.service/cgroup.procs); test -n "$p" && echo cgrun-$v || echo cgrun-empty\n' >&3
     await_log 10 'cgrun-populated' || true
     printf 'rctl stop cgrun.service\n' >&3
     await_log 10 'stopped cgrun.service' || true
     sleep 1
-    printf 'test -d /sys/fs/cgroup/rinit/cgrun.service && echo cgrun-left || echo cgrun-gone\n' >&3
+    printf 'v=gone; d=/sys/fs/cgroup/rinit/cgrun.service; test -d $d && echo cgrun-left || echo cgrun-$v\n' >&3
     await_log 10 'cgrun-gone' || true
     # The oneshot has exited by the time its log is read, so its cgroup has to
     # be gone too - the same cleanup, reached by the other exit path.
-    printf 'test -d /sys/fs/cgroup/rinit/cglimit.service && echo cglimit-left || echo cglimit-gone\n' >&3
+    printf 'v=gone; d=/sys/fs/cgroup/rinit/cglimit.service; test -d $d && echo cglimit-left || echo cglimit-$v\n' >&3
     await_log 10 'cglimit-gone' || true
 
     # M5 §7.3: the OOM link. This unit allocates past its own `memory.max`, so
@@ -216,6 +227,23 @@ await_log() {
     await_log 10 'started oom.service' || true
     await_log 20 'killed by the cgroup OOM killer' || true
     await_log 20 'oom.service will restart in' || true
+
+    # M5 §7.5: the hardware watchdog. This one is *not* a stand-in: run-qemu.sh
+    # attaches `-device i6300esb`, the guest kernel is built with the driver and
+    # `CONFIG_WATCHDOG_SYSFS`, and devtmpfs gives rinit a real `/dev/watchdog`.
+    # The 10 s timeout comes from `--kernel-args` (the default is 30 s; the test
+    # wants a window short enough to outlive), so the feed interval is 5 s.
+    #
+    # Three things are asked of the kernel: what the device is, that it is
+    # `active`, and what timeout it is running - the last one is the ioctl's
+    # answer from a real driver, not rinit's intention. Then the uptime, because
+    # the proof that the supervisor loop is *feeding* it is that this machine is
+    # still here: with the device armed and nothing feeding it, the hardware
+    # resets the machine within the timeout.
+    printf 'd=/sys/class/watchdog/watchdog0; echo wd-ident=$(cat $d/identity) wd-state=$(cat $d/state) wd-timeout=$(cat $d/timeout)\n' >&3
+    await_log 10 'wd-state=active' || true
+    printf 'u=$(cut -d" " -f1 /proc/uptime); echo wd-uptime=$u\n' >&3
+    await_log 10 'wd-uptime=' || true
 
     # M2: kill the console service and let rinit bring it back. `login` execs
     # the shell, so `$$` *is* the getty process tree; killing it makes rinit
@@ -234,7 +262,8 @@ set +e
 timeout -k 5 "${timeout_s}" \
     "${repo_root}/scripts/run-qemu.sh" \
     --arch "${arch}" --kernel "${kernel}" --initrd "${initrd}" \
-    ${service:+--service "${service}"} <"${fifo}" >"${log_file}" 2>&1
+    ${service:+--service "${service}"} \
+    --kernel-args "${kernel_args}" <"${fifo}" >"${log_file}" 2>&1
 qemu_rc=$?
 wait "${feeder_pid}" 2>/dev/null || true
 set -e
@@ -401,6 +430,31 @@ expect "the kernel OOM-killed a process inside the unit's cgroup" \
 expect "rinit named the OOM kill and the memory limit behind it" \
     "killed by the cgroup OOM killer (memory.max=16777216)"
 expect "an OOM-killed unit entered the restart policy" "oom.service will restart in"
+
+# M5 §7.5: the hardware watchdog, on the real device the guest was given.
+expect "rinit armed the guest's watchdog device" \
+    "rinit: watchdog /dev/watchdog armed: 10s timeout, feeding every 5s"
+expect "the guest's watchdog is the qemu device rinit opened" "wd-ident=i6300ESB timer"
+expect "the driver is running the device rinit armed" "wd-state=active"
+expect "the driver took the timeout rinit set" "wd-timeout=10"
+
+# The device was armed within seconds of boot with a 10 s timeout, and this
+# guest is long past that: a single missed feed would have reset the machine, so
+# the uptime *is* the evidence that the supervisor loop is feeding it. The boot
+# count is the same claim from the other side - a reset would leave a second
+# "Run /sbin/rinit as init process" in the log.
+uptime="$(grep -oE 'wd-uptime=[0-9]+' "${log_file}" | tail -1 | cut -d= -f2)"
+if [[ -n "${uptime}" && "${uptime}" -gt 10 ]]; then
+    pass "the guest outlived the watchdog timeout with the device armed"
+else
+    fail "the guest's uptime past the watchdog timeout (got: '${uptime:-missing}')"
+fi
+boots="$(grep -c -F "Run /sbin/rinit as init process" "${log_file}" || true)"
+if [[ "${boots}" -eq 1 ]]; then
+    pass "the guest booted exactly once (the watchdog never fired)"
+else
+    fail "the guest booted ${boots} times: the watchdog reset it"
+fi
 
 # A completed oneshot has nothing to restart, so `restart` is a conflict
 # (exit 4). `logdemo` proves it and that the unit is only started once.

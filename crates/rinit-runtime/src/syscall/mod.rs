@@ -17,6 +17,7 @@ pub mod reboot;
 pub mod signal;
 pub mod socket;
 pub mod wait;
+pub mod watchdog;
 
 /// Convert `s` into a `CString` for a syscall argument.
 ///

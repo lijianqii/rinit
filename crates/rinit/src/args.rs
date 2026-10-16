@@ -46,6 +46,17 @@ pub struct Config {
     /// integration tests, which drive the whole limit path against a directory
     /// of ordinary files without needing root or cgroups.
     pub cgroup_root: Option<PathBuf>,
+    /// The watchdog device (plan §7.5), or `None` for the default.
+    ///
+    /// `--watchdog <DEVICE>` names the device, which is how a board with the
+    /// watchdog somewhere unusual is served - and how the host tests drive the
+    /// feed/magic-close protocol against a file instead of against hardware.
+    /// The default path is never opened in `--dev`.
+    pub watchdog_device: Option<PathBuf>,
+    /// The hardware timeout rinit asks for and feeds against (plan §7.5).
+    ///
+    /// `--watchdog-timeout <SECONDS>`; the feed interval is half of it.
+    pub watchdog_timeout_sec: u64,
 }
 
 /// Parse arguments (excluding `argv[0]`), honouring [`ENV_TEST_SERVICE`].
@@ -97,6 +108,8 @@ fn parse_with_default<I: IntoIterator<Item = OsString>>(
         unit_dir: PathBuf::from(rinit_runtime::DEFAULT_UNIT_DIR),
         default_target: rinit_runtime::DEFAULT_TARGET.to_string(),
         cgroup_root: None,
+        watchdog_device: None,
+        watchdog_timeout_sec: rinit_runtime::syscall::watchdog::DEFAULT_TIMEOUT_SEC,
     };
 
     let mut iter = args.into_iter();
@@ -124,6 +137,18 @@ fn parse_with_default<I: IntoIterator<Item = OsString>>(
                     .next()
                     .ok_or_else(|| "--cgroup-root requires a directory".to_string())?;
                 cfg.cgroup_root = Some(PathBuf::from(value.to_string_lossy().into_owned()));
+            }
+            "--watchdog" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--watchdog requires a device path".to_string())?;
+                cfg.watchdog_device = Some(PathBuf::from(value.to_string_lossy().into_owned()));
+            }
+            "--watchdog-timeout" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--watchdog-timeout requires a number of seconds".to_string())?;
+                cfg.watchdog_timeout_sec = parse_seconds(&value.to_string_lossy())?;
             }
             "--" => {
                 // Everything after `--` is the service command and its args.
@@ -153,6 +178,10 @@ fn parse_with_default<I: IntoIterator<Item = OsString>>(
                     validate_target(&cfg.default_target)?;
                 } else if let Some(value) = other.strip_prefix("--cgroup-root=") {
                     cfg.cgroup_root = Some(PathBuf::from(value));
+                } else if let Some(value) = other.strip_prefix("--watchdog=") {
+                    cfg.watchdog_device = Some(PathBuf::from(value));
+                } else if let Some(value) = other.strip_prefix("--watchdog-timeout=") {
+                    cfg.watchdog_timeout_sec = parse_seconds(value)?;
                 } else if other.starts_with('-') {
                     return Err(format!("unknown argument: {other}"));
                 } else {
@@ -177,6 +206,33 @@ fn parse_with_default<I: IntoIterator<Item = OsString>>(
         rinit_core::UnitName::parse(target)
             .map(|_| ())
             .map_err(|e| format!("--default: {e}"))
+    }
+
+    /// A whole number of seconds, for `--watchdog-timeout`.
+    ///
+    /// A watchdog timeout is the one interval where a typo is dangerous rather
+    /// than merely wrong: `30s` or `-1` silently becoming a default would arm the
+    /// hardware for a length of time nobody chose. So a value that is not a plain
+    /// non-negative integer is a usage error, not a fallback - which is also why
+    /// the leading `+` and the surrounding whitespace `str::parse` accepts are
+    /// rejected here instead of being quietly accepted.
+    ///
+    /// Zero is rejected too, and it is the one value that is a whole number:
+    /// there is no such thing as a watchdog that fires after no seconds, and
+    /// accepting it would arm a device whose feed interval rounds to
+    /// milliseconds - a supervisor loop spinning at a kilohertz to feed a timer
+    /// that was never going to be satisfied.
+    fn parse_seconds(value: &str) -> Result<u64, String> {
+        if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(format!(
+                "--watchdog-timeout: '{value}' is not a whole number of seconds"
+            ));
+        }
+        match value.parse::<u64>() {
+            Ok(0) => Err("--watchdog-timeout: 0 seconds is not a watchdog timeout".to_string()),
+            Ok(seconds) => Ok(seconds),
+            Err(_) => Err(format!("--watchdog-timeout: '{value}' is out of range")),
+        }
     }
 
     // An empty argv is legitimate from M1 onwards: a normal boot starts the
@@ -207,6 +263,10 @@ Options:
       --default <TARGET>     Boot target (default: multi-user.target)
       --cgroup-root <DIR>    Mounted cgroup v2 hierarchy for unit limits
                              (default: /sys/fs/cgroup)
+      --watchdog <DEVICE>    Hardware watchdog to arm and feed
+                             (default: /dev/watchdog; not opened in --dev)
+      --watchdog-timeout <S> Hardware timeout in seconds; fed every half
+                             (default: 30)
       --test-service <CMD>   Launch this instead of the unit directory
       -- <SERVICE> [ARGS]    Service as an argv (kernel-cmdline form)
 
@@ -549,5 +609,64 @@ mod tests {
     fn cgroup_root_without_a_value_is_an_error() {
         let err = parse_args(&["--cgroup-root"]).expect_err("must fail");
         assert!(err.contains("--cgroup-root"), "got: {err}");
+    }
+
+    // --- the watchdog (plan §7.5) -------------------------------------
+
+    /// The device defaults to `None` - which is what tells `Watchdog::prepare`
+    /// to use `/dev/watchdog` except in `--dev` - and both flag forms name one.
+    #[test]
+    fn the_watchdog_device_is_parsed_in_both_forms_and_defaults_to_none() {
+        assert_eq!(parse_args(&[]).unwrap().watchdog_device, None);
+        assert_eq!(
+            parse_args(&["--watchdog", "/dev/watchdog1"])
+                .unwrap()
+                .watchdog_device,
+            Some(PathBuf::from("/dev/watchdog1"))
+        );
+        assert_eq!(
+            parse_args(&["--watchdog=/dev/watchdog1"])
+                .unwrap()
+                .watchdog_device,
+            Some(PathBuf::from("/dev/watchdog1"))
+        );
+    }
+
+    /// The timeout defaults to the plan's 30 s, and is a plain second count.
+    #[test]
+    fn the_watchdog_timeout_defaults_to_the_plans_value() {
+        let cfg = parse_args(&[]).unwrap();
+        assert_eq!(
+            cfg.watchdog_timeout_sec,
+            rinit_runtime::syscall::watchdog::DEFAULT_TIMEOUT_SEC
+        );
+        assert_eq!(
+            parse_args(&["--watchdog-timeout", "90"])
+                .unwrap()
+                .watchdog_timeout_sec,
+            90
+        );
+        assert_eq!(
+            parse_args(&["--watchdog-timeout=5"])
+                .unwrap()
+                .watchdog_timeout_sec,
+            5
+        );
+    }
+
+    /// A timeout that is not a usable second count is a usage error: this is the
+    /// one value where falling back to a default would arm hardware for a length
+    /// of time nobody chose. `0` is in the list on purpose - it is a whole
+    /// number, and it is the one that would make the supervisor loop spin.
+    #[test]
+    fn a_watchdog_timeout_that_is_not_a_usable_second_count_is_an_error() {
+        for bad in ["30s", "-1", "", "1.5", " 30", "+30", "thirty", "0", "0.0"] {
+            let err = parse_args(&["--watchdog-timeout", bad])
+                .expect_err("must fail")
+                .to_string();
+            assert!(err.contains("--watchdog-timeout"), "got: {err}");
+        }
+        let missing = parse_args(&["--watchdog-timeout"]).expect_err("must fail");
+        assert!(missing.contains("--watchdog-timeout"), "got: {missing}");
     }
 }

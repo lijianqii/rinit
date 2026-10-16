@@ -60,8 +60,8 @@ MAKE_KERNEL      := $(MAKE) -C $(KERNEL_SRC) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_
 MAKE_BUSYBOX     := $(MAKE) -C $(BUSYBOX_SRC) ARCH=$(BUSYBOX_ARCH) CROSS_COMPILE=$(CROSS_COMPILE)
 
 .DEFAULT_GOAL    := run
-.PHONY: run kernel busybox rinit initramfs qemu help clean distclean \
-        check test test-system soak
+.PHONY: run kernel kernel-config-check busybox rinit initramfs qemu help clean \
+        distclean check test test-system soak
 
 help:
 	@sed -n '2,/^# ====/p' $(MAKEFILE_LIST) | sed '$$d' | sed 's/^# \{0,1\}//'
@@ -98,21 +98,37 @@ $(KERNEL_SRC)/.config: $(KERNEL_TARBALL)
 	# config". `CONFIG_FAIR_GROUP_SCHED`, which it depends on, is already on.
 	sed -i -e 's/^# CONFIG_CFS_BANDWIDTH is not set$$/CONFIG_CFS_BANDWIDTH=y/' \
 	       $(KERNEL_SRC)/.config
+	# Plan §7.5 needs a watchdog the *guest* has: the defconfig has no
+	# watchdog driver at all, so the guest would only ever exercise the
+	# "no hardware" path. `-device i6300esb` on the qemu command line (see
+	# run-qemu.sh) provides the PCI device, this provides the driver, and
+	# `watchdog%d`'s legacy misc node is what makes `/dev/watchdog` appear
+	# in the devtmpfs rinit mounts. `CONFIG_WATCHDOG_SYSFS` is what lets the
+	# guest read back the timeout rinit asked for, which is how the ioctl is
+	# checked against a real driver rather than a stand-in file.
+	sed -i -e 's/^# CONFIG_I6300ESB_WDT is not set$$/CONFIG_I6300ESB_WDT=y/' \
+	       -e 's/^# CONFIG_WATCHDOG_SYSFS is not set$$/CONFIG_WATCHDOG_SYSFS=y/' \
+	       $(KERNEL_SRC)/.config
 	$(MAKE_KERNEL) olddefconfig
-	# `olddefconfig` drops a symbol whose dependencies are unmet without
-	# saying anything, so a defconfig change upstream could silently take
-	# `cpu.max` away again. The four the plan's §7.3 limits hang off are
-	# checked here, where the failure is a build error rather than a guest
-	# boot with limits that do not exist: `CgroupCPUMax=` needs the cpu
-	# controller and CFS bandwidth, `CgroupMemoryMax=`/`CgroupMemoryHigh=`
-	# need the memory controller, `CgroupTasksMax=` needs the pids one.
+
+# The symbols the guest's acceptance tests depend on, checked on every
+# `make kernel` and not only when the config is generated. `olddefconfig` drops
+# an unmet symbol without a word, so without this a defconfig change upstream
+# would turn into a guest boot where a limit, or the watchdog, silently does not
+# exist - which is the one failure mode these checks exist to prevent.
+kernel-config-check: $(KERNEL_SRC)/.config
 	@for opt in CGROUP_SCHED CFS_BANDWIDTH MEMCG CGROUP_PIDS; do \
 	    grep -q "^CONFIG_$$opt=y$$" $(KERNEL_SRC)/.config || { \
 	        echo "kernel config: CONFIG_$$opt is not set (plan §7.3 needs it)" >&2; \
 	        exit 1; }; \
 	done
+	@for opt in I6300ESB_WDT WATCHDOG_SYSFS; do \
+	    grep -q "^CONFIG_$$opt=y$$" $(KERNEL_SRC)/.config || { \
+	        echo "kernel config: CONFIG_$$opt is not set (plan §7.5 needs it)" >&2; \
+	        exit 1; }; \
+	done
 
-kernel: $(KERNEL_IMAGE)
+kernel: kernel-config-check $(KERNEL_IMAGE)
 
 $(KERNEL_IMAGE): $(KERNEL_SRC)/.config
 	$(MAKE_KERNEL) -j$(JOBS) Image
