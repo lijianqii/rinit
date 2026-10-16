@@ -35,14 +35,10 @@ use tokio::task::JoinHandle;
 use crate::log::rlog;
 
 /// The directory holding the control socket (plan §1.3(10)).
-pub const CONTROL_DIR: &str = "/run/rinit";
-
-/// Environment variable that overrides [`CONTROL_DIR`].
 ///
-/// The same shape as `RINIT_NOTIFY_DIR`: a test cannot create `/run/rinit`
-/// without root, so it points rinit at a scratch directory and drives the real
-/// socket path.
-pub const ENV_CONTROL_DIR: &str = "RINIT_CONTROL_DIR";
+/// Re-exported from `rinit-core` so the server, the client and the tests all
+/// agree on one name.
+pub use rinit_core::{CONTROL_DIR, ENV_CONTROL_DIR};
 
 /// How long a connection may take to send its request.
 const IO_TIMEOUT: Duration = Duration::from_secs(10);

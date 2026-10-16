@@ -31,6 +31,18 @@ pub const MAX_FRAME_BYTES: usize = 64 * 1024;
 /// Bytes of the little-endian length prefix that frames every message.
 pub const LENGTH_PREFIX_BYTES: usize = 4;
 
+/// Environment variable that overrides the control socket directory.
+///
+/// Shared with the server and the client so a test can point both at a scratch
+/// directory: neither can create `/run/rinit` without root.
+pub const ENV_CONTROL_DIR: &str = "RINIT_CONTROL_DIR";
+
+/// The directory holding the control socket (plan §1.3(10)).
+pub const CONTROL_DIR: &str = "/run/rinit";
+
+/// The control socket path.
+pub const CONTROL_SOCKET: &str = "/run/rinit/control.sock";
+
 /// Largest unit name accepted in a request, matching the name limit.
 const MAX_UNIT_NAME_BYTES: usize = 255;
 
