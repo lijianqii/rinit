@@ -8,32 +8,35 @@ README tracks implementation status.
 ## Status: M0–M4 complete, M5 in progress — verified on aarch64
 
 What is in place, and what it is proven by. Every claim below is either a host
-test (`make check`) or a guest assertion (`make test-system`, 41 of them in
+test (`make check`) or a guest assertion (`make test-system`, 54 of them in
 `scripts/system-test.sh`); "proven on the host" always means the fake-runtime or
 `--dev` form of the same code path, and the guest means the real one.
 
 | milestone | content | evidence |
 | --------- | ------- | -------- |
-| M0 | PID 1 via `rdinit=`, first-wave mounts (`/run` → `/proc` → `/sys` → `/dev` → `/tmp`) with fatal/degradable rules per plan §1.3(9), `SIGCHLD` + `waitpid(-1, WNOHANG)` reaping, panic hook to `/dev/kmsg` | guest: "mounted /run…", "no rinit panic"; host: `crates/rinit/tests/smoke.rs` |
+| M0 | PID 1 via `rdinit=`, first-wave mounts (`/run` → `/proc` → `/sys` → `/dev` → `/tmp` → `/sys/fs/cgroup`) with fatal/degradable rules per plan §1.3(9), `SIGCHLD` + `waitpid(-1, WNOHANG)` reaping, panic hook to `/dev/kmsg` | guest: "mounted /run…", "mounted /sys/fs/cgroup", "no rinit panic"; host: `crates/rinit/tests/smoke.rs` |
 | M1 | unit files parsed from `/etc/rinit/units`, dependency graph resolved, units started level by level with each level in parallel | guest: "resolved a boot plan", "startup levels run in dependency order", "no target was exec'd" |
-| M2 | supervision (spawn, track, reap, two-stage stop), restart policy with backoff and a circuit breaker, health probes, `Type=notify` readiness, in-memory log ring | guest: "a crashed service is scheduled for restart", "the breaker tripped on the failing unit"; host: `crates/rinit/tests/m2_lifecycle.rs` (19 tests) |
+| M2 | supervision (spawn, track, reap, two-stage stop), restart policy with backoff and a circuit breaker, health probes, `Type=notify` readiness, in-memory log ring | guest: "a crashed service is scheduled for restart", "the breaker tripped on the failing unit"; host: `crates/rinit/tests/m2_lifecycle.rs` (25 tests) |
 | M3 | control socket + `rctl` (`list`, `status`, `start`, `stop`, `restart`, `reset-failed`, `log`), with a documented exit-code contract | guest: "rctl list reached the control socket" and the five assertions after it; host: `crates/rctl/tests/control.rs` (6 tests) |
 | M4 | soak harness for sustained churn (`make soak`), leak and descriptor fixes, `--dev` control-socket peer relaxation | `scripts/soak.sh` (see [Testing](#testing)); `crates/rinit-core/tests/allocations.rs` |
-| M5 (in progress) | **§7.4 done**: `User=`, `Group=`, `NoNewPrivileges=`, `CapabilityBoundingSet=`, `AmbientCapabilities=`. **Next**: §7.3 cgroup v2 | guest: "a de-privileged service ran as nobody:nogroup with NoNewPrivs", "an empty CapabilityBoundingSet left a root service with no capabilities", "ambient capabilities reached a de-privileged service"; host: `crates/rinit/src/sandbox.rs` (14 tests), `crates/rinit-core/src/unit/sandbox.rs` (9), `crates/rinit-runtime/src/syscall/cred.rs` (16) |
+| M5 (in progress) | **§7.3 and §7.4 done.** cgroup v2: `CgroupCPUMax=`, `CgroupMemoryMax=`, `CgroupMemoryHigh=`, `CgroupTasksMax=` under `rinit/<unit>`, the process placing itself, stop-flow signalling of the cgroup's members, `rmdir` cleanup, and OOM-kill detection into the restart policy. Sandboxing: `User=`, `Group=`, `NoNewPrivileges=`, `CapabilityBoundingSet=`, `AmbientCapabilities=`. **Next**: §7.5 watchdog | guest: "a limited unit was placed in its own cgroup", "the memory hard and soft limits were written in bytes", "a stopped unit's cgroup was removed", "the kernel OOM-killed a process inside the unit's cgroup", "a de-privileged service ran as nobody:nogroup with NoNewPrivs", "an empty CapabilityBoundingSet left a root service with no capabilities", "ambient capabilities reached a de-privileged service"; host: `crates/rinit/src/cgroup.rs` (19 tests), `crates/rinit-core/src/unit/cgroup.rs` (9), `crates/rinit-runtime/src/syscall/cgroup.rs` (14), `crates/rinit/src/sandbox.rs` (14), `crates/rinit-core/src/unit/sandbox.rs` (9), `crates/rinit-runtime/src/syscall/cred.rs` (14) |
 
-A real boot of the committed tree, `make run`, serial console (`…` elides kernel
-noise). The last three lines are M2 working: `fault.service` exists to fail, is
-restarted, and then stops being restarted when the breaker trips:
+A real boot of the committed tree on the serial console (`…` elides kernel
+noise; the lines below are the ones `make test-system` asserts on). The last
+three lines are M2 working: `fault.service` exists to fail, is restarted, and
+then stops being restarted when the breaker trips:
 
 ```
-[    2.925620] Run /sbin/rinit as init process
+[    2.939522] Run /sbin/rinit as init process
 rinit: rinit 0.1.0 starting (pid 1)
 rinit: mounted /run
 rinit: mounted /proc
 rinit: mounted /sys
 rinit: mounted /dev
 rinit: mounted /tmp
-rinit: boot plan for 'multi-user.target': 9 unit(s) in 3 level(s)
+rinit: mounted /sys/fs/cgroup
+rinit: cgroup v2 ready at /sys/fs/cgroup
+rinit: boot plan for 'multi-user.target': 12 unit(s) in 3 level(s)
 rinit: plan 0: rinit-init.target (target)
 rinit: plan 1: fault.service (service)
 rinit: plan 1: getty.service (service)
@@ -54,10 +57,34 @@ rinit: reaped pid 50
 rinit: error: fault.service hit its start limit (2 failures); not restarting
 ```
 
-Note that the plan resolves **9 units** and starts **2**: everything in `units/`
+Note that the plan resolves **12 units** and starts **2**: everything in `units/`
 is parsed and ordered, and only the boot target's closure is started. The demo
-units (`priv`, `caps`, `ambient`, `logdemo`) are outside it on purpose and are
-driven by `rctl` in the system test.
+units (`priv`, `caps`, `ambient`, `logdemo`, `cglimit`, `cgrun`, `oom`) are
+outside it on purpose and are driven by `rctl` in the system test.
+
+The two halves of §7.3, from the same console. First the limits as the *service*
+reads them back - its own `/proc/<pid>/cgroup`, its own attribute files - and
+then an OOM kill, where rinit's line is followed by the kernel's:
+
+```
+~ # rctl log cglimit.service
+cglimit.service: self=0::/rinit/cglimit.service child=0::/rinit/cglimit.service
+cglimit.service: cpu=50000 100000 mem=33554432 high=25165824 pids=64
+
+~ # rctl start oom.service
+rinit: oom.service: cgroup /sys/fs/cgroup/rinit/oom.service with memory.max (memory.max=16777216)
+rinit: started oom.service as pid 105
+[   18.114347] Memory cgroup out of memory: Killed process 105 (sh) total-vm:26976kB, anon-rss:16264kB, file-rss:0kB, shmem-rss:1280kB, UID:0 pgtables:80kB oom_score_adj:0
+rinit: oom.service was killed by the cgroup OOM killer (memory.max=16777216)
+rinit: oom.service will restart in 1.139s
+```
+
+`self=0::/rinit/cglimit.service` is the placement, with `0::` the unified
+hierarchy's marker; `child=` is a process the service forked, which the kernel
+put in the same cgroup without rinit doing anything. The OOM unit is a shell that
+doubles a string past its own `memory.max`, so the kill comes from the *cgroup's*
+OOM killer; rinit then names the limit behind the `SIGKILL` and the unit's
+`Restart=on-failure` brings it back (once; the second kill trips the breaker).
 
 ## Layout
 
@@ -65,17 +92,19 @@ driven by `rctl` in the system test.
 crates/
   rinit-core/         # platform-independent engine (no_std + alloc)
     src/unit/         # parser.rs, dependency.rs, config.rs, job.rs, restart.rs,
-                      # notify.rs, sandbox.rs (the §7.4 drop *plan*), state/
+                      # notify.rs, sandbox.rs (the §7.4 drop *plan*), cgroup.rs
+                      # (the §7.3 limit model), state/
     src/              # control.rs (protocol), logger.rs, users.rs, error.rs
     tests/allocations.rs
   rinit-runtime/      # syscall layer, mounts, signals, reaping (std/libc/tokio)
     src/syscall/      # process.rs, wait.rs, cred.rs (ids + capabilities), fs.rs,
-                      # mount.rs, socket.rs, signal.rs, reboot.rs
+                      # mount.rs, socket.rs, signal.rs, reboot.rs, cgroup.rs
     tests/syscall.rs, tests/shipped_units.rs
   rinit/              # PID 1 binary
     src/boot.rs       # boot sequence + main loop (orchestration only)
     src/unit_manager.rs, service.rs, control.rs, logs.rs, log.rs
     src/sandbox.rs    # `User=`/`Group=`/capabilities -> Sandbox (one resolver)
+    src/cgroup.rs     # §7.3: where limits are applied, and the failure taxonomy
     src/notify.rs, readiness.rs, deadline.rs, args.rs, manager.rs
     tests/m2_lifecycle.rs, tests/smoke.rs
   rctl/               # control CLI (main.rs, parse.rs, client.rs) + tests
@@ -107,19 +136,20 @@ make test-system    # boot aarch64 qemu and assert the acceptance list
 make test           # check + test-system
 ```
 
-`cargo test --offline --workspace` (what `make check` runs last) executes **562
+`cargo test --offline --workspace` (what `make check` runs last) executes **615
 tests** across eleven binaries. The four shapes, and why each is not redundant:
 
-- **unit tests** next to the code (core 293, rinit 136, rinit-runtime 70,
+- **unit tests** next to the code (core 302, rinit 157, rinit-runtime 86,
   rctl 10), including `proptest` properties over the parser;
 - **integration tests** in `crates/*/tests/`: the syscall layer against the real
   kernel (`rinit-runtime` 21: run unprivileged, they assert that each drop is
   *refused* rather than silently skipped - `EPERM` from `setuid(0)`, `setgroups`,
   `PR_CAPBSET_DROP`, `capset` and the ambient raise, each naming the call that
   failed - with the root-only success paths deferred to the guest), the
-  lifecycle end to end in `--dev` mode (`rinit/tests/m2_lifecycle.rs` 19), the
+  lifecycle end to end in `--dev` mode (`rinit/tests/m2_lifecycle.rs` 25), the
   control CLI (`rctl/tests/control.rs` 6), the smoke test that runs the real
-  binary (`rinit/tests/smoke.rs` 2), and `shipped_units.rs` 3 - every unit in
+  binary (`rinit/tests/smoke.rs` 2), the allocation guard
+  (`rinit-core/tests/allocations.rs` 2), and `shipped_units.rs` 4 - every unit in
   `units/` parses through the loader, so a unit that would fail at boot fails
   here first;
 - **the soak harness** (`scripts/soak.sh`, plan §3 M4/§4.4): runs rinit under
@@ -129,11 +159,12 @@ tests** across eleven binaries. The four shapes, and why each is not redundant:
   259200'` is the 72-hour acceptance run the plan asks for;
 - **the guest system test** (`scripts/system-test.sh`, plan §4.3): boots the real
   initramfs on aarch64 qemu, types at the console to prove a root shell is
-  reachable, drives `rctl` against the running system, and asserts 41 things -
+  reachable, drives `rctl` against the running system, and asserts 54 things -
   including that levels run in dependency order, that no target is ever exec'd,
-  and the §7.4 privilege-drop outcomes. Exit codes are `0` pass, `1` assertion
-  failed, `2` missing artifacts, `3` qemu could not start. Logs land in
-  `build/logs/` (and are deleted on success unless `--keep-log` is passed).
+  the §7.4 privilege-drop outcomes, and the §7.3 limits read back out of the
+  guest's own kernel. Exit codes are `0` pass, `1` assertion failed, `2` missing
+  artifacts, `3` qemu could not start. Logs land in `build/logs/` (and are
+  deleted on success unless `--keep-log` is passed).
 
 The mount policy (plan §1.3(9)) is covered through the `MountOps` trait, so the
 fatal-vs-degradable rules are tested without `CAP_SYS_ADMIN` - the "fake
@@ -141,6 +172,15 @@ runtime" shape plan §4.2 asks for. The §7.4 drop plan is the same concern
 expressed as data rather than a trait: `Sandbox::steps()` returns the ordered
 steps, so "`setuid` before the ambient raise" is asserted in `rinit-core`
 instead of only being observable as root on a real system.
+
+§7.3 gets both treatments, because it has both kinds of content. The value model
+(directive → file → contents, and the percentage conversion) is data in
+`rinit-core`, unit-tested. The file operations take the cgroup directory as a
+*parameter*, so `--cgroup-root` pointed at a directory of ordinary files runs the
+real path - create, write, place, read back, clean up - in `--dev` on the host,
+no root and no `/sys`. What that stand-in cannot do is `rmdir` a directory full
+of stand-in attribute files, which is why the removal and the live `cgroup.procs`
+checks are asserted in the guest, against a real cgroupfs.
 
 Measured with `llvm-cov` **at M1**; not re-measured since, and treated as a
 shape rather than a current score. Reproduce with the commands below before
@@ -177,6 +217,14 @@ llvm-cov report -instr-profile=target-cov/merged.profdata \
   proven in the guest, where rinit is root. The host tests prove the refusals.
 - `boot.rs`'s reboot/halt paths are only exercised in the guest; on the host they
   must not run (they would reboot the machine).
+- **A cgroup limit is only proven against the controllers the running kernel
+  has.** The guest's kernel is built with all four the plan's directives need
+  (the Makefile checks that), so the *skip* branches - no `pids` controller, no
+  `cpu.max` - are exercised on the host, against a stand-in directory that simply
+  omits the attribute. The same goes for a write the kernel *refuses* (any errno
+  but `ENOENT`): a directory where the attribute file should be stands in for it,
+  because making a real cgroupfs refuse a limit needs a value or a kernel this
+  test does not control.
 - `signals.rs`'s pipe-full path (handler drops a byte) is not forced in a test.
 - RSS-at-boot is not measured yet, so plan §0.1's memory column is still open
   (`/proc/<pid>/status` inside the guest: ≤2 MB idle, ≤6 MB with 20 services),
@@ -293,6 +341,8 @@ rinit [OPTIONS] [-- <SERVICE> [ARGS...]]
       --dev                  Skip mounts; do not reboot (host/smoke testing)
       --units <DIR>          Unit directory (default: /etc/rinit/units)
       --default <TARGET>     Boot target (default: multi-user.target)
+      --cgroup-root <DIR>    cgroup v2 hierarchy for unit limits
+                             (default: /sys/fs/cgroup)
       --test-service <CMD>   Launch this instead of the unit directory
       -- <SERVICE> [ARGS]    Service as an argv (kernel-cmdline form)
 ```
@@ -300,6 +350,14 @@ rinit [OPTIONS] [-- <SERVICE> [ARGS...]]
 With no `--test-service`, rinit boots the unit directory. `--test-service` (and
 the `RINIT_TEST_SERVICE` environment variable) is the bring-up escape hatch
 that bypasses it; the guest never sets it.
+
+`--cgroup-root` exists for a system that mounts the hierarchy somewhere else,
+and it is also the seam the host tests use: pointed at a directory of ordinary
+files, the whole §7.3 path - create, write, place, read back - runs without
+root, without `CAP_SYS_ADMIN` and without `/sys`. `--dev` does not touch the
+machine's own hierarchy: with the mounts skipped, the limits are skipped too
+(with a log line), because a developer host's `/sys/fs/cgroup` is not rinit's
+to carve up. An explicit `--cgroup-root` wins over that.
 
 ### rctl
 
@@ -325,8 +383,8 @@ a length prefix - on either side - from becoming an unbounded allocation.
 
 ## Design decisions and deliberate deviations from the plan
 
-Nine points differ from the written plan or pin down something it leaves open.
-All are noted here so they are not mistaken for drift:
+Fifteen points differ from the written plan or pin down something it leaves
+open. All are noted here so they are not mistaken for drift:
 
 1. **Signals use a self-pipe, not `tokio::signal`.** Plan §2.1④ says to unify on
    `tokio::signal`. In the verification environment tokio's global signal driver
@@ -375,6 +433,56 @@ All are noted here so they are not mistaken for drift:
    `PR_CAPBSET_DROP`; carrying on without the drop would be exactly the failure
    §7.4 exists to prevent. It is also why the §7.4 success paths are only proven
    in the guest, and why those tests print the log they assert on.
+10. **The child places itself in its cgroup, not the parent.** Plan §7.3 says
+    "先 fork,父进程(仍是 root)把子进程 PID 写入 `cgroup.procs`,子进程再降权". The
+    parent cannot do it at the right time: `spawn_sandboxed` returns only after
+    the child has `exec`'d (the report pipe is what carries a failed `setuid` in
+    the child back to the parent), so a parent-side write would land after the
+    service is already running — and a service that forked in that window would
+    have put a process into rinit's cgroup, outside its own limits. The child
+    writes its own pid as its first action (after `setsid`, the descriptor
+    shuffling and `chdir`, before any §7.4 drop), while it still owns
+    `cgroup.procs` because it is still root. Same order as the plan, one process
+    over; see `cgroup::join_from_child`.
+11. **A `HealthCheck=` probe, an `ExecStop=` command and
+    `ExecStartPre=`/`ExecStartPost=` run outside the unit's cgroup.** They are
+    separate processes rinit tracks by pid, and having them join would make the
+    unit's cgroup look populated for as long as they run — which is exactly what
+    §7.3's `populated=0` rule reads as "keep this directory".
+12. **A limit the *kernel* cannot express is skipped, not fatal.** §7.3 names one
+    degrade case (no hierarchy at all). Two more are the same kind of thing: a
+    controller the kernel was not built with (`CONFIG_CGROUP_PIDS` off, so
+    `pids.max` does not exist), and an attribute that is absent while its
+    controller is present — `cpu.max` is built only under
+    `CONFIG_CFS_BANDWIDTH`, and the kernel answers `ENOENT` for it. Both warn,
+    skip that limit and let the unit run: a unit file written for one kernel has
+    to keep working on another. A write the kernel *refuses* — any other errno,
+    meaning the attribute is there and the value was not accepted — still fails
+    the start, because that is a unit file claiming a bound the service does not
+    have.
+13. **The kernel config is part of the build.** §7.3 puts this in M5's hands
+    ("否则 M5 需检查内核 config"): the Makefile's `.config` rule turns
+    `CONFIG_CFS_BANDWIDTH` on after `defconfig`, and then *checks* the four
+    symbols the four directives hang off (`CGROUP_SCHED`, `CFS_BANDWIDTH`,
+    `MEMCG`, `CGROUP_PIDS`). It has to check, because `olddefconfig` silently
+    drops a symbol whose dependencies are unmet, and a missing `cpu.max` would
+    otherwise show up as a guest boot in which a limit does not exist.
+14. **An OOM kill is detected, not inferred, and `Restart=` still decides.**
+    §7.3's "检测到 OOM kill 后进入重启策略" is read as *diagnosis* plus the existing
+    policy rather than as a policy of its own: rinit reads `memory.events`'
+    `oom_kill` counter and names the memory limit behind a `SIGKILL`, and the
+    unit's `Restart=` then does what it says. Forcing a restart on every unit
+    the cgroup OOM killer took would override `Restart=no`, which is a unit
+    author's explicit decision. The counter is compared against the value read
+    before the service could allocate anything, so a restart that reuses a kept
+    cgroup directory is not misread as a fresh kill.
+15. **`PermissionsStartOnly=` and the `+`/`-`/`!` command prefixes are not
+    supported**, which §7.4 calls out as a decision to record rather than a gap
+    to close. Every `Exec*` command - `ExecStart`, `ExecStartPre`,
+    `ExecStartPost`, `ExecStop`, `HealthCheck` - runs as `User=`/`Group=`, so a
+    preparation step cannot quietly run as root: `run_aux_command` resolves the
+    same sandbox the service gets. Work that genuinely needs root belongs in a
+    system oneshot (`rinit-init.service`), not in an `ExecStartPre=`.
 
 ## Measurements (plan §0.1 calibration point)
 
@@ -385,7 +493,7 @@ byte counts as `ls -l` reports them:
 | ------------------------------------ | ------------------- | ----------------------- | ----------- |
 | `aarch64-unknown-linux-gnu` (static) | `rinit`             | 1.45 MiB (1 518 640 B)  | yes         |
 | `aarch64-unknown-linux-gnu` (static) | `rinit-testservice` | 1.01 MiB (1 059 704 B)  | no          |
-| `x86_64-unknown-linux-musl` (static) | `rinit`             | 0.90 MiB (938 912 B)    | yes         |
+| `x86_64-unknown-linux-musl` (static) | `rinit`             | 0.92 MiB (967 584 B)    | yes         |
 
 `rinit-testservice` is a host-side bring-up helper (it proves fork/exec/reap
 deterministically), so it is built but not shipped: the guest's services come
@@ -393,7 +501,7 @@ from `units/` and busybox.
 
 The packed image the guest boots
 (`build/out/initramfs-aarch64-unknown-linux-gnu.cpio.gz`: static busybox +
-rinit + `units/`) is 2.24 MiB (2 353 264 B) gzipped.
+rinit + `units/`) is 2.26 MiB (2 365 968 B) gzipped.
 
 Both binaries are inside the plan §0.1 budget: the target is ≤2 MB per
 executable, with static builds allowed up to 4 MB. RSS-at-boot is not measured
@@ -402,7 +510,12 @@ yet; that needs a sampling loop in the guest (the soak harness measures the host
 
 ## Next
 
-The rest of M5, in rough order: §7.3 cgroup v2 (CPU/memory/task limits per unit,
-`rinit/<unit>` under `/sys/fs/cgroup`, degrade with a warning when cgroup v2 is
-absent), then the watchdog, then socket activation if it earns its place, then
-the docs/examples/acceptance checklist.
+The rest of M5: §7.5's hardware watchdog (`/dev/watchdog`), then §7.6 reload,
+§7.10 `Type=forking`, and the P3 items (templates, `Sockets=`, socket
+activation) if they earn their place, then the docs/examples/acceptance
+checklist.
+
+Two things plan §0.1 leaves open and this README does not claim: RSS-at-boot
+(≤2 MB idle, ≤6 MB with 20 services) and the "20 services in parallel, faster
+than serial" comparison. Both need a sampling loop inside the guest; the soak
+harness measures the host `--dev` process instead.
