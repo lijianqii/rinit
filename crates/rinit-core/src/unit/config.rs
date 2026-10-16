@@ -123,12 +123,15 @@ impl SizeBytes {
         if s.is_empty() {
             return None;
         }
-        let (digits, scale) = match s.as_bytes()[s.len() - 1] {
-            b'K' | b'k' => (&s[..s.len() - 1], 1024u64),
-            b'M' | b'm' => (&s[..s.len() - 1], 1024u64 * 1024),
-            b'G' | b'g' => (&s[..s.len() - 1], 1024u64 * 1024 * 1024),
-            _ => (s, 1),
-        };
+        let (digits, scale) = s
+            .strip_suffix(['K', 'k'])
+            .map(|rest| (rest, 1024u64))
+            .or_else(|| s.strip_suffix(['M', 'm']).map(|rest| (rest, 1024 * 1024)))
+            .or_else(|| {
+                s.strip_suffix(['G', 'g'])
+                    .map(|rest| (rest, 1024 * 1024 * 1024))
+            })
+            .unwrap_or((s, 1));
         let digits = digits.trim();
         if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
             return None;

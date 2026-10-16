@@ -79,7 +79,14 @@ pub fn spawn_service_in_group(
     output: Option<libc::c_int>,
 ) -> Result<libc::pid_t, RuntimeError> {
     let Prepared { argv, envp, cwd } = prepare(argv, env, working_directory)?;
-    let path = argv[0].as_c_str();
+    let Some(path) = argv.first().map(CString::as_c_str) else {
+        // `prepare` rejects an empty command, so this is unreachable; reporting
+        // it instead of panicking keeps the invariant from becoming a crash.
+        return Err(RuntimeError::Io {
+            op: "service argv",
+            source: std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty command"),
+        });
+    };
     let mut options = process::SpawnOptions::with_session();
     if let Some(fd) = output {
         options = options.with_stdio(fd);
@@ -97,7 +104,13 @@ pub fn spawn_service_in_group(
 pub fn spawn_service(argv: &[String]) -> Result<libc::pid_t, RuntimeError> {
     let base: Vec<String> = SERVICE_ENV.iter().map(|e| (*e).to_string()).collect();
     let Prepared { argv, envp, .. } = prepare(argv, &base, None)?;
-    let path = argv[0].as_c_str();
+    let Some(path) = argv.first().map(CString::as_c_str) else {
+        // As above: `prepare` guarantees a non-empty command.
+        return Err(RuntimeError::Io {
+            op: "service argv",
+            source: std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty command"),
+        });
+    };
     process::posix_spawn(path, &argv, &envp).map_err(RuntimeError::from)
 }
 

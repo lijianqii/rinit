@@ -156,7 +156,7 @@ impl UnitRuntime {
 /// `TimeoutStartSec=0` means no timeout (plan §1.1), so it must map to `None`
 /// rather than to a deadline of "now".
 fn deadline(secs: u64) -> Option<Instant> {
-    (secs > 0).then(|| Instant::now() + Duration::from_secs(secs))
+    (secs > 0).then(|| crate::deadline::after_secs(secs))
 }
 
 /// Arm the next health probe for `rt`, if it has a `HealthCheck` at all.
@@ -167,7 +167,7 @@ fn schedule_health(rt: &mut UnitRuntime) {
     rt.health_at = if rt.config.health_check.is_empty() || rt.config.health_interval_sec == 0 {
         None
     } else {
-        Some(Instant::now() + Duration::from_secs(rt.config.health_interval_sec))
+        Some(crate::deadline::after_secs(rt.config.health_interval_sec))
     };
 }
 
@@ -502,8 +502,11 @@ impl UnitManager {
         for _ in 0..order.len() {
             let mut changed = false;
             for index in 0..order.len() {
-                let conflicts = match self.units.get(&order[index]) {
+                let conflicts = match order.get(index).and_then(|name| self.units.get(name)) {
                     Some(rt) => rt.config.deps.conflicts.clone(),
+                    // A name in the order with no runtime is dropped when the
+                    // order is rebuilt, so skipping it is the same as ignoring
+                    // a unit that is no longer loaded.
                     None => continue,
                 };
                 for other in conflicts {
@@ -946,8 +949,9 @@ impl UnitManager {
         }
 
         rlog!("warning: {unit} failed its health check ({outcome:?})");
-        if rt.config.health_restart_on_failure && rt.pid.is_some() {
-            let pid = rt.pid.expect("checked above");
+        if rt.config.health_restart_on_failure
+            && let Some(pid) = rt.pid
+        {
             match process::kill_process_group(pid, libc::SIGTERM) {
                 Ok(()) => {
                     // Mark the stop as a restart so the reaped exit re-enters
@@ -1062,7 +1066,7 @@ impl UnitManager {
                 // Plan §1.1: `TimeoutStopSec=0` means SIGKILL at once.
                 let _ = process::kill_process_group(pid, libc::SIGKILL);
             } else {
-                rt.kill_at = Some(Instant::now() + Duration::from_secs(rt.config.timeout_stop_sec));
+                rt.kill_at = Some(crate::deadline::after_secs(rt.config.timeout_stop_sec));
             }
         }
     }
@@ -1181,7 +1185,7 @@ impl UnitManager {
         match rt.backoff.on_failure(now) {
             Some(delay) => {
                 rt.state = UnitState::RestartWait;
-                rt.restart_at = Some(Instant::now() + delay);
+                rt.restart_at = Some(crate::deadline::after(delay));
                 Outcome::RestartScheduled {
                     unit: unit.clone(),
                     delay,

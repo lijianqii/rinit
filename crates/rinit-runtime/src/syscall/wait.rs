@@ -4,6 +4,7 @@
 //! only correct shape is a `waitpid(-1, WNOHANG)` loop driven by `SIGCHLD`
 //! until it returns 0 (children exist, none ready) or fails with `ECHILD`.
 
+use crate::error::SyscallError;
 #[cfg(test)]
 use crate::syscall::process::{kill, posix_spawn};
 
@@ -29,16 +30,8 @@ pub fn reap_children() -> Vec<ChildExit> {
         let pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
         match pid {
             p if p > 0 => {
-                if libc::WIFEXITED(status) {
-                    reaped.push(ChildExit::Exited {
-                        pid: p,
-                        code: libc::WEXITSTATUS(status),
-                    });
-                } else if libc::WIFSIGNALED(status) {
-                    reaped.push(ChildExit::Signaled {
-                        pid: p,
-                        signal: libc::WTERMSIG(status),
-                    });
+                if let Some(exit) = decode_status(p, status) {
+                    reaped.push(exit);
                 }
                 // Stopped/continued states are ignored (no WUNTRACED requested).
             }
@@ -53,6 +46,58 @@ pub fn reap_children() -> Vec<ChildExit> {
         }
     }
     reaped
+}
+
+/// Decode a `waitpid` status word for `pid`.
+///
+/// `None` means the status reports neither exit nor death by signal, which is
+/// what a stop/continue report looks like; rinit never requests those (`waitpid`
+/// is always called without `WUNTRACED`/`WCONTINUED`), so this is the honest
+/// answer rather than inventing an outcome.
+fn decode_status(pid: libc::pid_t, status: libc::c_int) -> Option<ChildExit> {
+    if libc::WIFEXITED(status) {
+        Some(ChildExit::Exited {
+            pid,
+            code: libc::WEXITSTATUS(status),
+        })
+    } else if libc::WIFSIGNALED(status) {
+        Some(ChildExit::Signaled {
+            pid,
+            signal: libc::WTERMSIG(status),
+        })
+    } else {
+        None
+    }
+}
+
+/// Poll one specific child without blocking (plan §1.3(6)).
+///
+/// This is the single-child form of [`reap_children`], for the callers that
+/// wait for a *particular* pid (a `oneshot` unit's `ExecStart`, a service that
+/// must stop before its conflict can start). It lives here, next to
+/// `reap_children`, so that `libc::waitpid` is called from exactly one module
+/// (plan §2.3) and the status decoding above is shared.
+///
+/// Returns:
+///
+/// - `Ok(Some(exit))` once the child has terminated,
+/// - `Ok(None)` while it is still running,
+/// - `Err(e)` if `waitpid` itself failed. `EINTR` is the caller's to retry, and
+///   `ECHILD` means the child was already reaped or never existed.
+pub fn poll_child(pid: libc::pid_t) -> Result<Option<ChildExit>, SyscallError> {
+    let mut status: libc::c_int = 0;
+    // SAFETY: `status` is a valid out-pointer, and `WNOHANG` keeps this a poll
+    // rather than a block - which is what lets the async caller honour its own
+    // timeout.
+    let rc = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+    if rc == 0 {
+        return Ok(None);
+    }
+    if rc < 0 {
+        return Err(SyscallError::last_os_error("waitpid"));
+    }
+    // `WNOHANG` was requested, so a positive `rc` is this child terminating.
+    Ok(decode_status(pid, status))
 }
 
 #[cfg(test)]

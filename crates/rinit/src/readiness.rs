@@ -15,13 +15,14 @@
 //! looks random, because the failure surfaces much later in whatever depends on
 //! it.
 //!
-//! Waiting is done with `waitpid` on the specific pid rather than by draining
-//! the global `SIGCHLD` queue, so a concurrent reaper cannot steal the exit
-//! status this code depends on.
+//! Waiting polls the specific pid (`wait::poll_child`) rather than draining the
+//! global `SIGCHLD` queue, so a concurrent reaper cannot steal the exit status
+//! this code depends on.
 
 use std::time::Duration;
 
 use rinit_core::ServiceKind;
+use rinit_runtime::syscall::wait;
 
 /// How often to poll while waiting for a child to exit.
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
@@ -61,31 +62,23 @@ pub const fn readiness_of(kind: ServiceKind) -> Readiness {
 /// signal is reported as `Ok(None)`: it did not succeed, but it did terminate,
 /// so the caller can distinguish "hung" from "died".
 pub async fn wait_for_exit(pid: libc::pid_t, timeout: Duration) -> Result<Option<i32>, ()> {
-    let deadline = std::time::Instant::now() + timeout;
+    let deadline = crate::deadline::after(timeout);
     loop {
-        let mut status: libc::c_int = 0;
-        // SAFETY: `status` is a valid out-parameter. `WNOHANG` keeps this a
-        // poll rather than a block, so the timeout is honoured.
-        let rc = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-        if rc == pid {
-            return Ok(if libc::WIFEXITED(status) {
-                Some(libc::WEXITSTATUS(status))
-            } else {
-                None
-            });
-        }
-        if rc == -1 {
+        // The `waitpid` itself belongs to the syscall layer (plan §2.3); this
+        // module only decides what its result means.
+        match wait::poll_child(pid) {
+            Ok(Some(wait::ChildExit::Exited { code, .. })) => return Ok(Some(code)),
+            // It terminated, but not successfully: still `Ok`, so the caller
+            // can tell "hung" from "died".
+            Ok(Some(wait::ChildExit::Signaled { .. })) => return Ok(None),
+            // Still running.
+            Ok(None) => {}
             // An interrupted poll is not a failure: a signal handler with
             // `SA_RESTART` normally prevents this, but a handler installed by
             // something else (or on another thread) can still interrupt us.
-            let errno = std::io::Error::last_os_error()
-                .raw_os_error()
-                .unwrap_or(libc::ECHILD);
-            if errno == libc::EINTR {
-                continue;
-            }
+            Err(e) if e.errno() == libc::EINTR => continue,
             // ECHILD: someone else already reaped it, or it never existed.
-            return Err(());
+            Err(_) => return Err(()),
         }
         if std::time::Instant::now() >= deadline {
             return Err(());
@@ -187,16 +180,38 @@ mod tests {
         ])
         .expect("spawn");
 
-        // Reap it here so `wait_for_exit` finds no such child.
-        let mut status: libc::c_int = 0;
-        // SAFETY: `status` is a valid out-pointer; blocking on our own child.
-        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        // Reap it here so `wait_for_exit` finds no such child. The child has
+        // already exited, so the audited poll collects it.
+        assert!(matches!(
+            reap_and_report(pid),
+            wait::ChildExit::Exited { code: 0, .. }
+        ));
 
         assert_eq!(
             wait_for_exit(pid, Duration::from_secs(1)).await,
             Err(()),
             "an already-reaped child is an error, not an infinite wait"
         );
+    }
+
+    /// Wait until `pid` has been reaped, and report how it went.
+    ///
+    /// Sleeping is fine here: the test holds the children lock, so nothing else
+    /// is waiting on the runtime.
+    fn reap_and_report(pid: libc::pid_t) -> wait::ChildExit {
+        let give_up = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match wait::poll_child(pid) {
+                Ok(Some(exit)) => return exit,
+                Ok(None) => {}
+                Err(e) => panic!("polling {pid} failed: {e}"),
+            }
+            assert!(
+                std::time::Instant::now() < give_up,
+                "child {pid} never exited"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     /// Plan §1.1: `TimeoutStartSec=0` means wait forever, not zero seconds, so
@@ -219,7 +234,7 @@ mod tests {
 
     /// The unbounded wait that `TimeoutStartSec=0` maps to.
     fn unbounded() -> Duration {
-        Duration::from_secs(u32::MAX as u64)
+        crate::deadline::MAX_TIMEOUT
     }
 
     /// Spawn a unit and return the pid the manager tracked for it.

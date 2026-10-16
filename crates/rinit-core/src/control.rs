@@ -316,8 +316,9 @@ pub fn decode_request(body: &[u8]) -> Result<Request, ProtocolError> {
             expected: PROTOCOL_VERSION,
         });
     }
-    let command =
-        Command::from_byte(decoder.u8()?).ok_or(ProtocolError::UnknownCode { byte: body[2] })?;
+    let command_byte = decoder.u8()?;
+    let command = Command::from_byte(command_byte)
+        .ok_or(ProtocolError::UnknownCode { byte: command_byte })?;
 
     let request = match command {
         Command::List => Request::List,
@@ -412,17 +413,26 @@ impl<'a> Decoder<'a> {
     }
 
     fn u8(&mut self) -> Result<u8, ProtocolError> {
-        Ok(self.take(1)?[0])
+        let byte = self.take(1)?;
+        // `take(1)` guarantees one byte; the fallback keeps this panic-free
+        // without relying on that being true forever.
+        byte.first().copied().ok_or(ProtocolError::TooShort)
     }
 
     fn u16(&mut self) -> Result<u16, ProtocolError> {
-        let bytes = self.take(2)?;
-        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+        let bytes: [u8; 2] = self
+            .take(2)?
+            .try_into()
+            .map_err(|_| ProtocolError::TooShort)?;
+        Ok(u16::from_le_bytes(bytes))
     }
 
     fn u32(&mut self) -> Result<u32, ProtocolError> {
-        let bytes = self.take(4)?;
-        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        let bytes: [u8; 4] = self
+            .take(4)?
+            .try_into()
+            .map_err(|_| ProtocolError::TooShort)?;
+        Ok(u32::from_le_bytes(bytes))
     }
 
     fn unit(&mut self) -> Result<UnitName, ProtocolError> {

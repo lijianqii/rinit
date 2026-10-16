@@ -9,6 +9,21 @@
 //! It is deliberately synchronous: a CLI waits for one reply and exits, so the
 //! client needs no runtime (and rctl pulls in no tokio).
 
+// Production code must not panic (plan §3 M4): a bad command line is a `Result`
+// the user sees, not a crash. Test modules are exempt.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing
+    )
+)]
+
 mod client;
 mod parse;
 

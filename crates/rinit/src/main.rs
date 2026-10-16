@@ -4,9 +4,26 @@
 //! with a normal `main` and a single-threaded tokio runtime. `#[no_main]` is
 //! deliberately deferred until profiling shows `std` is the bottleneck.
 
+// Production code must not panic (plan §3 M4): a service that cannot start is
+// an ordinary, handled outcome, and an `unwrap` on the way there would abort
+// PID 1. Test modules are exempt.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing
+    )
+)]
+
 mod args;
 mod boot;
 mod control;
+mod deadline;
 mod log;
 mod logs;
 mod manager;

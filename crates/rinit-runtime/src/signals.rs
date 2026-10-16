@@ -28,6 +28,18 @@ use crate::error::SyscallError;
 /// user-data pointer. rinit create exactly one [`SignalSet`] for its lifetime.
 static WRITE_FD: AtomicI32 = AtomicI32::new(-1);
 
+/// Report a problem to the console.
+///
+/// This crate has no logger of its own (the binary owns `rlog!`), and the write
+/// must not be able to panic: `eprintln!` aborts the process when the write
+/// fails, which is the very outcome an error path is trying to avoid.
+fn report(prefix: &str, detail: &str) {
+    use std::io::Write;
+
+    let mut out = std::io::stdout();
+    let _ = writeln!(out, "rinit: {prefix} {detail}");
+}
+
 /// The signals rinit reacts to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Signal {
@@ -182,11 +194,19 @@ impl SignalSet {
                 return signal;
             }
 
-            let mut guard = self
-                .reader
-                .readable()
-                .await
-                .expect("signal self-pipe AsyncFd is never closed");
+            let mut guard = match self.reader.readable().await {
+                Ok(guard) => guard,
+                Err(e) => {
+                    // The self-pipe is private to this process and is never
+                    // closed while this `SignalSet` lives, so there is no
+                    // descriptor failure to recover from. Fail closed: report a
+                    // shutdown request rather than panic, because a PID 1 that
+                    // cannot receive signals has no way to honour poweroff and
+                    // is better off stopping than running on unmanageable.
+                    report("error: signal self-pipe failed:", &e.to_string());
+                    return Signal::Term;
+                }
+            };
 
             let mut buf = [0u8; 64];
             let read = guard.try_io(|inner| {
@@ -207,7 +227,9 @@ impl SignalSet {
 
             match read {
                 Ok(Ok(n)) => {
-                    for &byte in &buf[..n] {
+                    // `read(2)` reports at most `buf.len()`, so the fallback is
+                    // unreachable; it keeps this loop panic-free regardless.
+                    for &byte in buf.get(..n).unwrap_or(&[]) {
                         if let Some(signal) = Signal::from_number(byte as libc::c_int) {
                             self.pending.push_back(signal);
                         }

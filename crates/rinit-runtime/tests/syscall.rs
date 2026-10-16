@@ -226,3 +226,94 @@ fn drain_until_reaped(target: libc::pid_t) {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
+
+/// `poll_child` is the single-child form of the reaper, used by the callers
+/// that wait for one specific pid (a `oneshot` unit, a conflicting service that
+/// must stop first). A live child must read as "not yet", not as an error.
+#[test]
+fn poll_child_reports_a_running_child_as_still_running() {
+    let _guard = REAP_LOCK.lock().unwrap();
+    let argv = [cs("sh"), cs("-c"), cs("sleep 30")];
+    let pid = process::posix_spawn(c"/bin/sh", &argv, &[]).expect("posix_spawn");
+
+    assert!(
+        matches!(wait::poll_child(pid), Ok(None)),
+        "a child that has not exited is `None`, not a failure"
+    );
+
+    process::kill(pid, libc::SIGKILL).expect("kill");
+    drain_until_reaped(pid);
+}
+
+/// The exit code must survive the single-child path exactly as it does the
+/// drain path.
+#[test]
+fn poll_child_reports_a_successful_exit_code() {
+    let _guard = REAP_LOCK.lock().unwrap();
+    let argv = [cs("sh"), cs("-c"), cs("exit 4")];
+    let pid = process::posix_spawn(c"/bin/sh", &argv, &[]).expect("posix_spawn");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match wait::poll_child(pid) {
+            Ok(Some(ChildExit::Exited { code, .. })) => {
+                assert_eq!(code, 4, "the exit code must be reported as-is");
+                return;
+            }
+            Ok(Some(ChildExit::Signaled { signal, .. })) => {
+                panic!("the child was signalled ({signal}) instead of exiting");
+            }
+            Ok(None) => {}
+            Err(e) => panic!("poll_child failed: {e}"),
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "child {pid} never exited"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// Death by signal is the other terminal state, and the stopper relies on
+/// seeing it (`SIGKILL` at `TimeoutStopSec`).
+#[test]
+fn poll_child_reports_death_by_signal() {
+    let _guard = REAP_LOCK.lock().unwrap();
+    let argv = [cs("sh"), cs("-c"), cs("sleep 30")];
+    let pid = process::posix_spawn(c"/bin/sh", &argv, &[]).expect("posix_spawn");
+    process::kill(pid, libc::SIGKILL).expect("kill");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match wait::poll_child(pid) {
+            Ok(Some(ChildExit::Signaled { signal, .. })) => {
+                assert_eq!(signal, libc::SIGKILL);
+                return;
+            }
+            Ok(Some(ChildExit::Exited { code, .. })) => {
+                panic!("a SIGKILLed child must not report exit code {code}");
+            }
+            Ok(None) => {}
+            Err(e) => panic!("poll_child failed: {e}"),
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "child {pid} never died"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// Polling a child that is already gone is `ECHILD`, which the waiter must be
+/// able to tell apart from "still running" - otherwise a stolen exit status
+/// would look like a timeout.
+#[test]
+fn poll_child_on_a_reaped_child_is_echild() {
+    let _guard = REAP_LOCK.lock().unwrap();
+    let argv = [cs("sh"), cs("-c"), cs("exit 0")];
+    let pid = process::posix_spawn(c"/bin/sh", &argv, &[]).expect("posix_spawn");
+    drain_until_reaped(pid);
+
+    let err = wait::poll_child(pid).expect_err("the child is already reaped");
+    assert_eq!(err.errno(), libc::ECHILD);
+}

@@ -7,6 +7,22 @@
 //! M0 scope: first-wave mounts, `posix_spawn`/`kill`, non-blocking reaping and
 //! the `mount`/`reboot`/`sync` wrappers.
 
+// Production code must not panic (plan §3 M4). This crate is the `libc`
+// boundary, so "the syscall returned an error we did not expect" is a normal
+// state to report, never a reason to abort PID 1.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing
+    )
+)]
+
 pub mod error;
 pub mod mounts;
 pub mod signals;

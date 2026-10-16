@@ -87,8 +87,12 @@ fn lock(buffer: &Arc<Mutex<LogBuffer>>) -> std::sync::MutexGuard<'_, LogBuffer> 
 
 /// Read `reader` until end-of-file, appending whole lines to `buffer`.
 async fn pump(reader: OwnedFd, unit: UnitName, buffer: Arc<Mutex<LogBuffer>>) {
-    // SAFETY: `reader` owns a valid descriptor that stays open for the lifetime
-    // of the returned `AsyncFd`; it is never closed or replaced.
+    // SAFETY: this is the one `unsafe` left in the binary, and it is deliberate.
+    // `reader` is an `OwnedFd`, so this call owns a valid descriptor and never
+    // closes or replaces it while the `AsyncFd` lives; that is exactly the
+    // obligation `register` documents. The safe alternative, `AsyncFd::new`, is
+    // deprecated as *unsound* (it cannot know the caller keeps the descriptor
+    // valid), so `register` plus this invariant is the correct form.
     let afd = match unsafe { AsyncFd::register(reader) } {
         Ok(afd) => afd,
         Err(e) => {
@@ -116,7 +120,7 @@ async fn pump(reader: OwnedFd, unit: UnitName, buffer: Arc<Mutex<LogBuffer>>) {
             Ok(Ok(0)) => break,
             Ok(Ok(n)) => {
                 // Lossy: a service writing invalid UTF-8 must not lose its log.
-                pending.push_str(&String::from_utf8_lossy(&buf[..n]));
+                pending.push_str(&String::from_utf8_lossy(buf.get(..n).unwrap_or(&[])));
                 let mut lines: Vec<String> = Vec::new();
                 while let Some(newline) = pending.find('\n') {
                     let line: String = pending.drain(..=newline).collect();

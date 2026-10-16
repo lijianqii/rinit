@@ -167,7 +167,8 @@ impl NotifyHub {
             // A recv error on a datagram socket means the socket is unusable
             // (e.g. it was closed), so stop rather than spin.
             while let Ok(n) = socket.recv(&mut buf).await {
-                match parse_notify(&buf[..n]) {
+                // `recv` never reports more than the buffer holds.
+                match parse_notify(buf.get(..n).unwrap_or(&[])) {
                     Ok(message) => {
                         if sender.send((unit.clone(), message)).is_err() {
                             // The hub is gone; nothing left to notify.

@@ -557,3 +557,49 @@ TimeoutStopSec=1
         "a deliberate stop must not restart:\n{log}"
     );
 }
+
+/// Plan §3 M4: a unit file must not be able to abort PID 1.
+///
+/// Every timeout in a unit file lands in `Instant + Duration`, which *panics*
+/// when the sum leaves the representable range, and release builds carry
+/// `overflow-checks = true` (deliberately - see the workspace `Cargo.toml`), so
+/// a `u64::MAX` timeout used to take init down. The two timeouts below are the
+/// ones that are added to an `Instant` on the boot path: the `oneshot`'s
+/// `TimeoutStartSec` and the long-running service's `TimeoutStopSec`.
+///
+/// The assertions are the weak part here - what matters is that the boot
+/// survives at all, which it only does if the deadline arithmetic is clamped.
+#[test]
+fn an_absurd_timeout_does_not_abort_the_boot() {
+    let dir = TempDir::new("absurd-timeout");
+    dir.write(
+        "all.target",
+        "[Unit]\nType=target\nRequires=timer.service slow.service\n",
+    );
+    dir.write(
+        "timer.service",
+        "[Unit]\n\
+         [Service]\nType=oneshot\nExecStart=/bin/true\n\
+         TimeoutStartSec=18446744073709551615\n",
+    );
+    dir.write(
+        "slow.service",
+        "[Unit]\n\
+         [Service]\nType=simple\nExecStart=/bin/sleep 300\n\
+         TimeoutStopSec=18446744073709551615\nRestart=no\n",
+    );
+
+    let log = boot_units(&dir, "all.target", Duration::from_millis(700));
+
+    assert!(log.contains("boot complete"), "boot must finish:\n{log}");
+    assert!(
+        log.contains("timer.service completed"),
+        "an absurd TimeoutStartSec must not stop the oneshot from running:\n{log}"
+    );
+    // Shutting down stops `slow.service`, which arms the SIGKILL deadline from
+    // `TimeoutStopSec` - the other `Instant` arithmetic site.
+    assert!(
+        log.contains("stopping slow.service"),
+        "the long-running service must be stopped on shutdown:\n{log}"
+    );
+}

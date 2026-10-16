@@ -17,6 +17,18 @@
 //! Ordering ties are broken by [`UnitName`]'s `Ord`, so two boots of the same
 //! unit directory produce the same schedule.
 
+// This module indexes `Vec`s by design, and every index is derived in the same
+// function from the same `0..units.len()` range: `remaining`/`placed`/`marks`/
+// `stack` are all sized from `units.len()`, `cursor` walks `dependencies[node]`
+// while `cursor < len`, and `next` always comes from a `dependencies[i]` entry
+// holding an index that was itself produced by `index_of`. Rewriting each of
+// them as `.get(..)` would add a fallback branch per line that can never be
+// taken, in the one place where the *algorithm* is what needs reading.
+//
+// Duplicate names - the only way `index_of` could miss - are rejected before
+// any of this runs (see `build`), so the graph is always well formed.
+#![allow(clippy::indexing_slicing)]
+
 use alloc::format;
 use alloc::string::String;
 use alloc::vec;
@@ -173,7 +185,12 @@ impl DependencyGraph {
         let mut warnings = Vec::new();
 
         for cfg in &configs {
-            let me = index_of(&cfg.name).expect("every unit is indexed");
+            // Unreachable: `units` is exactly the configured names and
+            // duplicates were rejected above. Skipping rather than panicking
+            // keeps a future graph bug from taking PID 1 down with it.
+            let Some(me) = index_of(&cfg.name) else {
+                continue;
+            };
 
             // (referenced unit, strength) pairs. `Requires`/`Wants` imply
             // ordering (plan §1.1), so they produce edges here too.

@@ -258,7 +258,7 @@ async fn supervise(
 /// plan §7.1 caps the whole shutdown at a few seconds. `None` means "as long as
 /// the per-unit timeouts take".
 async fn stop_and_reap(manager: &mut UnitManager, budget: Option<std::time::Duration>) {
-    let give_up = budget.map(|b| std::time::Instant::now() + b);
+    let give_up = budget.map(crate::deadline::after);
     loop {
         for outcome in reap_into_manager(manager) {
             log_outcome(&outcome);
@@ -418,7 +418,10 @@ async fn run_aux_command(
         }
     };
     let limit = if timeout == 0 {
-        std::time::Duration::from_secs(u32::MAX as u64)
+        // `TimeoutStartSec=0` means "wait forever" (plan §1.1). There is no
+        // infinite `Instant`, so this is the longest deadline rinit computes -
+        // the same value `deadline` clamps an absurd timeout to.
+        crate::deadline::MAX_TIMEOUT
     } else {
         std::time::Duration::from_secs(timeout)
     };
@@ -819,7 +822,9 @@ async fn start_units(
         // that has not finished starting.
         for (name, pid, timeout_sec) in &oneshots {
             let timeout = if *timeout_sec == 0 {
-                std::time::Duration::from_secs(u32::MAX as u64)
+                // As above: `0` is "wait forever", spelled as the longest
+                // deadline rinit will compute.
+                crate::deadline::MAX_TIMEOUT
             } else {
                 std::time::Duration::from_secs(*timeout_sec)
             };

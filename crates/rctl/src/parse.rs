@@ -54,7 +54,9 @@ fn required_unit(rest: &[String]) -> Result<UnitName, String> {
     match rest {
         [] => Err("this command needs a unit name".to_string()),
         [unit] => parse_unit(unit),
-        _ => Err(format!("unexpected extra argument '{}'", rest[1])),
+        // The `[]` and `[unit]` arms above are matched first, so `extra` below
+        // is the second argument: indexing `rest[1]` is safe but unnecessary.
+        [_, extra, ..] => Err(format!("unexpected extra argument '{extra}'")),
     }
 }
 
@@ -63,8 +65,7 @@ fn parse_optional_unit_and_tail(rest: &[String]) -> Result<(Option<UnitName>, u3
     let mut unit: Option<UnitName> = None;
     let mut tail: u32 = 0;
     let mut index = 0;
-    while index < rest.len() {
-        let arg = &rest[index];
+    while let Some(arg) = rest.get(index) {
         if let Some(value) = arg.strip_prefix("--tail=") {
             tail = parse_tail(value)?;
         } else if arg == "--tail" {

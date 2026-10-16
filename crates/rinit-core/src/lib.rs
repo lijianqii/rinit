@@ -11,6 +11,26 @@
 //! manager land in M2 (plan §3).
 #![no_std]
 #![forbid(unsafe_code)]
+// Production code must not panic. rinit does not unwind, and a panic in PID 1
+// is a kernel panic at best and a hung machine at worst, so an `unwrap` on a
+// "cannot happen" path is not a cheap assertion - it is the most expensive
+// possible failure mode (plan §3 M4, the panic-free production path).
+//
+// `cfg_attr(not(test), ...)` keeps the test modules - where `unwrap` is how you
+// assert - out of it. The few places where a bound is genuinely proven carry a
+// targeted `#[allow]` with the reasoning next to it.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing
+    )
+)]
 
 extern crate alloc;
 

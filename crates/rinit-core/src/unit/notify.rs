@@ -69,12 +69,15 @@ pub fn parse(message: &[u8]) -> Result<NotifyMessage, NotifyError> {
             continue;
         }
 
-        let Some(eq) = line.iter().position(|&b| b == b'=') else {
+        // Split on the *first* `=`, so a value may itself contain `=`.
+        // (`slice::split_once` is still unstable, hence `splitn(2, ..)`.)
+        let mut parts = line.splitn(2, |&b| b == b'=');
+        // A non-empty slice always yields a first part; the fallback keeps this
+        // panic-free without depending on that.
+        let key = parts.next().unwrap_or(&[]);
+        let Some(value) = parts.next() else {
             return Err(NotifyError::Malformed { line: index + 1 });
         };
-        // Split on the *first* `=`, so a value may itself contain `=`.
-        let key = &line[..eq];
-        let value = &line[eq + 1..];
 
         match key {
             b"READY" => out.ready = value == b"1",
