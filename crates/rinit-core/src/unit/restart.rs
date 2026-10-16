@@ -19,7 +19,7 @@
 //! deliberately stricter than systemd: a service that crashes every 30s with
 //! `StartLimitIntervalSec=10` should keep accumulating, not quietly reset.
 
-use alloc::vec::Vec;
+use alloc::collections::VecDeque;
 use core::time::Duration;
 
 use super::job::Millis;
@@ -81,7 +81,7 @@ pub struct BackoffState {
     /// Consecutive restarts so far; the `n` of `base * 2^(n-1)`.
     consecutive: u32,
     /// Failures inside the sliding window.
-    window: Vec<Millis>,
+    window: VecDeque<Millis>,
     /// Failures allowed per window before the breaker trips.
     burst: u32,
     /// Width of the sliding window.
@@ -101,7 +101,7 @@ impl BackoffState {
         BackoffState {
             base,
             consecutive: 0,
-            window: Vec::new(),
+            window: VecDeque::new(),
             burst,
             interval,
             became_active_at: None,
@@ -147,19 +147,39 @@ impl BackoffState {
             self.window.clear();
         }
         self.became_active_at = None;
-
-        self.window.push(now);
-        // Drop timestamps that have slid out of the window.
-        let width = as_millis(self.interval);
-        if width > 0 {
-            self.window.retain(|&t| now.saturating_sub(t) < width);
-        }
-
         self.consecutive = self.consecutive.saturating_add(1);
 
-        // Plan §1.1: interval 0 disables the breaker; burst 0 means no limit.
+        // Plan §1.1: `StartLimitIntervalSec=0` disables the breaker and
+        // `StartLimitBurst=0` means no limit. Neither can ever read the window,
+        // and with a zero interval nothing could expire out of it either, so
+        // recording the failure here would grow the window forever - one
+        // `Millis` per restart, without bound. (The M4 soak caught exactly
+        // that.) When there is a breaker, `is_tripped` already answers `false`
+        // for these configurations, so this is the same rule, applied where the
+        // memory is spent.
+        let width = as_millis(self.interval);
         if width == 0 || self.burst == 0 {
             return Some(self.next_delay());
+        }
+
+        self.window.push_back(now);
+        // The window slides with the clock: failures older than `interval` have
+        // left it. `now` is monotonic by construction (`UnitManager::now_millis`
+        // counts from a fixed origin), so the expired entries are at the front,
+        // which keeps this O(1) amortised instead of a scan of the whole window.
+        while let Some(&front) = self.window.front() {
+            if now.saturating_sub(front) >= width {
+                self.window.pop_front();
+            } else {
+                break;
+            }
+        }
+        // Only the newest `burst` failures can matter: that many is already a
+        // tripped breaker, and the ones behind them can never be the reason it
+        // trips. Without this, a long interval (or a high restart rate) would
+        // let the window grow to `rate * interval` entries.
+        while self.window.len() > self.burst as usize {
+            self.window.pop_front();
         }
 
         if self.window.len() as u32 >= self.burst {
@@ -213,6 +233,7 @@ impl BackoffState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec::Vec;
 
     /// A deterministic seed, so a failing test is reproducible.
     fn engine(base_secs: u64, burst: u32, interval_secs: u64) -> BackoffState {
@@ -378,6 +399,59 @@ mod tests {
         for i in 0..50 {
             assert!(e.on_failure(i * 1000).is_some(), "attempt {i}");
         }
+    }
+
+    /// The M4 soak's leak, as a test. With the breaker disabled nothing can read
+    /// the window, and a zero interval could never expire anything out of it, so
+    /// recording failures there grew it by one `Millis` per restart for as long
+    /// as the unit kept restarting - a unit file (`StartLimitIntervalSec=0`)
+    /// bought an unbounded allocation.
+    #[test]
+    fn a_disabled_breaker_records_nothing() {
+        let mut e = engine(0, 1000, 0);
+        for _ in 0..100_000 {
+            assert!(
+                e.on_failure(0).is_some(),
+                "the breaker is off: always retry"
+            );
+        }
+        assert_eq!(
+            e.failures_in_window(),
+            0,
+            "100,000 failures must not be 100,000 remembered timestamps"
+        );
+    }
+
+    /// `StartLimitBurst=0` means "no limit", which is the other way to turn the
+    /// breaker off, and it must not record either.
+    #[test]
+    fn a_zero_burst_records_nothing() {
+        let mut e = engine(0, 0, 1_000_000);
+        for _ in 0..100_000 {
+            assert!(e.on_failure(0).is_some());
+        }
+        assert_eq!(e.failures_in_window(), 0);
+    }
+
+    /// The window holds what the breaker needs and no more: `burst` entries,
+    /// however long the interval is and however fast the unit restarts.
+    #[test]
+    fn the_window_never_grows_past_the_burst() {
+        // An interval of 11 days, so nothing expires during the test, and a
+        // burst of 5: the window may be 5 entries wide, not 10,000.
+        let mut e = BackoffState::new(Duration::ZERO, 5, Duration::from_secs(1_000_000), 0x5eed);
+        let mut tripped_at = None;
+        for millis in 0..10_000 {
+            if e.on_failure(millis).is_none() && tripped_at.is_none() {
+                tripped_at = Some(millis);
+            }
+            assert!(
+                e.failures_in_window() <= 5,
+                "the window grew to {} entries",
+                e.failures_in_window()
+            );
+        }
+        assert_eq!(tripped_at, Some(4), "5 failures inside the window trip it");
     }
 
     /// `rctl reset-failed` and a manual start must both clear the counters.

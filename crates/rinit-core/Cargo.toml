@@ -16,4 +16,8 @@ license.workspace = true
 proptest = "1.11"
 
 [lints.rust]
-unsafe_code = "forbid"
+# `deny`, not `forbid`: the library itself is `#![forbid(unsafe_code)]` in
+# `src/lib.rs` and cannot opt out, but `tests/allocations.rs` must install a
+# counting global allocator to check the core for leaks (plan §4.4) and so
+# carries a local, documented `allow`.
+unsafe_code = "deny"
