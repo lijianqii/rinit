@@ -134,7 +134,36 @@ export RINIT_CONTROL_DIR="$work/control"
 export RINIT_NOTIFY_DIR="$work/notify"
 
 log="$work/rinit.log"
-"$rinit" --dev --units "$units" --default soak.target >"$log" 2>&1 &
+counts="$work/counts"
+# rinit's console is the one unbounded thing in this script. The churn unit is
+# deliberately unthrottled (`RestartSec=0`, breaker off) so rinit logs every
+# restart, on the order of a thousand lines a second: a 72h run wrote 955 MB in
+# five hours, filled the 978M /tmp tmpfs, and the soak died of ENOSPC rather than
+# of anything it was measuring.
+#
+# So the console goes into a fifo and a reader instead of into a file. The reader
+# is the only thing that has to keep up, and it keeps almost nothing: a running
+# count of the two lines the assertions below need - written out as it goes, so
+# they are readable *before* the shutdown - and a rolling tail of the last
+# `log_lines` lines for a post-mortem. The run is unchanged in every way but how
+# much disk it uses.
+log_lines=2000
+mkfifo "$work/console"
+# (`snapshot`, not `log`: gawk has a `log` builtin and refuses the name.)
+awk -v counts="$counts" -v snapshot="$log" -v keep="$log_lines" '
+    /churn\.service will restart in/ { r++; if (r % 200 == 0) { print "R " r > counts; close(counts) } }
+    /control: .* ok/                 { c++; if (c % 50 == 0)  { print "C " c > counts; close(counts) } }
+    { ring[NR % keep] = $0 }
+    END {
+        print "R " r > counts
+        print "C " c > counts
+        close(counts)
+        for (i = NR - keep + 1; i <= NR; i++) if ((i % keep) in ring) print ring[i % keep] > snapshot
+        close(snapshot)
+    }
+' <"$work/console" &
+console_pid=$!
+"$rinit" --dev --units "$units" --default soak.target >"$work/console" 2>&1 &
 rinit_pid=$!
 
 cleanup() {
@@ -145,6 +174,9 @@ cleanup() {
         kill -TERM "$rinit_pid" 2>/dev/null || true
         wait "$rinit_pid" 2>/dev/null || true
     fi
+    # rinit's exit closes the fifo, so the reader is at EOF; waiting for it
+    # guarantees the log is complete before anyone is told to read it.
+    flush_log
     if [[ $keep -eq 1 ]]; then
         echo "kept: $work (rinit log: $log)"
     else
@@ -152,6 +184,21 @@ cleanup() {
     fi
 }
 trap cleanup EXIT
+
+# Wait for the console reader, which is at EOF once rinit's end of the fifo is
+# closed - so it has written the final counts and the tail. Called before
+# anything reads them, so the numbers and the diagnostics are complete.
+flush_log() {
+    [[ -n "$console_pid" ]] && wait "$console_pid" 2>/dev/null || true
+    return 0
+}
+
+# One of the reader's running counts, or 0 when it has not written that one yet
+# (it writes every 200 restarts and every 50 control commands, so early in a run
+# the file may hold only the other).
+counted() {
+    awk -v want="$1" '$1 == want { n = $2 } END { print n + 0 }' "$counts" 2>/dev/null || echo 0
+}
 
 # Sample one number out of /proc, or 0 when the field is missing.
 proc_field() {
@@ -180,6 +227,7 @@ for _ in $(seq 1 50); do
     [[ -S "$RINIT_CONTROL_DIR/control.sock" ]] && break
     kill -0 "$rinit_pid" 2>/dev/null || {
         echo "rinit exited during boot:" >&2
+        flush_log
         cat "$log" >&2
         exit 2
     }
@@ -209,6 +257,7 @@ while ((SECONDS < end)); do
 
     kill -0 "$rinit_pid" 2>/dev/null || {
         echo "rinit died mid-soak:" >&2
+        flush_log
         tail -40 "$log" >&2
         exit 1
     }
@@ -218,7 +267,7 @@ done
 # Steady state is everything after the warmup: boot, the first allocations and
 # the allocator's own arena growth all belong to the samples before it.
 steady="$(awk -v w="$warmup" 'NR > w' "$curve")"
-if [[ -z "$steady" ]]; then
+if [[ -z "$steady" ]] || (($(echo "$steady" | wc -l) < 2)); then
     echo "soak too short to reach steady state (warmup $warmup of $sample samples)" >&2
     exit 2
 fi
@@ -255,7 +304,7 @@ if ((max_zombies > 0)); then
 fi
 
 # The restart loop has to have actually run, or the soak proves nothing.
-restarts="$(grep -c 'churn.service will restart in' "$log" || true)"
+restarts="$(counted R)"
 if ((restarts < 10)); then
     echo "FAIL: only ${restarts} churn restarts in ${seconds}s: the churn workload is not churning" >&2
     fail=1
@@ -266,6 +315,7 @@ fi
 kill -TERM "$rinit_pid"
 if ! wait "$rinit_pid"; then
     echo "FAIL: rinit did not exit 0 on SIGTERM" >&2
+    flush_log
     tail -20 "$log" >&2
     fail=1
 fi
@@ -273,7 +323,7 @@ rinit_pid=""
 
 # The control socket has to have answered, or the request/reply path - the
 # thing that owns a connection, a job and a log query per call - went untested.
-control_ok="$(grep -c 'control: .* ok' "$log" || true)"
+control_ok="$(counted C)"
 if ((control_ok < sample)); then
     echo "FAIL: only ${control_ok} control command(s) succeeded for ${sample} samples" >&2
     fail=1
