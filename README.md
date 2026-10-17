@@ -324,7 +324,11 @@ tests** across eleven binaries. The four shapes, and why each is not redundant:
   churn, samples RSS/descriptors/threads/zombies, drives the control socket in a
   loop, and fails if the steady state is not flat or if `SIGTERM` does not exit 0.
   The default 60 s is a commit-time check; `make soak SOAK_ARGS='--seconds
-  259200'` is the 72-hour acceptance run the plan asks for;
+  259200'` is the 72-hour acceptance run the plan asks for. rinit's console is the
+  one unbounded thing in a run - the churn unit is deliberately unthrottled, so
+  rinit logs every restart - and it goes through a reader that keeps only the
+  counts the assertions need and a 2000-line tail, which is why a 72-hour run
+  leaves ~100 KB behind instead of filling the disk;
 - **the guest system test** (`scripts/system-test.sh`, plan §4.3): boots the real
   initramfs on aarch64 qemu, types at the console to prove a root shell is
   reachable, drives `rctl` against the running system, and asserts 93 things -
