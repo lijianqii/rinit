@@ -22,6 +22,7 @@ use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
 use crate::error::SyscallError;
+use crate::syscall::ioctl_request;
 
 /// Where the watchdog device normally lives (plan §7.5's `WatchdogDevice=`).
 pub const DEFAULT_DEVICE: &str = "/dev/watchdog";
@@ -122,8 +123,13 @@ impl Watchdog {
         let mut seconds: libc::c_int = timeout_sec.min(libc::c_int::MAX as u64) as libc::c_int;
         // SAFETY: `WDIOC_SETTIMEOUT` takes a pointer to an `int`, and `seconds`
         // is one for the duration of the call. Nothing else touches it.
-        let rc =
-            unsafe { libc::ioctl(self.device_file.as_raw_fd(), WDIOC_SETTIMEOUT, &mut seconds) };
+        let rc = unsafe {
+            libc::ioctl(
+                self.device_file.as_raw_fd(),
+                ioctl_request(WDIOC_SETTIMEOUT),
+                &mut seconds,
+            )
+        };
         if rc < 0 {
             return Err(SyscallError::last_os_error("ioctl(WDIOC_SETTIMEOUT)"));
         }
@@ -147,8 +153,13 @@ impl Watchdog {
         let mut seconds: libc::c_int = 0;
         // SAFETY: `WDIOC_GETTIMEOUT` takes a pointer to an `int`, and `seconds`
         // is one for the duration of the call. Nothing else touches it.
-        let rc =
-            unsafe { libc::ioctl(self.device_file.as_raw_fd(), WDIOC_GETTIMEOUT, &mut seconds) };
+        let rc = unsafe {
+            libc::ioctl(
+                self.device_file.as_raw_fd(),
+                ioctl_request(WDIOC_GETTIMEOUT),
+                &mut seconds,
+            )
+        };
         if rc < 0 {
             return Err(SyscallError::last_os_error("ioctl(WDIOC_GETTIMEOUT)"));
         }

@@ -10,9 +10,8 @@
 //! `Result<_, SyscallError>` and records the `errno` on failure, so business logic
 //! (`manager`, `unit`, `boot`) never sees a raw errno it has to remember.
 
-use std::ffi::CString;
-
 use crate::error::SyscallError;
+use std::ffi::CString;
 
 pub mod cgroup;
 pub mod cred;
@@ -32,6 +31,20 @@ pub mod watchdog;
 /// would turn `/bin/foo\0bar` into a *successful* call on `/bin/foo`.
 pub fn cstring(op: &'static str, s: &str) -> Result<CString, SyscallError> {
     CString::new(s).map_err(|_| SyscallError::new(op, libc::EINVAL))
+}
+
+/// An `ioctl` request constant as the type this target's `ioctl` wants.
+///
+/// glibc's prototype takes `unsigned long` and musl's takes `int` - libc's
+/// `Ioctl` is `c_ulong` on the first and `c_int` on the second - while the
+/// request constants (`TIOCSCTTY`, `WDIOC_SETTIMEOUT`, ...) are `c_ulong`
+/// either way. So every request has to be cast, and the cast is a
+/// reinterpretation rather than a conversion: `WDIOC_SETTIMEOUT` is above
+/// `i32::MAX`, and its bit pattern is what the kernel compares. Without this the
+/// musl target does not compile at all, which is how it was found.
+#[must_use]
+pub const fn ioctl_request(request: libc::c_ulong) -> libc::Ioctl {
+    request as libc::Ioctl
 }
 
 #[cfg(test)]

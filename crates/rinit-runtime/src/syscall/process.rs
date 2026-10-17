@@ -11,7 +11,7 @@ use std::os::fd::AsRawFd;
 use rinit_core::unit::sandbox::{Sandbox, SandboxStep};
 
 use crate::error::SyscallError;
-use crate::syscall::{cred, fs, wait};
+use crate::syscall::{cred, fs, ioctl_request, wait};
 
 /// The attributes a spawned service gets.
 ///
@@ -559,11 +559,11 @@ fn setup_tty(tty: &ChildTty<'_>, report_write: libc::c_int) {
     if tty.reset {
         // SAFETY: `fd` is a terminal descriptor we just opened, and this ioctl
         // takes no argument.
-        unsafe { libc::ioctl(fd, TIOCVHANGUP) };
+        unsafe { libc::ioctl(fd, ioctl_request(TIOCVHANGUP)) };
     }
     // SAFETY: as above; `TIOCSCTTY` takes an `int` argument, and this kernel
     // accepts 0 for "take it over unconditionally".
-    if unsafe { libc::ioctl(fd, TIOCSCTTY, 0) } < 0 {
+    if unsafe { libc::ioctl(fd, ioctl_request(TIOCSCTTY), 0) } < 0 {
         die(report_write, ChildStep::SetControllingTerminal);
     }
     for target in [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO] {

@@ -12,6 +12,9 @@
 #   make test-system boot the guest and assert the M0/M1 acceptance list
 #   make soak        long-run leak check: restart churn while watching RSS/fds
 #   make parallel    20 services in parallel vs chained: measures the speedup
+#   make gates       acceptance gates: binary size + test coverage
+#   make size-check  the shipped binaries against plan §0.1's size budget
+#   make coverage-check  plan §6's 80%/90% coverage thresholds, measured
 #   make help        show this help
 #   make clean       remove build outputs (keeps downloads)
 #   make distclean   remove everything, including downloads
@@ -62,7 +65,8 @@ MAKE_BUSYBOX     := $(MAKE) -C $(BUSYBOX_SRC) ARCH=$(BUSYBOX_ARCH) CROSS_COMPILE
 
 .DEFAULT_GOAL    := run
 .PHONY: run kernel kernel-config-check busybox rinit initramfs qemu help clean \
-        distclean check test test-system soak parallel
+        distclean check test test-system soak parallel gates size-check \
+        coverage-check
 
 help:
 	@sed -n '2,/^# ====/p' $(MAKEFILE_LIST) | sed '$$d' | sed 's/^# \{0,1\}//'
@@ -209,6 +213,34 @@ test-system: $(KERNEL_IMAGE) $(INITRAMFS)
 SOAK_ARGS ?= --seconds 60
 soak:
 	$(SCRIPTS)/soak.sh $(SOAK_ARGS)
+
+# --- acceptance gates -----------------------------------------------------
+# `check` above is deliberately fast, and these are deliberately not part of it:
+# both need artifacts the commit-time gate does not build, and the coverage run
+# takes minutes rather than seconds. They are gates rather than tables in the
+# README so that plan §6's two numeric items cannot rot: `make gates` is what a
+# release, or the acceptance pass, runs.
+#
+# Plan §0.1's size budget: <=2 MB for a dynamic binary, <=4 MB for a static one.
+# Both shipped binaries are static aarch64, and they are what the initramfs
+# packs (`scripts/build-initramfs.sh`).
+SIZE_BUDGET_STATIC := 4194304
+
+size-check: rinit
+	@fail=0; for b in $(RINIT_BIN) $(RCTL_BIN); do \
+	    size=$$(stat -c%s "$$b"); \
+	    printf 'size-check: %-46s %8d bytes (budget %d)\n' "$$b" "$$size" $(SIZE_BUDGET_STATIC); \
+	    if [ "$$size" -gt $(SIZE_BUDGET_STATIC) ]; then \
+	        echo "size-check: FAIL $$b is over the budget" >&2; fail=1; \
+	    fi; \
+	done; [ "$$fail" -eq 0 ] || exit 1; echo "size-check: OK"
+
+# Plan §6's coverage thresholds, measured rather than quoted: 80% overall, 90%
+# in rinit-core. Needs the `llvm-tools` component.
+coverage-check:
+	$(SCRIPTS)/coverage-check.sh
+
+gates: size-check coverage-check
 
 # --- parallel startup measurement (plan §6 acceptance) --------------------
 # Runs the *host* rinit in `--dev` mode, so it needs no cross toolchain and no
