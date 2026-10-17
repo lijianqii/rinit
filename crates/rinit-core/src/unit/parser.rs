@@ -1332,7 +1332,7 @@ mod tests {
             (
                 ParseError::UnknownKey {
                     line: 2,
-                    section: "Service".into(),
+                    section: "Service",
                     key: "ExecStar".into(),
                 },
                 "line 2: unknown key 'ExecStar' in [Service]",
@@ -1373,8 +1373,8 @@ mod tests {
             (
                 ParseError::TypeSuffixConflict {
                     unit: "x.target".into(),
-                    declared: "service".into(),
-                    implied: "target".into(),
+                    declared: "service",
+                    implied: "target",
                 },
                 "x.target: [Unit] Type=service contradicts the file suffix (target)",
             ),

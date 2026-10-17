@@ -19,7 +19,6 @@ pub enum CoreError {
     Dependency(crate::unit::dependency::DependencyError),
     /// An event was not legal in the unit's current state.
     Transition(crate::unit::state::TransitionError),
-    // M2+ adds: State(StateError).
 }
 
 impl From<crate::unit::parser::ParseError> for CoreError {
