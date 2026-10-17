@@ -4,7 +4,8 @@
 #
 # Usage:
 #   scripts/soak.sh [--seconds N] [--interval SECONDS] [--rinit PATH]
-#                   [--warmup N] [--max-rss-kb N] [--keep]
+#                   [--warmup N] [--max-rss-kb N] [--min-free-kb N]
+#                   [--max-samples N] [--keep]
 #
 # What it does:
 #   1. builds a scratch unit directory whose services churn: one crash-restarts
@@ -33,6 +34,11 @@
 #   0  every assertion held
 #   1  an assertion failed (the sampled curve is printed)
 #   2  bad usage / rinit could not be built or started
+#   3  the harness itself could not keep going: the work filesystem ran out of
+#      room, or the console reader died. Nothing about rinit is implied. A 72-hour
+#      run must not be cut short by the machine it runs on, so both are checked
+#      every sample and reported as themselves instead of turning into an
+#      unexplained "rinit died" an hour later.
 set -euo pipefail
 
 seconds=60
@@ -41,8 +47,15 @@ rinit=""
 warmup=5
 max_rss_kb=1024
 keep=0
+# The work directory itself needs almost nothing (the console is streamed, not
+# kept), but the machine is shared: another process filling the filesystem would
+# otherwise kill the run for a reason it never reports.
+min_free_kb=65536
+# 0 means "until `--seconds` is up"; a positive value is a hard limit on the
+# number of samples, which is what makes the window check below exercisable.
+max_samples=0
 
-usage() { sed -n '2,32p' "$0"; }
+usage() { sed -n '2,/^set -euo pipefail$/p' "$0" | sed '$d'; }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -51,6 +64,8 @@ while [[ $# -gt 0 ]]; do
         --rinit) rinit="${2:?}"; shift 2 ;;
         --warmup) warmup="${2:?}"; shift 2 ;;
         --max-rss-kb) max_rss_kb="${2:?}"; shift 2 ;;
+        --min-free-kb) min_free_kb="${2:?}"; shift 2 ;;
+        --max-samples) max_samples="${2:?}"; shift 2 ;;
         --keep) keep=1; shift ;;
         -h | --help) usage; exit 0 ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
@@ -200,6 +215,12 @@ counted() {
     awk -v want="$1" '$1 == want { n = $2 } END { print n + 0 }' "$counts" 2>/dev/null || echo 0
 }
 
+# Free space in kB on the filesystem the work directory lives on, or empty when
+# the question cannot be answered - an unanswerable question must not stop the
+# soak, so this never fails.
+free_kb() { df -Pk "$work" 2>/dev/null | awk 'NR == 2 { print $4 }' || true; }
+work_fs() { df -Pk "$work" 2>/dev/null | awk 'NR == 2 { print $6 }' || true; }
+
 # Sample one number out of /proc, or 0 when the field is missing.
 proc_field() {
     awk -v want="$2" '$1 == want { print $2; found = 1 } END { if (!found) print 0 }' \
@@ -235,20 +256,43 @@ for _ in $(seq 1 50); do
 done
 
 echo "soaking for ${seconds}s (interval ${interval}s, warmup ${warmup} samples)..."
-echo "sample  rss_kb  fds  threads  zombies"
+echo "sample  when             rss_kb  fds  threads  zombies"
 curve="$work/curve.txt"
 : >"$curve"
 
 sample=0
 end=$((SECONDS + seconds))
 while ((SECONDS < end)); do
+    # An `if`, not `&& break`: under `set -e` a false `(( ))` as the last command
+    # of a list is an error, which would abort the run on the first sample.
+    if ((max_samples > 0)) && ((sample >= max_samples)); then
+        break
+    fi
     sample=$((sample + 1))
     rss="$(rss_of "$rinit_pid")"
     fds="$(fds_of "$rinit_pid")"
     threads="$(threads_of "$rinit_pid")"
     zombies="$(zombies_of "$rinit_pid")"
-    printf '%6d  %6d  %3d  %7d  %7d\n' "$sample" "$rss" "$fds" "$threads" "$zombies"
+    # A timestamp per sample, so a run that stops at hour 60 says *when* it
+    # stopped: the curve itself is numbers only, and a wall-clock time is the one
+    # thing a post-mortem needs that the numbers cannot carry.
+    printf '%6d  %-14s  %6d  %3d  %7d  %7d\n' \
+        "$sample" "$(date '+%m-%d %H:%M')" "$rss" "$fds" "$threads" "$zombies"
     printf '%d %d %d %d\n' "$rss" "$fds" "$threads" "$zombies" >>"$curve"
+
+    # The two ways the harness itself can stop, checked rather than assumed. The
+    # reader dying would freeze the counts and the assertions would then fail for
+    # a reason that has nothing to do with rinit; a full filesystem would abort
+    # the appends (`set -e`) and look like a crash.
+    kill -0 "$console_pid" 2>/dev/null || {
+        echo "the console reader (pid ${console_pid}) is gone: the restart and control counts would stop, so this run cannot assert anything" >&2
+        exit 3
+    }
+    free="$(free_kb)"
+    if [[ -n "$free" ]] && ((free < min_free_kb)); then
+        echo "${free}kB left on $(work_fs) (floor ${min_free_kb}kB): the work directory cannot be written, so the run is stopping here rather than aborting mid-sample" >&2
+        exit 3
+    fi
 
     # Drive the control socket: a start/stop cycle plus a log read, every
     # sample. Each one is a fresh connection, a fresh request and a reply.
@@ -281,11 +325,18 @@ half=$(($(echo "$steady" | wc -l) / 2))
 first_half="$(echo "$steady" | head -n "$half")"
 second_half="$(echo "$steady" | tail -n "$half")"
 peak() { echo "$1" | awk -v column="$2" '{ if ($column > m) m = $column } END { print m + 0 }'; }
+# The lowest value in a half: what the descriptor check is actually about. The
+# count moves with the churn - a log pipe, an accepted connection, a spawned
+# child - so a *peak* per half is a coin flip over 72 hours (one sample catching
+# the wrong instant fails the run), while the trough is the state everything is
+# supposed to come back to. A leak raises the trough; a spike leaves it alone.
+trough() { echo "$1" | awk -v column="$2" 'NR == 1 { m = $column } { if ($column < m) m = $column } END { print m + 0 }'; }
 
 first_rss="$(peak "$first_half" 1)"
 last_rss="$(peak "$second_half" 1)"
-first_fds="$(peak "$first_half" 2)"
-last_fds="$(peak "$second_half" 2)"
+first_fds="$(trough "$first_half" 2)"
+last_fds="$(trough "$second_half" 2)"
+fds_peak="$(peak "$steady" 2)"
 max_zombies="$(peak "$steady" 4)"
 
 fail=0
@@ -295,11 +346,19 @@ if ((rss_delta > max_rss_kb)); then
     fail=1
 fi
 if ((last_fds > first_fds + 2)); then
-    echo "FAIL: descriptors kept climbing: ${first_fds} peak in the first half, ${last_fds} in the second: something is not closing" >&2
+    echo "FAIL: descriptors kept climbing: their lowest was ${first_fds} in the first half and ${last_fds} in the second (peak ${fds_peak}): something is not closing" >&2
     fail=1
 fi
 if ((max_zombies > 0)); then
     echo "FAIL: ${max_zombies} zombie(s) parented to rinit: the reaper is missing exits" >&2
+    fail=1
+fi
+
+# A clock step, a signal or any other early exit must not be able to turn a
+# short window into a pass: the samples have to cover what was asked for.
+expected=$((seconds / interval))
+if ((sample < expected * 95 / 100)); then
+    echo "FAIL: only ${sample} samples for a ${seconds}s window at ${interval}s (expected ~${expected}): the window is too short to assert anything" >&2
     fail=1
 fi
 
@@ -330,7 +389,7 @@ if ((control_ok < sample)); then
 fi
 
 echo
-echo "steady state (peak per half): rss ${first_rss}kB -> ${last_rss}kB (delta ${rss_delta}kB), fds ${first_fds} -> ${last_fds}, max zombies ${max_zombies}"
+echo "steady state: rss ${first_rss}kB -> ${last_rss}kB peak per half (delta ${rss_delta}kB), fds ${first_fds} -> ${last_fds} at their lowest (peak ${fds_peak}), max zombies ${max_zombies}"
 echo "churn: ${restarts} restarts, ${control_ok} control command(s) answered"
 
 if ((fail)); then
