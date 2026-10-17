@@ -210,6 +210,14 @@ impl UnitRuntime {
     /// Deliberately *not* "the state is active": a `oneshot` that finished is
     /// `Active(Exited)` with no process, and a reload must be free to replace its
     /// definition - there is nothing running to protect.
+    ///
+    /// The second half is a guard rather than a second case: every path that
+    /// clears `pid` also leaves `Deactivating` (`stop_unit` goes straight to
+    /// `Inactive` when there is nothing to signal, and `on_child_exit` settles
+    /// the unit it just cleared), so `Deactivating` currently implies a pid. It
+    /// is checked anyway because plan §7.6's rule is about a unit *tearing
+    /// down*, and a future stop path that clears the pid first would otherwise
+    /// let a reload swap the definition of a unit that is still stopping.
     fn is_up(&self) -> bool {
         self.pid.is_some() || self.state == UnitState::Deactivating
     }
@@ -1957,6 +1965,210 @@ mod tests {
         let mut m = UnitManager::new();
         m.add(config(name, restart));
         m
+    }
+
+    /// A scratch directory standing in for the mounted cgroup v2 hierarchy, with
+    /// one unit's cgroup inside it.
+    ///
+    /// `cgroup.procs` is an ordinary file here, and `members`/`place` only ever
+    /// read or write that one, so the real code runs against it unchanged - the
+    /// same stand-in `cgroup.rs`'s tests use.
+    struct FakeCgroup {
+        root: std::path::PathBuf,
+    }
+
+    impl FakeCgroup {
+        fn new(tag: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "rinit-unit-manager-cgroup-{}-{tag}",
+                std::process::id()
+            ));
+            std::fs::remove_dir_all(&root).ok();
+            std::fs::create_dir_all(&root).expect("scratch cgroup root");
+            FakeCgroup { root }
+        }
+
+        /// The unit's cgroup directory, created if it is not there.
+        fn unit_dir(&self, unit: &str) -> std::path::PathBuf {
+            let dir = self
+                .root
+                .join(CgroupLimits::path_for(&UnitName::parse(unit).unwrap()));
+            std::fs::create_dir_all(&dir).expect("unit cgroup directory");
+            dir
+        }
+
+        fn cgroup(&self) -> Cgroup {
+            Cgroup::at(&self.root)
+        }
+
+        /// What `cgroup.procs` says, as a trimmed string.
+        fn procs(&self, unit: &str) -> String {
+            std::fs::read_to_string(self.unit_dir(unit).join("cgroup.procs"))
+                .unwrap_or_default()
+                .trim()
+                .to_string()
+        }
+
+        /// Write `pids` into the unit's `cgroup.procs`.
+        fn set_procs(&self, unit: &str, pids: &[libc::pid_t]) {
+            let text: String = pids.iter().map(|pid| format!("{pid}\n")).collect();
+            std::fs::write(self.unit_dir(unit).join("cgroup.procs"), text)
+                .expect("write cgroup.procs");
+        }
+    }
+
+    impl Drop for FakeCgroup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// Plan §7.3's stop flow signals `cgroup.procs` as well as the process group:
+    /// a service that called `setsid` is out of its process group but still in
+    /// the cgroup, and this is the signal that reaches it.
+    #[test]
+    fn a_cgroup_signal_reaches_a_process_that_left_its_process_group() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let _guard = crate::test_support::children_lock();
+        let fake = FakeCgroup::new("signal");
+        let unit = UnitName::parse("app.service").unwrap();
+
+        // A real process, in the unit's cgroup only - which is exactly what
+        // `setsid` leaves behind.
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn a stand-in for the stray service");
+        fake.set_procs("app.service", &[child.id() as libc::pid_t]);
+
+        let mut m = UnitManager::new();
+        m.set_cgroup(fake.cgroup());
+        m.signal_cgroup_members(&unit, libc::SIGKILL);
+
+        let status = child.wait().expect("the signalled process must exit");
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGKILL),
+            "the pid named in cgroup.procs is the one that must be signalled"
+        );
+    }
+
+    /// A unit with no cgroup of its own is the normal case for a unit without
+    /// limits, and signalling it is a no-op rather than an error.
+    #[test]
+    fn a_cgroup_signal_without_a_cgroup_is_a_no_op() {
+        let m = UnitManager::new();
+        m.signal_cgroup_members(&UnitName::parse("app.service").unwrap(), libc::SIGKILL);
+    }
+
+    /// Plan §7.10's PIDFile rules, one at a time: the daemon must exist, and one
+    /// that is not already in the unit's cgroup is *moved* into it - being in the
+    /// cgroup is what makes the unit's limits, its stop signalling and its
+    /// cleanup apply to it.
+    #[test]
+    fn a_located_daemon_outside_its_cgroup_is_moved_into_it() {
+        let fake = FakeCgroup::new("place");
+        let unit = UnitName::parse("app.service").unwrap();
+        let mut cfg = config("app.service", RestartPolicy::No);
+        let pid_file = fake.root.join("app.pid");
+        // rinit's own pid: it exists, and `find_daemon` only probes it with
+        // signal 0, so nothing is signalled.
+        let pid = std::process::id() as libc::pid_t;
+        std::fs::write(&pid_file, format!("{pid}\n")).expect("pid file");
+        cfg.pid_file = Some(pid_file.display().to_string());
+        fake.set_procs("app.service", &[]);
+
+        let located = find_daemon(&cfg, &fake.cgroup(), &unit).expect("the daemon is found");
+
+        assert_eq!(located, pid);
+        assert_eq!(
+            fake.procs("app.service"),
+            pid.to_string(),
+            "a daemon outside its cgroup must be moved into it"
+        );
+    }
+
+    /// A daemon that is already in the cgroup is left alone: writing the same pid
+    /// back is a no-op the kernel does not need.
+    #[test]
+    fn a_daemon_already_in_its_cgroup_is_not_moved() {
+        let fake = FakeCgroup::new("already");
+        let unit = UnitName::parse("app.service").unwrap();
+        let mut cfg = config("app.service", RestartPolicy::No);
+        let pid_file = fake.root.join("app.pid");
+        let pid = std::process::id() as libc::pid_t;
+        std::fs::write(&pid_file, format!("{pid}\n")).expect("pid file");
+        cfg.pid_file = Some(pid_file.display().to_string());
+        fake.set_procs("app.service", &[pid]);
+
+        assert_eq!(find_daemon(&cfg, &fake.cgroup(), &unit).unwrap(), pid);
+        assert_eq!(fake.procs("app.service"), pid.to_string());
+    }
+
+    /// A `PIDFile=` naming a pid that is not running is an error, not a start:
+    /// the unit would otherwise be marked active around a process nobody has.
+    #[test]
+    fn a_pid_file_naming_a_dead_pid_is_refused() {
+        let fake = FakeCgroup::new("dead");
+        let unit = UnitName::parse("app.service").unwrap();
+        let mut cfg = config("app.service", RestartPolicy::No);
+        let pid_file = fake.root.join("app.pid");
+        // A child that has already been waited for: its pid is free again, and
+        // the chance of reuse inside one test is not one worth hedging.
+        let mut exited = std::process::Command::new("/bin/true")
+            .spawn()
+            .expect("run /bin/true");
+        let dead = exited.id() as libc::pid_t;
+        exited.wait().expect("reap it");
+        std::fs::write(&pid_file, format!("{dead}\n")).expect("pid file");
+        cfg.pid_file = Some(pid_file.display().to_string());
+
+        let why = find_daemon(&cfg, &fake.cgroup(), &unit).expect_err("a dead pid is not a daemon");
+
+        assert!(why.contains("not running"), "unexpected reason: {why}");
+    }
+
+    /// Without a `PIDFile=`, the cgroup is all there is - and it has to name
+    /// exactly one process, or the daemon is not determined.
+    #[test]
+    fn without_a_pid_file_the_cgroup_must_name_exactly_one_process() {
+        let fake = FakeCgroup::new("members");
+        let unit = UnitName::parse("app.service").unwrap();
+        let cfg = config("app.service", RestartPolicy::No);
+        assert!(cfg.pid_file.is_none(), "this test is about the fallback");
+
+        let me = std::process::id() as libc::pid_t;
+        fake.set_procs("app.service", &[me]);
+        assert_eq!(
+            find_daemon(&cfg, &fake.cgroup(), &unit).expect("one member is the daemon"),
+            me
+        );
+
+        fake.set_procs("app.service", &[me, 1]);
+        let why = find_daemon(&cfg, &fake.cgroup(), &unit)
+            .expect_err("two members are not a unique daemon");
+        assert!(
+            why.contains("not uniquely determined"),
+            "unexpected reason: {why}"
+        );
+    }
+
+    /// And a unit with neither a `PIDFile=` nor a cgroup of its own has nothing
+    /// to look at, which is said rather than guessed at.
+    #[test]
+    fn without_a_pid_file_or_a_cgroup_the_daemon_is_undetermined() {
+        let fake = FakeCgroup::new("no-cgroup");
+        let unit = UnitName::parse("app.service").unwrap();
+        let cfg = config("app.service", RestartPolicy::No);
+
+        let why =
+            find_daemon(&cfg, &fake.cgroup(), &unit).expect_err("there is nothing to look at");
+
+        assert!(
+            why.contains("no PIDFile= and no cgroup"),
+            "unexpected reason: {why}"
+        );
     }
 
     #[test]

@@ -214,3 +214,26 @@ fn help_and_version_need_no_server() {
         assert!(!output.stdout.is_empty(), "{args:?}");
     }
 }
+
+/// A real request with no server behind it: the client says so on stderr and
+/// exits 1, rather than panicking or hanging. That is what an operator sees when
+/// rinit is not up, or when the control directory is not the one rinit used.
+#[test]
+fn a_request_with_no_server_is_reported_and_exits_one() {
+    // The directory exists; nothing is listening in it.
+    let dir = TempDir::new("no-server");
+
+    let out = run_rctl(&dir, &["list"]);
+
+    assert_eq!(out.status.code(), Some(1), "unexpected exit: {out:?}");
+    assert!(out.stdout.is_empty(), "nothing to print: {out:?}");
+    let text = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        text.contains("cannot connect"),
+        "the error must say what failed: {text}"
+    );
+    assert!(
+        text.contains("control.sock"),
+        "and name the socket it tried: {text}"
+    );
+}

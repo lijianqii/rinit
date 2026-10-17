@@ -71,6 +71,9 @@ pub struct Config {
     /// or `none` turns it off. A `nofstab` token on the kernel command line still
     /// wins over both, because that is what a board passes when it has mounted
     /// what it needs itself.
+    ///
+    /// Like the first wave, this is a *mount* step, so `--dev` skips it: a test
+    /// build must not mount anything, and the flag is not an exception to that.
     pub fstab: Option<PathBuf>,
 }
 

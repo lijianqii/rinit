@@ -1627,6 +1627,10 @@ fn a_socket_activated_unit_starts_on_its_first_connection() {
 
     assert!(connected, "the socket has to be bound by boot time:\n{log}");
     assert!(
+        !sock.exists(),
+        "and rinit must remove it on shutdown, or a later run cannot bind it again:\n{log}"
+    );
+    assert!(
         log.contains("api.service: waiting for a connection"),
         "a socket-activated unit is bound, not started:\n{log}"
     );
@@ -1666,6 +1670,10 @@ fn an_idle_socket_activated_unit_is_stopped() {
         connected
     })
     .0;
+    assert!(
+        !sock.exists(),
+        "an idle socket survives the unit, but not rinit: the file goes on shutdown"
+    );
     let _ = fs::remove_file(&sock);
 
     assert!(
@@ -2384,4 +2392,43 @@ fn a_reload_the_graph_rejects_changes_nothing() {
     );
 
     stop_rinit(child);
+}
+
+// --- §1.3(9): the second wave ----------------------------------
+
+/// `--dev` means "do not touch mounts", and the second wave is mounts: an
+/// `--fstab` naming a real, readable file must still be ignored there.
+///
+/// The file exists and parses, so this is about the decision rather than about a
+/// failed read - which is why the assertion is on the log and not on an error.
+#[test]
+fn dev_mode_ignores_the_fstab() {
+    let dir = TempDir::new("dev-fstab");
+    dir.write("all.target", "[Unit]\nType=target\nRequires=app.service\n");
+    dir.write(
+        "app.service",
+        "[Service]\nType=simple\nExecStart=/bin/sleep 30\n",
+    );
+    let fstab = std::env::temp_dir().join(format!("rinit-dev-fstab-{}", std::process::id()));
+    fs::write(&fstab, "tmpfs /mnt/rinit-dev-fstab tmpfs defaults 0 0\n").expect("write fstab");
+
+    let log = boot_units_inspect(
+        &dir,
+        "all.target",
+        SETTLE,
+        libc::SIGTERM,
+        &["--fstab", fstab.to_str().expect("utf-8 path")],
+        || (),
+    )
+    .0;
+    let _ = fs::remove_file(&fstab);
+
+    assert!(
+        !log.contains("fstab"),
+        "--dev must not read an fstab at all:\n{log}"
+    );
+    assert!(
+        log.contains("dev mode: skipping first-wave mounts"),
+        "and the reason must be in the log, not just the absence of a line:\n{log}"
+    );
 }

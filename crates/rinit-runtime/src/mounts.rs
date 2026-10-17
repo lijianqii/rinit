@@ -47,6 +47,9 @@ pub trait MountOps {
         flags: libc::c_ulong,
         data: Option<&str>,
     ) -> Result<(), SyscallError>;
+    /// `umount2(2)`: `flags` is `0` for a plain unmount or `MNT_DETACH` for the
+    /// lazy retry (plan §1.3(8)).
+    fn umount2(&mut self, target: &Path, flags: libc::c_int) -> Result<(), SyscallError>;
 }
 
 /// The real thing: `mkdir(2)` + `mount(2)` through the audited syscall layer.
@@ -87,6 +90,10 @@ impl MountOps for RealMounts {
         data: Option<&str>,
     ) -> Result<(), SyscallError> {
         mount::mount(source, target, fstype, flags, data)
+    }
+
+    fn umount2(&mut self, target: &Path, flags: libc::c_int) -> Result<(), SyscallError> {
+        mount::umount2(target, flags)
     }
 }
 
@@ -207,18 +214,31 @@ fn unescape_mount_field(field: &str) -> String {
 /// one that still will not go is reported and left alone: the shutdown must
 /// reach `reboot(2)` regardless.
 pub fn unmount_filesystems() -> UnmountReport {
+    // No /proc: nothing we can enumerate, so there is nothing to do.
+    let contents = std::fs::read_to_string("/proc/mounts").ok();
+    unmount_filesystems_with(&mut RealMounts, contents.as_deref())
+}
+
+/// The policy half of [`unmount_filesystems`], against injected `ops` and an
+/// already-read `/proc/mounts`.
+///
+/// `contents` is `None` when `/proc` could not be read at all. The split exists
+/// for the same reason as [`first_wave_mounts_with`]: the order, the lazy retry
+/// and the "report it and keep going" rule are the parts that decide whether a
+/// shutdown reaches `reboot(2)`, and they are testable on the host without
+/// `CAP_SYS_ADMIN` (plan §4.2).
+pub fn unmount_filesystems_with(ops: &mut impl MountOps, contents: Option<&str>) -> UnmountReport {
     let mut report = UnmountReport::default();
-    let Ok(contents) = std::fs::read_to_string("/proc/mounts") else {
-        // No /proc: nothing we can enumerate, so there is nothing to do.
+    let Some(contents) = contents else {
         return report;
     };
 
-    for point in unmount_order(&contents) {
-        match mount::umount2(Path::new(&point), 0) {
+    for point in unmount_order(contents) {
+        match ops.umount2(Path::new(&point), 0) {
             Ok(()) => report.unmounted.push(point),
             Err(first) => {
                 // Busy, or already gone. Try lazily, then give up on it.
-                if mount::umount2(Path::new(&point), libc::MNT_DETACH).is_ok() {
+                if ops.umount2(Path::new(&point), libc::MNT_DETACH).is_ok() {
                     report.unmounted.push(point);
                 } else if !matches!(first.errno(), libc::EINVAL | libc::ENOENT) {
                     report
@@ -238,13 +258,26 @@ mod tests {
     /// Records the exact call sequence and can fail one named step, optionally
     /// restricted to a single mount point (so `/run` can succeed while `/tmp`
     /// fails).
-    #[derive(Default)]
     struct FakeMounts {
         calls: Vec<String>,
         fail: Option<(&'static str, Option<&'static str>)>,
         /// Additional injected failures, so a test can break more than one step
         /// (e.g. both degradable mounts).
         fail_many: Vec<(&'static str, &'static str)>,
+        /// The errno every injected failure reports. `EPERM` by default; the
+        /// unmount tests set `EINVAL`/`ENOENT` to mean "already gone".
+        errno: libc::c_int,
+    }
+
+    impl Default for FakeMounts {
+        fn default() -> Self {
+            FakeMounts {
+                calls: Vec::new(),
+                fail: None,
+                fail_many: Vec::new(),
+                errno: libc::EPERM,
+            }
+        }
     }
 
     impl FakeMounts {
@@ -273,14 +306,14 @@ mod tests {
                 && fail_name == name
                 && fail_target.is_none_or(|t| t == target_s)
             {
-                return Err(SyscallError::new(name, libc::EPERM));
+                return Err(SyscallError::new(name, self.errno));
             }
             if self
                 .fail_many
                 .iter()
                 .any(|(fail_name, fail_target)| *fail_name == name && *fail_target == target_s)
             {
-                return Err(SyscallError::new(name, libc::EPERM));
+                return Err(SyscallError::new(name, self.errno));
             }
             Ok(())
         }
@@ -323,6 +356,17 @@ mod tests {
             _data: Option<&str>,
         ) -> Result<(), SyscallError> {
             Err(SyscallError::new("mount_fs", libc::EINVAL))
+        }
+
+        fn umount2(&mut self, target: &Path, flags: libc::c_int) -> Result<(), SyscallError> {
+            // The two calls are distinguishable in `calls`, so a test can fail
+            // just the plain one and watch the lazy retry succeed.
+            let name = if flags == 0 {
+                "umount2"
+            } else {
+                "umount2_lazy"
+            };
+            self.step(name, target)
         }
     }
 
@@ -503,6 +547,107 @@ tmpfs /run tmpfs rw 0 0
     fn unmount_order_decodes_octal_escapes() {
         let proc_mounts = "/dev/sda1 / ext4 rw 0 0\ntmpfs /mnt/with\\040space tmpfs rw 0 0\n";
         assert_eq!(unmount_order(proc_mounts), ["/mnt/with space"]);
+    }
+
+    /// The loop that actually unmounts, which the guest cannot reach: it never
+    /// shuts down gracefully, and the host has no mounts to give it. The order
+    /// comes from `unmount_order`, and the root must not be touched - rinit is
+    /// running from it.
+    #[test]
+    fn the_shutdown_loop_unmounts_newest_first_and_keeps_the_root() {
+        let mut ops = FakeMounts::default();
+        let report = unmount_filesystems_with(
+            &mut ops,
+            Some(
+                "\
+/dev/root / ext4 rw 0 0
+proc /proc proc rw 0 0
+tmpfs /tmp tmpfs rw 0 0
+tmpfs /run tmpfs rw 0 0
+",
+            ),
+        );
+
+        assert_eq!(
+            ops.calls,
+            ["umount2 /run", "umount2 /tmp", "umount2 /proc"],
+            "the root must not be unmounted from under PID 1"
+        );
+        assert_eq!(report.unmounted, ["/run", "/tmp", "/proc"]);
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    }
+
+    /// A busy mount gets exactly one lazy retry, and that retry succeeding counts
+    /// as unmounted (it is the `MNT_DETACH` case: the namespace entry goes now,
+    /// the users drain later).
+    #[test]
+    fn a_busy_mount_is_retried_lazily_and_counts_as_unmounted() {
+        let mut ops = FakeMounts::failing("umount2");
+        let report = unmount_filesystems_with(&mut ops, Some("tmpfs /run tmpfs rw 0 0\n"));
+
+        assert_eq!(ops.calls, ["umount2 /run", "umount2_lazy /run"]);
+        assert_eq!(report.unmounted, ["/run"]);
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    }
+
+    /// A mount that refuses both is reported and left alone, and the loop keeps
+    /// going: a stuck mount must not stop the shutdown from reaching `reboot(2)`.
+    #[test]
+    fn a_mount_that_will_not_go_is_reported_and_the_loop_continues() {
+        let mut ops = FakeMounts {
+            fail_many: vec![("umount2", "/tmp"), ("umount2_lazy", "/tmp")],
+            ..FakeMounts::default()
+        };
+        let report = unmount_filesystems_with(
+            &mut ops,
+            Some("tmpfs /run tmpfs rw 0 0\ntmpfs /tmp tmpfs rw 0 0\n"),
+        );
+
+        assert_eq!(
+            ops.calls,
+            ["umount2 /tmp", "umount2_lazy /tmp", "umount2 /run"],
+            "the stuck mount must not abort the rest of the loop"
+        );
+        assert_eq!(report.unmounted, ["/run"]);
+        assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+        assert!(
+            report.warnings[0].contains("/tmp"),
+            "the warning must name the mount: {:?}",
+            report.warnings
+        );
+    }
+
+    /// `EINVAL`/`ENOENT` mean the mount is already gone - the common case at
+    /// shutdown, since `unmount_order` reads `/proc/mounts` a moment earlier - so
+    /// they are not warnings. Anything else is.
+    #[test]
+    fn an_already_gone_mount_is_silent() {
+        let mut ops = FakeMounts {
+            fail_many: vec![("umount2", "/run"), ("umount2_lazy", "/run")],
+            errno: libc::ENOENT,
+            ..FakeMounts::default()
+        };
+        let report = unmount_filesystems_with(&mut ops, Some("tmpfs /run tmpfs rw 0 0\n"));
+
+        assert_eq!(ops.calls, ["umount2 /run", "umount2_lazy /run"]);
+        assert!(report.unmounted.is_empty());
+        assert!(
+            report.warnings.is_empty(),
+            "an already-unmounted path is not a failure: {:?}",
+            report.warnings
+        );
+    }
+
+    /// No `/proc` (a broken rootfs, or `--dev`): there is nothing to enumerate,
+    /// so nothing is attempted and the shutdown proceeds.
+    #[test]
+    fn without_proc_mounts_there_is_nothing_to_do() {
+        let mut ops = FakeMounts::default();
+        let report = unmount_filesystems_with(&mut ops, None);
+
+        assert!(ops.calls.is_empty(), "{:?}", ops.calls);
+        assert!(report.unmounted.is_empty());
+        assert!(report.warnings.is_empty());
     }
 
     /// An unmountable path reports the syscall error instead of panicking.

@@ -270,6 +270,11 @@ mod tests {
             }
             Ok(())
         }
+        fn umount2(&mut self, _target: &Path, _flags: libc::c_int) -> Result<(), SyscallError> {
+            // The second wave only mounts; unmounting is the shutdown's job, and a
+            // test that sees this happen has found the two paths mixed up.
+            Err(SyscallError::new("umount2", libc::EINVAL))
+        }
     }
 
     /// The six fields, in order, with comments and `noauto` skipped.

@@ -239,4 +239,50 @@ mod tests {
         assert_eq!(file.name.canonical(), "a.service");
         assert!(file.contents.contains("ExecStart"));
     }
+
+    /// Plan §4.3's "one bad entry must not make the system unbootable": a unit
+    /// file that cannot be read is skipped with a warning, and the rest of the
+    /// directory still loads.
+    ///
+    /// A *directory* named like a unit is the portable way to reach that path: it
+    /// has the suffix the loader looks for, and reading it fails for everyone -
+    /// including root, which a `chmod 000` file would not.
+    #[test]
+    fn an_unreadable_unit_file_is_skipped_with_a_warning() {
+        let dir = TempDir::new("unreadable");
+        dir.write("good.service", "[Service]\nExecStart=/bin/true\n");
+        fs::create_dir(dir.0.join("bad.service")).unwrap();
+
+        let (files, warnings) = load_unit_files(&dir.0).unwrap();
+
+        assert_eq!(files.len(), 1, "the readable unit still loads");
+        assert_eq!(files[0].name.canonical(), "good.service");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].starts_with("skipping"), "{warnings:?}");
+        assert!(
+            warnings[0].contains("bad.service"),
+            "the warning must name the file: {warnings:?}"
+        );
+    }
+
+    /// The single-file path reports the same failure as an error rather than a
+    /// warning, because there is no "rest of the directory" to carry on with.
+    #[test]
+    fn read_unit_file_reports_an_unreadable_file() {
+        let dir = TempDir::new("read-unreadable");
+        fs::create_dir(dir.0.join("bad.service")).unwrap();
+
+        let err = read_unit_file(&dir.0.join("bad.service")).unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                RuntimeError::Io {
+                    op: "read_to_string(unit)",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+    }
 }
