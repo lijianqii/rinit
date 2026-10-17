@@ -9,7 +9,7 @@
 #   make qemu        alias for `make run`
 #   make check       pre-commit gate: fmt + clippy + host tests (no cross toolchain)
 #   make test        check + the qemu system test
-#   make test-system boot the guest and assert the M0/M1 acceptance list
+#   make test-system boot the guest and assert the acceptance list (M0-M5)
 #   make soak        long-run leak check: restart churn while watching RSS/fds
 #   make parallel    20 services in parallel vs chained: measures the speedup
 #   make gates       acceptance gates: binary size + test coverage

@@ -67,7 +67,7 @@ cargo build --offline --release --target aarch64-unknown-linux-gnu
 
 The release profile is part of the contract, not a preference: `panic="abort"`
 (a panic in PID 1 must not unwind into a half-dead system), `overflow-checks` and
-`lto`. `make rinit` wraps this and asserts the three binaries exist.
+`lto`. `make rinit` wraps this and asserts both binaries exist.
 
 Nothing in the Rust source is architecture-specific. A new architecture needs
 three things changed, and they are all in the scripts:
@@ -97,6 +97,8 @@ rinit [OPTIONS]
   --watchdog-timeout <S> hardware timeout; fed every half (default 30)
   --log-file <PATH>      mirror service output to a file
                          (default /var/log/rinit/log; 'none' disables)
+  --fstab <PATH>         second-wave mount table
+                         (default /etc/fstab; 'none' disables)
 ```
 
 `--dev` is for developers, not for a target: it skips the mounts, does not
@@ -156,7 +158,14 @@ make check         # fmt, clippy, and the host test suite
 make parallel      # 20 services in parallel vs chained: the scheduler's speedup
 make soak          # restart churn, watching RSS, descriptors and zombies
 make test-system   # boots the guest and asserts plan §6's list
+make gates         # the two numeric acceptance items: size and coverage
 ```
+
+`make gates` is what keeps plan §6's numbers from being hand-copied: `size-check`
+measures the shipped binaries against the §0.1 budget, and `coverage-check`
+measures the suite against §6's 80% (overall) and 90% (`rinit-core`) and prints
+the counts behind each percentage. Neither is in `make check`, which stays the
+fast per-commit gate.
 
 A note on the tools that are *not* in the list, because the plan asks for them and
 this environment cannot run them: `miri` (nightly-only; the core is

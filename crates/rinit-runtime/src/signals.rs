@@ -365,7 +365,9 @@ mod tests {
         let _guard = SIGNAL_LOCK.lock().await;
 
         let before = query_disposition(libc::SIGTERM);
-        let writer_fd = {
+        // The inode is read while the set is alive; the descriptor number cannot
+        // be checked afterwards (see the assertion below).
+        let inode = {
             let signals = SignalSet::new(&[Signal::Term]).expect("SignalSet::new");
             let fd = signals.writer.as_raw_fd();
             assert!(fd >= 0);
@@ -375,7 +377,7 @@ mod tests {
                 query_disposition(libc::SIGTERM).sa_sigaction,
                 before.sa_sigaction
             );
-            fd
+            pipe_inode_of(fd).expect("the writer is a pipe while it is alive")
         };
 
         assert_eq!(
@@ -389,12 +391,14 @@ mod tests {
             "the previous disposition must be restored"
         );
 
-        // The pipe write end must be closed. If the fd were still open,
-        // `fcntl(F_GETFD)` would succeed instead of reporting EBADF.
-        assert_eq!(
-            fcntl_getfd(writer_fd),
-            Some(libc::EBADF),
-            "the self-pipe write end must be closed on drop"
+        // The pipe must be closed. It is identified by its inode rather than by
+        // its descriptor number: the number is recycled the moment it is freed,
+        // and this binary runs its tests in parallel threads, so by the time it
+        // is checked the number may belong to another test (which is exactly how
+        // the sibling test below used to fail).
+        assert!(
+            !open_pipe_inodes().contains(&inode),
+            "the self-pipe ({inode}) must be closed on drop"
         );
     }
 
@@ -404,17 +408,26 @@ mod tests {
     async fn successive_sets_do_not_leak_descriptors() {
         let _guard = SIGNAL_LOCK.lock().await;
 
-        let mut fds = Vec::new();
+        let mut inodes = Vec::new();
         for _ in 0..8 {
             let signals = SignalSet::new(&[Signal::Child]).expect("SignalSet::new");
-            fds.push(signals.writer.as_raw_fd());
+            inodes.push(
+                pipe_inode_of(signals.writer.as_raw_fd())
+                    .expect("the writer is a pipe while it is alive"),
+            );
+            // Dropped here, so the next set is built after this one is gone -
+            // which is what "successive" means in the name.
         }
         assert_eq!(WRITE_FD.load(Ordering::Relaxed), -1);
-        for fd in fds {
-            assert_eq!(
-                fcntl_getfd(fd),
-                Some(libc::EBADF),
-                "fd {fd} leaked across SignalSet lifetimes"
+
+        // One inode per set, all distinct, and none of them open now. The read
+        // end shares the writer's inode, so this covers both descriptors.
+        let open = open_pipe_inodes();
+        assert_eq!(inodes.len(), 8);
+        for inode in &inodes {
+            assert!(
+                !open.contains(inode),
+                "{inode} is still open: a SignalSet leaked its pipe"
             );
         }
     }
@@ -428,15 +441,49 @@ mod tests {
         action
     }
 
-    /// `Some(errno)` when `fcntl` fails, so a closed fd is distinguishable
-    /// from a live one.
-    fn fcntl_getfd(fd: libc::c_int) -> Option<i32> {
-        // SAFETY: `fcntl` on a read-only query does not modify the descriptor.
-        let rc = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-        if rc == -1 {
-            Some(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
-        } else {
-            None
+    /// The positive control for the two tests above: while a set is alive its
+    /// pipe *is* visible to the same probe. Without it, a probe that found
+    /// nothing would make their leak assertions vacuous.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_live_sets_pipe_is_visible_to_the_probe() {
+        let _guard = SIGNAL_LOCK.lock().await;
+
+        let signals = SignalSet::new(&[Signal::Child]).expect("SignalSet::new");
+        let inode = pipe_inode_of(signals.writer.as_raw_fd()).expect("a pipe while it is alive");
+
+        assert!(
+            open_pipe_inodes().contains(&inode),
+            "the probe must see a pipe that is open, or the leak tests prove nothing"
+        );
+    }
+
+    /// The `pipe:[inode]` identity of `fd`, or `None` when it is not a pipe.
+    ///
+    /// Descriptor *numbers* are what a leak test would like to check and what it
+    /// cannot: they are reused as soon as they are freed, and the other tests in
+    /// this binary are allocating descriptors at the same time. The inode is
+    /// unique to one pipe and pipefs hands them out from a monotonic counter, so
+    /// it cannot be confused with another test's pipe either.
+    fn pipe_inode_of(fd: libc::c_int) -> Option<String> {
+        let target = std::fs::read_link(format!("/proc/self/fd/{fd}")).ok()?;
+        let text = target.to_string_lossy().into_owned();
+        text.starts_with("pipe:[").then_some(text)
+    }
+
+    /// Every pipe the process currently holds, by inode.
+    fn open_pipe_inodes() -> std::collections::HashSet<String> {
+        let mut found = std::collections::HashSet::new();
+        let Ok(entries) = std::fs::read_dir("/proc/self/fd") else {
+            return found;
+        };
+        for entry in entries.flatten() {
+            if let Ok(target) = std::fs::read_link(entry.path()) {
+                let text = target.to_string_lossy().into_owned();
+                if text.starts_with("pipe:[") {
+                    found.insert(text);
+                }
+            }
         }
+        found
     }
 }
