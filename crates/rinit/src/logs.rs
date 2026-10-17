@@ -225,12 +225,14 @@ fn lock(sink: &Arc<Mutex<Sink>>) -> std::sync::MutexGuard<'_, Sink> {
 
 /// Read `reader` until end-of-file, appending whole lines to `buffer`.
 async fn pump(reader: OwnedFd, unit: UnitName, sink: Arc<Mutex<Sink>>) {
-    // SAFETY: this is the one `unsafe` left in the binary, and it is deliberate.
-    // `reader` is an `OwnedFd`, so this call owns a valid descriptor and never
-    // closes or replaces it while the `AsyncFd` lives; that is exactly the
+    // SAFETY: `reader` is an `OwnedFd`, so this call owns a valid descriptor and
+    // never closes or replaces it while the `AsyncFd` lives; that is exactly the
     // obligation `register` documents. The safe alternative, `AsyncFd::new`, is
     // deprecated as *unsound* (it cannot know the caller keeps the descriptor
-    // valid), so `register` plus this invariant is the correct form.
+    // valid), so `register` plus this invariant is the correct form. This is one
+    // of the binary's three `unsafe` call sites outside the syscall layer and
+    // `signals`; the others are `activation.rs` (the same `register`) and the
+    // `kill(pid, 0)` probe in `unit_manager.rs`.
     let afd = match unsafe { AsyncFd::register(reader) } {
         Ok(afd) => afd,
         Err(e) => {

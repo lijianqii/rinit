@@ -28,7 +28,7 @@ appended: `Requires=db` means `db.service`.
 Description=A name for the console and rctl status
 
 [Service]
-Type=smart
+Type=simple
 ExecStart=/usr/bin/thing --flag
 ```
 
@@ -311,8 +311,10 @@ oversight (the README's deviation list has the reasoning):
 
 - `PermissionsStartOnly=` and the `+`/`-`/`!` command prefixes: every `Exec*`
   runs as `User=`/`Group=`.
-- `Sockets=` and socket activation, `WantedBy=`/`[Install]` sections (rinit has
-  no `enable`: the boot target's closure is what starts), `Type=idle`/`dbus`,
-  `$MAINPID`, cgroup v1, and every other directive not in the tables above. An
-  unknown key is an error, so a unit written for systemd fails loudly rather than
-  silently losing a setting.
+- `WantedBy=`/`[Install]` sections (rinit has no `enable`: the boot target's
+  closure is what starts), `Type=idle`/`dbus`, `$MAINPID`, cgroup v1, and every
+  other directive not in the tables above. An unknown key is an error, so a unit
+  written for systemd fails loudly rather than silently losing a setting.
+
+(`Sockets=` and socket activation were on this list before §7.8 and §7.9 landed;
+they are in the tables above now, which is where their rules live.)
