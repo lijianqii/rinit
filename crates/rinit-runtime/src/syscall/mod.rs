@@ -1,8 +1,11 @@
 //! Thin, audited wrappers over the raw `libc` syscalls rinit needs (plan §2.3).
 //!
-//! This is the *only* module tree allowed to contain `unsafe`. Every wrapper
-//! returns `Result<_, SyscallError>` and records the `errno` on failure;
-//! business logic (`manager`, `unit`, `boot`) stays free of raw `unsafe`.
+//! Only two module trees contain `unsafe`: this one and [`crate::signals`], which
+//! installs the `sigaction` handlers and owns the self-pipe. Everything else -
+//! `mounts`, `fstab`, `units`, and the whole of `rinit-core` (which is
+//! `#![forbid(unsafe_code)]`) - is safe code. Every wrapper here returns
+//! `Result<_, SyscallError>` and records the `errno` on failure, so business logic
+//! (`manager`, `unit`, `boot`) never sees a raw errno it has to remember.
 
 use std::ffi::CString;
 

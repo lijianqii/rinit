@@ -69,17 +69,16 @@ help:
 
 # --- rinit (static aarch64 binaries) --------------------------------------
 RINIT_BIN        := target/$(TARGET)/release/rinit
-RINIT_TEST_BIN   := target/$(TARGET)/release/rinit-testservice
 RCTL_BIN         := target/$(TARGET)/release/rctl
 RINIT_SRCS       := $(shell find crates -name '*.rs' 2>/dev/null) Cargo.toml Cargo.lock
 
 rinit: $(RINIT_BIN)
 
-# Grouped target: one cargo invocation builds all three binaries. Nothing
-# happens when they already exist and are newer than the sources.
-$(RINIT_BIN) $(RINIT_TEST_BIN) $(RCTL_BIN) &: $(RINIT_SRCS)
+# Grouped target: one cargo invocation builds both binaries. Nothing happens
+# when they already exist and are newer than the sources.
+$(RINIT_BIN) $(RCTL_BIN) &: $(RINIT_SRCS)
 	cargo build --release --target $(TARGET)
-	@test -x $(RINIT_TEST_BIN) || { echo "rinit build failed"; exit 1; }
+	@test -x $(RINIT_BIN) || { echo "rinit build failed"; exit 1; }
 	@test -x $(RCTL_BIN) || { echo "rctl build failed"; exit 1; }
 
 # --- Linux kernel ---------------------------------------------------------

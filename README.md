@@ -304,17 +304,17 @@ make test-system    # boot aarch64 qemu and assert the acceptance list
 make test           # check + test-system
 ```
 
-`cargo test --offline --workspace` (what `make check` runs last) executes **684
+`cargo test --offline --workspace` (what `make check` runs last) executes **686
 tests** across eleven binaries. The four shapes, and why each is not redundant:
 
-- **unit tests** next to the code (core 322, rinit 180, rinit-runtime 92,
+- **unit tests** next to the code (core 315, rinit 180, rinit-runtime 100,
   rctl 11), including `proptest` properties over the parser;
 - **integration tests** in `crates/*/tests/`: the syscall layer against the real
   kernel (`rinit-runtime` 21: run unprivileged, they assert that each drop is
   *refused* rather than silently skipped - `EPERM` from `setuid(0)`, `setgroups`,
   `PR_CAPBSET_DROP`, `capset` and the ambient raise, each naming the call that
   failed - with the root-only success paths deferred to the guest), the
-  lifecycle end to end in `--dev` mode (`rinit/tests/m2_lifecycle.rs` 40), the
+  lifecycle end to end in `--dev` mode (`rinit/tests/m2_lifecycle.rs` 41), the
   control CLI (`rctl/tests/control.rs` 8), the smoke test that runs the real
   binary (`rinit/tests/smoke.rs` 2), the allocation guard
   (`rinit-core/tests/allocations.rs` 2), and `shipped_units.rs` 4 - every unit in
@@ -365,7 +365,9 @@ optional extra: without them the guest could only ever exercise the
 "no watchdog hardware" path.
 
 `cargo llvm-cov --offline --workspace --summary-only`, measured at the §7.9
-commit. The plan's checklist asks for ≥80% overall and ≥90% in the core, so these
+commit - before `rinit-testservice` was deleted and before §1.3(9) and §4.3 added
+their tests, so re-run the command below rather than quoting these numbers as the
+current tree's. The plan's checklist asks for ≥80% overall and ≥90% in the core, so these
 are the numbers that answer it rather than a shape:
 
 | crate            | line coverage | functions |
@@ -382,9 +384,18 @@ machine), `syscall/mount.rs` (50% - needs `CAP_SYS_ADMIN`), `syscall/process.rs`
 (58% - the child-side drop paths, which a host run refuses by design),
 `src/main.rs` (48% - the entry point) and `src/control.rs` (76% - the socket
 server, which the guest drives and the host reaches only through
-`RINIT_CONTROL_DIR`). `rinit-testservice` is 0% because nothing runs it any more:
-it was M0's bring-up helper, and the smoke test drives the real binary and the
-real unit path instead.
+`RINIT_CONTROL_DIR`).
+
+Two kinds of line are uncovered, and they are worth telling apart: **guest-only**
+lines (the control server, the child-side sandbox steps, `mount(2)`), which the
+system test exercises on a real kernel but `cargo llvm-cov` cannot see because it
+only runs the host suite, and **genuinely unreached** ones, which is what this
+number is for. The second kind is what the audit that followed this measurement
+went after: it deleted `rinit-testservice` (M0's bring-up helper, 0% because
+nothing had run it for months - `--test-service` and the real unit path replaced
+it), and it added the two tests the same listing pointed at, one for `SIGINT`
+(handled, and the only one of the four shutdown signals with no test) and one for
+every `ParseError` message.
 
 ```bash
 cargo llvm-cov --offline --workspace --summary-only          # the table above
@@ -831,12 +842,12 @@ byte counts as `ls -l` reports them:
 | target                               | binary              | size                    | in an image |
 | ------------------------------------ | ------------------- | ----------------------- | ----------- |
 | `aarch64-unknown-linux-gnu` (static) | `rinit`             | 1.45 MiB (1 518 640 B)  | yes         |
-| `aarch64-unknown-linux-gnu` (static) | `rinit-testservice` | 1.01 MiB (1 059 704 B)  | no          |
 | `x86_64-unknown-linux-musl` (static) | `rinit`             | 0.92 MiB (967 584 B)    | yes         |
 
-`rinit-testservice` is a host-side bring-up helper (it proves fork/exec/reap
-deterministically), so it is built but not shipped: the guest's services come
-from `units/` and busybox.
+M0's bring-up helper `rinit-testservice` is gone: nothing ran it any more and it
+was not shipped, so the §7.9 audit deleted it rather than keep a megabyte of dead
+binary in every build. A repeat of that step is `--test-service` now, which runs a
+command through the same spawn path a unit uses.
 
 The packed image the guest boots
 (`build/out/initramfs-aarch64-unknown-linux-gnu.cpio.gz`: static busybox +

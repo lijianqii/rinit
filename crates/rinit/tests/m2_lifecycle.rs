@@ -353,6 +353,30 @@ fn starting_a_unit_stops_what_it_conflicts_with() {
     );
 }
 
+/// Plan §7.1 lists `SIGINT` beside `SIGTERM` as a graceful shutdown, and it was
+/// the one of the four signals nothing exercised: the loop handles it on its own
+/// arm, so a change that broke only that arm would have shipped green.
+#[test]
+fn sigint_shuts_down_gracefully_too() {
+    let dir = TempDir::new("sigint");
+    dir.write("all.target", "[Unit]\nType=target\nRequires=app.service\n");
+    dir.write(
+        "app.service",
+        "[Service]\nType=simple\nExecStart=/bin/sleep 30\n",
+    );
+
+    let log = boot_units_with_signal(&dir, "all.target", SETTLE, libc::SIGINT);
+
+    assert!(
+        log.contains("received SIGINT"),
+        "SIGINT must be handled like SIGTERM:\n{log}"
+    );
+    assert!(
+        log.contains("stopping app.service"),
+        "and it must stop the units rather than just exit:\n{log}"
+    );
+}
+
 /// Plan §7.1: `SIGPWR` is a *fast* shutdown - the per-unit timeout is capped at
 /// 2s and the whole shutdown at 5s, so a service with a 30s timeout is still
 /// killed promptly.

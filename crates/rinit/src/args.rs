@@ -414,8 +414,8 @@ mod tests {
     /// rest are its own flags.
     #[test]
     fn bare_positional_forms_the_service_command() {
-        let cfg = parse_args(&["/sbin/rinit-testservice", "--ticks", "6"]).expect("parse");
-        assert_eq!(service(&cfg), ["/sbin/rinit-testservice", "--ticks", "6"]);
+        let cfg = parse_args(&["/sbin/init-helper", "--ticks", "6"]).expect("parse");
+        assert_eq!(service(&cfg), ["/sbin/init-helper", "--ticks", "6"]);
     }
 
     #[test]

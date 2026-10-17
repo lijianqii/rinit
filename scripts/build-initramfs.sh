@@ -68,11 +68,6 @@ install -m 0755 "${bin_dir}/rinit" "${work}/sbin/rinit"
 # together.
 install -m 0755 "${bin_dir}/rctl" "${work}/bin/rctl"
 
-# rinit-testservice is deliberately NOT packed. It is a M0 bring-up helper used
-# to prove fork/exec/reap, and it is still built into target/ for the host
-# smoke test; shipping a ~1 MB binary that no unit refers to would only bloat
-# the image. The guest's services come from units/ and busybox.
-
 # Plan §1.3(9)'s second wave: the mount table rinit reads after the first wave.
 # It ships in the image because the second wave runs at *boot* - a table written
 # at run time would be too late - and it is the repo's `fstab` verbatim so the

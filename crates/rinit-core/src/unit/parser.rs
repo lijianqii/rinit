@@ -158,11 +158,6 @@ pub fn parse(name: &UnitName, input: &str) -> Result<UnitConfig, ParseError> {
 }
 
 /// Parse text for a unit identified by name.
-pub fn parse_named(name: &str, input: &str) -> Result<UnitConfig, crate::CoreError> {
-    let unit = UnitName::parse(name)?;
-    Ok(parse(&unit, input)?)
-}
-
 /// A section of the file being parsed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Section {
@@ -1311,6 +1306,82 @@ mod tests {
             ),
             ParseError::InvalidValue { line: 2, .. }
         ));
+    }
+
+    /// Every `ParseError` has a message an operator will read, and the `Display`
+    /// arms were the largest uncovered block in the parser: a message only some
+    /// errors ever reach is a message nobody has seen.
+    #[test]
+    fn every_parse_error_says_something_specific() {
+        use super::ParseError;
+        let cases: Vec<(ParseError, &str)> = vec![
+            (
+                ParseError::Syntax {
+                    line: 3,
+                    message: "expected '='".into(),
+                },
+                "line 3: expected '='",
+            ),
+            (
+                ParseError::UnknownSection {
+                    line: 1,
+                    section: "Widget".into(),
+                },
+                "line 1: unknown section [Widget]",
+            ),
+            (
+                ParseError::UnknownKey {
+                    line: 2,
+                    section: "Service".into(),
+                    key: "ExecStar".into(),
+                },
+                "line 2: unknown key 'ExecStar' in [Service]",
+            ),
+            (
+                ParseError::DuplicateKey {
+                    line: 4,
+                    key: "User".into(),
+                },
+                "line 4: duplicate key 'User'",
+            ),
+            (
+                ParseError::EntryOutsideSection {
+                    line: 1,
+                    key: "ExecStart".into(),
+                },
+                "line 1: 'ExecStart' appears before any section header",
+            ),
+            (
+                ParseError::InvalidValue {
+                    line: 5,
+                    key: "Type".into(),
+                    value: "widget".into(),
+                    reason: "expected 'simple'".into(),
+                },
+                "line 5: invalid value for 'Type': \"widget\" (expected 'simple')",
+            ),
+            (
+                ParseError::UnterminatedQuote { line: 6 },
+                "line 6: unterminated quoted string",
+            ),
+            (
+                ParseError::MissingExecStart {
+                    unit: "app.service".into(),
+                },
+                "app.service: a service must define ExecStart=",
+            ),
+            (
+                ParseError::TypeSuffixConflict {
+                    unit: "x.target".into(),
+                    declared: "service".into(),
+                    implied: "target".into(),
+                },
+                "x.target: [Unit] Type=service contradicts the file suffix (target)",
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(error.to_string(), expected, "for {error:?}");
+        }
     }
 
     /// Plan §7.9: the socket-activation pair, and the rules they share with the
