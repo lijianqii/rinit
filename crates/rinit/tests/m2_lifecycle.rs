@@ -2432,3 +2432,55 @@ fn dev_mode_ignores_the_fstab() {
         "and the reason must be in the log, not just the absence of a line:\n{log}"
     );
 }
+
+// --- console rate limiting --------------------------------------
+
+/// A service that crash-loops writes as fast as the supervisor can restart it,
+/// and rinit's own console is the one log sink with no bound of its own (the
+/// ring is per unit and byte-capped, the file mirror truncates). The limiter
+/// folds a call site's flood and says so.
+///
+/// The 72-hour soak is where this came from: the churn unit is deliberately
+/// unthrottled, and its console reached 955 MB in five hours, which filled the
+/// tmpfs the run was using.
+#[test]
+fn a_crash_loop_cannot_flood_the_console() {
+    let dir = TempDir::new("ratelimit");
+    dir.write(
+        "all.target",
+        "[Unit]\nType=target\nRequires=churn.service\n",
+    );
+    dir.write(
+        "churn.service",
+        "[Service]\nType=simple\nExecStart=/bin/true\nRestart=always\nRestartSec=0\n\
+         StartLimitBurst=1000000\nStartLimitIntervalSec=0\n",
+    );
+
+    let log = boot_units_inspect(
+        &dir,
+        "all.target",
+        Duration::from_secs(3),
+        libc::SIGTERM,
+        &[],
+        || (),
+    )
+    .0;
+
+    assert!(
+        log.contains("will restart in"),
+        "the loop has to have been churning, or this test proves nothing:\n{log}"
+    );
+    assert!(
+        log.contains("message(s) suppressed"),
+        "a flood must be folded and reported, not silently dropped:\n{log}"
+    );
+
+    // The budget is 40 messages per call site per 5 s, and a restart prints
+    // through three call sites - so a 3 s window is tens of lines, plus a notice
+    // per window. A limiter that did nothing would put thousands here.
+    let lines = log.lines().count();
+    assert!(
+        lines < 600,
+        "a crash loop must not write thousands of lines in 3 s, got {lines}:\n{log}"
+    );
+}

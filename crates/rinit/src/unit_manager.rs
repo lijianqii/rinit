@@ -2114,13 +2114,13 @@ mod tests {
         let unit = UnitName::parse("app.service").unwrap();
         let mut cfg = config("app.service", RestartPolicy::No);
         let pid_file = fake.root.join("app.pid");
-        // A child that has already been waited for: its pid is free again, and
-        // the chance of reuse inside one test is not one worth hedging.
-        let mut exited = std::process::Command::new("/bin/true")
-            .spawn()
-            .expect("run /bin/true");
-        let dead = exited.id() as libc::pid_t;
-        exited.wait().expect("reap it");
+        // A pid that can never exist, rather than one that has just exited: the
+        // kernel's pid space is bounded by `/proc/sys/kernel/pid_max`, which is
+        // itself capped at 4194304 (`PID_MAX_LIMIT`), so this is ESRCH for the
+        // `kill(pid, 0)` probe every time. Reaping a child and reusing its pid
+        // looked deterministic and was not - another test in the same binary
+        // spawns processes, and one of them took the freed number.
+        let dead: libc::pid_t = i32::MAX - 1;
         std::fs::write(&pid_file, format!("{dead}\n")).expect("pid file");
         cfg.pid_file = Some(pid_file.display().to_string());
 

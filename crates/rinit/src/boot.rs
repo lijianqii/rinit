@@ -21,6 +21,7 @@ use rinit_runtime::{RuntimeError, Signal, SignalSet};
 use crate::activation::Activated;
 use crate::args::Config;
 use crate::control::ControlServer;
+use crate::log::flush_suppressed;
 use crate::log::rlog;
 use crate::logs::ServiceLogs;
 use crate::manager;
@@ -158,6 +159,10 @@ pub async fn run(cfg: Config) -> Result<(), RuntimeError> {
         // hung loop never gets here, and that is the mechanism.
         watchdog.disarm();
         control.disarm();
+        // Whatever the console limiter folded and has not reported yet: a flood
+        // that stopped leaves its count in the table, and the log would otherwise
+        // end mid-sentence (see `log.rs`).
+        flush_suppressed();
         // A dev-mode boot (`--dev`) is a host smoke test, not PID 1: returning
         // lets the test process exit instead of spinning in `reboot_now`,
         // where `reboot(2)` would fail without `CAP_SYS_BOOT`.

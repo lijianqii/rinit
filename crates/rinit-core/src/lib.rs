@@ -41,6 +41,7 @@ extern crate std;
 pub mod control;
 pub mod error;
 pub mod logger;
+pub mod ratelimit;
 pub mod unit;
 pub mod users;
 
@@ -51,6 +52,7 @@ pub use control::{
 };
 pub use error::CoreError;
 pub use logger::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINE_BYTES, LogBuffer, LogLine};
+pub use ratelimit::{Decision, Key, Limiter};
 pub use unit::state::{Effect, Event, ExitOutcome, TransitionError, transition};
 pub use unit::{
     DependencyError, DependencyGraph, ExecCommand, FailedReason, Job, JobQueue, JobTarget,
