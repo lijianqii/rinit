@@ -384,19 +384,20 @@ and a kernel built with its driver are part of the test rig rather than an
 optional extra: without them the guest could only ever exercise the
 "no watchdog hardware" path.
 
-`cargo llvm-cov --offline --workspace --summary-only`, measured at the §7.9
-commit - before `rinit-testservice` was deleted and before §1.3(9) and §4.3 added
-their tests, so re-run the command below rather than quoting these numbers as the
-current tree's. The plan's checklist asks for ≥80% overall and ≥90% in the core, so these
-are the numbers that answer it rather than a shape:
+`make coverage-check` is where these come from - `cargo llvm-cov --offline
+--workspace --summary-only` with plan §6's thresholds applied to the result - so
+they are measured on the tree as it stands rather than copied from one run:
 
 | crate            | line coverage | functions |
 | ---------------- | ------------- | --------- |
-| `rinit-core`     | **96.79%**    | 554/566   |
-| `rinit-runtime`  | 85.36%        | 254/291   |
-| `rinit`          | 91.74%        | 578/624   |
-| `rctl`           | 96.08%        | 27/32     |
-| **total**        | **92.45%**    | 1413/1513 |
+| `rinit-core`     | **97.74%**    | 571/582   |
+| `rinit-runtime`  | 84.93%        | 290/335   |
+| `rinit`          | 91.05%        | 602/646   |
+| `rctl`           | 96.67%        | 27/32     |
+| **total**        | **92.31%**    | 2980/3190 |
+
+The plan's checklist asks for ≥80% overall and ≥90% in the core, so these are the
+numbers that answer it rather than a shape:
 
 The low outliers are the ones that *cannot* run on a host, which is why the guest
 tests exist rather than an omission: `syscall/reboot.rs` (0% - it would reboot the
@@ -507,9 +508,9 @@ repository or a measurement in this README:
 | crash-restart, breaker, health checks | `make test-system` ("a crashed service is scheduled for restart", "the breaker tripped on the failing unit") and `crates/rinit/tests/m2_lifecycle.rs` |
 | `rctl` can start, stop, query and read logs | `make test-system`'s M3 block and `crates/rctl/tests/control.rs` |
 | graceful shutdown, no zombies, no fd leak | `make soak` samples descriptors, threads and zombie children through restart churn, and asserts each comes back to its baseline |
-| 72 h soak with stable RSS | **not run here.** `make soak` is the harness and `make soak SOAK_ARGS='--seconds 259200'` is the run; what has been run is a five-minute one - 149778 restart cycles, RSS 4668 kB → 4672 kB (+4 kB) across the second half, descriptors 21 → 23, zero zombie children. The descriptor figures in that row are the peaks the old check compared; it now compares the *lowest* count in each half, which is what "come back to the baseline" always meant - a peak is a coin flip once a run is long enough: the 8.9-hour segment run before this change read peaks 25 → 24 but lows 14 → 14 across 18.5 million restarts |
+| 72 h soak with stable RSS | **running now.** Restarted on a clean machine at 2026-10-18 00:07:38 (`make soak SOAK_ARGS='--seconds 259200'`), so the window ends 2026-10-21 00:07 and the numbers land in this row then. The evidence so far is an **8.92-hour segment** (535 samples, 18 519 600 restarts): RSS 5116 → 5116 kB peak per half, descriptors 14 → 14 at their lowest, zero zombies - measured while this pass was being written, so not a quiet machine's. Two things changed in that pass because of it: the descriptor check compares the *lowest* count in each half rather than the peak (a peak is a coin flip once a run is long enough - that segment's peaks read 25 → 24 while its lows were 14 → 14), and rinit now rate limits its own console, which is the sink that filled the disk the first run died on |
 | binaries ≤2 MB dynamic / ≤4 MB static | [Measurements](#measurements-plan-01-calibration-point): 1.57 MiB static aarch64, checked by `make size-check` |
-| unit test coverage ≥80% overall, ≥90% in the core | **92.45%** and **96.79%** (llvm-cov, [above](#testing)) |
+| unit test coverage ≥80% overall, ≥90% in the core | **92.31%** and **97.74%** (`make coverage-check`, [above](#testing)) |
 | documentation: architecture, unit format, `rctl`, porting | this README (architecture, status, measurements), [`docs/units.md`](docs/units.md) (every directive, its value syntax and its default), [`docs/porting.md`](docs/porting.md) (kernel, userspace, build, differences from systemd), and `rinit-开发计划.md` |
 
 One number the checklist does not ask for, but plan §0.1's design goals do: rinit's
