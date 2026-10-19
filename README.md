@@ -899,8 +899,13 @@ command through the same spawn path a unit uses.
 
 The packed images (`build/out/initramfs-aarch64-unknown-linux-gnu.cpio.gz` and
 `…-demo.cpio.gz`: static busybox + rinit + rctl + the unit directory) are
-2.30 MiB (2 414 274 B) and 2.31 MiB (2 422 337 B) gzipped. The difference is the
-fourteen files in `units/demo/`, which only the second one carries.
+2.30 MiB (2 414 295 B) and 2.31 MiB (2 421 618 B) gzipped. The difference is the
+fourteen files in `units/demo/`, which only the second one carries. The packing is
+reproducible - `scripts/mkinitramfs.sh` zeroes the mtimes and inode numbers the
+archive would otherwise record, so repacking the same binaries gives the same
+bytes, which is what makes the number checkable rather than merely re-measured. A
+*forced* rebuild of busybox (`make -B`) is the exception: busybox's own build is
+not byte-reproducible, so the image moves by a few bytes with it.
 
 Both binaries are inside the plan §0.1 budget: the target is ≤2 MB per
 executable, with static builds allowed up to 4 MB.
