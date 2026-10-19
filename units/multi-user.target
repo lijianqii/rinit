@@ -22,6 +22,12 @@
 # Neither alternative is expressed as a `Conflicts=`, because M1 parses
 # conflicts but does not stop units - that needs a live unit being stopped,
 # which is M2's job.
+#
+# This file and the two targets beside it are the whole of what `make run` packs:
+# `units/` is the boot set, and the §7.x acceptance units live in `units/demo/`,
+# which only `make test-system` packs. A `Wants=` naming one of those here would
+# be a boot that warns about a unit the run image does not carry, so the demo
+# units are started on demand by the console instead.
 [Unit]
 Description=Multi-user system
 Type=target
@@ -30,7 +36,3 @@ After=rinit-init.target
 Requires=rinit-init.target
 # Requires=shell.service
 Requires=getty.service
-
-# The M2 fault-injection service is `Wants=` (soft), not `Requires=`: it fails
-# on purpose, and a unit designed to fail must not be able to fail the boot.
-Wants=fault.service

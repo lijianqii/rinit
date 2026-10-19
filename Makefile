@@ -6,6 +6,7 @@
 #   make kernel      build the Linux kernel Image only
 #   make busybox     build busybox only
 #   make initramfs   build rinit and assemble the initramfs
+#   make initramfs-demo  the same image plus units/demo/ (what `make test-system` boots)
 #   make qemu        alias for `make run`
 #   make check       pre-commit gate: fmt + clippy + host tests (no cross toolchain)
 #   make test        check + the qemu system test
@@ -58,15 +59,18 @@ BUSYBOX_SRC      := $(SRC_DIR)/busybox-$(BUSYBOX_VERSION)
 KERNEL_IMAGE     := $(KERNEL_SRC)/arch/arm64/boot/Image
 BUSYBOX_BIN      := $(BUSYBOX_SRC)/busybox
 INITRAMFS        := $(OUT_DIR)/initramfs-$(TARGET).cpio.gz
+# The acceptance image: the same root plus units/demo/. `make run` boots the
+# image above, `make test-system` this one - see the packing rules below.
+INITRAMFS_DEMO   := $(OUT_DIR)/initramfs-$(TARGET)-demo.cpio.gz
 
 SCRIPTS          := scripts
 MAKE_KERNEL      := $(MAKE) -C $(KERNEL_SRC) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE)
 MAKE_BUSYBOX     := $(MAKE) -C $(BUSYBOX_SRC) ARCH=$(BUSYBOX_ARCH) CROSS_COMPILE=$(CROSS_COMPILE)
 
 .DEFAULT_GOAL    := run
-.PHONY: run kernel kernel-config-check busybox rinit initramfs qemu help clean \
-        distclean check test test-system soak parallel gates size-check \
-        coverage-check
+.PHONY: run kernel kernel-config-check busybox rinit initramfs initramfs-demo qemu \
+        help clean distclean check test test-system soak parallel gates \
+        size-check coverage-check
 
 help:
 	@sed -n '2,/^# ====/p' $(MAKEFILE_LIST) | sed '$$d' | sed 's/^# \{0,1\}//'
@@ -167,15 +171,27 @@ $(BUSYBOX_BIN): $(BUSYBOX_SRC)/.config
 
 # --- initramfs ------------------------------------------------------------
 initramfs: $(INITRAMFS)
+initramfs-demo: $(INITRAMFS_DEMO)
 
 # Repacked when rinit, busybox, a unit file, or the packing script itself
 # changes - the script decides what goes in the image, so editing it has to
-# invalidate the image just like editing a unit does.
-UNIT_FILES := $(wildcard units/*.service) $(wildcard units/*.target)
+# invalidate the image just like editing a unit does. The two unit lists are
+# separate because the images are: the run image does not contain `units/demo/`,
+# so a change there must not repack it.
+BOOT_UNIT_FILES := $(wildcard units/*.service) $(wildcard units/*.target)
+DEMO_UNIT_FILES := $(wildcard units/demo/*.service) $(wildcard units/demo/*.target)
 INITRAMFS_SCRIPTS := $(SCRIPTS)/build-initramfs.sh $(SCRIPTS)/mkinitramfs.sh
 
-$(INITRAMFS): $(RINIT_BIN) $(RCTL_BIN) $(BUSYBOX_BIN) $(UNIT_FILES) $(INITRAMFS_SCRIPTS)
+# Two images, one difference: `units/demo/` is the §7.x acceptance set, and it is
+# packed only into the one the system test boots. `make run` is the development
+# loop - boot, get a console, look at a service - and fourteen units that exist
+# to be started one at a time from the console are not part of that.
+$(INITRAMFS): $(RINIT_BIN) $(RCTL_BIN) $(BUSYBOX_BIN) $(BOOT_UNIT_FILES) $(INITRAMFS_SCRIPTS)
 	$(SCRIPTS)/build-initramfs.sh $(TARGET) --busybox-src $(BUSYBOX_SRC) --out $@
+
+$(INITRAMFS_DEMO): $(RINIT_BIN) $(RCTL_BIN) $(BUSYBOX_BIN) $(BOOT_UNIT_FILES) \
+                   $(DEMO_UNIT_FILES) $(INITRAMFS_SCRIPTS)
+	$(SCRIPTS)/build-initramfs.sh $(TARGET) --busybox-src $(BUSYBOX_SRC) --demo-units --out $@
 
 # The guest boots units/, so nothing is put on the kernel cmdline: any token
 # there would override the unit directory and the console shell would never
@@ -203,8 +219,10 @@ test: check
 
 # `test-system` boots the guest and asserts the acceptance list (M0-M5,
 # `scripts/system-test.sh`) on the serial console. Logs land in build/logs/.
-test-system: $(KERNEL_IMAGE) $(INITRAMFS)
-	$(SCRIPTS)/system-test.sh --kernel $(KERNEL_IMAGE) --initrd $(INITRAMFS)
+# It boots the acceptance image: the §7.x units it drives from the console are
+# in `units/demo/`, which `make run`'s image does not carry.
+test-system: $(KERNEL_IMAGE) $(INITRAMFS_DEMO)
+	$(SCRIPTS)/system-test.sh --kernel $(KERNEL_IMAGE) --initrd $(INITRAMFS_DEMO)
 
 # `soak` is the M4 long-run leak check: sustained restart churn plus a loop
 # driving the control socket, watching RSS, descriptors and zombies. The default

@@ -3,16 +3,21 @@
 #
 # Usage:
 #   scripts/build-initramfs.sh <target-triple> [--busybox-src DIR] [--out FILE]
+#                                                    [--demo-units]
 #
 # Options:
 #   --busybox-src DIR  install the given *built* busybox source tree
 #                      (runs `make CONFIG_PREFIX=<root> install`) so a full
 #                      applet set (sh/getty/login/mount/ps/...) is available.
 #   --out FILE         output path (default: build/out/initramfs-<triple>.cpio.gz)
+#   --demo-units       also pack units/demo/, the §7.x acceptance units. Without
+#                      it the image carries the boot set only, which is what
+#                      `make run` wants; `make test-system` passes it.
 #
 # Examples:
 #   scripts/build-initramfs.sh aarch64-unknown-linux-gnu --busybox-src build/src/busybox-1.36.1
 #   scripts/build-initramfs.sh x86_64-unknown-linux-musl         # rinit only
+#   scripts/build-initramfs.sh aarch64-unknown-linux-gnu --demo-units --out x-demo.cpio.gz
 #
 # The rinit binaries must be built first:
 #   cargo build --release --target <triple>
@@ -24,17 +29,19 @@ repo_root="$(cd "${here}/.." && pwd)"
 triple=""
 busybox_src=""
 output=""
+demo_units=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --busybox-src) busybox_src="${2:?}"; shift 2 ;;
         --out) output="${2:?}"; shift 2 ;;
-        -h | --help) sed -n '2,20p' "$0"; exit 0 ;;
+        --demo-units) demo_units=1; shift ;;
+        -h | --help) sed -n '2,23p' "$0"; exit 0 ;;
         -*) echo "unknown option: $1" >&2; exit 2 ;;
         *) triple="$1"; shift ;;
     esac
 done
 
-: "${triple:?usage: build-initramfs.sh <target-triple> [--busybox-src DIR] [--out FILE]}"
+: "${triple:?usage: build-initramfs.sh <target-triple> [--busybox-src DIR] [--out FILE] [--demo-units]}"
 [[ -n "${output}" ]] || output="${repo_root}/build/out/initramfs-${triple}.cpio.gz"
 
 bin_dir="${repo_root}/target/${triple}/release"
@@ -75,9 +82,34 @@ install -m 0755 "${bin_dir}/rctl" "${work}/bin/rctl"
 install -m 0644 "${repo_root}/fstab" "${work}/etc/fstab"
 
 # The unit directory, which is what the guest actually boots.
-for glob in "${repo_root}"/units/*.service "${repo_root}"/units/*.target; do
-    [[ -e "${glob}" ]] || continue
-    install -m 0644 "${glob}" "${work}/etc/rinit/units/"
+#
+# `units/` is the boot set - the console and the two targets - and is all the
+# image `make run` needs. The §7.x acceptance units live in `units/demo/` and go
+# in only when `--demo-units` is passed, which is what `make test-system` does:
+# each exists to be driven from the console one at a time, so a run image that
+# carried them would be packing fourteen units nothing boots.
+#
+# Both directories are flattened into one `/etc/rinit/units`, so a name that
+# appears in both would silently shadow - the second `install` wins and the image
+# boots a different file than the one the host tests read. That is a build error,
+# not a warning.
+unit_dirs=("${repo_root}/units")
+if [[ -n "${demo_units}" ]]; then
+    unit_dirs+=("${repo_root}/units/demo")
+fi
+declare -A unit_from=()
+for dir in "${unit_dirs[@]}"; do
+    for glob in "${dir}"/*.service "${dir}"/*.target; do
+        [[ -e "${glob}" ]] || continue
+        name="$(basename "${glob}")"
+        if [[ -n "${unit_from[${name}]:-}" ]]; then
+            echo "error: ${name} is in both ${unit_from[${name}]} and ${dir}," \
+                "and the image flattens them into one directory" >&2
+            exit 1
+        fi
+        unit_from["${name}"]="${dir}"
+        install -m 0644 "${glob}" "${work}/etc/rinit/units/"
+    done
 done
 
 # Optional busybox: install the full built tree (creates applet symlinks).

@@ -15,6 +15,11 @@
 #   5. asserts the M0-M5 acceptance list on that log;
 #   6. reports kernel panics / oopses as failures.
 #
+# It boots the *acceptance* image (`make initramfs-demo`), not the one `make run`
+# packs: the §7.x units it drives from the console live in `units/demo/`, which
+# the run image does not carry. Nothing in the boot closure references them, so
+# they arrive inactive and the console starts them one at a time.
+#
 # `--keep-log` keeps the log even when every assertion passes (it is always
 # kept on failure).
 #
@@ -45,7 +50,7 @@ service=""
 # Rinit's own default is what `make run` boots with.
 kernel_args="--watchdog-timeout 10"
 
-usage() { sed -n '2,22p' "$0"; }
+usage() { sed -n '2,27p' "$0"; }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -170,6 +175,17 @@ await_log() {
     await_log 10 'no process to restart' || true
     printf 'rctl stop logdemo.service\n' >&3
     await_log 10 'stopped logdemo.service' || true
+
+    # M2's fault injection is no longer part of the boot closure: `fault.service`
+    # lives in `units/demo/` and nothing references it, so the console starts it
+    # here. `/bin/false` with `Restart=always` and a burst of two is what trips
+    # the breaker, and the two static checks at the end of this script read those
+    # lines back out of the log. The `reset-failed` comes after the failures, so
+    # that "cleared the failed unit" is about a unit that has failed.
+    printf 'rctl start fault.service\n' >&3
+    await_log 10 'started fault.service as pid' || true
+    await_log 20 'fault.service will restart in' || true
+    await_log 20 'error: fault.service hit its start limit' || true
     printf 'rctl reset-failed fault.service\n' >&3
     await_log 10 'fault.service: cleared' || true
 
@@ -538,19 +554,16 @@ else
     fail "getty.service should have been started"
 fi
 
-# Both services in the closure must be started. Asserting the exact total would
-# break every time a unit is added, so check the units themselves and only that
-# the count is sane.
-if grep -qF "started fault.service as pid" "${log_file}" \
-    && grep -qF "started getty.service as pid" "${log_file}"; then
-    pass "getty and the fault-injection unit were started at boot"
+# The boot closure is the console and nothing else. `units/` is the boot set -
+# the two targets and getty - and the §7.x acceptance units live in `units/demo/`,
+# which this image carries but the boot target does not reference. The count is
+# exact on purpose: adding a unit to the closure is a design change, and this is
+# where it should be noticed rather than in a boot log nobody reads.
+boot_line="$(grep -oE 'boot complete: [0-9]+ unit\(s\) started' "${log_file}" | head -1)"
+if [[ "${boot_line}" == "boot complete: 1 unit(s) started" ]]; then
+    pass "the boot started exactly the console, nothing else"
 else
-    fail "boot should have started getty.service and fault.service"
-fi
-if grep -qE "boot complete: [1-9][0-9]* unit\(s\) started" "${log_file}"; then
-    pass "boot reported a positive number of started units"
-else
-    fail "boot should report the units it started"
+    fail "boot should have started exactly 1 unit (got: '${boot_line:-missing}')"
 fi
 
 # Logging in must work, and with an empty password field there is nothing to

@@ -6,6 +6,14 @@
 //! repository's `units/` through the same loader boot uses, so a typo in a
 //! shipped unit fails `make check` instead of an aarch64 boot.
 //!
+//! There are two directories and they mean different things. `units/` is the
+//! **boot set**: the console and the two targets, and the whole of what
+//! `make run` packs. `units/demo/` is the **acceptance set**: the §7.x units the
+//! guest system test starts from the console one at a time, packed only into the
+//! image `make test-system` boots. `scripts/build-initramfs.sh` flattens both
+//! into one `/etc/rinit/units`, so the tests read them as one directory too -
+//! which is also why a name in both is an error rather than a shadowing.
+//!
 //! The second half is narrower and on purpose: `priv.service` (the §7.4
 //! de-privileging acceptance unit) relies on the tokeniser keeping a
 //! double-quoted shell command in one piece, `$(...)`, `|` and `^` included.
@@ -18,10 +26,75 @@ use rinit_core::UnitName;
 use rinit_core::unit::cgroup::CgroupLimits;
 use rinit_core::unit::config::{RestartPolicy, ServiceKind, SizeBytes};
 use rinit_core::unit::parser::parse;
-use rinit_runtime::units::load_unit_files;
+use rinit_runtime::units::{UnitFile, load_unit_files};
 
 fn units_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../units")
+}
+
+fn demo_dir() -> PathBuf {
+    units_dir().join("demo")
+}
+
+/// Both directories, concatenated, as the image sees them.
+fn load_shipped() -> (Vec<UnitFile>, Vec<String>) {
+    let mut files = Vec::new();
+    let mut warnings = Vec::new();
+    for dir in [units_dir(), demo_dir()] {
+        let (mut found, mut warned) =
+            load_unit_files(&dir).unwrap_or_else(|e| panic!("load {}: {e}", dir.display()));
+        files.append(&mut found);
+        warnings.append(&mut warned);
+    }
+    (files, warnings)
+}
+
+/// `units/` is what `make run` packs: the console, its alternative, and the two
+/// targets. The §7.x acceptance units live in `units/demo/`, and this is what
+/// keeps the run image a run image - a demo unit moved back here would ship in
+/// every developer's boot with nothing that starts it.
+#[test]
+fn the_boot_set_is_the_console_and_its_targets() {
+    let (files, warnings) = load_unit_files(&units_dir()).expect("load the boot set");
+    assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+
+    let mut names: Vec<&str> = files.iter().map(|f| f.name.canonical()).collect();
+    names.sort();
+    assert_eq!(
+        names,
+        [
+            "getty.service",
+            "multi-user.target",
+            "rinit-init.target",
+            "shell.service"
+        ],
+        "units/ is the boot set; the acceptance units belong in units/demo/"
+    );
+}
+
+/// The packing script flattens both directories into one `/etc/rinit/units` and
+/// refuses a duplicate name; this refuses it at `make check` time, where the
+/// failure is cheaper to read than a build error minutes into `make run`.
+#[test]
+fn no_unit_name_is_in_both_directories() {
+    let (boot, _) = load_unit_files(&units_dir()).expect("load units/");
+    let (demo, warnings) = load_unit_files(&demo_dir()).expect("load units/demo/");
+    assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    assert!(
+        demo.len() >= 5,
+        "units/demo/ should hold the acceptance units, found {}",
+        demo.len()
+    );
+
+    for shipped in &boot {
+        assert!(
+            !demo
+                .iter()
+                .any(|d| d.name.canonical() == shipped.name.canonical()),
+            "{} is in both units/ and units/demo/",
+            shipped.name.canonical()
+        );
+    }
 }
 
 /// The template unit (plan §7.7): the guest asserts that starting
@@ -30,7 +103,7 @@ fn units_dir() -> PathBuf {
 /// way, and that the expansion is what parses.
 #[test]
 fn the_template_unit_expands_into_what_the_guest_checks() {
-    let (files, _) = load_unit_files(&units_dir()).expect("load units/");
+    let (files, _) = load_shipped();
     let file = files
         .iter()
         .find(|f| f.name.canonical() == "worker@.service")
@@ -59,7 +132,7 @@ fn the_template_unit_expands_into_what_the_guest_checks() {
 
 #[test]
 fn every_shipped_unit_parses() {
-    let (files, warnings) = load_unit_files(&units_dir()).expect("load units/");
+    let (files, warnings) = load_shipped();
     assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
     assert!(files.len() >= 5, "expected the shipped units to be there");
 
@@ -75,7 +148,7 @@ fn every_shipped_unit_parses() {
 /// otherwise still let the unit start, just as root.
 #[test]
 fn the_priv_drop_unit_asks_for_everything_the_guest_checks() {
-    let (files, _) = load_unit_files(&units_dir()).expect("load units/");
+    let (files, _) = load_shipped();
     let file = files
         .iter()
         .find(|f| f.name.canonical() == "priv.service")
@@ -102,7 +175,7 @@ fn the_priv_drop_unit_asks_for_everything_the_guest_checks() {
 /// turn the assertion below into a service running as root with everything.
 #[test]
 fn the_capability_units_ask_for_what_the_guest_checks() {
-    let (files, _) = load_unit_files(&units_dir()).expect("load units/");
+    let (files, _) = load_shipped();
     let body = |name: &str| {
         let file = files
             .iter()
@@ -146,7 +219,7 @@ fn the_capability_units_ask_for_what_the_guest_checks() {
 /// still start - and would report the wrong process's cgroup.
 #[test]
 fn the_cgroup_units_ask_for_what_the_guest_checks() {
-    let (files, _) = load_unit_files(&units_dir()).expect("load units/");
+    let (files, _) = load_shipped();
     let body = |name: &str| {
         let file = files
             .iter()

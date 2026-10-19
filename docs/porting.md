@@ -107,7 +107,8 @@ or the machine's own cgroup hierarchy. On a real device it should not appear.
 
 The boot target's *closure* is what starts. A unit that nothing references is
 loaded and listed by `rctl` but never started - that is where the demo units in
-`units/` sit, and `rctl start <unit>` is how they come up.
+`units/demo/` sit, and `rctl start <unit>` is how they come up. (`units/` itself
+is the boot set: the two targets, `getty.service` and `shell.service`.)
 
 ## 5. Differences from systemd to expect
 

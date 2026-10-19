@@ -13,7 +13,7 @@ answers plan §6's checklist line by line, with one exception - the 72 h soak, w
 is a deployment-time run of `make soak` rather than a feature.
 
 What is in place, and what it is proven by. Every claim below is either a host
-test (`make check`) or a guest assertion (`make test-system`, 93 of them in
+test (`make check`) or a guest assertion (`make test-system`, 92 of them in
 `scripts/system-test.sh`); "proven on the host" always means the fake-runtime or
 `--dev` form of the same code path, and the guest means the real one.
 
@@ -27,12 +27,13 @@ test (`make check`) or a guest assertion (`make test-system`, 93 of them in
 | M5 (in progress) | **§7.3–§7.11 done.** cgroup v2: `CgroupCPUMax=`, `CgroupMemoryMax=`, `CgroupMemoryHigh=`, `CgroupTasksMax=` under `rinit/<unit>`, the process placing itself, stop-flow signalling of the cgroup's members, `rmdir` cleanup, and OOM-kill detection into the restart policy. Sandboxing: `User=`, `Group=`, `NoNewPrivileges=`, `CapabilityBoundingSet=`, `AmbientCapabilities=`. Hardware watchdog: `/dev/watchdog` armed at boot, fed from the supervisor loop's health checkpoint, magic-closed on shutdown. Reload: `rctl reload` re-reads the unit directory, adds, changes, defers and removes, and refuses a directory that does not resolve. Legacy daemons: `Type=forking` with `PIDFile=`, located through the file or the unit's own cgroup. Terminals: `TTYPath=`/`TTYReset=` give a service a controlling terminal (plan §7.11). Templates: `worker@.service` with `%i`/`%n`/`%p` expanded at instantiation (plan §7.7). Sockets as dependencies: `Sockets=`/`NeedsSocket=`, resolved to a hard edge and a wait for the path (plan §7.8). Socket activation: `SocketActivate=`/`IdleTimeoutSec=`, rinit binding the socket and the connection starting the service (plan §7.9). With that, **every item of the plan's extension list (§7.1–§7.11) is implemented** | guest: "a limited unit was placed in its own cgroup", "the memory hard and soft limits were written in bytes", "a stopped unit's cgroup was removed", "the kernel OOM-killed a process inside the unit's cgroup", "rinit armed the guest's watchdog device", "the driver took the timeout rinit set", "the guest outlived the watchdog timeout with the device armed", "an added unit the boot target does not need was not started", "a changed unit that is running kept it for the next start", "a directory that does not resolve was refused whole", "the unit is active with the daemon the PIDFile named", "stopping a forking unit stopped the daemon it took over", "a TTYPath that is not a terminal fails the start", "a template is not a unit to start", "every specifier was expanded before the command ran", "a socket consumer waited for the path before starting", "a socket that never appears fails the start, naming it", "rinit bound the socket before any unit started", "starting it hands the service the listening socket", "a de-privileged service ran as nobody:nogroup with NoNewPrivs", "an empty CapabilityBoundingSet left a root service with no capabilities", "ambient capabilities reached a de-privileged service"; host: `crates/rinit/src/cgroup.rs` (19 tests), `crates/rinit-core/src/unit/cgroup.rs` (9), `crates/rinit-runtime/src/syscall/cgroup.rs` (14), `crates/rinit/src/watchdog.rs` (6), `crates/rinit-runtime/src/syscall/watchdog.rs` (6), `crates/rinit/src/unit_manager.rs` (5 for the reload itself, `reload.rs` is policy over them), `crates/rinit/tests/m2_lifecycle.rs` (11, end to end), `crates/rinit/src/sandbox.rs` (14), `crates/rinit-core/src/unit/sandbox.rs` (9), `crates/rinit-runtime/src/syscall/cred.rs` (14) |
 
 A real boot of the committed tree on the serial console (`…` elides kernel
-noise; the lines below are the ones `make test-system` asserts on). The last
-three lines are M2 working: `fault.service` exists to fail, is restarted, and
-then stops being restarted when the breaker trips:
+noise; the lines below are the ones `make test-system` asserts on, except that the
+system test boots the acceptance image and so counts the `units/demo/` units in
+its plan line too). This is `make run`, and the boot target's closure is the
+console and nothing else:
 
 ```
-[    4.481903] Run /sbin/rinit as init process
+[    2.344175] Run /sbin/rinit as init process
 rinit: rinit 0.1.0 starting (pid 1)
 rinit: mounted /run
 rinit: mounted /proc
@@ -43,46 +44,43 @@ rinit: mounted /sys/fs/cgroup
 rinit: mounted /data (fstab)
 rinit: cgroup v2 ready at /sys/fs/cgroup
 rinit: logging to /var/log/rinit/log
-rinit: boot plan for 'multi-user.target': 17 unit(s) in 3 level(s)
+rinit: boot plan for 'multi-user.target': 4 unit(s) in 3 level(s)
 rinit: plan 0: rinit-init.target (target)
-rinit: plan 1: fault.service (service)
 rinit: plan 1: getty.service (service)
 rinit: plan 2: multi-user.target (target)
-rinit: api.service: listening on /run/api.sock
 rinit: starting level 0: 0 service(s)
 rinit: level 0 reached: rinit-init.target active
-rinit: starting level 1: 2 service(s)
-rinit: started fault.service as pid 48
-rinit: started getty.service as pid 49
+rinit: starting level 1: 1 service(s)
+rinit: started getty.service as pid 48
 rinit: starting level 2: 0 service(s)
 rinit: level 2 reached: multi-user.target active
-rinit: boot complete: 2 unit(s) started from 'multi-user.target' (2 still running)
-rinit: boot timing: first service at 4840ms of kernel uptime (rinit's own boot: 484ms)
-rinit: watchdog /dev/watchdog armed: 10s timeout, feeding every 5s
-rinit: reaped pid 48
-rinit: fault.service will restart in 1.195s
+rinit: boot complete: 1 unit(s) started from 'multi-user.target' (1 still running)
+rinit: boot timing: first service at 2590ms of kernel uptime (rinit's own boot: 239ms)
+rinit: watchdog /dev/watchdog armed: 30s timeout, feeding every 15s
 
-(none) login: rinit: started fault.service as pid 50
-rinit: reaped pid 50
-rinit: error: fault.service hit its start limit (2 failures); not restarting
+(none) login:
 ```
 Two lines in that boot are measurements rather than steps. `mounted /data (fstab)`
 is plan §1.3(9)'s second wave - an `/etc/fstab` entry, mounted after the first
-wave - and `boot timing: first service at 4840ms of kernel uptime (rinit's own
-boot: 484ms)` is plan §4.3's number, on the kernel's own clock so it covers the
+wave - and `boot timing: first service at 2590ms of kernel uptime (rinit's own
+boot: 239ms)` is plan §4.3's number, on the kernel's own clock so it covers the
 kernel's boot as well. Both figures come from a run whose *host* was also running
-the 72 h soak, and they move from boot to boot (a later one under the same load
-read 5020 ms and 572 ms); the guest asserts the measurement is the kernel's clock,
+the 72 h soak, and they move from boot to boot (an earlier one under the same load
+read 4840 ms and 484 ms); the guest asserts the measurement is the kernel's clock,
 not that it hit a number.
 
-Note that the plan resolves **17 units** and starts **2**: everything in `units/`
-is parsed and ordered, and only the boot target's closure is started. The demo
-units (`priv`, `caps`, `ambient`, `logdemo`, `cglimit`, `cgrun`, `oom`, `forking`,
-`tty`, `sockd`, `sockc`, `api`) and the one template (`worker@`) are outside it on
-purpose and are driven by `rctl` in the system test. The watchdog's
-`10s` is `make test-system`'s own shortening of the 30 s default (see the CLI
-section above); the arm line itself is what the committed binary prints, and
-`make run` shows `30s ... every 15s` for the same boot.
+Note that the plan resolves **4 units** and starts **1**: `units/` is the boot set
+- the two targets, the console and its alternative - and only the boot target's
+closure is started. `shell.service` is parsed and ordered but not activated,
+because it would fight `getty.service` for `ttyAMA0`. The §7.x acceptance units
+live in `units/demo/`, which `make test-system` packs and `make run` does not:
+`priv`/`caps`/`ambient` (§7.4), `cglimit`/`cgrun`/`oom` (§7.3), `forking` (§7.10),
+`logdemo`, `tty`, `sockd`, `sockc`, `api` and the `worker@` template are outside
+the closure on purpose and are started from the console with `rctl`. M2's
+`fault.service` is one of them, so the breaker it demonstrates appears in the
+system test's log rather than in this one. The watchdog's `30s` is what `make run`
+boots with; `make test-system` shortens it to `10s` (see the CLI section above) so
+that the guest can outlive it and prove the device is being fed.
 
 The two halves of §7.3, from the same console. First the limits as the *service*
 reads them back - its own `/proc/<pid>/cgroup`, its own attribute files - and
@@ -129,7 +127,8 @@ here) rather than appearing literally in the input - an assertion that its own
 echo satisfies proves nothing.
 
 §7.6's reload, which is the one feature whose evidence *has* to come from the
-guest: the initramfs unpacks `units/` into a ramfs, so the console can add,
+guest: the initramfs unpacks the unit directory into a ramfs (the boot set, plus
+`units/demo/` in the acceptance image), so the console can add,
 change and remove unit files under a running rinit. The four reloads below are
 "nothing changed", "one added", "one stopped unit changed and one running unit
 changed", and "one removed":
@@ -277,7 +276,10 @@ crates/
     src/notify.rs, readiness.rs, deadline.rs, args.rs, manager.rs
     tests/m2_lifecycle.rs, tests/smoke.rs
   rctl/               # control CLI (main.rs, parse.rs, client.rs) + tests
-units/                # unit files; getty.service is `make run`'s console login
+units/                # the boot set: the two targets, getty.service (the console
+                      # login `make run` boots) and shell.service, its alternative
+units/demo/           # the §7.x acceptance units; packed only into the image
+                      # `make test-system` boots, and started from the console
 scripts/              # fetch/kernel/busybox/initramfs/qemu/system-test/soak
 ```
 
@@ -306,11 +308,11 @@ make test           # check + test-system
 make gates          # acceptance gates: binary size + coverage thresholds
 ```
 
-`cargo test --offline --workspace` (what `make check` runs last) executes **714
+`cargo test --offline --workspace` (what `make check` runs last) executes **717
 tests** across twelve test binaries. The five shapes, and why each is not
 redundant:
 
-- **unit tests** next to the code (core 324, rinit 189, rinit-runtime 107,
+- **unit tests** next to the code (core 324, rinit 189, rinit-runtime 108,
   rctl 11), including `proptest` properties over the parser;
 - **integration tests** in `crates/*/tests/`: the syscall layer against the real
   kernel (`rinit-runtime` 22: run unprivileged, they assert that each drop is
@@ -320,9 +322,10 @@ redundant:
   lifecycle end to end in `--dev` mode (`rinit/tests/m2_lifecycle.rs` 43), the
   control CLI (`rctl/tests/control.rs` 9), the smoke test that runs the real
   binary (`rinit/tests/smoke.rs` 2), the allocation guard
-  (`rinit-core/tests/allocations.rs` 2), and `shipped_units.rs` 5 - every unit in
-  `units/` parses through the loader, so a unit that would fail at boot fails
-  here first;
+  (`rinit-core/tests/allocations.rs` 2), and `shipped_units.rs` 7 - every unit in
+  `units/` and `units/demo/` parses through the loader, so a unit that would fail
+  at boot fails here first, and the two directories are checked not to shadow each
+  other's names when the packing script flattens them;
 - **the soak harness** (`scripts/soak.sh`, plan §3 M4/§4.4): runs rinit under
   churn, samples RSS/descriptors/threads/zombies, drives the control socket in a
   loop, and fails if the steady state is not flat or if `SIGTERM` does not exit 0.
@@ -346,7 +349,7 @@ redundant:
   tested;
 - **the guest system test** (`scripts/system-test.sh`, plan §4.3): boots the real
   initramfs on aarch64 qemu, types at the console to prove a root shell is
-  reachable, drives `rctl` against the running system, and asserts 93 things -
+  reachable, drives `rctl` against the running system, and asserts 92 things -
   including that levels run in dependency order, that no target is ever exec'd,
   the §7.4 privilege-drop outcomes, the §7.3 limits read back out of the guest's
   own kernel, rinit's own RSS at boot and under 20 services read out of
@@ -503,7 +506,7 @@ repository or a measurement in this README:
 
 | plan §6 | where it stands |
 | ------- | --------------- |
-| boots as PID 1 in qemu (128M) with no kernel panic | `make test-system`: 93 assertions, including "no rinit panic" and four kernel-log checks |
+| boots as PID 1 in qemu (128M) with no kernel panic | `make test-system`: 92 assertions, including "no rinit panic" and four kernel-log checks |
 | 20 services in parallel, visibly faster than serial | **19.2x**: `make parallel` - 20 `oneshot` services that each sleep 1 s finish in 1065 ms together and 20 424 ms chained |
 | crash-restart, breaker, health checks | `make test-system` ("a crashed service is scheduled for restart", "the breaker tripped on the failing unit") and `crates/rinit/tests/m2_lifecycle.rs` |
 | `rctl` can start, stop, query and read logs | `make test-system`'s M3 block and `crates/rctl/tests/control.rs` |
@@ -539,7 +542,9 @@ What it does, in order (see [Makefile](Makefile)):
    `mirrors.tuna.tsinghua.edu.cn/kernel/v6.x/` and build `arch/arm64/boot/Image`.
 3. Fetch `busybox-1.36.1.tar.bz2` and build a **static** busybox with the
    applets the initramfs needs.
-4. Assemble `build/out/initramfs-<target>.cpio.gz` (busybox + rinit + units).
+4. Assemble `build/out/initramfs-<target>.cpio.gz` (busybox + rinit + rctl +
+   `units/`). The acceptance image `build/out/initramfs-<target>-demo.cpio.gz` is
+   the same root plus `units/demo/`, and is what `make test-system` boots.
 5. Boot it in `qemu-system-aarch64 -machine virt -cpu cortex-a57 -m 128M` with
    `-device i6300esb`, the watchdog rinit arms (plan §7.5).
 
@@ -556,6 +561,7 @@ make run            # build if needed, boot → interactive root shell
 make kernel         # kernel only
 make busybox        # busybox only
 make initramfs      # rinit + initramfs only
+make initramfs-demo # the same, plus units/demo/ (what the system test boots)
 make qemu           # alias for `make run`
 make check          # fmt + clippy + host tests (no cross toolchain)
 make soak           # churn + memory/fd/zombie regression check (host, --dev)
@@ -564,9 +570,11 @@ make MIRROR=https://... run   # different source mirror
 make KERNEL_VERSION=6.6.158 BUSYBOX_VERSION=1.36.1 ...   # pin versions
 ```
 
-The image is rebuilt whenever `rinit`, `busybox`, a file in `units/`, or one of
-the packing scripts changes — editing `units/getty.service` repacks the
-initramfs, because the unit directory is what the guest boots.
+The run image is rebuilt whenever `rinit`, `rctl`, `busybox`, a file in `units/`,
+or one of the packing scripts changes — editing `units/getty.service` repacks it,
+because the unit directory is what the guest boots. The acceptance image also
+depends on `units/demo/`, and only on it in addition: editing a demo unit repacks
+that image and leaves the run image alone.
 
 ### Getting a shell in the guest
 
@@ -602,8 +610,8 @@ it just boots. In particular:
 - `busybox-1.36.1/busybox` present → busybox is not rebuilt;
 - `target/.../release/rinit` newer than the sources → `cargo build` is not
   re-run;
-- the initramfs is repacked when rinit, busybox, a file in `units/`, or one of
-  the packing scripts changes.
+- the initramfs is repacked when rinit, busybox, a file in `units/` (or, for the
+  acceptance image, `units/demo/`), or one of the packing scripts changes.
 
 Because that already holds, there is no `SKIP_BUILD` knob to forget to pass.
 
@@ -889,9 +897,10 @@ was not shipped, so the §7.9 audit deleted it rather than keep a megabyte of de
 binary in every build. A repeat of that step is `--test-service` now, which runs a
 command through the same spawn path a unit uses.
 
-The packed image the guest boots
-(`build/out/initramfs-aarch64-unknown-linux-gnu.cpio.gz`: static busybox +
-rinit + rctl + `units/`) is 2.31 MiB (2 422 236 B) gzipped.
+The packed images (`build/out/initramfs-aarch64-unknown-linux-gnu.cpio.gz` and
+`…-demo.cpio.gz`: static busybox + rinit + rctl + the unit directory) are
+2.30 MiB (2 414 274 B) and 2.31 MiB (2 422 337 B) gzipped. The difference is the
+fourteen files in `units/demo/`, which only the second one carries.
 
 Both binaries are inside the plan §0.1 budget: the target is ≤2 MB per
 executable, with static builds allowed up to 4 MB.
