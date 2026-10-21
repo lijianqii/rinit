@@ -34,17 +34,23 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # The runners start with an empty cargo registry, and everything below
+      # runs with --offline. Fetch the locked dependency set once, online, so
+      # the cache and the offline commands have something to resolve against.
+      - name: Fetch dependencies
+        run: cargo fetch --locked
+
       - name: Formatting
         run: cargo fmt --all --check
 
       - name: Clippy
-        run: cargo clippy --offline --all-targets -- -D warnings
+        run: cargo clippy --offline --locked --all-targets -- -D warnings
 
       - name: Tests
-        run: cargo test --offline --workspace -- --nocapture
+        run: cargo test --offline --locked --workspace -- --nocapture
 
       - name: Docs build
-        run: cargo doc --offline --workspace --no-deps
+        run: cargo doc --offline --locked --workspace --no-deps
 
   aarch64:
     name: cross-compile (aarch64, static)
@@ -66,8 +72,11 @@ jobs:
         with:
           key: aarch64
 
+      - name: Fetch dependencies
+        run: cargo fetch --locked
+
       - name: Build
-        run: cargo build --offline --release --target aarch64-unknown-linux-gnu
+        run: cargo build --offline --locked --release --target aarch64-unknown-linux-gnu
 
       - name: Verify the binaries are really static
         # Plan §5 risk 6b: a dynamic build against a mismatched sysroot is a
@@ -95,11 +104,15 @@ jobs:
           rustup target add aarch64-unknown-linux-gnu
           sudo apt-get update
           sudo apt-get install -y \
-            gcc-aarch64-linux-gnu qemu-system-arm bc flex bison libssl-dev
+            gcc-aarch64-linux-gnu qemu-system-arm bc flex bison libssl-dev \
+            libelf-dev
 
       - uses: Swatinem/rust-cache@v2
         with:
           key: aarch64
+
+      - name: Fetch dependencies
+        run: cargo fetch --locked
 
       - name: Kernel config cache
         uses: actions/cache@v4

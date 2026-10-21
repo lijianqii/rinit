@@ -486,11 +486,11 @@ cargo llvm-cov --offline --workspace --html                  # target/llvm-cov/h
   from the files and an instance is not one of them. Instances are started by name,
   which is also what creates them; systemd's `[Install]`/`WantedBy=` symlinks are
   what rinit has no equivalent of.
-- `signals.rs`'s pipe-full path (handler drops a byte) is not forced in a test, and
-  `signals::tests::successive_sets_do_not_leak_descriptors` can flake: it asserts
-  that eight closed descriptors are `EBADF`, and a test running beside it that
-  opens one can take a number back. Three consecutive `make check` runs of the
-  §7.9 commit were green; it is a rare race, not a leak.
+- `signals.rs`'s pipe-full path (the handler drops a byte rather than blocking)
+  is not forced in a test. The descriptor-leak tests do not depend on fd numbers
+  being recycled: they record the pipe's inode while the set is alive and check
+  that it is closed afterwards, so a test running beside them cannot make them
+  flaky.
 - **`miri`, `valgrind` and `cargo-fuzz` cannot run in this environment**, and what
   stands in for each is worth naming rather than implying nothing checks:
   `miri` needs a *nightly* toolchain (only stable is installed, `cargo miri` says

@@ -415,10 +415,9 @@ cargo llvm-cov --offline --workspace --html                  # target/llvm-cov/h
 - **单元文件不能指名模板实例**（计划 §7.7）：`Requires=worker@1.service` 在加载目录时
   会被拒绝，因为依赖图是由文件构建的，而实例不是文件之一。实例按名字启动，这同时也是
   创建它的方式；systemd 的 `[Install]`/`WantedBy=` 符号链接在 rinit 里没有对应物。
-- `signals.rs` 的管道写满路径（handler 丢弃一个字节）没有在测试中强制触发，且
-  `signals::tests::successive_sets_do_not_leak_descriptors` 可能偶发失败：它断言八个
-  已关闭的描述符都是 `EBADF`，而旁边运行的测试如果恰好打开一个，就可能把号拿回去。
-  §7.9 那次提交连续三次 `make check` 都是绿的；这是罕见竞态，不是泄漏。
+- `signals.rs` 的管道写满路径（handler 丢弃一个字节而不是阻塞）没有在测试中强制
+  触发。描述符泄漏测试不再依赖 fd 号是否被复用：它们在 SignalSet 存活时记录管道的
+  inode，结束后检查该 inode 已关闭，因此旁边运行的测试不会让它们偶发失败。
 - **`miri`、`valgrind` 和 `cargo-fuzz` 在本环境里跑不了**，各自用什么替代值得说明，
   而不是暗示没有任何检查：`miri` 需要 *nightly* 工具链（这里只装了 stable，
   `cargo miri` 自己会这么说，而且环境离线），所以它要在 `rinit-core` 里找的东西——
