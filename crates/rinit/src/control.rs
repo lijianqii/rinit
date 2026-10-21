@@ -46,6 +46,15 @@ pub use rinit_core::{CONTROL_DIR, ENV_CONTROL_DIR};
 /// How long a connection may take to send its request.
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long the main loop may take to answer a request.
+///
+/// `TimeoutStartSec` defaults to 30 s and `TimeoutStopSec` to 10 s, so a
+/// `start`, `stop` or `restart` can legitimately wait for a whole job. 60 s
+/// covers both with room to spare; past that the manager is not going to
+/// answer this request in any useful sense, and holding the connection open
+/// leaves the client blocked in `read` forever.
+const REPLY_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// A request from a client, with the channel to answer on.
 pub type Incoming = (Request, oneshot::Sender<(Status, String)>);
 
@@ -243,9 +252,28 @@ async fn serve(
     if sender.send((request, reply_tx)).is_err() {
         return write_response(&mut stream, Status::Error, "rinit is shutting down").await;
     }
-    match reply_rx.await {
-        Ok((status, text)) => write_response(&mut stream, status, &text).await,
-        Err(_) => write_response(&mut stream, Status::Error, "the request was dropped").await,
+    let (status, text) = await_reply(reply_rx, REPLY_TIMEOUT).await;
+    write_response(&mut stream, status, &text).await
+}
+
+/// Wait for the main loop to answer, but not forever.
+///
+/// A request the manager accepted and then never completed would otherwise
+/// pin this connection open for as long as the client is willing to wait,
+/// which for a plain `read` is forever. Timing out here is a reply: the
+/// client still gets a status and a sentence, instead of a hang it cannot
+/// distinguish from rinit being busy - or wedged.
+async fn await_reply(
+    reply_rx: oneshot::Receiver<(Status, String)>,
+    timeout: Duration,
+) -> (Status, String) {
+    match tokio::time::timeout(timeout, reply_rx).await {
+        Ok(Ok(reply)) => reply,
+        Ok(Err(_)) => (Status::Error, "the request was dropped".to_string()),
+        Err(_) => (
+            Status::Error,
+            "timed out waiting for the manager; the request may still be running".to_string(),
+        ),
     }
 }
 
@@ -340,5 +368,34 @@ mod tests {
     #[test]
     fn root_is_admitted_even_in_dev_mode() {
         assert!(peer_allowed(true, 0, 1000));
+    }
+
+    /// A job the manager never finishes still has to produce a reply; the
+    /// production timeout is 60 s, so the test gives the same code 10 ms.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_request_that_is_never_answered_times_out() {
+        let (_tx, rx) = oneshot::channel();
+        let (status, text) = await_reply(rx, Duration::from_millis(10)).await;
+        assert_eq!(status, Status::Error);
+        assert!(text.contains("timed out"), "{text}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_dropped_request_is_reported_as_dropped() {
+        let (tx, rx) = oneshot::channel();
+        drop(tx);
+        let (status, text) = await_reply(rx, Duration::from_secs(1)).await;
+        assert_eq!(status, Status::Error);
+        assert!(text.contains("dropped"), "{text}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_answer_within_the_timeout_is_passed_through() {
+        let (tx, rx) = oneshot::channel();
+        tx.send((Status::Ok, "fine".to_string()))
+            .expect("the receiver is alive");
+        let (status, text) = await_reply(rx, Duration::from_secs(1)).await;
+        assert_eq!(status, Status::Ok);
+        assert_eq!(text, "fine");
     }
 }
