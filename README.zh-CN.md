@@ -24,7 +24,7 @@ soak，它是部署期跑一次 `make soak`，而不是一个功能。
 | M2 | 进程监管（spawn、跟踪、回收、两阶段停止），带退避和熔断的重启策略，健康检查，`Type=notify` 就绪通知，内存日志环及其可选的落盘镜像（计划 §1.3(7)） | 客户机："a crashed service is scheduled for restart"、"the breaker tripped on the failing unit"；宿主：`crates/rinit/tests/m2_lifecycle.rs`（43 个测试） |
 | M3 | 控制 socket + `rctl`（`list`、`status`、`start`、`stop`、`restart`、`reset-failed`、`log`、`reload`），退出码契约有文档 | 客户机："rctl list reached the control socket" 及其后的五条断言；宿主：`crates/rctl/tests/control.rs`（9 个测试） |
 | M4 | 持续 churn 下的 soak harness（`make soak`），泄漏与描述符修复，`--dev` 模式下控制 socket 对端放宽 | `scripts/soak.sh`（见 [测试](#测试)）；`crates/rinit-core/tests/allocations.rs` |
-| M5（进行中） | **§7.3–§7.11 已完成。** cgroup v2：`CgroupCPUMax=`、`CgroupMemoryMax=`、`CgroupMemoryHigh=`、`CgroupTasksMax=`，写在 `rinit/<unit>` 下；进程自己把自己放进 cgroup；停止流程向 cgroup 成员发信号；`rmdir` 清理；OOM kill 检测接入重启策略。沙箱：`User=`、`Group=`、`NoNewPrivileges=`、`CapabilityBoundingSet=`、`AmbientCapabilities=`。硬件看门狗：启动时打开 `/dev/watchdog`，由监管循环的健康检查点喂狗，关闭时 magic close。重载：`rctl reload` 重新读取单元目录，增、改、延迟、删，并拒绝无法解析的目录。传统守护进程：`Type=forking` 配 `PIDFile=`，通过文件或单元自己的 cgroup 定位。终端：`TTYPath=`/`TTYReset=` 给服务一个控制终端（计划 §7.11）。模板：`worker@.service`，实例化时展开 `%i`/`%n`/`%p`（计划 §7.7）。socket 作为依赖：`Sockets=`/`NeedsSocket=`，解析成硬依赖并等待路径出现（计划 §7.8）。socket 激活：`SocketActivate=`/`IdleTimeoutSec=`，rinit 绑定 socket，连接到来时启动服务（计划 §7.9）。至此，**计划扩展清单（§7.1–§7.11）的每一项都已实现** | 客户机："a limited unit was placed in its own cgroup"、"the memory hard and soft limits were written in bytes"、"a stopped unit's cgroup was removed"、"the kernel OOM-killed a process inside the unit's cgroup"、"rinit armed the guest's watchdog device"、"the driver took the timeout rinit set"、"the guest outlived the watchdog timeout with the device armed"、"an added unit the boot target does not need was not started"、"a changed unit that is running kept it for the next start"、"a directory that does not resolve was refused whole"、"the unit is active with the daemon the PIDFile named"、"stopping a forking unit stopped the daemon it took over"、"a TTYPath that is not a terminal fails the start"、"a template is not a unit to start"、"every specifier was expanded before the command ran"、"a socket consumer waited for the path before starting"、"a socket that never appears fails the start, naming it"、"rinit bound the socket before any unit started"、"starting it hands the service the listening socket"、"a de-privileged service ran as nobody:nogroup with NoNewPrivs"、"an empty CapabilityBoundingSet left a root service with no capabilities"、"ambient capabilities reached a de-privileged service"；宿主：`crates/rinit/src/cgroup.rs`（19 个测试）、`crates/rinit-core/src/unit/cgroup.rs`（9 个）、`crates/rinit-runtime/src/syscall/cgroup.rs`（14 个）、`crates/rinit/src/watchdog.rs`（6 个）、`crates/rinit-runtime/src/syscall/watchdog.rs`（6 个）、`crates/rinit/src/unit_manager.rs`（reload 本身 5 个，`reload.rs` 是它们之上的策略）、`crates/rinit/tests/m2_lifecycle.rs`（11 个，端到端）、`crates/rinit/src/sandbox.rs`（14 个）、`crates/rinit-core/src/unit/sandbox.rs`（9 个）、`crates/rinit-runtime/src/syscall/cred.rs`（14 个） |
+| M5 | **§7.3–§7.11 已完成。** cgroup v2：`CgroupCPUMax=`、`CgroupMemoryMax=`、`CgroupMemoryHigh=`、`CgroupTasksMax=`，写在 `rinit/<unit>` 下；进程自己把自己放进 cgroup；停止流程向 cgroup 成员发信号；`rmdir` 清理；OOM kill 检测接入重启策略。沙箱：`User=`、`Group=`、`NoNewPrivileges=`、`CapabilityBoundingSet=`、`AmbientCapabilities=`。硬件看门狗：启动时打开 `/dev/watchdog`，由监管循环的健康检查点喂狗，关闭时 magic close。重载：`rctl reload` 重新读取单元目录，增、改、延迟、删，并拒绝无法解析的目录。传统守护进程：`Type=forking` 配 `PIDFile=`，通过文件或单元自己的 cgroup 定位。终端：`TTYPath=`/`TTYReset=` 给服务一个控制终端（计划 §7.11）。模板：`worker@.service`，实例化时展开 `%i`/`%n`/`%p`（计划 §7.7）。socket 作为依赖：`Sockets=`/`NeedsSocket=`，解析成硬依赖并等待路径出现（计划 §7.8）。socket 激活：`SocketActivate=`/`IdleTimeoutSec=`，rinit 绑定 socket，连接到来时启动服务（计划 §7.9）。至此，**计划扩展清单（§7.1–§7.11）的每一项都已实现** | 客户机："a limited unit was placed in its own cgroup"、"the memory hard and soft limits were written in bytes"、"a stopped unit's cgroup was removed"、"the kernel OOM-killed a process inside the unit's cgroup"、"rinit armed the guest's watchdog device"、"the driver took the timeout rinit set"、"the guest outlived the watchdog timeout with the device armed"、"an added unit the boot target does not need was not started"、"a changed unit that is running kept it for the next start"、"a directory that does not resolve was refused whole"、"the unit is active with the daemon the PIDFile named"、"stopping a forking unit stopped the daemon it took over"、"a TTYPath that is not a terminal fails the start"、"a template is not a unit to start"、"every specifier was expanded before the command ran"、"a socket consumer waited for the path before starting"、"a socket that never appears fails the start, naming it"、"rinit bound the socket before any unit started"、"starting it hands the service the listening socket"、"a de-privileged service ran as nobody:nogroup with NoNewPrivs"、"an empty CapabilityBoundingSet left a root service with no capabilities"、"ambient capabilities reached a de-privileged service"；宿主：`crates/rinit/src/cgroup.rs`（19 个测试）、`crates/rinit-core/src/unit/cgroup.rs`（9 个）、`crates/rinit-runtime/src/syscall/cgroup.rs`（14 个）、`crates/rinit/src/watchdog.rs`（6 个）、`crates/rinit-runtime/src/syscall/watchdog.rs`（6 个）、`crates/rinit/src/unit_manager.rs`（reload 本身 5 个，`reload.rs` 是它们之上的策略）、`crates/rinit/tests/m2_lifecycle.rs`（11 个，端到端）、`crates/rinit/src/sandbox.rs`（14 个）、`crates/rinit-core/src/unit/sandbox.rs`（9 个）、`crates/rinit-runtime/src/syscall/cred.rs`（14 个） |
 
 下面是已提交代码在串口控制台上的一次真实启动（`…` 省略内核噪声；除系统测试
 会启动验收镜像、因此计划行里还算上了 `units/demo/` 的单元之外，这些行正是
@@ -74,7 +74,7 @@ at 2590ms of kernel uptime (rinit's own boot: 239ms)` 是计划 §4.3 的数字�
 `logdemo`、`tty`、`sockd`、`sockc`、`api` 和 `worker@` 模板都在闭包之外，需要
 从控制台用 `rctl` 显式启动。M2 的 `fault.service` 也是其中之一，所以它演示的
 熔断出现在系统测试的日志里，而不是这次启动里。看门狗的 `30s` 是 `make run` 的
-取值；`make test-system` 会把它缩短到 `10s`（见上面的 CLI 一节），好让客户机活过
+取值；`make test-system` 会把它缩短到 `10s`（见下面的 CLI 一节），好让客户机活过
 这个超时，从而证明设备确实在被喂。
 
 §7.3 的两半，同样来自控制台。先看*服务自己*读回的限额——它自己的
@@ -113,7 +113,7 @@ wd-uptime=18.64
 ```
 
 这些命令是刻意这么写的：控制台会回显输入内容，而那些行会进入断言读取的同一份
-日志，所以标记必须由变量拼出（上面的 `v=populated; ... echo cgrun-$v`，这里的
+日志，所以标记必须由变量拼出（系统测试里的 `v=populated; ... echo cgrun-$v`，这里的
 `$d/identity`），而不是字面出现在输入里——断言被自己的回显满足，什么也证明不了。
 
 §7.6 的 reload，是唯一一个证据*必须*来自客户机的功能：initramfs 把单元目录解包到
@@ -283,7 +283,7 @@ make test           # check + test-system
 make gates          # acceptance gates: binary size + coverage thresholds
 ```
 
-`cargo test --offline --workspace`（`make check` 最后一步跑的就是它）在十二个测试
+`cargo test --offline --workspace`（`make check` 最后一步跑的就是它）在十个测试
 二进制里执行 **735 个测试**。五种形态，以及为什么每种都不是多余的：
 
 - **单元测试**紧挨着代码（core 329、rinit 197、rinit-runtime 110、rctl 14），
@@ -346,19 +346,21 @@ qemu 的 `i6300esb` 设备和带该驱动编译的内核是测试装置的一部
 
 | crate            | 行覆盖率      | 函数      |
 | ---------------- | ------------- | --------- |
-| `rinit-core`     | **97.74%**    | 571/582   |
-| `rinit-runtime`  | 84.93%        | 290/335   |
-| `rinit`          | 91.05%        | 602/646   |
-| `rctl`           | 96.67%        | 27/32     |
-| **总计**         | **92.31%**    | 2980/3190 |
+| `rinit-core`     | **97.76%**    | 576/587   |
+| `rinit-runtime`  | 84.93%        | 294/339   |
+| `rinit`          | 91.13%        | 619/665   |
+| `rctl`           | 95.56%        | 32/38     |
+| **总计**         | **92.34%**    | 1521/1629 |
 
 计划清单要求总体 ≥80%、核心 ≥90%，所以回答它的是这些数字，而不是某种形状：
 
-覆盖率最低的恰好是*无法*在宿主机上运行的那些，这也是客户机测试存在的原因，而不是
-遗漏：`syscall/reboot.rs`（0%——它会重启机器）、`syscall/mount.rs`（50%——需要
-`CAP_SYS_ADMIN`）、`syscall/process.rs`（58%——子进程侧的降权路径，宿主运行按设计
-会拒绝）、`src/main.rs`（48%——入口）和 `src/control.rs`（76%——socket 服务器，
-客户机会驱动它，宿主机只能通过 `RINIT_CONTROL_DIR` 到达）。
+覆盖率最低的多数是*无法*在宿主机上运行的那些，这也是客户机测试存在的原因，而不是
+遗漏：`syscall/reboot.rs`（0%——它会重启机器）、`syscall/mount.rs`（46.84%——需要
+`CAP_SYS_ADMIN`）、`syscall/process.rs`（56.80%——子进程侧的降权路径，宿主运行按设计
+会拒绝）、`src/main.rs`（46.67%——入口）和 `src/control.rs`（70.72%——socket 服务器，
+客户机会驱动它，宿主机只能通过 `RINIT_CONTROL_DIR` 到达）。这个区间里唯一能在宿主机
+上运行的文件是 `rinit-core/src/error.rs`（52.94%），它未覆盖的行是 `ParseError` 和
+`TransitionError` 的 `From` 实现与 `Display` 分支。
 
 未被覆盖的行有两类，值得区分：**仅客户机**的行（控制服务器、子进程侧的沙箱步骤、
 `mount(2)`），系统测试会在真实内核上执行它们，但 `cargo llvm-cov` 看不到，因为它
@@ -412,9 +414,6 @@ cargo llvm-cov --offline --workspace --html                  # target/llvm-cov/h
   `signals::tests::successive_sets_do_not_leak_descriptors` 可能偶发失败：它断言八个
   已关闭的描述符都是 `EBADF`，而旁边运行的测试如果恰好打开一个，就可能把号拿回去。
   §7.9 那次提交连续三次 `make check` 都是绿的；这是罕见竞态，不是泄漏。
-- 启动时的 RSS 还没有测量，所以计划 §0.1 的内存列仍待补（客户机内
-  `/proc/<pid>/status`：空闲 ≤2 MB，20 个服务 ≤6 MB），"20 个服务并行、明显快于串行"
-  的对比同理。下面的体积数字是二进制大小，不是内存测量。
 - **`miri`、`valgrind` 和 `cargo-fuzz` 在本环境里跑不了**，各自用什么替代值得说明，
   而不是暗示没有任何检查：`miri` 需要 *nightly* 工具链（这里只装了 stable，
   `cargo miri` 自己会这么说，而且环境离线），所以它要在 `rinit-core` 里找的东西——
@@ -437,12 +436,12 @@ cargo llvm-cov --offline --workspace --html                  # target/llvm-cov/h
 | 优雅关闭、无僵尸、无 fd 泄漏 | `make soak` 在重启 churn 中采样描述符、线程和僵尸子进程，并断言各自回到基线 |
 | 72 小时 soak，RSS 稳定 | **正在运行**，第七段，2026-10-21 17:41 启动，工作目录放在 `build/` 而不是 `/tmp`，因此窗口在 2026-10-24 17:41 结束，届时数字写进本行；本次运行的日志写到 `build/soak-charts/soak-72h-seg7.log`，所以与那些日志只存在于 `/tmp` 的运行不同，即使机器宕机也会留下时间戳。第六段在 1 小时 50 分（109 个采样）后由人工停止，而不是被断言终止：在 `--interval 1` 下每个采样约 70 ms，循环在采样后又完整睡一个 interval，于是默认 60 秒门禁只采到 60 个槽位中的 56 个，失败于它自己的采样覆盖检查（在僵尸扫描合并为单次 awk 之前只有 21 个）；现在循环睡到下一个绝对槽位，`make soak` 能采满 60/60。此前的每一段都不是被断言结束的：**8.92 小时**（535 个采样、18 519 600 次重启），前后半段 RSS 峰值均为 5116 kB，描述符最低值 14 → 14，僵尸 0；**44.6 小时**（2587 个采样），RSS 在 3892 到 3960 kB 之间以约 16 kB 的台阶上下移动——后半段斜率 −1.28 kB/h——每小时描述符最低值都在 13-14，僵尸 0，被一次主机重启终止，曲线也随 tmpfs 上的工作目录一起丢失；**43 分钟**，被 harness 自己的剩余空间地板终止，原因是机器上别的进程填满了共享的 978 MB `/tmp`——这也是现在把约 100 KB 的工作目录放在仓库文件系统上的原因；以及 **13.6 小时**（796 个采样，2026-10-20 06:09 → 19:46），被重启终止，但这次曲线没有丢，因为工作目录已经搬走：RSS 在启动后两次下台阶，逐小时均值前 3 小时为 5068-5087 kB，随后 5 小时为 4381-4443 kB，最后 6 小时为 4202-4252 kB，最后一个采样 4296 kB，描述符 14-28，线程 1，僵尸 0。这些运行带来了四处改动：描述符检查改为比较每一半的*最低*值而不是峰值（运行足够久之后峰值就是掷硬币——8.92 小时那一段峰值读到 25 → 24，而最低值是 14 → 14）；rinit 对自己的控制台限流，而控制台正是磁盘被写满那次的出口；harness 打印的重启次数是限流后的下界——它统计的那行被限制为每个调用点每 5 秒 40 条，所以 `churn: N restarts` 读出来约 8/s，而真实 churn 用宿主 `/proc/stat` 的 fork 速率独立测得约 545/s；以及采样器改为睡到下一个绝对槽位——原来每次采样后再睡满一个 `interval`，使一次 60 秒运行只采到 60 个样本中的 56 个，失败于一个它本来已经满足的覆盖检查 |
 | 二进制 ≤2 MB 动态 / ≤4 MB 静态 | [测量](#测量计划-01-校准点)：aarch64 静态 1.57 MiB，由 `make size-check` 检查 |
-| 单元测试覆盖率总体 ≥80%、核心 ≥90% | **92.31%** 和 **97.74%**（`make coverage-check`，见[上文](#测试)） |
+| 单元测试覆盖率总体 ≥80%、核心 ≥90% | **92.34%** 和 **97.76%**（`make coverage-check`，见[上文](#测试)） |
 | 文档：架构、单元格式、`rctl`、移植 | 本 README（架构、状态、测量）、[`docs/units.md`](docs/units.md)（每条指令、取值语法和默认值）、[`docs/porting.md`](docs/porting.md)（内核、用户空间、构建、与 systemd 的差异），以及 `rinit-开发计划.md` |
 
 还有一个清单没要求、但计划 §0.1 的设计目标要求的数字：rinit 的 RSS，在*客户机里*从
-`/proc/1/status` 测得，而不是在宿主机上——空闲 **1492 kB**，跑 20 个服务时
-**1764 kB**，对应 §0.1 的 2 MB 和 6 MB。有意思的是增量：多二十个单元只多花不到
+`/proc/1/status` 测得，而不是在宿主机上——空闲 **1 632 kB**，跑 20 个服务时
+**1 872 kB**，对应 §0.1 的 2 MB 和 6 MB。有意思的是增量：多二十个单元只多花不到
 200 kB，因为一个单元是一份配置、一个状态和几个定时器，而不是一个线程。
 
 ## 运行：`make run`（aarch64，完整流水线）
@@ -739,7 +738,7 @@ rinit 对**自己的**控制台输出限流，按调用点：每 5 秒 40 行，
 | 目标                                 | 二进制              | 大小                    | 在镜像里 |
 | ------------------------------------ | ------------------- | ----------------------- | ----------- |
 | `aarch64-unknown-linux-gnu`（静态）  | `rinit`             | 1.57 MiB (1 649 776 B)  | 是         |
-| `x86_64-unknown-linux-musl`（静态）  | `rinit`             | 1.04 MiB (1 094 624 B)  | 是         |
+| `x86_64-unknown-linux-musl`（静态）  | `rinit`             | 1.05 MiB (1 098 720 B)  | 是         |
 
 `rctl` 在 aarch64 上是 994 152 B，在 musl 上是 406 200 B；两者都在 initramfs 里。
 `make size-check` 是门禁，它按计划 §0.1 的 4 MiB 静态预算检查两个 aarch64 二进制。
@@ -755,7 +754,7 @@ M0 的 bring-up 辅助程序 `rinit-testservice` 已经删除：没有东西再�
 
 打包后的镜像（`build/out/initramfs-aarch64-unknown-linux-gnu.cpio.gz` 和
 `…-demo.cpio.gz`：静态 busybox + rinit + rctl + 单元目录）gzip 后分别是
-2.30 MiB（2 414 295 B）和 2.31 MiB（2 421 618 B）。差值就是 `units/demo/` 里的
+2.30 MiB（2 416 366 B）和 2.31 MiB（2 423 381 B）。差值就是 `units/demo/` 里的
 十四个文件，只有第二个镜像带它们。打包是可复现的——`scripts/mkinitramfs.sh` 把归档
 本来会记录的 mtime 和 inode 号归零，所以同样的二进制重复打包得到同样的字节，这才让
 这个数字可核对，而不只是"重新测了一遍"。例外是*强制*重建 busybox（`make -B`）：

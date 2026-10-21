@@ -36,8 +36,8 @@ ExecStart=/usr/bin/thing --flag
   any section header, or a key that is not in the tables below, is an error
   (`UnknownKey`) - this parser fails closed on typos instead of ignoring them.
 - A key that may appear **once** is an error the second time. Only these repeat:
-  `Environment`, `Requires`, `Wants`, `After`, `Before`, `Conflicts`,
-  `ExecStartPre`, `ExecStartPost`.
+  `Environment`, `Sockets`, `NeedsSocket`, `Requires`, `Wants`, `After`, `Before`,
+  `Conflicts`, `ExecStartPre`, `ExecStartPost`.
 - Blank values are usually meaningful rather than errors; each directive says
   what its empty form means.
 - A line ending in `\` continues on the next line, joined with a single space.
@@ -245,8 +245,12 @@ service does not have is the one outcome §7.3 exists to prevent.
 which only the image `make test-system` boots carries, and the console starts them
 one at a time: `fault.service` (a crashing service, for the restart policy and the
 breaker), `priv.service`/`caps.service`/`ambient.service` (§7.4),
-`cglimit.service`/`cgrun.service`/`oom.service` (§7.3), `forking.service` (§7.10)
-and `logdemo.service` (a `rctl log` target). Start with `getty.service`:
+`cglimit.service`/`cgrun.service`/`oom.service` (§7.3), `forking.service` (§7.10),
+`logdemo.service` (a `rctl log` target), `tty.service` (§7.11),
+`sockd.service`/`sockc.service` (§7.8), `api.service` (§7.9) and the
+`worker@.service` template (§7.7, started as an instance). The system test also
+writes `reload.service`/`badfork.service`/`waitsock.service` into the guest's
+directory at runtime and drives those. Start with `getty.service`:
 
 ```ini
 [Unit]

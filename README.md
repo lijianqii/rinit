@@ -25,7 +25,7 @@ test (`make check`) or a guest assertion (`make test-system`, 92 of them in
 | M2 | supervision (spawn, track, reap, two-stage stop), restart policy with backoff and a circuit breaker, health probes, `Type=notify` readiness, the in-memory log ring and its optional file mirror (plan §1.3(7)) | guest: "a crashed service is scheduled for restart", "the breaker tripped on the failing unit"; host: `crates/rinit/tests/m2_lifecycle.rs` (43 tests) |
 | M3 | control socket + `rctl` (`list`, `status`, `start`, `stop`, `restart`, `reset-failed`, `log`, `reload`), with a documented exit-code contract | guest: "rctl list reached the control socket" and the five assertions after it; host: `crates/rctl/tests/control.rs` (9 tests) |
 | M4 | soak harness for sustained churn (`make soak`), leak and descriptor fixes, `--dev` control-socket peer relaxation | `scripts/soak.sh` (see [Testing](#testing)); `crates/rinit-core/tests/allocations.rs` |
-| M5 (in progress) | **§7.3–§7.11 done.** cgroup v2: `CgroupCPUMax=`, `CgroupMemoryMax=`, `CgroupMemoryHigh=`, `CgroupTasksMax=` under `rinit/<unit>`, the process placing itself, stop-flow signalling of the cgroup's members, `rmdir` cleanup, and OOM-kill detection into the restart policy. Sandboxing: `User=`, `Group=`, `NoNewPrivileges=`, `CapabilityBoundingSet=`, `AmbientCapabilities=`. Hardware watchdog: `/dev/watchdog` armed at boot, fed from the supervisor loop's health checkpoint, magic-closed on shutdown. Reload: `rctl reload` re-reads the unit directory, adds, changes, defers and removes, and refuses a directory that does not resolve. Legacy daemons: `Type=forking` with `PIDFile=`, located through the file or the unit's own cgroup. Terminals: `TTYPath=`/`TTYReset=` give a service a controlling terminal (plan §7.11). Templates: `worker@.service` with `%i`/`%n`/`%p` expanded at instantiation (plan §7.7). Sockets as dependencies: `Sockets=`/`NeedsSocket=`, resolved to a hard edge and a wait for the path (plan §7.8). Socket activation: `SocketActivate=`/`IdleTimeoutSec=`, rinit binding the socket and the connection starting the service (plan §7.9). With that, **every item of the plan's extension list (§7.1–§7.11) is implemented** | guest: "a limited unit was placed in its own cgroup", "the memory hard and soft limits were written in bytes", "a stopped unit's cgroup was removed", "the kernel OOM-killed a process inside the unit's cgroup", "rinit armed the guest's watchdog device", "the driver took the timeout rinit set", "the guest outlived the watchdog timeout with the device armed", "an added unit the boot target does not need was not started", "a changed unit that is running kept it for the next start", "a directory that does not resolve was refused whole", "the unit is active with the daemon the PIDFile named", "stopping a forking unit stopped the daemon it took over", "a TTYPath that is not a terminal fails the start", "a template is not a unit to start", "every specifier was expanded before the command ran", "a socket consumer waited for the path before starting", "a socket that never appears fails the start, naming it", "rinit bound the socket before any unit started", "starting it hands the service the listening socket", "a de-privileged service ran as nobody:nogroup with NoNewPrivs", "an empty CapabilityBoundingSet left a root service with no capabilities", "ambient capabilities reached a de-privileged service"; host: `crates/rinit/src/cgroup.rs` (19 tests), `crates/rinit-core/src/unit/cgroup.rs` (9), `crates/rinit-runtime/src/syscall/cgroup.rs` (14), `crates/rinit/src/watchdog.rs` (6), `crates/rinit-runtime/src/syscall/watchdog.rs` (6), `crates/rinit/src/unit_manager.rs` (5 for the reload itself, `reload.rs` is policy over them), `crates/rinit/tests/m2_lifecycle.rs` (11, end to end), `crates/rinit/src/sandbox.rs` (14), `crates/rinit-core/src/unit/sandbox.rs` (9), `crates/rinit-runtime/src/syscall/cred.rs` (14) |
+| M5 | **§7.3–§7.11 done.** cgroup v2: `CgroupCPUMax=`, `CgroupMemoryMax=`, `CgroupMemoryHigh=`, `CgroupTasksMax=` under `rinit/<unit>`, the process placing itself, stop-flow signalling of the cgroup's members, `rmdir` cleanup, and OOM-kill detection into the restart policy. Sandboxing: `User=`, `Group=`, `NoNewPrivileges=`, `CapabilityBoundingSet=`, `AmbientCapabilities=`. Hardware watchdog: `/dev/watchdog` armed at boot, fed from the supervisor loop's health checkpoint, magic-closed on shutdown. Reload: `rctl reload` re-reads the unit directory, adds, changes, defers and removes, and refuses a directory that does not resolve. Legacy daemons: `Type=forking` with `PIDFile=`, located through the file or the unit's own cgroup. Terminals: `TTYPath=`/`TTYReset=` give a service a controlling terminal (plan §7.11). Templates: `worker@.service` with `%i`/`%n`/`%p` expanded at instantiation (plan §7.7). Sockets as dependencies: `Sockets=`/`NeedsSocket=`, resolved to a hard edge and a wait for the path (plan §7.8). Socket activation: `SocketActivate=`/`IdleTimeoutSec=`, rinit binding the socket and the connection starting the service (plan §7.9). With that, **every item of the plan's extension list (§7.1–§7.11) is implemented** | guest: "a limited unit was placed in its own cgroup", "the memory hard and soft limits were written in bytes", "a stopped unit's cgroup was removed", "the kernel OOM-killed a process inside the unit's cgroup", "rinit armed the guest's watchdog device", "the driver took the timeout rinit set", "the guest outlived the watchdog timeout with the device armed", "an added unit the boot target does not need was not started", "a changed unit that is running kept it for the next start", "a directory that does not resolve was refused whole", "the unit is active with the daemon the PIDFile named", "stopping a forking unit stopped the daemon it took over", "a TTYPath that is not a terminal fails the start", "a template is not a unit to start", "every specifier was expanded before the command ran", "a socket consumer waited for the path before starting", "a socket that never appears fails the start, naming it", "rinit bound the socket before any unit started", "starting it hands the service the listening socket", "a de-privileged service ran as nobody:nogroup with NoNewPrivs", "an empty CapabilityBoundingSet left a root service with no capabilities", "ambient capabilities reached a de-privileged service"; host: `crates/rinit/src/cgroup.rs` (19 tests), `crates/rinit-core/src/unit/cgroup.rs` (9), `crates/rinit-runtime/src/syscall/cgroup.rs` (14), `crates/rinit/src/watchdog.rs` (6), `crates/rinit-runtime/src/syscall/watchdog.rs` (6), `crates/rinit/src/unit_manager.rs` (5 for the reload itself, `reload.rs` is policy over them), `crates/rinit/tests/m2_lifecycle.rs` (11, end to end), `crates/rinit/src/sandbox.rs` (14), `crates/rinit-core/src/unit/sandbox.rs` (9), `crates/rinit-runtime/src/syscall/cred.rs` (14) |
 
 A real boot of the committed tree on the serial console (`…` elides kernel
 noise; the lines below are the ones `make test-system` asserts on, except that the
@@ -80,7 +80,7 @@ live in `units/demo/`, which `make test-system` packs and `make run` does not:
 the closure on purpose and are started from the console with `rctl`. M2's
 `fault.service` is one of them, so the breaker it demonstrates appears in the
 system test's log rather than in this one. The watchdog's `30s` is what `make run`
-boots with; `make test-system` shortens it to `10s` (see the CLI section above) so
+boots with; `make test-system` shortens it to `10s` (see the CLI section below) so
 that the guest can outlive it and prove the device is being fed.
 
 The two halves of §7.3, from the same console. First the limits as the *service*
@@ -123,8 +123,8 @@ wd-uptime=18.64
 
 The commands are written that way on purpose: the console echoes what is typed
 and those lines land in the same log the assertions read, so the markers are
-built from a variable (`v=populated; ... echo cgrun-$v` above, `$d/identity`
-here) rather than appearing literally in the input - an assertion that its own
+built from a variable (`v=populated; ... echo cgrun-$v` in the system test,
+`$d/identity` here) rather than appearing literally in the input - an assertion that its own
 echo satisfies proves nothing.
 
 §7.6's reload, which is the one feature whose evidence *has* to come from the
@@ -310,7 +310,7 @@ make gates          # acceptance gates: binary size + coverage thresholds
 ```
 
 `cargo test --offline --workspace` (what `make check` runs last) executes **735
-tests** across twelve test binaries. The five shapes, and why each is not
+tests** across ten test binaries. The five shapes, and why each is not
 redundant:
 
 - **unit tests** next to the code (core 329, rinit 197, rinit-runtime 110,
@@ -394,22 +394,24 @@ they are measured on the tree as it stands rather than copied from one run:
 
 | crate            | line coverage | functions |
 | ---------------- | ------------- | --------- |
-| `rinit-core`     | **97.74%**    | 571/582   |
-| `rinit-runtime`  | 84.93%        | 290/335   |
-| `rinit`          | 91.05%        | 602/646   |
-| `rctl`           | 96.67%        | 27/32     |
-| **total**        | **92.31%**    | 2980/3190 |
+| `rinit-core`     | **97.76%**    | 576/587   |
+| `rinit-runtime`  | 84.93%        | 294/339   |
+| `rinit`          | 91.13%        | 619/665   |
+| `rctl`           | 95.56%        | 32/38     |
+| **total**        | **92.34%**    | 1521/1629 |
 
 The plan's checklist asks for ≥80% overall and ≥90% in the core, so these are the
 numbers that answer it rather than a shape:
 
-The low outliers are the ones that *cannot* run on a host, which is why the guest
-tests exist rather than an omission: `syscall/reboot.rs` (0% - it would reboot the
-machine), `syscall/mount.rs` (50% - needs `CAP_SYS_ADMIN`), `syscall/process.rs`
-(58% - the child-side drop paths, which a host run refuses by design),
-`src/main.rs` (48% - the entry point) and `src/control.rs` (76% - the socket
-server, which the guest drives and the host reaches only through
-`RINIT_CONTROL_DIR`).
+The lowest files are mostly ones that *cannot* run on a host, which is why the
+guest tests exist rather than an omission: `syscall/reboot.rs` (0% - it would
+reboot the machine), `syscall/mount.rs` (46.84% - needs `CAP_SYS_ADMIN`),
+`syscall/process.rs` (56.80% - the child-side drop paths, which a host run
+refuses by design), `src/main.rs` (46.67% - the entry point) and
+`src/control.rs` (70.72% - the socket server, which the guest drives and the host
+reaches only through `RINIT_CONTROL_DIR`). The one host-runnable file in that
+range is `rinit-core/src/error.rs` (52.94%), whose uncovered lines are the
+`From` impls and `Display` arms for `ParseError` and `TransitionError`.
 
 Two kinds of line are uncovered, and they are worth telling apart: **guest-only**
 lines (the control server, the child-side sandbox steps, `mount(2)`), which the
@@ -482,10 +484,6 @@ cargo llvm-cov --offline --workspace --html                  # target/llvm-cov/h
   that eight closed descriptors are `EBADF`, and a test running beside it that
   opens one can take a number back. Three consecutive `make check` runs of the
   §7.9 commit were green; it is a rare race, not a leak.
-- RSS-at-boot is not measured yet, so plan §0.1's memory column is still open
-  (`/proc/<pid>/status` inside the guest: ≤2 MB idle, ≤6 MB with 20 services),
-  as is the "20 services in parallel, faster than serial" comparison. The size
-  numbers below are binary sizes, not a memory measurement.
 - **`miri`, `valgrind` and `cargo-fuzz` cannot run in this environment**, and what
   stands in for each is worth naming rather than implying nothing checks:
   `miri` needs a *nightly* toolchain (only stable is installed, `cargo miri` says
@@ -514,13 +512,13 @@ repository or a measurement in this README:
 | graceful shutdown, no zombies, no fd leak | `make soak` samples descriptors, threads and zombie children through restart churn, and asserts each comes back to its baseline |
 | 72 h soak with stable RSS | **running now**, seventh segment, started 2026-10-21 17:41 with its work directory under `build/` rather than `/tmp`, so the window ends 2026-10-24 17:41 and the numbers land in this row then; this run writes its log to `build/soak-charts/soak-72h-seg7.log`, so unlike the runs whose log lived only in `/tmp` it leaves timestamps behind even if the machine goes down. The sixth segment was stopped by hand after 1 h 50 m (109 samples), not by an assertion, once the harness itself was fixed: at `--interval 1` a sample cost ~70 ms, the loop slept a full interval *after* the work, and the default 60 s gate therefore collected 56 of 60 samples and failed its own coverage check (21 before the zombie scan became a single awk pass); the loop now sleeps until the next absolute slot and `make soak` collects 60/60. Earlier segments were all ended by something other than an assertion: **8.92 hours** (535 samples, 18 519 600 restarts) with RSS 5116 → 5116 kB peak per half, descriptors 14 → 14 at their lowest and zero zombies; **44.6 hours** (2587 samples) whose RSS moved between 3892 and 3960 kB in ~16 kB plateaus that went up *and* down - the second-half slope was −1.28 kB/h - with descriptors 13-14 at their lowest in every hour and zero zombies, ended by a host reboot that took the curves with it because the work directory was on tmpfs; and **43 minutes**, stopped by the harness's own free-space floor when something else on the machine filled the shared 978 MB `/tmp` - which is why the run now keeps its ~100 KB work directory on the repository's filesystem instead; and **13.6 hours** (796 samples, 2026-10-20 06:09 → 19:46), ended by the reboot that this time did not take the curve with it, because the work directory had already moved: RSS stepped down twice after boot, hourly means 5068-5087 kB for the first three hours, 4381-4443 kB for the next five and 4202-4252 kB for the last six, with last sample 4296 kB, descriptors 14-28, one thread and zero zombies. Four things changed because of these runs: the descriptor check compares the *lowest* count in each half rather than the peak (a peak is a coin flip once a run is long enough - the 8.92-hour segment's peaks read 25 → 24 while its lows were 14 → 14), rinit rate limits its own console, which is the sink that filled the disk a run died on, and the restart count the harness prints is a rate-limited lower bound - the line it counts is capped at 40 per 5 s per call site, so `churn: N restarts` reads ~8/s while the real churn, measured independently as the host's `fork` rate, is ~545/s; and the sampler sleeps until its next absolute slot, because sleeping a full `interval` after each sample made a 60 s run collect 56 of 60 samples and fail a coverage check it had already met |
 | binaries ≤2 MB dynamic / ≤4 MB static | [Measurements](#measurements-plan-01-calibration-point): 1.57 MiB static aarch64, checked by `make size-check` |
-| unit test coverage ≥80% overall, ≥90% in the core | **92.31%** and **97.74%** (`make coverage-check`, [above](#testing)) |
+| unit test coverage ≥80% overall, ≥90% in the core | **92.34%** and **97.76%** (`make coverage-check`, [above](#testing)) |
 | documentation: architecture, unit format, `rctl`, porting | this README (architecture, status, measurements), [`docs/units.md`](docs/units.md) (every directive, its value syntax and its default), [`docs/porting.md`](docs/porting.md) (kernel, userspace, build, differences from systemd), and `rinit-开发计划.md` |
 
 One number the checklist does not ask for, but plan §0.1's design goals do: rinit's
 RSS, measured *in the guest* out of `/proc/1/status` rather than on the host -
-**1492 kB idle** and **1764 kB with 20 services running**, against §0.1's 2 MB and
-6 MB. The growth is the interesting part: twenty more units cost under 200 kB,
+**1 632 kB idle** and **1 872 kB with 20 services running**, against §0.1's 2 MB
+and 6 MB. The growth is the interesting part: twenty more units cost under 200 kB,
 because a unit is a config, a state and a few timers rather than a thread.
 
 ## Running: `make run` (aarch64, full pipeline)
@@ -882,7 +880,7 @@ byte counts as `ls -l` reports them:
 | target                               | binary              | size                    | in an image |
 | ------------------------------------ | ------------------- | ----------------------- | ----------- |
 | `aarch64-unknown-linux-gnu` (static) | `rinit`             | 1.57 MiB (1 649 776 B)  | yes         |
-| `x86_64-unknown-linux-musl` (static) | `rinit`             | 1.04 MiB (1 094 624 B)  | yes         |
+| `x86_64-unknown-linux-musl` (static) | `rinit`             | 1.05 MiB (1 098 720 B)  | yes         |
 
 `rctl` is 994 152 B on aarch64 and 406 200 B on musl; both are inside the
 initramfs. `make size-check` is the gate, and it checks the two aarch64 binaries
@@ -900,7 +898,7 @@ command through the same spawn path a unit uses.
 
 The packed images (`build/out/initramfs-aarch64-unknown-linux-gnu.cpio.gz` and
 `…-demo.cpio.gz`: static busybox + rinit + rctl + the unit directory) are
-2.30 MiB (2 414 295 B) and 2.31 MiB (2 421 618 B) gzipped. The difference is the
+2.30 MiB (2 416 366 B) and 2.31 MiB (2 423 381 B) gzipped. The difference is the
 fourteen files in `units/demo/`, which only the second one carries. The packing is
 reproducible - `scripts/mkinitramfs.sh` zeroes the mtimes and inode numbers the
 archive would otherwise record, so repacking the same binaries gives the same
