@@ -3,7 +3,8 @@
 A lightweight, systemd-like PID 1 init and service manager written in Rust,
 targeted at resource-constrained embedded Linux (aarch64). See
 [`rinit-开发计划.md`](rinit-开发计划.md) for the full development plan; this
-README tracks implementation status.
+README tracks implementation status. A Chinese translation of this file lives at
+[`README.zh-CN.md`](README.zh-CN.md); this English version is the authoritative one.
 
 ## Status: M0–M5 implemented — verified on aarch64
 
