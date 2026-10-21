@@ -10,6 +10,7 @@
 //! `UnitManager` + reaper path the guest uses.
 
 use std::fs;
+use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -56,59 +57,110 @@ fn wait_for(timeout: Duration, what: &str, mut condition: impl FnMut() -> bool) 
     }
 }
 
-/// Boot a unit directory in dev mode, let it settle, then ask it to shut down.
+/// Boot a unit directory in dev mode, wait for the boot to finish, then ask it
+/// to shut down.
 ///
 /// Returns everything rinit logged on stdout and stderr.
-fn boot_units(units: &TempDir, target: &str, settle: Duration) -> String {
-    boot_units_with_signal(units, target, settle, libc::SIGTERM)
+fn boot_units(units: &TempDir, target: &str) -> String {
+    boot_units_with_signal(units, target, libc::SIGTERM)
 }
 
 /// As [`boot_units`], but shutting down with `signal`.
-fn boot_units_with_signal(
-    units: &TempDir,
-    target: &str,
-    settle: Duration,
-    signal: libc::c_int,
-) -> String {
-    boot_units_extra(units, target, settle, signal, &[])
+fn boot_units_with_signal(units: &TempDir, target: &str, signal: libc::c_int) -> String {
+    boot_units_extra(units, target, signal, &[])
 }
 
 /// As [`boot_units_with_signal`], with extra command-line arguments.
 ///
 /// The extra arguments exist for `--cgroup-root` (plan §7.3): it is how the
 /// host tests point the whole limit path at a directory of ordinary files.
-fn boot_units_extra(
-    units: &TempDir,
-    target: &str,
-    settle: Duration,
-    signal: libc::c_int,
-    extra: &[&str],
-) -> String {
-    boot_units_inspect(units, target, settle, signal, extra, |_| ()).0
+fn boot_units_extra(units: &TempDir, target: &str, signal: libc::c_int, extra: &[&str]) -> String {
+    boot_units_inspect(units, target, signal, extra, |_, _| ()).0
 }
 
-/// Boot a unit directory, look at it while it is up, then shut it down.
+/// rinit's console, read as it is written.
 ///
-/// `inspect` runs after the boot has settled and before the shutdown signal, so
-/// a test can read state that only exists while the boot is running - a service
-/// pid that is still alive, or the cgroup files it wrote. It receives the
-/// control socket path, because a condition the test has to *wait* for (a unit
-/// becoming active, a restart being counted) is only observable through it; a
-/// fixed sleep there would be a guess about the machine. It must not panic:
-/// panicking there would leave rinit running, so assertions belong after the
-/// pair is returned.
+/// The boot is a sequence of events, not a duration: sleeping 1.5 s for it is a
+/// guess that is too short on a loaded machine and wasted on an idle one. The
+/// reader threads make the sequence observable, so a test can wait for the line
+/// it needs instead of for a duration.
+struct Console {
+    bytes: std::sync::Mutex<Vec<u8>>,
+}
+
+impl Console {
+    fn new() -> Self {
+        Console {
+            bytes: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.bytes.lock().expect("console lock")).into_owned()
+    }
+
+    fn contains(&self, needle: &str) -> bool {
+        self.text().contains(needle)
+    }
+
+    /// Wait for `needle` to appear, or fail the test with what did appear.
+    fn wait_for(&self, needle: &str, timeout: Duration) {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if self.contains(needle) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out after {timeout:?} waiting for {needle:?} in rinit's console:\n{}",
+                self.text()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+/// Read one pipe into the shared console until the child closes it.
+fn drain_console<R: Read + Send + 'static>(
+    mut pipe: R,
+    console: std::sync::Arc<Console>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        loop {
+            match pipe.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => console
+                    .bytes
+                    .lock()
+                    .expect("console lock")
+                    .extend_from_slice(&buf[..n]),
+            }
+        }
+    })
+}
+
+/// Boot a unit directory, look at it once the boot is complete, then shut it down.
+///
+/// `inspect` runs after rinit has printed "boot complete" and before the
+/// shutdown signal, so a test can read state that only exists while the boot is
+/// running - a service pid that is still alive, or the cgroup files it wrote. It
+/// receives the control socket path and the live console, because a condition
+/// the test has to *wait* for (a restart being counted, a line about a rate
+/// limit) is only observable there; a fixed sleep would be a guess about the
+/// machine. It must not panic: panicking there would leave rinit running, so
+/// assertions belong after the pair is returned.
 fn boot_units_inspect<T>(
     units: &TempDir,
     target: &str,
-    settle: Duration,
     signal: libc::c_int,
     extra: &[&str],
-    inspect: impl FnOnce(&std::path::Path) -> T,
+    inspect: impl FnOnce(&std::path::Path, &Console) -> T,
 ) -> (String, T) {
     let bin = env!("CARGO_BIN_EXE_rinit");
     let control_dir = units.0.join("control");
     let control_socket = control_dir.join("control.sock");
-    let child = Command::new(bin)
+    let mut child = Command::new(bin)
         .arg("--dev")
         .arg("--units")
         .arg(&units.0)
@@ -122,8 +174,31 @@ fn boot_units_inspect<T>(
         .spawn()
         .expect("spawn rinit");
 
-    // Let the unit directory boot and any restart/breaker activity happen.
-    std::thread::sleep(settle);
+    let console = std::sync::Arc::new(Console::new());
+    let readers = [
+        drain_console(
+            child.stdout.take().expect("piped stdout"),
+            std::sync::Arc::clone(&console),
+        ),
+        drain_console(
+            child.stderr.take().expect("piped stderr"),
+            std::sync::Arc::clone(&console),
+        ),
+    ];
+
+    // rinit prints "boot complete" after the boot levels, whether they all
+    // succeeded or one failed; that is the event every caller needs before it
+    // looks at the machine.
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while !console.contains("boot complete:") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "rinit did not finish booting within 15 s:\n{}",
+            console.text()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while !control_socket.exists() {
         assert!(
@@ -132,17 +207,19 @@ fn boot_units_inspect<T>(
         );
         std::thread::sleep(Duration::from_millis(20));
     }
-    let inspected = inspect(&control_socket);
+
+    let inspected = inspect(&control_socket, &console);
+
     // SAFETY: signalling our own child.
     unsafe { libc::kill(child.id() as libc::pid_t, signal) };
-
-    let out = child.wait_with_output().expect("wait for rinit");
-    let mut log = String::from_utf8_lossy(&out.stdout).into_owned();
-    log.push_str(&String::from_utf8_lossy(&out.stderr));
+    let status = child.wait().expect("wait for rinit");
+    for reader in readers {
+        let _ = reader.join();
+    }
+    let log = console.text();
     assert!(
-        out.status.success(),
-        "rinit should exit cleanly on the shutdown signal, got {:?}:\n{log}",
-        out.status
+        status.success(),
+        "rinit should exit cleanly on the shutdown signal, got {status:?}:\n{log}"
     );
     (log, inspected)
 }
@@ -163,7 +240,17 @@ fn a_crashing_unit_is_restarted_then_the_breaker_trips() {
          Restart=always\nRestartSec=0\nStartLimitBurst=2\nStartLimitIntervalSec=300\n",
     );
 
-    let log = boot_units(&dir, "all.target", Duration::from_millis(1500));
+    let (log, ()) = boot_units_inspect(
+        &dir,
+        "all.target",
+        libc::SIGTERM,
+        &[],
+        |_socket, console| {
+            // The breaker trips after the boot levels; the line is the event the
+            // assertions below need, so wait for it rather than for a window.
+            console.wait_for("fault.service hit its start limit", Duration::from_secs(15));
+        },
+    );
 
     assert!(log.contains("boot complete"), "boot must finish:\n{log}");
     assert!(
@@ -186,7 +273,7 @@ fn a_unit_without_restart_is_left_down() {
         "[Unit]\n[Service]\nType=simple\nExecStart=/bin/false\nRestart=no\n",
     );
 
-    let log = boot_units(&dir, "all.target", Duration::from_millis(600));
+    let log = boot_units(&dir, "all.target");
 
     assert!(log.contains("boot complete"), "boot must finish:\n{log}");
     assert!(
@@ -219,7 +306,7 @@ fn environment_and_working_directory_reach_the_service() {
     );
     dir.write("env.service", &unit);
 
-    let log = boot_units(&dir, "all.target", Duration::from_millis(800));
+    let log = boot_units(&dir, "all.target");
     let text = std::fs::read_to_string(&probe).unwrap_or_else(|e| panic!("no probe: {e}\n{log}"));
 
     assert!(text.contains("PROBE"), "the service must run:\n{text}");
@@ -258,7 +345,7 @@ fn exec_start_pre_and_post_run_around_the_main_command() {
     );
     dir.write("app.service", &app);
 
-    let log = boot_units(&dir, "all.target", Duration::from_millis(900));
+    let log = boot_units(&dir, "all.target");
     let text = std::fs::read_to_string(&order).unwrap_or_else(|e| panic!("no marker: {e}\n{log}"));
     let lines: Vec<&str> = text.lines().collect();
     assert_eq!(
@@ -282,7 +369,7 @@ fn a_failing_exec_start_pre_prevents_the_start() {
     );
     dir.write("app.service", &app);
 
-    let log = boot_units(&dir, "all.target", Duration::from_millis(700));
+    let log = boot_units(&dir, "all.target");
 
     assert!(
         log.contains("ExecStartPre"),
@@ -317,7 +404,7 @@ fn a_unit_that_cannot_start_fails_its_required_dependents() {
         ),
     );
 
-    let log = boot_units(&dir, "all.target", Duration::from_millis(800));
+    let log = boot_units(&dir, "all.target");
 
     assert!(
         log.contains("cannot start"),
@@ -343,7 +430,7 @@ fn shutdown_stops_dependents_before_their_dependencies() {
         "[Unit]\nRequires=base.service\n[Service]\nType=simple\nExecStart=/bin/sleep 30\n",
     );
 
-    let log = boot_units(&dir, "all.target", Duration::from_millis(700));
+    let log = boot_units(&dir, "all.target");
 
     let app = log
         .find("stopping app.service")
@@ -375,7 +462,7 @@ fn starting_a_unit_stops_what_it_conflicts_with() {
         "[Unit]\nConflicts=alpha.service\n[Service]\nType=simple\nExecStart=/bin/sleep 30\n",
     );
 
-    let log = boot_units(&dir, "all.target", Duration::from_millis(800));
+    let log = boot_units(&dir, "all.target");
 
     assert!(
         log.contains("stopping alpha.service: it conflicts with beta.service"),
@@ -399,7 +486,7 @@ fn sigint_shuts_down_gracefully_too() {
         "[Service]\nType=simple\nExecStart=/bin/sleep 30\n",
     );
 
-    let log = boot_units_with_signal(&dir, "all.target", SETTLE, libc::SIGINT);
+    let log = boot_units_with_signal(&dir, "all.target", libc::SIGINT);
 
     assert!(
         log.contains("received SIGINT"),
@@ -428,7 +515,7 @@ TimeoutStopSec=30
     dir.write("app.service", app);
 
     let started = std::time::Instant::now();
-    let log = boot_units_with_signal(&dir, "all.target", Duration::from_millis(700), libc::SIGPWR);
+    let log = boot_units_with_signal(&dir, "all.target", libc::SIGPWR);
     let elapsed = started.elapsed();
 
     assert!(
@@ -461,7 +548,7 @@ TimeoutStopSec=1
 "#;
     dir.write("app.service", app);
 
-    let log = boot_units(&dir, "all.target", Duration::from_millis(700));
+    let log = boot_units(&dir, "all.target");
 
     assert!(
         log.contains("ExecStop pid"),
@@ -669,7 +756,7 @@ TimeoutStopSec=1
 "#;
     dir.write("stubborn.service", stubborn);
 
-    let log = boot_units(&dir, "all.target", Duration::from_millis(700));
+    let log = boot_units(&dir, "all.target");
 
     assert!(log.contains("boot complete"), "boot must finish:\n{log}");
     assert!(
@@ -713,7 +800,7 @@ fn an_absurd_timeout_does_not_abort_the_boot() {
          TimeoutStopSec=18446744073709551615\nRestart=no\n",
     );
 
-    let log = boot_units(&dir, "all.target", Duration::from_millis(700));
+    let log = boot_units(&dir, "all.target");
 
     assert!(log.contains("boot complete"), "boot must finish:\n{log}");
     assert!(
@@ -730,12 +817,6 @@ fn an_absurd_timeout_does_not_abort_the_boot() {
 
 // --- §7.4: the privilege drop, end to end ---------------------------------
 //
-// These wait `SETTLE` rather than the tighter windows some tests above use:
-// every assertion here is about something the *boot* has to have got to
-// (a service started, a spawn refused, the boot finished), and a window that is
-// merely usually long enough is how this file grows a flaky test. `SETTLE`
-// matches the value the breaker test uses.
-//
 // These boot the real binary, so they exercise the whole path a unit takes -
 // `User=`/`Group=`/`NoNewPrivileges=` resolved, a sandbox built, the child
 // started through `fork`+`exec` - rather than the pieces separately. What the
@@ -743,9 +824,6 @@ fn an_absurd_timeout_does_not_abort_the_boot() {
 // is the guest's assertion; what is proved here is that the directives reach the
 // child, and that when a drop cannot be carried out the unit fails instead of
 // quietly running as root.
-
-/// How long the §7.4 tests below let a boot settle before shutting it down.
-const SETTLE: Duration = Duration::from_millis(1500);
 
 /// Whether *this* test process already denies privilege escalation, which some
 /// runners do. Used as the baseline for the "no flag asked for" case, so the
@@ -780,7 +858,7 @@ fn no_new_privileges_reaches_the_service() {
     dir.write("with.service", &unit("true", &with));
     dir.write("without.service", &unit("false", &without));
 
-    let log = boot_units(&dir, "all.target", SETTLE);
+    let log = boot_units(&dir, "all.target");
 
     let with_text = std::fs::read_to_string(&with)
         .unwrap_or_else(|e| panic!("the flagged service never wrote its probe: {e}\n{log}"));
@@ -817,7 +895,7 @@ fn a_unit_with_an_unknown_user_is_failed_rather_than_run_as_root() {
         ),
     );
 
-    let log = boot_units(&dir, "all.target", SETTLE);
+    let log = boot_units(&dir, "all.target");
 
     assert!(
         log.contains("User= lookup failed"),
@@ -858,7 +936,7 @@ fn a_drop_that_cannot_be_applied_fails_the_unit_closed() {
         ),
     );
 
-    let log = boot_units(&dir, "all.target", SETTLE);
+    let log = boot_units(&dir, "all.target");
 
     let named_step = ["setgid failed", "setgroups failed", "setuid failed"]
         .iter()
@@ -894,7 +972,7 @@ fn a_unit_with_an_unknown_capability_is_failed_rather_than_started() {
         ),
     );
 
-    let log = boot_units(&dir, "all.target", SETTLE);
+    let log = boot_units(&dir, "all.target");
 
     assert!(
         log.contains("CapabilityBoundingSet= failed"),
@@ -928,7 +1006,7 @@ fn a_capability_drop_that_cannot_be_applied_fails_the_unit_closed() {
         ),
     );
 
-    let log = boot_units(&dir, "all.target", SETTLE);
+    let log = boot_units(&dir, "all.target");
 
     assert!(
         log.contains("prctl(PR_CAPBSET_DROP) failed"),
@@ -1040,10 +1118,9 @@ fn a_unit_with_limits_is_bounded_in_its_own_cgroup() {
     let (log, (cpu, memory_max, memory_high, pids, pid, alive)) = boot_units_inspect(
         &dir,
         "all.target",
-        SETTLE,
         libc::SIGTERM,
         &["--cgroup-root", cg.path()],
-        |_socket| {
+        |_socket, _| {
             let read = |rel: &str| fs::read_to_string(cg.0.join(rel)).unwrap_or_default();
             let procs = read("rinit/worker.service/cgroup.procs");
             let pid: libc::pid_t = procs.trim().parse().unwrap_or(-1);
@@ -1108,7 +1185,6 @@ fn a_missing_hierarchy_warns_and_still_boots() {
     let log = boot_units_extra(
         &dir,
         "all.target",
-        SETTLE,
         libc::SIGTERM,
         &["--cgroup-root", not_a_hierarchy.0.to_str().unwrap()],
     );
@@ -1156,7 +1232,6 @@ fn a_limit_the_kernel_refuses_fails_the_start() {
     let log = boot_units_extra(
         &dir,
         "all.target",
-        SETTLE,
         libc::SIGTERM,
         &["--cgroup-root", cg.path()],
     );
@@ -1206,7 +1281,6 @@ fn a_limit_this_kernel_cannot_express_does_not_stop_the_unit() {
     let log = boot_units_extra(
         &dir,
         "all.target",
-        SETTLE,
         libc::SIGTERM,
         &["--cgroup-root", cg.path()],
     );
@@ -1274,10 +1348,9 @@ fn a_cgroup_oom_kill_is_named_and_the_unit_restarts() {
     let (log, killed) = boot_units_inspect(
         &dir,
         "all.target",
-        SETTLE,
         libc::SIGTERM,
         &["--cgroup-root", cg.path()],
-        |socket| {
+        |socket, _| {
             let procs = fs::read_to_string(cg.0.join("rinit/worker.service/cgroup.procs"))
                 .unwrap_or_default();
             let pid: libc::pid_t = procs.trim().parse().unwrap_or(-1);
@@ -1366,10 +1439,9 @@ fn a_sigkill_the_cgroup_did_not_make_is_not_reported_as_an_oom_kill() {
     let (log, killed) = boot_units_inspect(
         &dir,
         "all.target",
-        SETTLE,
         libc::SIGTERM,
         &["--cgroup-root", cg.path()],
-        |socket| {
+        |socket, _| {
             let procs = fs::read_to_string(cg.0.join("rinit/worker.service/cgroup.procs"))
                 .unwrap_or_default();
             let pid: libc::pid_t = procs.trim().parse().unwrap_or(-1);
@@ -1465,7 +1537,6 @@ fn the_supervisor_loop_feeds_the_watchdog_and_shutdown_disarms_it() {
     let log = boot_units_extra(
         &dir,
         "all.target",
-        SETTLE,
         libc::SIGTERM,
         &[
             "--watchdog",
@@ -1525,7 +1596,7 @@ fn dev_mode_does_not_arm_the_default_watchdog_device() {
         "[Service]\nType=simple\nExecStart=/bin/sleep 30\n",
     );
 
-    let log = boot_units_extra(&dir, "all.target", SETTLE, libc::SIGTERM, &[]);
+    let log = boot_units_extra(&dir, "all.target", libc::SIGTERM, &[]);
 
     assert!(
         log.contains("dev mode: not touching the watchdog device"),
@@ -1569,7 +1640,7 @@ fn a_forking_unit_is_active_once_its_daemon_is_located() {
     );
 
     let (log, (daemon, alive)) =
-        boot_units_inspect(&dir, "all.target", SETTLE, libc::SIGTERM, &[], |_socket| {
+        boot_units_inspect(&dir, "all.target", libc::SIGTERM, &[], |_socket, _| {
             let pid = fs::read_to_string(&pid_file)
                 .ok()
                 .and_then(|text| text.trim().parse::<libc::pid_t>().ok())
@@ -1650,7 +1721,7 @@ fn a_forking_unit_whose_daemon_cannot_be_located_fails_its_start() {
             fs::write(&path, "2147483647\n").expect("write the stale pid file");
         }
 
-        let log = boot_units(&dir, "all.target", SETTLE);
+        let log = boot_units(&dir, "all.target");
 
         assert!(
             log.contains("cannot locate the daemon"),
@@ -1708,7 +1779,7 @@ fn a_socket_activated_unit_starts_on_its_first_connection() {
     );
 
     let (log, (connected, probed)) =
-        boot_units_inspect(&dir, "all.target", SETTLE, libc::SIGTERM, &[], |_socket| {
+        boot_units_inspect(&dir, "all.target", libc::SIGTERM, &[], |_socket, _| {
             let connected = std::os::unix::net::UnixStream::connect(&sock).is_ok();
             let deadline = std::time::Instant::now() + Duration::from_secs(3);
             let mut probed = String::new();
@@ -1763,7 +1834,7 @@ fn an_idle_socket_activated_unit_is_stopped() {
         ),
     );
 
-    let log = boot_units_inspect(&dir, "all.target", SETTLE, libc::SIGTERM, &[], |socket| {
+    let log = boot_units_inspect(&dir, "all.target", libc::SIGTERM, &[], |socket, _| {
         // Start it, then leave it alone for longer than its idle timeout. The
         // state names are what prove both halves happened: active means the
         // connection really started it, inactive means the idle rule stopped it.
@@ -1853,7 +1924,7 @@ fn a_needs_socket_unit_waits_for_the_path() {
         ),
     );
 
-    let log = boot_units(&dir, "all.target", SETTLE);
+    let log = boot_units(&dir, "all.target");
     let found_it = found.exists();
     for stale in [&path, &found, &missing] {
         let _ = fs::remove_file(stale);
@@ -1904,7 +1975,7 @@ fn a_needs_socket_that_never_appears_fails_the_start() {
         ),
     );
 
-    let log = boot_units(&dir, "all.target", SETTLE);
+    let log = boot_units(&dir, "all.target");
 
     assert!(
         log.contains(&format!(
@@ -2066,7 +2137,6 @@ ExecStart=/bin/echo persisted-marker
     let log = boot_units_extra(
         &dir,
         "all.target",
-        SETTLE,
         libc::SIGTERM,
         &["--log-file", path.to_str().expect("UTF-8 path")],
     );
@@ -2107,7 +2177,6 @@ ExecStart=/bin/echo still-runs\n",
     let log = boot_units_extra(
         &dir,
         "all.target",
-        SETTLE,
         libc::SIGTERM,
         &["--log-file", "/proc/rinit-cannot-create-this/log"],
     );
@@ -2237,10 +2306,9 @@ TTYPath={}
         ),
     );
 
-    let (log, seen) =
-        boot_units_inspect(&dir, "all.target", SETTLE, libc::SIGTERM, &[], |_socket| {
-            pty.wait_for("via-tty", Duration::from_secs(2))
-        });
+    let (log, seen) = boot_units_inspect(&dir, "all.target", libc::SIGTERM, &[], |_socket, _| {
+        pty.wait_for("via-tty", Duration::from_secs(2))
+    });
 
     assert!(
         seen,
@@ -2276,7 +2344,7 @@ TTYPath=/dev/null
          ExecStart=/bin/sh -c \"echo should-not-run > /dev/null\"\n",
     );
 
-    let log = boot_units(&dir, "all.target", SETTLE);
+    let log = boot_units(&dir, "all.target");
 
     assert!(
         log.contains("ioctl(TIOCSCTTY) failed"),
@@ -2582,10 +2650,9 @@ fn dev_mode_ignores_the_fstab() {
     let log = boot_units_inspect(
         &dir,
         "all.target",
-        SETTLE,
         libc::SIGTERM,
         &["--fstab", fstab.to_str().expect("utf-8 path")],
-        |_socket| (),
+        |_socket, _| (),
     )
     .0;
     let _ = fs::remove_file(&fstab);
@@ -2626,10 +2693,13 @@ fn a_crash_loop_cannot_flood_the_console() {
     let log = boot_units_inspect(
         &dir,
         "all.target",
-        Duration::from_secs(3),
         libc::SIGTERM,
         &[],
-        |_socket| (),
+        |_socket, console| {
+            // The notice is proof the limiter folded a flood; the old 3 s window
+            // was only a guess that one had appeared by then.
+            console.wait_for("message(s) suppressed", Duration::from_secs(15));
+        },
     )
     .0;
 
