@@ -166,12 +166,12 @@ log_lines=2000
 mkfifo "$work/console"
 # (`snapshot`, not `log`: gawk has a `log` builtin and refuses the name.)
 awk -v counts="$counts" -v snapshot="$log" -v keep="$log_lines" '
-    /churn\.service will restart in/ { r++; if (r % 200 == 0) { print "R " r > counts; close(counts) } }
-    /control: .* ok/                 { c++; if (c % 50 == 0)  { print "C " c > counts; close(counts) } }
+    /churn\.service will restart in/ { r++; if (r % 200 == 0) { print "R " r >> counts; close(counts) } }
+    /control: .* ok/                 { c++; if (c % 50 == 0)  { print "C " c >> counts; close(counts) } }
     { ring[NR % keep] = $0 }
     END {
-        print "R " r > counts
-        print "C " c > counts
+        print "R " r >> counts
+        print "C " c >> counts
         close(counts)
         for (i = NR - keep + 1; i <= NR; i++) if ((i % keep) in ring) print ring[i % keep] > snapshot
         close(snapshot)
@@ -362,15 +362,12 @@ if ((sample < expected * 95 / 100)); then
     fail=1
 fi
 
-# The restart loop has to have actually run, or the soak proves nothing.
-restarts="$(counted R)"
-if ((restarts < 10)); then
-    echo "FAIL: only ${restarts} churn restarts in ${seconds}s: the churn workload is not churning" >&2
-    fail=1
-fi
-
 # Shutdown is part of the soak: a manager that leaks may still stop cleanly, but
-# one that cannot stop has definitely broken.
+# one that cannot stop has definitely broken. Stopping first is also what makes
+# the counts below complete: the reader writes them as it goes and once more at
+# end of input, so a count read while the reader is still behind is an
+# undercount. `R` is only written every 200 restarts, so a short run could read
+# 0 after churning all along.
 kill -TERM "$rinit_pid"
 if ! wait "$rinit_pid"; then
     echo "FAIL: rinit did not exit 0 on SIGTERM" >&2
@@ -379,6 +376,14 @@ if ! wait "$rinit_pid"; then
     fail=1
 fi
 rinit_pid=""
+flush_log
+
+# The restart loop has to have actually run, or the soak proves nothing.
+restarts="$(counted R)"
+if ((restarts < 10)); then
+    echo "FAIL: only ${restarts} churn restarts in ${seconds}s: the churn workload is not churning" >&2
+    fail=1
+fi
 
 # The control socket has to have answered, or the request/reply path - the
 # thing that owns a connection, a job and a log query per call - went untested.
