@@ -27,6 +27,7 @@
 mod client;
 mod parse;
 
+use std::ffi::OsString;
 use std::process::ExitCode;
 
 use rinit_core::Status;
@@ -54,8 +55,29 @@ Exit codes:
   0 success   1 error   2 usage   3 no such unit   4 operation conflict
 ";
 
+/// The command line as text, or the first argument that is not UTF-8.
+///
+/// `std::env::args()` panics on a non-UTF-8 argument, and a panic is the wrong
+/// answer for a CLI that documents `2` as "bad usage": a script that passes a
+/// stray byte should get the same exit code as a typo, not a crash with no
+/// message. Collecting `OsString`s and converting here is what keeps that
+/// promise; every argument rctl accepts is a unit name, a number or a keyword,
+/// so rejecting the odd byte is correct rather than lossy.
+fn collect_args(args: impl Iterator<Item = OsString>) -> Result<Vec<String>, OsString> {
+    args.map(OsString::into_string).collect()
+}
+
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args = match collect_args(std::env::args_os().skip(1)) {
+        Ok(args) => args,
+        Err(argument) => {
+            // A command line is user input, so a byte that is not UTF-8 is a
+            // usage error like any other - not the panic `std::env::args()`
+            // would raise on this machine (exit code 101, no message).
+            eprintln!("rctl: argument {argument:?} is not valid UTF-8\n\n{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
 
     let request = match parse::command_line(&args) {
         Ok(parse::Parsed::Help) => {
@@ -88,5 +110,25 @@ fn main() -> ExitCode {
             eprintln!("rctl: {message}");
             ExitCode::from(1)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::ffi::OsStringExt;
+
+    #[test]
+    fn non_utf8_arguments_are_a_usage_error() {
+        let bad = OsString::from_vec(vec![b'x', 0xff]);
+        assert_eq!(collect_args(std::iter::once(bad.clone())), Err(bad));
+    }
+
+    #[test]
+    fn utf8_arguments_pass_through_unchanged() {
+        let args =
+            collect_args([OsString::from("status"), OsString::from("a.service")].into_iter())
+                .expect("both are UTF-8");
+        assert_eq!(args, ["status", "a.service"]);
     }
 }

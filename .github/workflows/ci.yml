@@ -73,7 +73,7 @@ jobs:
         # Plan §5 risk 6b: a dynamic build against a mismatched sysroot is a
         # black screen at boot, so assert statically at CI time.
         run: |
-          for bin in rinit rinit-testservice; do
+          for bin in rinit rctl; do
             path="target/aarch64-unknown-linux-gnu/release/${bin}"
             test -x "$path" || { echo "missing $path"; exit 1; }
             if readelf -d "$path" 2>/dev/null | grep -q NEEDED; then
