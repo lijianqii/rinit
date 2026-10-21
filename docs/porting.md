@@ -53,9 +53,14 @@ still boots with every unit unlimited.
 - `/etc/passwd` and `/etc/group` if any unit uses `User=`/`Group=`. rinit parses
   them itself (no NSS, no `libnss_files.so`), so a minimal
   `name:passwd:uid:gid:...` file is enough.
+- a small FHS skeleton: `/var/log`, `/var/tmp`, `/var/run -> ../run`, `/mnt`,
+  `/home`, `/opt`, `/srv`, `/usr/local`, and `/etc/profile`, `/etc/hostname`,
+  `/etc/hosts`, `/etc/resolv.conf`, `/etc/motd`. rinit reads none of them; they
+  are what the login shell and the tools expect. `/etc/profile` applies
+  `/etc/hostname`, because rinit does not call `sethostname(2)`.
 
-The image `make initramfs` builds has exactly this layout; see
-`scripts/build-initramfs.sh`. It chmods the image root to `0755`, which matters:
+The image `make initramfs` builds has this layout (plus busybox's applet tree);
+see `scripts/build-initramfs.sh`. It chmods the image root to `0755`, which matters:
 a service that drops privileges cannot traverse a root directory it may not
 search, and the failure looks like a missing binary.
 

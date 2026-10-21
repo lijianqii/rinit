@@ -463,8 +463,9 @@ make run                 # default; builds rinit, kernel, busybox, initramfs, bo
 2. 从 `mirrors.tuna.tsinghua.edu.cn/kernel/v6.x/` 取 `linux-6.6.158.tar.xz`，
    构建 `arch/arm64/boot/Image`。
 3. 取 `busybox-1.36.1.tar.bz2`，用 initramfs 需要的 applet 构建一个**静态** busybox。
-4. 组装 `build/out/initramfs-<target>.cpio.gz`（busybox + rinit + rctl + `units/`）。
-   验收镜像 `build/out/initramfs-<target>-demo.cpio.gz` 是同一套根，再加
+4. 组装 `build/out/initramfs-<target>.cpio.gz`（busybox + rinit + rctl + `units/`，
+   再加上登录 shell 需要的 `/etc` 与 `/var` 骨架）。验收镜像
+   `build/out/initramfs-<target>-demo.cpio.gz` 是同一套根，再加
    `units/demo/`，也是 `make test-system` 启动的那个。
 5. 用 `qemu-system-aarch64 -machine virt -cpu cortex-a57 -m 128M` 启动，并加
    `-device i6300esb`——rinit 武装的看门狗（计划 §7.5）。
@@ -497,7 +498,9 @@ make KERNEL_VERSION=6.6.158 BUSYBOX_VERSION=1.36.1 ...   # pin versions
 
 `make run` 启动 `units/getty.service`，它在串口控制台上给出登录提示。输入 `root`
 回车即可——`/etc/passwd` 里的密码字段是空的，之后什么都不用输。上面的记录就是那个
-提示符。
+提示符。登录后 `/etc/motd` 会打印常用命令（`rctl list`、`rctl status getty.service`、
+`rctl log getty.service`、`poweroff -f`），`/etc/profile` 会设置 `PATH` 并应用
+`/etc/hostname`。
 
 这刻意不是一个安全边界：能碰到串口的人已经拥有这台机器，而开发用 initramfs 不是放
 真实凭据的地方。给 root 设密码意味着要写 `/etc/shadow`，而它没有被打包。
@@ -753,9 +756,9 @@ M0 的 bring-up 辅助程序 `rinit-testservice` 已经删除：没有东西再�
 那个步骤现在的替代是 `--test-service`，它通过与单元相同的 spawn 路径运行命令。
 
 打包后的镜像（`build/out/initramfs-aarch64-unknown-linux-gnu.cpio.gz` 和
-`…-demo.cpio.gz`：静态 busybox + rinit + rctl + 单元目录）gzip 后分别是
-2.30 MiB（2 416 366 B）和 2.31 MiB（2 423 381 B）。差值就是 `units/demo/` 里的
-十四个文件，只有第二个镜像带它们。打包是可复现的——`scripts/mkinitramfs.sh` 把归档
+`…-demo.cpio.gz`：静态 busybox + rinit + rctl + 单元目录 + `/etc`/`/var` 骨架）
+gzip 后都是 2.31 MiB（分别为 2 417 741 B 和 2 423 800 B）。差值就是 `units/demo/`
+里的十四个文件，只有第二个镜像带它们。打包是可复现的——`scripts/mkinitramfs.sh` 把归档
 本来会记录的 mtime 和 inode 号归零，所以同样的二进制重复打包得到同样的字节，这才让
 这个数字可核对，而不只是"重新测了一遍"。例外是*强制*重建 busybox（`make -B`）：
 busybox 自己的构建不是字节级可复现的，镜像会随之变动几个字节。

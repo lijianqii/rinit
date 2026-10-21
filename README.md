@@ -542,7 +542,8 @@ What it does, in order (see [Makefile](Makefile)):
 3. Fetch `busybox-1.36.1.tar.bz2` and build a **static** busybox with the
    applets the initramfs needs.
 4. Assemble `build/out/initramfs-<target>.cpio.gz` (busybox + rinit + rctl +
-   `units/`). The acceptance image `build/out/initramfs-<target>-demo.cpio.gz` is
+   `units/`, plus the `/etc` and `/var` skeleton the login shell expects). The
+   acceptance image `build/out/initramfs-<target>-demo.cpio.gz` is
    the same root plus `units/demo/`, and is what `make test-system` boots.
 5. Boot it in `qemu-system-aarch64 -machine virt -cpu cortex-a57 -m 128M` with
    `-device i6300esb`, the watchdog rinit arms (plan §7.5).
@@ -580,7 +581,9 @@ that image and leaves the run image alone.
 `make run` boots `units/getty.service`, which puts a login prompt on the serial
 console. Type `root` and press enter — the password field in `/etc/passwd` is
 empty, so there is nothing to type after that. The transcript above is that
-prompt.
+prompt. After login `/etc/motd` prints the commands that matter (`rctl list`,
+`rctl status getty.service`, `rctl log getty.service`, `poweroff -f`), and
+`/etc/profile` sets `PATH` and applies `/etc/hostname`.
 
 This is deliberately not a security boundary: anyone who can reach the serial
 port already has the machine, and a development initramfs is not the place for
@@ -897,9 +900,10 @@ binary in every build. A repeat of that step is `--test-service` now, which runs
 command through the same spawn path a unit uses.
 
 The packed images (`build/out/initramfs-aarch64-unknown-linux-gnu.cpio.gz` and
-`…-demo.cpio.gz`: static busybox + rinit + rctl + the unit directory) are
-2.30 MiB (2 416 366 B) and 2.31 MiB (2 423 381 B) gzipped. The difference is the
-fourteen files in `units/demo/`, which only the second one carries. The packing is
+`…-demo.cpio.gz`: static busybox + rinit + rctl + the unit directory + the
+`/etc`/`/var` skeleton) are 2.31 MiB each (2 417 741 B and 2 423 800 B) gzipped.
+The difference is the fourteen files in `units/demo/`, which only the second one
+carries. The packing is
 reproducible - `scripts/mkinitramfs.sh` zeroes the mtimes and inode numbers the
 archive would otherwise record, so repacking the same binaries gives the same
 bytes, which is what makes the number checkable rather than merely re-measured. A

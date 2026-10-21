@@ -67,7 +67,18 @@ trap 'rm -rf "${work}"' EXIT
 chmod 0755 "${work}"
 
 # Directory layout (plan §4.3). No /init symlink: we boot with rdinit=.
-install -d "${work}"/{sbin,bin,etc/rinit/units,proc,sys,dev,run,tmp,root}
+#
+# The first group is what rinit mounts or execs from. The second is the FHS
+# skeleton a login expects to find: `/var/log` for the log mirror and wtmp,
+# `/mnt`, `/home`, `/opt`, `/srv` and `/usr/local` for an operator, and `/var/run`
+# pointing at the `/run` tmpfs rinit mounts over the image's own directory.
+install -d "${work}"/{sbin,bin,etc/rinit/units,proc,sys,dev,run,usr/local/bin,usr/local/sbin}
+install -d "${work}"/{var/log/rinit,var/spool,mnt,media,home,opt,srv}
+install -d -m 0700 "${work}/root"
+install -d -m 1777 "${work}/tmp" "${work}/var/tmp"
+ln -s ../run "${work}/var/run"
+: >"${work}/var/log/wtmp"
+chmod 0644 "${work}/var/log/wtmp"
 
 install -m 0755 "${bin_dir}/rinit" "${work}/sbin/rinit"
 # The control client goes where a user can type it. It is useless without the
@@ -80,6 +91,48 @@ install -m 0755 "${bin_dir}/rctl" "${work}/bin/rctl"
 # at run time would be too late - and it is the repo's `fstab` verbatim so the
 # guest's evidence points at a file instead of at the packing script.
 install -m 0644 "${repo_root}/fstab" "${work}/etc/fstab"
+
+# The rest of the skeleton. rinit reads none of these: they belong to the login
+# shell and the tools an operator runs after it. Keeping them in the image means
+# a `make run` guest behaves like a small root filesystem rather than just enough
+# to start getty - PATH is defined, localhost resolves, the hostname is applied
+# once a session starts, and the motd says where the units are.
+write_config() {
+    local dest="$1"
+    cat >"${dest}"
+    chmod 0644 "${dest}"
+}
+write_config "${work}/etc/profile" <<'EOF'
+# Login shell setup for the rinit development image.
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+umask 022
+
+# rinit does not call sethostname(); apply the standard file once a session
+# starts, so the next getty prompt and every command see the name too.
+[ -s /etc/hostname ] && hostname -F /etc/hostname 2>/dev/null
+EOF
+printf 'rinit\n' >"${work}/etc/hostname"
+chmod 0644 "${work}/etc/hostname"
+write_config "${work}/etc/hosts" <<'EOF'
+127.0.0.1	localhost
+::1		localhost
+127.0.1.1	rinit
+EOF
+write_config "${work}/etc/resolv.conf" <<'EOF'
+# The development image configures no network. Add `nameserver` lines here if
+# the guest is given an interface and a DHCP client.
+EOF
+write_config "${work}/etc/motd" <<'EOF'
+rinit development guest
+
+Units live in /etc/rinit/units; this image carries the boot set only.
+  rctl list                  known units
+  rctl status getty.service  one unit in detail
+  rctl log getty.service     its buffered output
+  poweroff -f                stop the guest
+
+The acceptance image (make test-system) adds units/demo/.
+EOF
 
 # The unit directory, which is what the guest actually boots.
 #
