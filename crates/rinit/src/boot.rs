@@ -706,10 +706,9 @@ pub(crate) async fn apply_effect(
             manager.stop_unit(unit);
             Ok(false)
         }
-        // `JobQueue::reconcile` produces neither: a backoff is armed by the
-        // reaper, and a dependency failure is propagated where the graph
-        // lives. Reaching one here would be a bug worth seeing.
-        Some(Effect::ScheduleBackoff { .. } | Effect::PropagateFailure) => {
+        // `JobQueue::reconcile` does not produce one: a backoff is armed by the
+        // reaper. Reaching one here would be a bug worth seeing.
+        Some(Effect::ScheduleBackoff { .. }) => {
             rlog!("warning: unexpected effect for {unit}; ignoring");
             Ok(false)
         }

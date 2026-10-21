@@ -61,8 +61,6 @@ pub enum Effect {
     CancelBackoffAndStart,
     /// Cancel a pending restart timer and stop now.
     CancelBackoffAndStop,
-    /// A required unit failed; propagate `Failed` downstream.
-    PropagateFailure,
     /// Clear the start-limit counters and start now.
     ClearStartLimitAndStart,
 }
@@ -202,10 +200,11 @@ pub fn transition(
 
 /// Apply a sequence of events, collecting the effects.
 ///
-/// Stops at the first invalid transition and returns what was applied, so a
-/// caller driving a unit through a scripted sequence sees exactly how far it
-/// got. Used by the property tests below to check that any event sequence
-/// terminates in a consistent state rather than looping forever.
+/// Stops at the first invalid transition and returns `Err`, discarding the
+/// events that were applied before it; the error names the state and the event
+/// that was rejected. A caller that needs the state it reached must drive the
+/// events itself. Used by the property tests below to check that any event
+/// sequence terminates in a consistent state rather than looping forever.
 pub fn drive(
     state: UnitState,
     events: &[Event],

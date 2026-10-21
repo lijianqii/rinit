@@ -15,12 +15,19 @@ use rinit_core::CoreError;
 pub struct SyscallError {
     op: &'static str,
     errno: i32,
+    /// What the call was for, when "mount failed" alone would not say (e.g. the
+    /// mount point). `None` for calls whose operation name is the whole story.
+    context: Option<String>,
 }
 
 impl SyscallError {
     /// Build from an explicit `errno` (e.g. the value `posix_spawn` returns).
     pub const fn new(op: &'static str, errno: i32) -> Self {
-        SyscallError { op, errno }
+        SyscallError {
+            op,
+            errno,
+            context: None,
+        }
     }
 
     /// Capture the current thread's `errno`.
@@ -33,9 +40,23 @@ impl SyscallError {
         SyscallError::new(op, err.raw_os_error().unwrap_or(0))
     }
 
+    /// Attach what the operation was for, so the message names the object and
+    /// not just the syscall: `mount /proc failed: ...` instead of `mount
+    /// failed: ...`, which sends the reader to a different mount point than the
+    /// one that broke.
+    pub fn with_context(mut self, context: impl Into<String>) -> Self {
+        self.context = Some(context.into());
+        self
+    }
+
     /// The operation that failed (e.g. `"mount"`).
     pub const fn op(&self) -> &'static str {
         self.op
+    }
+
+    /// What the operation was for, when it named something (e.g. `/proc`).
+    pub fn context(&self) -> Option<&str> {
+        self.context.as_deref()
     }
 
     /// The raw `errno` value.
@@ -51,13 +72,11 @@ impl SyscallError {
 
 impl fmt::Display for SyscallError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{} failed: {} (errno {})",
-            self.op,
-            self.io_error(),
-            self.errno
-        )
+        write!(f, "{}", self.op)?;
+        if let Some(context) = &self.context {
+            write!(f, " {context}")?;
+        }
+        write!(f, " failed: {} (errno {})", self.io_error(), self.errno)
     }
 }
 
@@ -226,6 +245,22 @@ mod tests {
         let err = RuntimeError::from(CoreError::InvalidUnitName("bad name".to_string()));
         assert!(matches!(err, RuntimeError::Core(_)));
         assert!(err.to_string().contains("bad name"), "got: {err}");
+    }
+
+    #[test]
+    fn a_context_names_the_object_in_the_message() {
+        let err = SyscallError::from_io("mount", &io::Error::from_raw_os_error(libc::ENOENT))
+            .with_context("/sys");
+        let text = err.to_string();
+        assert!(text.starts_with("mount /sys failed:"), "{text}");
+        assert_eq!(err.context(), Some("/sys"));
+    }
+
+    #[test]
+    fn a_context_is_optional() {
+        let err = SyscallError::new("fork", libc::EAGAIN);
+        assert_eq!(err.context(), None);
+        assert!(err.to_string().starts_with("fork failed:"));
     }
 
     /// A runtime error must stay usable as a boxed `dyn Error`; the binaries

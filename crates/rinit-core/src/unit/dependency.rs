@@ -296,7 +296,18 @@ impl DependencyGraph {
                     }
                 }
             }
-            // `Conflicts=` intentionally contributes no start edge.
+            // `Conflicts=` intentionally contributes no start edge - that is
+            // what mutual exclusion is - but a reference that names no unit is
+            // still a typo the operator should hear about, the same way a
+            // dangling `Wants=` is.
+            for unit in &cfg.deps.conflicts {
+                if index_of(unit).is_none() {
+                    warnings.push(format!(
+                        "{}: Conflicts={} but no such unit file exists",
+                        cfg.name, unit
+                    ));
+                }
+            }
 
             for (unit, edge) in edges {
                 let Some(other) = index_of(unit) else {
@@ -875,6 +886,32 @@ mod tests {
         );
     }
 
+    /// A conflict with a unit that exists is a valid declaration and must not
+    /// warn; only a dangling name does.
+    #[test]
+    fn missing_conflicts_is_a_warning() {
+        let configs = vec![UnitConfig {
+            deps: super::super::config::Dependencies {
+                conflicts: vec![name("ghost.service")],
+                ..Default::default()
+            },
+            ..unit("a.service", &[], &[], UnitType::Service)
+        }];
+        let graph = DependencyGraph::build(&configs).expect("must not fail");
+        assert_eq!(graph.warnings.len(), 1, "{:?}", graph.warnings);
+        assert!(
+            graph.warnings[0].contains("ghost.service"),
+            "{:?}",
+            graph.warnings
+        );
+        assert!(
+            graph.warnings[0].contains("Conflicts="),
+            "{:?}",
+            graph.warnings
+        );
+        assert!(graph.dependencies_of(&name("a.service")).is_empty());
+    }
+
     /// `Conflicts=` must not become a start edge, or mutually exclusive units
     /// would deadlock each other.
     #[test]
@@ -891,6 +928,7 @@ mod tests {
                 .unwrap();
         assert!(graph.dependencies_of(&name("a.service")).is_empty());
         assert!(graph.dependencies_of(&name("other.service")).is_empty());
+        assert!(graph.warnings.is_empty(), "{:?}", graph.warnings);
     }
 
     /// Plan §1.1: `Before=` is the mirror of `After=`. `late Before=early`

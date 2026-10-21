@@ -42,7 +42,7 @@ pub fn mount(
     if rc == 0 {
         Ok(())
     } else {
-        Err(SyscallError::last_os_error("mount"))
+        Err(SyscallError::last_os_error("mount").with_context(target.display().to_string()))
     }
 }
 
