@@ -17,8 +17,10 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # Keep the pinned toolchain from rust-toolchain.toml in effect.
-  RUSTFLAGS: -D warnings
+  # Do not set RUSTFLAGS globally: for the aarch64 target, `.cargo/config.toml`
+  # puts `+crt-static` in `target.*.rustflags`, and a global RUSTFLAGS overrides
+  # those target flags - which is exactly what made the first CI build
+  # dynamically linked. Clippy below passes `-D warnings` explicitly.
 
 jobs:
   host:
