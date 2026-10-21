@@ -7,10 +7,11 @@
 //! shipped unit fails `make check` instead of an aarch64 boot.
 //!
 //! There are two directories and they mean different things. `units/` is the
-//! **boot set**: the console and the two targets, and the whole of what
-//! `make run` packs. `units/demo/` is the **acceptance set**: the §7.x units the
-//! guest system test starts from the console one at a time, packed only into the
-//! image `make test-system` boots. `scripts/build-initramfs.sh` flattens both
+//! **boot set**: the console, the DHCP client and the two targets, and all of
+//! the unit set `make run` packs. `units/demo/` is the **acceptance set**: the
+//! §7.x units the guest system test starts from the console one at a time,
+//! packed only into the image `make test-system` boots.
+//! `scripts/build-initramfs.sh` flattens both
 //! into one `/etc/rinit/units`, so the tests read them as one directory too -
 //! which is also why a name in both is an error rather than a shadowing.
 //!
@@ -49,12 +50,12 @@ fn load_shipped() -> (Vec<UnitFile>, Vec<String>) {
     (files, warnings)
 }
 
-/// `units/` is what `make run` packs: the console, its alternative, and the two
-/// targets. The §7.x acceptance units live in `units/demo/`, and this is what
-/// keeps the run image a run image - a demo unit moved back here would ship in
-/// every developer's boot with nothing that starts it.
+/// `units/` is what `make run` packs: the console, its alternative, the DHCP
+/// client and the two targets. The §7.x acceptance units live in `units/demo/`,
+/// and this is what keeps the run image a run image - a demo unit moved back
+/// here would ship in every developer's boot with nothing that starts it.
 #[test]
-fn the_boot_set_is_the_console_and_its_targets() {
+fn the_boot_set_is_what_make_run_packs() {
     let (files, warnings) = load_unit_files(&units_dir()).expect("load the boot set");
     assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
 
@@ -65,6 +66,7 @@ fn the_boot_set_is_the_console_and_its_targets() {
         [
             "getty.service",
             "multi-user.target",
+            "network.service",
             "rinit-init.target",
             "shell.service"
         ],

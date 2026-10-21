@@ -23,6 +23,10 @@
 #   scripts/run-qemu.sh --arch x86_64 --kernel /boot/vmlinuz-6.12.111+deb13-amd64 \
 #       --initrd initramfs-x86_64-unknown-linux-musl.cpio.gz
 #
+# The aarch64 machine also gets qemu's user-mode network: DHCP hands the guest
+# 10.0.2.15/24, gateway 10.0.2.2 and DNS 10.0.2.3, and `units/network.service`
+# configures the interface from the lease.
+#
 # Exit from the guest: send SIGTERM/SIGINT to PID 1 (rinit reboots), or Ctrl-A X
 # in qemu to quit.
 set -euo pipefail
@@ -43,7 +47,7 @@ while [[ $# -gt 0 ]]; do
         --mem) mem="${2:?}"; shift 2 ;;
         --service) service="${2:?}"; shift 2 ;;
         --kernel-args) kernel_args="${2:?}"; shift 2 ;;
-        -h | --help) sed -n '2,20p' "$0"; exit 0 ;;
+        -h | --help) sed -n '2,31p' "$0"; exit 0 ;;
         --) shift; extra=("$@"); break ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
@@ -65,10 +69,15 @@ case "${arch}" in
         # below boots the host's `vmlinuz`, whose watchdog driver is a module
         # that is not in the initramfs, so the device would have nothing behind
         # it and rinit would report nothing - correct, but not worth a device.
+        # qemu's user-mode network: its DHCP server hands the guest 10.0.2.15/24,
+        # gateway 10.0.2.2 and DNS 10.0.2.3. The kernel has virtio-net and the
+        # mmio transport built in, both checked by `make kernel-config-check`.
         exec qemu-system-aarch64 \
             -machine virt -cpu cortex-a57 -m "${mem}" \
             -kernel "${kernel}" -initrd "${initrd}" \
             -append "${append}" \
+            -netdev user,id=net0 \
+            -device virtio-net-device,netdev=net0 \
             -device i6300esb \
             -nographic "${extra[@]}"
         ;;

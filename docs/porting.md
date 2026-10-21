@@ -17,6 +17,7 @@ script puts in the image, so the kernel has to hand it a few things:
 | `CONFIG_PROC_FS`, `CONFIG_SYSFS` | `/proc` and `/sys`; `/proc` is what `rctl status` and reaping read | same |
 | a cgroup v2 hierarchy: `CGROUP_SCHED`, `CFS_BANDWIDTH`, `MEMCG`, `CGROUP_PIDS` | the `Cgroup*=` limits (plan §7.3); without one of them the kernel answers `ENOENT` for that attribute and rinit skips the limit with a warning | `make kernel-config-check` |
 | a watchdog driver (`WATCHDOG_CORE` + your hardware's) | plan §7.5; the Makefile builds `I6300ESB_WDT` because that is what qemu's `virt` machine can attach | `make kernel-config-check` |
+| a NIC driver (`VIRTIO_NET` + `VIRTIO_MMIO` on qemu's `virt`) | `units/network.service` runs `udhcpc` on `eth0`; without a NIC the unit exits and the rest still boots | `make kernel-config-check` |
 | `CONFIG_WATCHDOG_SYSFS` | only so the *test* can read back the timeout rinit set; rinit itself does not need it | same |
 | `CONFIG_TMPFS` | `/run` and `/tmp` | `mounts.rs` |
 | signals that the kernel delivers normally (`SIGCHLD`, `SIGTERM`, ...) | rinit catches them with `sigaction` handlers and a self-pipe - no `signalfd`, no configuration | `crates/rinit-runtime/src/signals.rs` |
@@ -113,7 +114,8 @@ or the machine's own cgroup hierarchy. On a real device it should not appear.
 The boot target's *closure* is what starts. A unit that nothing references is
 loaded and listed by `rctl` but never started - that is where the demo units in
 `units/demo/` sit, and `rctl start <unit>` is how they come up. (`units/` itself
-is the boot set: the two targets, `getty.service` and `shell.service`.)
+is the boot set: the two targets, `getty.service`, `network.service` and
+`shell.service`.)
 
 ## 5. Differences from systemd to expect
 

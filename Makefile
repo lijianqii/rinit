@@ -138,6 +138,11 @@ kernel-config-check: $(KERNEL_SRC)/.config
 	        echo "kernel config: CONFIG_$$opt is not set (plan §7.5 needs it)" >&2; \
 	        exit 1; }; \
 	done
+	@for opt in VIRTIO_NET VIRTIO_MMIO; do \
+	    grep -q "^CONFIG_$$opt=y$$" $(KERNEL_SRC)/.config || { \
+	        echo "kernel config: CONFIG_$$opt is not set (the guest's NIC needs it)" >&2; \
+	        exit 1; }; \
+	done
 
 kernel: kernel-config-check $(KERNEL_IMAGE)
 

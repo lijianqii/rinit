@@ -14,7 +14,7 @@
 soak，它是部署期跑一次 `make soak`，而不是一个功能。
 
 下面列出现有的能力，以及各自的证据。每一条结论要么来自宿主测试（`make check`），
-要么来自客户机断言（`make test-system`，`scripts/system-test.sh` 里共 92 条）；
+要么来自客户机断言（`make test-system`，`scripts/system-test.sh` 里共 97 条）；
 "在宿主机上验证"始终指同一段代码的 fake-runtime 或 `--dev` 形态，"客户机"指真实形态。
 
 | 里程碑 | 内容 | 证据 |
@@ -28,7 +28,8 @@ soak，它是部署期跑一次 `make soak`，而不是一个功能。
 
 下面是已提交代码在串口控制台上的一次真实启动（`…` 省略内核噪声；除系统测试
 会启动验收镜像、因此计划行里还算上了 `units/demo/` 的单元之外，这些行正是
-`make test-system` 断言的内容）。这就是 `make run`，启动目标的闭包里只有控制台：
+`make test-system` 断言的内容）。这就是 `make run`，启动目标的闭包里是控制台和
+DHCP 客户端：
 
 ```
 [    2.344175] Run /sbin/rinit as init process
@@ -42,18 +43,20 @@ rinit: mounted /sys/fs/cgroup
 rinit: mounted /data (fstab)
 rinit: cgroup v2 ready at /sys/fs/cgroup
 rinit: logging to /var/log/rinit/log
-rinit: boot plan for 'multi-user.target': 4 unit(s) in 3 level(s)
+rinit: boot plan for 'multi-user.target': 5 unit(s) in 3 level(s)
 rinit: plan 0: rinit-init.target (target)
 rinit: plan 1: getty.service (service)
+rinit: plan 1: network.service (service)
 rinit: plan 2: multi-user.target (target)
 rinit: starting level 0: 0 service(s)
 rinit: level 0 reached: rinit-init.target active
-rinit: starting level 1: 1 service(s)
+rinit: starting level 1: 2 service(s)
 rinit: started getty.service as pid 48
+rinit: started network.service as pid 49
 rinit: starting level 2: 0 service(s)
 rinit: level 2 reached: multi-user.target active
-rinit: boot complete: 1 unit(s) started from 'multi-user.target' (1 still running)
-rinit: boot timing: first service at 2590ms of kernel uptime (rinit's own boot: 239ms)
+rinit: boot complete: 2 unit(s) started from 'multi-user.target' (2 still running)
+rinit: boot timing: first service at 5190ms of kernel uptime (rinit's own boot: 505ms)
 rinit: watchdog /dev/watchdog armed: 30s timeout, feeding every 15s
 
 (none) login:
@@ -61,14 +64,16 @@ rinit: watchdog /dev/watchdog armed: 30s timeout, feeding every 15s
 
 这次启动里有两行是测量值而不是步骤。`mounted /data (fstab)` 是计划 §1.3(9) 的
 第二波挂载——一条 `/etc/fstab` 记录，在第一波之后挂载；`boot timing: first service
-at 2590ms of kernel uptime (rinit's own boot: 239ms)` 是计划 §4.3 的数字，用的是
+at 5190ms of kernel uptime (rinit's own boot: 505ms)` 是计划 §4.3 的数字，用的是
 内核自己的时钟，因此也覆盖了内核启动阶段。两个数字都来自同一次运行，而那次运行的
 *宿主机*同时还在跑 72 小时 soak，数字每次启动都会变（同样负载下更早的一次读到
-4840 ms 和 484 ms）；客户机断言的是"这个测量取自内核时钟"，不是某个具体数值。
+2590 ms 和 239 ms）；客户机断言的是"这个测量取自内核时钟"，不是某个具体数值。
 
-注意计划解析出 **4 个单元**、只启动 **1 个**：`units/` 是启动集——两个 target、
-控制台及其替代品——并且只启动启动目标的闭包。`shell.service` 会被解析和排序，
-但不会被激活，因为否则它会和 `getty.service` 抢 `ttyAMA0`。§7.x 的验收单元放在
+注意计划解析出 **5 个单元**、启动 **2 个**：`units/` 是启动集——两个 target、
+控制台及其替代品、以及 DHCP 客户端——并且只启动启动目标的闭包。`shell.service`
+会被解析和排序，但不会被激活，因为否则它会和 `getty.service` 抢 `ttyAMA0`。
+`network.service` 在闭包内：`multi-user.target` 要求它，qemu 的用户态 DHCP 给
+客户机分配 `10.0.2.15/24`、网关 `10.0.2.2` 和 DNS `10.0.2.3`。§7.x 的验收单元放在
 `units/demo/`，`make test-system` 会打包它们，`make run` 不会：`priv`/`caps`/
 `ambient`（§7.4）、`cglimit`/`cgrun`/`oom`（§7.3）、`forking`（§7.10）、
 `logdemo`、`tty`、`sockd`、`sockc`、`api` 和 `worker@` 模板都在闭包之外，需要
@@ -252,7 +257,7 @@ crates/
     tests/m2_lifecycle.rs, tests/smoke.rs
   rctl/               # 控制 CLI（main.rs, parse.rs, client.rs）+ 测试
 units/                # 启动集：两个 target、getty.service（`make run` 启动的
-                      # 控制台登录）和它的替代品 shell.service
+                      # 控制台登录）、network.service（DHCP）和替代品 shell.service
 units/demo/           # §7.x 的验收单元；只打进 `make test-system` 启动的镜像，
                       # 并从控制台手动启动
 scripts/              # fetch/kernel/busybox/initramfs/qemu/system-test/soak
@@ -314,13 +319,13 @@ make gates          # acceptance gates: binary size + coverage thresholds
   这样门禁自己的算术也能被测；
 - **客户机系统测试**（`scripts/system-test.sh`，计划 §4.3）：在 aarch64 qemu 上启动
   真实的 initramfs，在控制台上输入以证明 root shell 可达，对运行中的系统驱动
-  `rctl`，并断言 92 件事——包括层级按依赖顺序运行、target 从不被 exec、§7.4 的
+  `rctl`，并断言 97 件事——包括层级按依赖顺序运行、target 从不被 exec、§7.4 的
   降权结果、§7.3 的限额从客户机自己的内核里读回、rinit 自己在启动时和 20 个服务下的
   RSS（从 `/proc/1/status` 读）、§4.3 的启动耗时（取自内核时钟）、qemu 真实挂载的
-  设备上的 §7.5 看门狗、针对客户机自己的（可写的 ramfs）单元目录执行的 §7.6
-  reload，以及 §7.10 的 forking 守护进程——通过 `PIDFile=` 定位，然后作为单元的
-  进程停止。退出码 `0` 通过、`1` 断言失败、`2` 缺少产物、`3` qemu 无法启动。
-  日志落在 `build/logs/`（成功时删除，除非传了 `--keep-log`）。
+  设备上的 §7.5 看门狗、DHCP 客户端拿到的地址/路由/DNS、针对客户机自己的（可写的
+  ramfs）单元目录执行的 §7.6 reload，以及 §7.10 的 forking 守护进程——通过 `PIDFile=`
+  定位，然后作为单元的进程停止。退出码 `0` 通过、`1` 断言失败、`2` 缺少产物、
+  `3` qemu 无法启动。日志落在 `build/logs/`（成功时删除，除非传了 `--keep-log`）。
 挂载策略（计划 §1.3(9)）通过 `MountOps` trait 覆盖，因此致命/可降级规则不需要
 `CAP_SYS_ADMIN` 就能测试——这就是计划 §4.2 要求"fake runtime"的形态。§7.4 的降权计划
 是同一个关注点的另一种表达：用数据而不是 trait 表示。`Sandbox::steps()` 返回有序
@@ -429,7 +434,7 @@ cargo llvm-cov --offline --workspace --html                  # target/llvm-cov/h
 
 | 计划 §6 | 现状 |
 | ------- | --------------- |
-| 在 qemu（128M）里作为 PID 1 启动，内核无 panic | `make test-system`：92 条断言，包括 "no rinit panic" 和四条内核日志检查 |
+| 在 qemu（128M）里作为 PID 1 启动，内核无 panic | `make test-system`：97 条断言，包括 "no rinit panic" 和四条内核日志检查 |
 | 20 个服务并行，明显快于串行 | **19.2x**：`make parallel`——20 个各睡 1 s 的 `oneshot` 服务，并行总耗时 1065 ms，串行 20 424 ms |
 | 崩溃重启、熔断、健康检查 | `make test-system`（"a crashed service is scheduled for restart"、"the breaker tripped on the failing unit"）和 `crates/rinit/tests/m2_lifecycle.rs` |
 | `rctl` 能启动、停止、查询、读日志 | `make test-system` 的 M3 段和 `crates/rctl/tests/control.rs` |
@@ -468,7 +473,8 @@ make run                 # default; builds rinit, kernel, busybox, initramfs, bo
    `build/out/initramfs-<target>-demo.cpio.gz` 是同一套根，再加
    `units/demo/`，也是 `make test-system` 启动的那个。
 5. 用 `qemu-system-aarch64 -machine virt -cpu cortex-a57 -m 128M` 启动，并加
-   `-device i6300esb`——rinit 武装的看门狗（计划 §7.5）。
+   `-device i6300esb`——rinit 武装的看门狗（计划 §7.5）——以及 qemu 的用户态网络
+   （`-netdev user` 加 `virtio-net-device`），DHCP 客户端就跑在它上面。
 
 没有需要配置的东西：`make run` 总是构建过期的部分并启动单元目录。重跑不会下载、
 不会编译——下面的文件目标已经编码了这一点，所以没有"跳过构建"开关。一个例外恰好
@@ -500,7 +506,8 @@ make KERNEL_VERSION=6.6.158 BUSYBOX_VERSION=1.36.1 ...   # pin versions
 回车即可——`/etc/passwd` 里的密码字段是空的，之后什么都不用输。上面的记录就是那个
 提示符。登录后 `/etc/motd` 会打印常用命令（`rctl list`、`rctl status getty.service`、
 `rctl log getty.service`、`poweroff -f`），`/etc/profile` 会设置 `PATH` 并应用
-`/etc/hostname`。
+`/etc/hostname`。`network.service` 运行 DHCP 客户端：qemu 的用户态网络给客户机分配
+`10.0.2.15/24`、网关 `10.0.2.2` 和 DNS `10.0.2.3`，所以接口无需手工配置。
 
 这刻意不是一个安全边界：能碰到串口的人已经拥有这台机器，而开发用 initramfs 不是放
 真实凭据的地方。给 root 设密码意味着要写 `/etc/shadow`，而它没有被打包。
@@ -757,7 +764,7 @@ M0 的 bring-up 辅助程序 `rinit-testservice` 已经删除：没有东西再�
 
 打包后的镜像（`build/out/initramfs-aarch64-unknown-linux-gnu.cpio.gz` 和
 `…-demo.cpio.gz`：静态 busybox + rinit + rctl + 单元目录 + `/etc`/`/var` 骨架）
-gzip 后都是 2.31 MiB（分别为 2 417 741 B 和 2 423 800 B）。差值就是 `units/demo/`
+gzip 后都是 2.31 MiB（分别为 2 418 529 B 和 2 425 440 B）。差值就是 `units/demo/`
 里的十四个文件，只有第二个镜像带它们。打包是可复现的——`scripts/mkinitramfs.sh` 把归档
 本来会记录的 mtime 和 inode 号归零，所以同样的二进制重复打包得到同样的字节，这才让
 这个数字可核对，而不只是"重新测了一遍"。例外是*强制*重建 busybox（`make -B`）：

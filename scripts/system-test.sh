@@ -144,6 +144,15 @@ await_log() {
     printf 'id\n' >&3
     await_log 10 'uid=0\(root\)' || true
 
+    # The boot set's DHCP client. qemu's user-mode network answers the lease, so
+    # the interface, the default route and the resolver all have to be set by
+    # the unit - not by anything the test typed.
+    printf 'n=$(rctl status network.service | grep state); echo net-$n; ip addr show dev eth0 | grep "inet "; ip route | grep default; grep nameserver /etc/resolv.conf\n' >&3
+    await_log 10 'net-state: active' || true
+    await_log 10 'inet 10\.0\.2\.15/24' || true
+    await_log 10 'default via 10\.0\.2\.2' || true
+    await_log 10 'nameserver 10\.0\.2\.3' || true
+
     # Plan §0.1's memory column: rinit's own RSS at boot, read out of the kernel
     # rather than out of rinit. This is the *idle* number, so it is measured here,
     # before anything on this console starts another unit.
@@ -526,6 +535,7 @@ else
 fi
 expect "the init anchor is scheduled" "plan 0: rinit-init.target"
 expect "the console getty is scheduled" "getty.service"
+expect "the DHCP client is scheduled" "network.service"
 
 # Boot must be ordered: mounts before any unit is started, and levels in
 # dependency order.
@@ -554,16 +564,16 @@ else
     fail "getty.service should have been started"
 fi
 
-# The boot closure is the console and nothing else. `units/` is the boot set -
-# the two targets and getty - and the §7.x acceptance units live in `units/demo/`,
-# which this image carries but the boot target does not reference. The count is
-# exact on purpose: adding a unit to the closure is a design change, and this is
-# where it should be noticed rather than in a boot log nobody reads.
+# The boot closure is the console and the DHCP client. `units/` is the boot set
+# - the two targets, getty and network - and the §7.x acceptance units live in
+# `units/demo/`, which this image carries but the boot target does not reference.
+# The count is exact on purpose: adding a unit to the closure is a design change,
+# and this is where it should be noticed rather than in a boot log nobody reads.
 boot_line="$(grep -oE 'boot complete: [0-9]+ unit\(s\) started' "${log_file}" | head -1)"
-if [[ "${boot_line}" == "boot complete: 1 unit(s) started" ]]; then
-    pass "the boot started exactly the console, nothing else"
+if [[ "${boot_line}" == "boot complete: 2 unit(s) started" ]]; then
+    pass "the boot started exactly the console and the DHCP client"
 else
-    fail "boot should have started exactly 1 unit (got: '${boot_line:-missing}')"
+    fail "boot should have started exactly 2 units (got: '${boot_line:-missing}')"
 fi
 
 # Logging in must work, and with an empty password field there is nothing to
@@ -571,6 +581,14 @@ fi
 # getty, login, /etc/passwd - actually worked.
 expect "getty presents a login prompt" "login:"
 expect "login succeeded and gave a root shell" "uid=0(root)"
+
+# The DHCP client is a supervised rinit unit, and qemu's user-mode network is
+# what answers it: the address, the route and the resolver are all consequences
+# of `units/network.service`, not of anything the test typed.
+expect "network.service is active" "net-state: active"
+expect "the guest got its address from DHCP" "inet 10.0.2.15/24"
+expect "the DHCP default route is installed" "default via 10.0.2.2"
+expect "the DHCP DNS server reached /etc/resolv.conf" "nameserver 10.0.2.3"
 
 # M3 acceptance (plan §3): the guest's own `rctl` drives the running system and
 # reads its logs back. `list`/`status`/`start`/`log`/`stop`/`reset-failed` are

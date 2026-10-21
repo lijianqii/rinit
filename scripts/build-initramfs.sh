@@ -72,7 +72,7 @@ chmod 0755 "${work}"
 # skeleton a login expects to find: `/var/log` for the log mirror and wtmp,
 # `/mnt`, `/home`, `/opt`, `/srv` and `/usr/local` for an operator, and `/var/run`
 # pointing at the `/run` tmpfs rinit mounts over the image's own directory.
-install -d "${work}"/{sbin,bin,etc/rinit/units,proc,sys,dev,run,usr/local/bin,usr/local/sbin}
+install -d "${work}"/{sbin,bin,etc/rinit/units,etc/udhcpc,proc,sys,dev,run,usr/local/bin,usr/local/sbin}
 install -d "${work}"/{var/log/rinit,var/spool,mnt,media,home,opt,srv}
 install -d -m 0700 "${work}/root"
 install -d -m 1777 "${work}/tmp" "${work}/var/tmp"
@@ -101,6 +101,11 @@ write_config() {
     local dest="$1"
     cat >"${dest}"
     chmod 0644 "${dest}"
+}
+write_script() {
+    local dest="$1"
+    cat >"${dest}"
+    chmod 0755 "${dest}"
 }
 write_config "${work}/etc/profile" <<'EOF'
 # Login shell setup for the rinit development image.
@@ -132,6 +137,53 @@ Units live in /etc/rinit/units; this image carries the boot set only.
   poweroff -f                stop the guest
 
 The acceptance image (make test-system) adds units/demo/.
+EOF
+
+# The DHCP client is a real unit (`units/network.service`); these two files are
+# what it runs. `start.sh` keeps a host-verification image without a NIC quiet,
+# and the event script does the actual address/route/DNS work.
+write_script "${work}/etc/udhcpc/start.sh" <<'EOF'
+#!/bin/sh
+# rinit starts this as network.service. The aarch64 qemu machine always has the
+# virtio NIC; a host-verification boot without one leaves the unit inactive
+# rather than filling the log with restart failures.
+[ -e /sys/class/net/eth0 ] || exit 0
+
+exec /sbin/udhcpc -i eth0 -f -s /etc/udhcpc/default.script
+EOF
+write_script "${work}/etc/udhcpc/default.script" <<'EOF'
+#!/bin/sh
+# udhcpc event script for the development image. busybox exports the prefix
+# length as $mask (and the dotted netmask as $subnet); $router and $dns are
+# space-separated lists. Absolute paths: rinit starts this without a login shell.
+case "$1" in
+deconfig)
+    /sbin/ip addr flush dev "$interface"
+    /sbin/ip link set dev "$interface" up
+    ;;
+bound|renew)
+    /sbin/ip addr flush dev "$interface"
+    if [ -n "${broadcast:-}" ]; then
+        /sbin/ip addr add "$ip/${mask:-24}" broadcast "$broadcast" dev "$interface"
+    else
+        /sbin/ip addr add "$ip/${mask:-24}" dev "$interface"
+    fi
+    /sbin/ip link set dev "$interface" up
+
+    if [ -n "${router:-}" ]; then
+        while /sbin/ip route del default dev "$interface" 2>/dev/null; do :; done
+        for r in ${router}; do
+            /sbin/ip route add default via "$r" dev "$interface" && break
+        done
+    fi
+
+    {
+        [ -n "${domain:-}" ] && echo "search $domain"
+        for d in ${dns:-}; do echo "nameserver $d"; done
+    } > /etc/resolv.conf
+    ;;
+esac
+exit 0
 EOF
 
 # The unit directory, which is what the guest actually boots.

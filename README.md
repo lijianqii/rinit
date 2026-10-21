@@ -14,7 +14,7 @@ answers plan §6's checklist line by line, with one exception - the 72 h soak, w
 is a deployment-time run of `make soak` rather than a feature.
 
 What is in place, and what it is proven by. Every claim below is either a host
-test (`make check`) or a guest assertion (`make test-system`, 92 of them in
+test (`make check`) or a guest assertion (`make test-system`, 97 of them in
 `scripts/system-test.sh`); "proven on the host" always means the fake-runtime or
 `--dev` form of the same code path, and the guest means the real one.
 
@@ -31,7 +31,7 @@ A real boot of the committed tree on the serial console (`…` elides kernel
 noise; the lines below are the ones `make test-system` asserts on, except that the
 system test boots the acceptance image and so counts the `units/demo/` units in
 its plan line too). This is `make run`, and the boot target's closure is the
-console and nothing else:
+console and the DHCP client:
 
 ```
 [    2.344175] Run /sbin/rinit as init process
@@ -45,35 +45,40 @@ rinit: mounted /sys/fs/cgroup
 rinit: mounted /data (fstab)
 rinit: cgroup v2 ready at /sys/fs/cgroup
 rinit: logging to /var/log/rinit/log
-rinit: boot plan for 'multi-user.target': 4 unit(s) in 3 level(s)
+rinit: boot plan for 'multi-user.target': 5 unit(s) in 3 level(s)
 rinit: plan 0: rinit-init.target (target)
 rinit: plan 1: getty.service (service)
+rinit: plan 1: network.service (service)
 rinit: plan 2: multi-user.target (target)
 rinit: starting level 0: 0 service(s)
 rinit: level 0 reached: rinit-init.target active
-rinit: starting level 1: 1 service(s)
+rinit: starting level 1: 2 service(s)
 rinit: started getty.service as pid 48
+rinit: started network.service as pid 49
 rinit: starting level 2: 0 service(s)
 rinit: level 2 reached: multi-user.target active
-rinit: boot complete: 1 unit(s) started from 'multi-user.target' (1 still running)
-rinit: boot timing: first service at 2590ms of kernel uptime (rinit's own boot: 239ms)
+rinit: boot complete: 2 unit(s) started from 'multi-user.target' (2 still running)
+rinit: boot timing: first service at 5190ms of kernel uptime (rinit's own boot: 505ms)
 rinit: watchdog /dev/watchdog armed: 30s timeout, feeding every 15s
 
 (none) login:
 ```
 Two lines in that boot are measurements rather than steps. `mounted /data (fstab)`
 is plan §1.3(9)'s second wave - an `/etc/fstab` entry, mounted after the first
-wave - and `boot timing: first service at 2590ms of kernel uptime (rinit's own
-boot: 239ms)` is plan §4.3's number, on the kernel's own clock so it covers the
+wave - and `boot timing: first service at 5190ms of kernel uptime (rinit's own
+boot: 505ms)` is plan §4.3's number, on the kernel's own clock so it covers the
 kernel's boot as well. Both figures come from a run whose *host* was also running
 the 72 h soak, and they move from boot to boot (an earlier one under the same load
-read 4840 ms and 484 ms); the guest asserts the measurement is the kernel's clock,
+read 2590 ms and 239 ms); the guest asserts the measurement is the kernel's clock,
 not that it hit a number.
 
-Note that the plan resolves **4 units** and starts **1**: `units/` is the boot set
-- the two targets, the console and its alternative - and only the boot target's
-closure is started. `shell.service` is parsed and ordered but not activated,
-because it would fight `getty.service` for `ttyAMA0`. The §7.x acceptance units
+Note that the plan resolves **5 units** and starts **2**: `units/` is the boot set
+- the two targets, the console and its alternative, and the DHCP client - and only
+the boot target's closure is started. `shell.service` is parsed and ordered but
+not activated, because it would fight `getty.service` for `ttyAMA0`.
+`network.service` is in the closure: `multi-user.target` requires it, and qemu's
+user-mode DHCP gives the guest `10.0.2.15/24`, gateway `10.0.2.2` and DNS
+`10.0.2.3`. The §7.x acceptance units
 live in `units/demo/`, which `make test-system` packs and `make run` does not:
 `priv`/`caps`/`ambient` (§7.4), `cglimit`/`cgrun`/`oom` (§7.3), `forking` (§7.10),
 `logdemo`, `tty`, `sockd`, `sockc`, `api` and the `worker@` template are outside
@@ -278,7 +283,8 @@ crates/
     tests/m2_lifecycle.rs, tests/smoke.rs
   rctl/               # control CLI (main.rs, parse.rs, client.rs) + tests
 units/                # the boot set: the two targets, getty.service (the console
-                      # login `make run` boots) and shell.service, its alternative
+                      # login `make run` boots), network.service (DHCP) and
+                      # shell.service, its alternative
 units/demo/           # the §7.x acceptance units; packed only into the image
                       # `make test-system` boots, and started from the console
 scripts/              # fetch/kernel/busybox/initramfs/qemu/system-test/soak
@@ -350,12 +356,13 @@ redundant:
   tested;
 - **the guest system test** (`scripts/system-test.sh`, plan §4.3): boots the real
   initramfs on aarch64 qemu, types at the console to prove a root shell is
-  reachable, drives `rctl` against the running system, and asserts 92 things -
+  reachable, drives `rctl` against the running system, and asserts 97 things -
   including that levels run in dependency order, that no target is ever exec'd,
   the §7.4 privilege-drop outcomes, the §7.3 limits read back out of the guest's
   own kernel, rinit's own RSS at boot and under 20 services read out of
   `/proc/1/status`, §4.3's boot timing read off the kernel's clock, §7.5's
-  watchdog on the real device qemu attaches, §7.6's reload
+  watchdog on the real device qemu attaches, the DHCP client's address, route and
+  resolver, §7.6's reload
   against the guest's own (writable, ramfs) unit directory, and §7.10's forking
   daemon - located through its `PIDFile=` and then stopped as the unit's process.
   Exit codes are
@@ -505,7 +512,7 @@ repository or a measurement in this README:
 
 | plan §6 | where it stands |
 | ------- | --------------- |
-| boots as PID 1 in qemu (128M) with no kernel panic | `make test-system`: 92 assertions, including "no rinit panic" and four kernel-log checks |
+| boots as PID 1 in qemu (128M) with no kernel panic | `make test-system`: 97 assertions, including "no rinit panic" and four kernel-log checks |
 | 20 services in parallel, visibly faster than serial | **19.2x**: `make parallel` - 20 `oneshot` services that each sleep 1 s finish in 1065 ms together and 20 424 ms chained |
 | crash-restart, breaker, health checks | `make test-system` ("a crashed service is scheduled for restart", "the breaker tripped on the failing unit") and `crates/rinit/tests/m2_lifecycle.rs` |
 | `rctl` can start, stop, query and read logs | `make test-system`'s M3 block and `crates/rctl/tests/control.rs` |
@@ -546,7 +553,9 @@ What it does, in order (see [Makefile](Makefile)):
    acceptance image `build/out/initramfs-<target>-demo.cpio.gz` is
    the same root plus `units/demo/`, and is what `make test-system` boots.
 5. Boot it in `qemu-system-aarch64 -machine virt -cpu cortex-a57 -m 128M` with
-   `-device i6300esb`, the watchdog rinit arms (plan §7.5).
+   `-device i6300esb`, the watchdog rinit arms (plan §7.5), and qemu's user-mode
+   network (`-netdev user` plus `virtio-net-device`), which is what the DHCP
+   client runs on.
 
 There is nothing to configure: `make run` always builds whatever is out of date
 and boots the unit directory. Re-running it does no downloading and no
@@ -583,7 +592,10 @@ console. Type `root` and press enter — the password field in `/etc/passwd` is
 empty, so there is nothing to type after that. The transcript above is that
 prompt. After login `/etc/motd` prints the commands that matter (`rctl list`,
 `rctl status getty.service`, `rctl log getty.service`, `poweroff -f`), and
-`/etc/profile` sets `PATH` and applies `/etc/hostname`.
+`/etc/profile` sets `PATH` and applies `/etc/hostname`. `network.service` runs
+the DHCP client: qemu's user-mode network gives the guest `10.0.2.15/24`,
+gateway `10.0.2.2` and DNS `10.0.2.3`, so the interface is configured without a
+manual step.
 
 This is deliberately not a security boundary: anyone who can reach the serial
 port already has the machine, and a development initramfs is not the place for
@@ -901,7 +913,7 @@ command through the same spawn path a unit uses.
 
 The packed images (`build/out/initramfs-aarch64-unknown-linux-gnu.cpio.gz` and
 `…-demo.cpio.gz`: static busybox + rinit + rctl + the unit directory + the
-`/etc`/`/var` skeleton) are 2.31 MiB each (2 417 741 B and 2 423 800 B) gzipped.
+`/etc`/`/var` skeleton) are 2.31 MiB each (2 418 529 B and 2 425 440 B) gzipped.
 The difference is the fourteen files in `units/demo/`, which only the second one
 carries. The packing is
 reproducible - `scripts/mkinitramfs.sh` zeroes the mtimes and inode numbers the

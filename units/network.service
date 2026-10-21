@@ -1,0 +1,20 @@
+# DHCP client for the development image's qemu NIC.
+#
+# This is a normal rinit service rather than an init script: `Type=simple`
+# because `udhcpc -f` stays in the foreground for the life of the lease,
+# `Restart=on-failure` because a DHCP client that dies has to come back, and
+# `multi-user.target` requires it so the unit is part of the boot closure.
+#
+# `/etc/udhcpc/start.sh` exits 0 when there is no eth0 (the x86_64 verification
+# image boots without a NIC), which leaves the unit inactive instead of tripping
+# the start-limit breaker.
+[Unit]
+Description=DHCP client on eth0
+Requires=rinit-init.target
+After=rinit-init.target
+
+[Service]
+Type=simple
+ExecStart=/etc/udhcpc/start.sh
+Restart=on-failure
+RestartSec=2

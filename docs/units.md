@@ -240,8 +240,9 @@ service does not have is the one outcome §7.3 exists to prevent.
 ## Examples
 
 [`units/`](../units) is the boot set - the two targets, the console
-(`getty.service`) and its alternative (`shell.service`) - and is the whole of what
-`make run` packs. The acceptance units live in [`units/demo/`](../units/demo),
+(`getty.service`), its alternative (`shell.service`) and the DHCP client
+(`network.service`) - and is all of the unit set `make run` packs. The acceptance
+units live in [`units/demo/`](../units/demo),
 which only the image `make test-system` boots carries, and the console starts them
 one at a time: `fault.service` (a crashing service, for the restart policy and the
 breaker), `priv.service`/`caps.service`/`ambient.service` (§7.4),

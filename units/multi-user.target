@@ -36,3 +36,6 @@ After=rinit-init.target
 Requires=rinit-init.target
 # Requires=shell.service
 Requires=getty.service
+# The DHCP client is part of the closure: `make run` gives the guest a NIC and
+# qemu's user-mode network answers the lease.
+Requires=network.service
