@@ -309,12 +309,12 @@ make test           # check + test-system
 make gates          # acceptance gates: binary size + coverage thresholds
 ```
 
-`cargo test --offline --workspace` (what `make check` runs last) executes **717
+`cargo test --offline --workspace` (what `make check` runs last) executes **735
 tests** across twelve test binaries. The five shapes, and why each is not
 redundant:
 
-- **unit tests** next to the code (core 324, rinit 189, rinit-runtime 108,
-  rctl 11), including `proptest` properties over the parser;
+- **unit tests** next to the code (core 329, rinit 197, rinit-runtime 110,
+  rctl 14), including `proptest` properties over the parser;
 - **integration tests** in `crates/*/tests/`: the syscall layer against the real
   kernel (`rinit-runtime` 22: run unprivileged, they assert that each drop is
   *refused* rather than silently skipped - `EPERM` from `setuid(0)`, `setgroups`,

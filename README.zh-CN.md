@@ -284,9 +284,9 @@ make gates          # acceptance gates: binary size + coverage thresholds
 ```
 
 `cargo test --offline --workspace`（`make check` 最后一步跑的就是它）在十二个测试
-二进制里执行 **717 个测试**。五种形态，以及为什么每种都不是多余的：
+二进制里执行 **735 个测试**。五种形态，以及为什么每种都不是多余的：
 
-- **单元测试**紧挨着代码（core 324、rinit 189、rinit-runtime 108、rctl 11），
+- **单元测试**紧挨着代码（core 329、rinit 197、rinit-runtime 110、rctl 14），
   包括解析器上的 `proptest` 属性测试；
 - **集成测试**在 `crates/*/tests/`：系统调用层面对真实内核（`rinit-runtime` 22 个：
   以非特权身份运行，断言每次降权都*被拒绝*而不是被静默跳过——`setuid(0)`、
