@@ -331,9 +331,9 @@ fn fail_file_actions(
 /// rinit is single-threaded by design (plan §2.1⑤), so the child inherits no
 /// other thread's locks; it still calls only `libc` and allocates nothing,
 /// because between `fork` and `exec` nothing else is safe to assume. Everything
-/// the child needs - the argument vectors, the working directory, the sandbox,
-/// the cgroup path - is built in the parent and lives in the address space the
-/// child is sharing.
+/// the child needs - the argument vectors, the working directory, the sandbox
+/// steps, the cgroup path - is built in the parent and lives in the address space
+/// the child is sharing.
 ///
 /// A step that fails in the child is reported back over a close-on-exec pipe,
 /// so the caller gets a [`SyscallError`] naming the step (`setuid failed:
@@ -362,6 +362,7 @@ pub fn spawn_sandboxed(
         options,
         working_directory,
         sandbox,
+        steps: sandbox.steps(),
         paths,
     };
 
@@ -414,6 +415,10 @@ struct ChildSetup<'a> {
     options: SpawnOptions,
     working_directory: Option<&'a CStr>,
     sandbox: &'a Sandbox,
+    /// The privilege-drop steps, already ordered. `Sandbox::steps` builds a
+    /// `Vec`; doing that in the child would be an allocation between `fork` and
+    /// `exec`, which is exactly what this struct exists to avoid.
+    steps: Vec<SandboxStep>,
     /// The files the child opens and acts on after the fork (plan §7.3, §7.11).
     paths: ChildPaths<'a>,
 }
@@ -496,7 +501,7 @@ fn child_exec(setup: &ChildSetup<'_>, report_read: libc::c_int, report_write: li
 
     // Plan §7.4's order, from the plan that `rinit_core::unit::sandbox`
     // produced: the steps are already in it.
-    for step in setup.sandbox.steps() {
+    for &step in &setup.steps {
         let outcome = match step {
             SandboxStep::NoNewPrivileges => cred::set_no_new_privs(),
             SandboxStep::KeepCapabilities => cred::keep_capabilities(),
