@@ -201,3 +201,60 @@ pub async fn reload(
     rlog!("{}", report.summary());
     Ok(report)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn name(s: &str) -> UnitName {
+        UnitName::parse(s).expect("valid unit name")
+    }
+
+    /// A reload that changed nothing is the common case and has to say exactly
+    /// that, in one line, with no stray action lines.
+    #[test]
+    fn an_empty_report_has_no_lines_and_counts_zero() {
+        let report = Report::default();
+        assert!(report.lines().is_empty());
+        assert_eq!(
+            report.summary(),
+            "reload: 0 added (0 started), 0 changed (0 deferred), 0 removed (0 stopped), 0 unchanged"
+        );
+    }
+
+    /// The lines name each action once, in the order a reader needs: what went
+    /// away, what changed, what arrived, and what is still deferred.
+    #[test]
+    fn each_action_gets_one_line() {
+        let report = Report {
+            added: vec![name("new.service")],
+            started: vec![name("wanted.service")],
+            applied: vec![name("changed.service")],
+            deferred: vec![name("running.service")],
+            removed: vec![name("gone.service")],
+            stopped: vec![name("stopped.service")],
+            pruned: 2,
+            unchanged: 7,
+        };
+
+        assert_eq!(
+            report.lines(),
+            [
+                "stopped stopped.service: its unit file is gone",
+                "removed gone.service",
+                "changed.service: new definition in force",
+                "running.service is running; its new definition applies at the next start",
+                "registered new.service",
+                "started wanted.service: the boot target requires it",
+                "dropped 2 unit(s) a previous reload removed",
+            ]
+        );
+        // "changed" is applied + deferred, and "stopped" is a subset of
+        // "removed": the summary counts the union, and names the subset, rather
+        // than double-counting either.
+        assert_eq!(
+            report.summary(),
+            "reload: 1 added (1 started), 2 changed (1 deferred), 1 removed (1 stopped), 7 unchanged"
+        );
+    }
+}

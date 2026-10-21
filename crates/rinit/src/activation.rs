@@ -178,3 +178,95 @@ async fn watch(listener: OwnedFd, sender: mpsc::UnboundedSender<UnitName>, unit:
         tokio::time::sleep(WATCH_FLOOR).await;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixStream;
+
+    fn name(s: &str) -> UnitName {
+        UnitName::parse(s).expect("valid unit name")
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("rinit-activation-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch directory");
+        dir
+    }
+
+    /// Binding is what makes a unit socket-activated at all: the socket exists,
+    /// anyone may connect, rinit can hand its descriptor over, and shutdown
+    /// removes the file so the next run can bind again.
+    #[tokio::test(flavor = "current_thread")]
+    async fn bind_creates_the_socket_and_disarm_removes_it() {
+        let dir = scratch("bind");
+        let path = dir.join("nested").join("svc.sock");
+        let mut activated = Activated::disabled();
+        let unit = name("svc.service");
+
+        activated.bind(&unit, &path).expect("bind");
+
+        assert!(path.exists(), "bind creates missing parents and the socket");
+        let mode = std::fs::metadata(&path)
+            .expect("stat the socket")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o666, "the socket must be connectable");
+        assert!(activated.listener_fd(&unit).is_some());
+        assert!(
+            activated.listener_fd(&name("other.service")).is_none(),
+            "a unit without a socket has no descriptor"
+        );
+
+        activated.disarm();
+        assert!(!path.exists(), "disarm removes the socket file");
+
+        drop(activated);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A socket left at the path by a previous rinit must not make the next
+    /// bind fail with `EADDRINUSE`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn bind_replaces_a_file_left_at_the_path() {
+        let dir = scratch("stale");
+        let path = dir.join("svc.sock");
+        std::fs::write(&path, b"not a socket").expect("stale file");
+        let mut activated = Activated::disabled();
+
+        activated
+            .bind(&name("svc.service"), &path)
+            .expect("bind replaces the stale entry");
+        assert!(activated.listener_fd(&name("svc.service")).is_some());
+
+        activated.disarm();
+        drop(activated);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The watcher's whole job: a connection becomes the unit's name on the
+    /// channel the main loop selects on.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_connection_reports_the_unit() {
+        let dir = scratch("wake");
+        let path = dir.join("svc.sock");
+        let mut activated = Activated::disabled();
+        let unit = name("svc.service");
+        activated.bind(&unit, &path).expect("bind");
+
+        let client = UnixStream::connect(&path).expect("connect");
+        let woken = tokio::time::timeout(Duration::from_secs(2), activated.recv())
+            .await
+            .expect("a queued connection must wake the loop")
+            .expect("rinit still holds the sender");
+        assert_eq!(woken, unit);
+
+        drop(client);
+        activated.disarm();
+        drop(activated);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

@@ -36,6 +36,26 @@ impl Drop for TempDir {
     }
 }
 
+/// Poll `condition` until it holds, or fail the test at the deadline.
+///
+/// A fixed sleep is the flaky half of a timing test: it has to be long enough
+/// for the slowest machine and is then paid for on every run, and when it is
+/// too short the failure names nothing. Polling keeps the wait proportional to
+/// what actually happened and says what never happened when it gives up.
+fn wait_for(timeout: Duration, what: &str, mut condition: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if condition() {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out after {timeout:?} waiting for {what}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// Boot a unit directory in dev mode, let it settle, then ask it to shut down.
 ///
 /// Returns everything rinit logged on stdout and stderr.
@@ -1501,7 +1521,14 @@ fn a_forking_unit_is_active_once_its_daemon_is_located() {
 
     // The unit was stopped with rinit, and its process is the daemon: a daemon
     // that was only located but not tracked would still be running here.
-    std::thread::sleep(Duration::from_millis(300));
+    wait_for(
+        Duration::from_secs(5),
+        "the daemon to exit with its unit",
+        || {
+            // SAFETY: signal 0 only probes whether the pid exists.
+            (unsafe { libc::kill(daemon, 0) }) != 0
+        },
+    );
     // SAFETY: signal 0 only probes whether the pid exists.
     let still_there = unsafe { libc::kill(daemon, 0) } == 0;
     let _ = fs::remove_file(&pid_file);
@@ -1860,7 +1887,21 @@ Environment=INSTANCE=%i
         rinit_core::Request::Start(unit("worker@1.service")),
     );
     assert_eq!(status, rinit_core::Status::Ok, "{text}");
-    std::thread::sleep(Duration::from_millis(400));
+    let expanded = "instance=1 name=worker@1.service prefix=worker env=1";
+    wait_for(
+        Duration::from_secs(5),
+        "worker@1's log to name every specifier",
+        || {
+            let (_, text) = control(
+                &socket,
+                rinit_core::Request::Log {
+                    unit: Some(unit("worker@1.service")),
+                    tail: 0,
+                },
+            );
+            text.contains(expanded)
+        },
+    );
     let (_, text) = control(
         &socket,
         rinit_core::Request::Log {
@@ -1869,7 +1910,7 @@ Environment=INSTANCE=%i
         },
     );
     assert!(
-        text.contains("instance=1 name=worker@1.service prefix=worker env=1"),
+        text.contains(expanded),
         "every specifier, expanded before the command ran: {text}"
     );
 
@@ -1879,7 +1920,16 @@ Environment=INSTANCE=%i
         rinit_core::Request::Start(unit("worker@2.service")),
     );
     assert_eq!(status, rinit_core::Status::Ok);
-    std::thread::sleep(Duration::from_millis(400));
+    wait_for(Duration::from_secs(5), "worker@2's log to appear", || {
+        let (_, text) = control(
+            &socket,
+            rinit_core::Request::Log {
+                unit: Some(unit("worker@2.service")),
+                tail: 0,
+            },
+        );
+        text.contains("instance=2 name=worker@2.service")
+    });
     let (_, text) = control(
         &socket,
         rinit_core::Request::Log {
@@ -2285,10 +2335,32 @@ fn a_reload_applies_the_difference_without_a_restart() {
     // ...and after a stop and a start, the new one is the one in use.
     let (status, _) = control(&socket, rinit_core::Request::Stop(unit("app.service")));
     assert_eq!(status, rinit_core::Status::Ok);
-    std::thread::sleep(Duration::from_millis(400));
+    wait_for(Duration::from_secs(5), "app.service to stop", || {
+        let (_, text) = control(
+            &socket,
+            rinit_core::Request::Status {
+                unit: Some(unit("app.service")),
+                tail: 0,
+            },
+        );
+        text.contains("state: inactive")
+    });
     let (status, _) = control(&socket, rinit_core::Request::Start(unit("app.service")));
     assert_eq!(status, rinit_core::Status::Ok);
-    std::thread::sleep(Duration::from_millis(400));
+    wait_for(
+        Duration::from_secs(5),
+        "app.service to start with its new definition",
+        || {
+            let (_, text) = control(
+                &socket,
+                rinit_core::Request::Status {
+                    unit: Some(unit("app.service")),
+                    tail: 0,
+                },
+            );
+            text.contains("description: second")
+        },
+    );
     let (_, text) = control(
         &socket,
         rinit_core::Request::Status {
