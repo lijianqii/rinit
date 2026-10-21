@@ -84,14 +84,17 @@ fn boot_units_extra(
     signal: libc::c_int,
     extra: &[&str],
 ) -> String {
-    boot_units_inspect(units, target, settle, signal, extra, || ()).0
+    boot_units_inspect(units, target, settle, signal, extra, |_| ()).0
 }
 
 /// Boot a unit directory, look at it while it is up, then shut it down.
 ///
 /// `inspect` runs after the boot has settled and before the shutdown signal, so
 /// a test can read state that only exists while the boot is running - a service
-/// pid that is still alive, or the cgroup files it wrote. It must not panic:
+/// pid that is still alive, or the cgroup files it wrote. It receives the
+/// control socket path, because a condition the test has to *wait* for (a unit
+/// becoming active, a restart being counted) is only observable through it; a
+/// fixed sleep there would be a guess about the machine. It must not panic:
 /// panicking there would leave rinit running, so assertions belong after the
 /// pair is returned.
 fn boot_units_inspect<T>(
@@ -100,9 +103,11 @@ fn boot_units_inspect<T>(
     settle: Duration,
     signal: libc::c_int,
     extra: &[&str],
-    inspect: impl FnOnce() -> T,
+    inspect: impl FnOnce(&std::path::Path) -> T,
 ) -> (String, T) {
     let bin = env!("CARGO_BIN_EXE_rinit");
+    let control_dir = units.0.join("control");
+    let control_socket = control_dir.join("control.sock");
     let child = Command::new(bin)
         .arg("--dev")
         .arg("--units")
@@ -110,6 +115,7 @@ fn boot_units_inspect<T>(
         .arg("--default")
         .arg(target)
         .args(extra)
+        .env("RINIT_CONTROL_DIR", &control_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -118,7 +124,15 @@ fn boot_units_inspect<T>(
 
     // Let the unit directory boot and any restart/breaker activity happen.
     std::thread::sleep(settle);
-    let inspected = inspect();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !control_socket.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "rinit must bind the control socket"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let inspected = inspect(&control_socket);
     // SAFETY: signalling our own child.
     unsafe { libc::kill(child.id() as libc::pid_t, signal) };
 
@@ -563,6 +577,8 @@ fn a_notify_unit_becomes_active_when_it_reports_ready() {
         "[Service]\nType=notify\nExecStart=/bin/sh -c \"sleep 30\"\n",
     );
     let notify_dir = dir.0.join("notify");
+    let control_dir = dir.0.join("control");
+    let control_socket = control_dir.join("control.sock");
 
     let bin = env!("CARGO_BIN_EXE_rinit");
     let child = Command::new(bin)
@@ -572,6 +588,7 @@ fn a_notify_unit_becomes_active_when_it_reports_ready() {
         .arg("--default")
         .arg("all.target")
         .env("RINIT_NOTIFY_DIR", &notify_dir)
+        .env("RINIT_CONTROL_DIR", &control_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -591,7 +608,32 @@ fn a_notify_unit_becomes_active_when_it_reports_ready() {
     // The service reports readiness, exactly as `sd_notify(READY=1)` would.
     let client = UnixDatagram::unbound().expect("client socket");
     client.send_to(b"READY=1", &socket).expect("send READY=1");
-    std::thread::sleep(Duration::from_millis(300));
+
+    // `Active` is the state the READY datagram produces, and the "is ready"
+    // line is written in the same pass as the transition - so waiting for the
+    // state is waiting for the log line, without guessing a duration.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !control_socket.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "rinit must bind the control socket"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    wait_for(
+        Duration::from_secs(5),
+        "app.service to become active",
+        || {
+            let (_, text) = control(
+                &control_socket,
+                rinit_core::Request::Status {
+                    unit: Some(rinit_core::UnitName::parse("app.service").expect("name")),
+                    tail: 0,
+                },
+            );
+            text.contains("state: active")
+        },
+    );
 
     // SAFETY: signalling our own child.
     unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
@@ -1001,7 +1043,7 @@ fn a_unit_with_limits_is_bounded_in_its_own_cgroup() {
         SETTLE,
         libc::SIGTERM,
         &["--cgroup-root", cg.path()],
-        || {
+        |_socket| {
             let read = |rel: &str| fs::read_to_string(cg.0.join(rel)).unwrap_or_default();
             let procs = read("rinit/worker.service/cgroup.procs");
             let pid: libc::pid_t = procs.trim().parse().unwrap_or(-1);
@@ -1235,7 +1277,7 @@ fn a_cgroup_oom_kill_is_named_and_the_unit_restarts() {
         SETTLE,
         libc::SIGTERM,
         &["--cgroup-root", cg.path()],
-        || {
+        |socket| {
             let procs = fs::read_to_string(cg.0.join("rinit/worker.service/cgroup.procs"))
                 .unwrap_or_default();
             let pid: libc::pid_t = procs.trim().parse().unwrap_or(-1);
@@ -1251,9 +1293,25 @@ fn a_cgroup_oom_kill_is_named_and_the_unit_restarts() {
                 // SAFETY: signalling the service this test started.
                 unsafe { libc::kill(pid, libc::SIGKILL) };
             }
-            // Long enough for the reaper to log the cause and schedule the
-            // restart before the harness shuts rinit down.
-            std::thread::sleep(Duration::from_millis(400));
+            // The reaper logs the cause and then schedules the restart; the
+            // restart counter is the observable result of that same pass, so
+            // waiting for it waits for the line the assertion needs.
+            wait_for(
+                Duration::from_secs(5),
+                "the reaper to count the restart",
+                || {
+                    let (_, text) = control(
+                        socket,
+                        rinit_core::Request::Status {
+                            unit: Some(
+                                rinit_core::UnitName::parse("worker.service").expect("name"),
+                            ),
+                            tail: 0,
+                        },
+                    );
+                    text.contains("restarts: 1")
+                },
+            );
             pid
         },
     );
@@ -1311,7 +1369,7 @@ fn a_sigkill_the_cgroup_did_not_make_is_not_reported_as_an_oom_kill() {
         SETTLE,
         libc::SIGTERM,
         &["--cgroup-root", cg.path()],
-        || {
+        |socket| {
             let procs = fs::read_to_string(cg.0.join("rinit/worker.service/cgroup.procs"))
                 .unwrap_or_default();
             let pid: libc::pid_t = procs.trim().parse().unwrap_or(-1);
@@ -1319,7 +1377,22 @@ fn a_sigkill_the_cgroup_did_not_make_is_not_reported_as_an_oom_kill() {
                 // SAFETY: signalling the service this test started.
                 unsafe { libc::kill(pid, libc::SIGKILL) };
             }
-            std::thread::sleep(Duration::from_millis(400));
+            wait_for(
+                Duration::from_secs(5),
+                "the reaper to count the restart",
+                || {
+                    let (_, text) = control(
+                        socket,
+                        rinit_core::Request::Status {
+                            unit: Some(
+                                rinit_core::UnitName::parse("worker.service").expect("name"),
+                            ),
+                            tail: 0,
+                        },
+                    );
+                    text.contains("restarts: 1")
+                },
+            );
             pid
         },
     );
@@ -1496,7 +1569,7 @@ fn a_forking_unit_is_active_once_its_daemon_is_located() {
     );
 
     let (log, (daemon, alive)) =
-        boot_units_inspect(&dir, "all.target", SETTLE, libc::SIGTERM, &[], || {
+        boot_units_inspect(&dir, "all.target", SETTLE, libc::SIGTERM, &[], |_socket| {
             let pid = fs::read_to_string(&pid_file)
                 .ok()
                 .and_then(|text| text.trim().parse::<libc::pid_t>().ok())
@@ -1635,7 +1708,7 @@ fn a_socket_activated_unit_starts_on_its_first_connection() {
     );
 
     let (log, (connected, probed)) =
-        boot_units_inspect(&dir, "all.target", SETTLE, libc::SIGTERM, &[], || {
+        boot_units_inspect(&dir, "all.target", SETTLE, libc::SIGTERM, &[], |_socket| {
             let connected = std::os::unix::net::UnixStream::connect(&sock).is_ok();
             let deadline = std::time::Instant::now() + Duration::from_secs(3);
             let mut probed = String::new();
@@ -1690,10 +1763,31 @@ fn an_idle_socket_activated_unit_is_stopped() {
         ),
     );
 
-    let log = boot_units_inspect(&dir, "all.target", SETTLE, libc::SIGTERM, &[], || {
-        // Start it, then leave it alone for longer than its idle timeout.
+    let log = boot_units_inspect(&dir, "all.target", SETTLE, libc::SIGTERM, &[], |socket| {
+        // Start it, then leave it alone for longer than its idle timeout. The
+        // state names are what prove both halves happened: active means the
+        // connection really started it, inactive means the idle rule stopped it.
         let connected = std::os::unix::net::UnixStream::connect(&sock).is_ok();
-        std::thread::sleep(Duration::from_millis(2500));
+        let api = || {
+            control(
+                socket,
+                rinit_core::Request::Status {
+                    unit: Some(rinit_core::UnitName::parse("api.service").expect("name")),
+                    tail: 0,
+                },
+            )
+            .1
+        };
+        wait_for(
+            Duration::from_secs(5),
+            "the connection to start api.service",
+            || api().contains("state: active"),
+        );
+        wait_for(
+            Duration::from_secs(10),
+            "the idle timeout to stop api.service",
+            || api().contains("state: inactive"),
+        );
         connected
     })
     .0;
@@ -2143,9 +2237,10 @@ TTYPath={}
         ),
     );
 
-    let (log, seen) = boot_units_inspect(&dir, "all.target", SETTLE, libc::SIGTERM, &[], || {
-        pty.wait_for("via-tty", Duration::from_secs(2))
-    });
+    let (log, seen) =
+        boot_units_inspect(&dir, "all.target", SETTLE, libc::SIGTERM, &[], |_socket| {
+            pty.wait_for("via-tty", Duration::from_secs(2))
+        });
 
     assert!(
         seen,
@@ -2490,7 +2585,7 @@ fn dev_mode_ignores_the_fstab() {
         SETTLE,
         libc::SIGTERM,
         &["--fstab", fstab.to_str().expect("utf-8 path")],
-        || (),
+        |_socket| (),
     )
     .0;
     let _ = fs::remove_file(&fstab);
@@ -2534,7 +2629,7 @@ fn a_crash_loop_cannot_flood_the_console() {
         Duration::from_secs(3),
         libc::SIGTERM,
         &[],
-        || (),
+        |_socket| (),
     )
     .0;
 
