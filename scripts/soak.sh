@@ -232,15 +232,19 @@ threads_of() { proc_field "$1" "Threads:"; }
 fds_of() { find "/proc/$1/fd" -mindepth 1 2>/dev/null | wc -l | tr -d ' '; }
 
 # Zombies are children of rinit specifically: PID 1 must have none, ever.
+#
+# One awk over every status file rather than an awk per file: the per-file
+# version forked twice per process on the machine (167 processes here, ~0.8s a
+# sample), which at `--interval 1` cost more than the interval itself and made
+# the default 60s gate sample only a third of the window it asked for. `State:`
+# precedes `PPid:` in /proc/<pid>/status, so a single pass sees both.
 zombies_of() {
-    local count=0 pid state ppid
-    for pid in /proc/[0-9]*; do
-        state="$(awk '$1 == "State:" { print $2 }' "$pid/status" 2>/dev/null || true)"
-        [[ "$state" == "Z" ]] || continue
-        ppid="$(awk '$1 == "PPid:" { print $2 }' "$pid/status" 2>/dev/null || true)"
-        [[ "$ppid" == "$1" ]] && count=$((count + 1))
-    done
-    echo "$count"
+    awk -v parent="$1" '
+        FNR == 1        { zombie = 0 }
+        $1 == "State:"  { zombie = ($2 == "Z") }
+        $1 == "PPid:"   { if (zombie && $2 == parent) count++ }
+        END             { print count + 0 }
+    ' /proc/[0-9]*/status 2>/dev/null || echo 0
 }
 
 # Wait for the control socket so the churn loop does not race the boot.
@@ -261,12 +265,28 @@ curve="$work/curve.txt"
 : >"$curve"
 
 sample=0
-end=$((SECONDS + seconds))
+started=$SECONDS
+end=$((started + seconds))
+next=$started
 while ((SECONDS < end)); do
     # An `if`, not `&& break`: under `set -e` a false `(( ))` as the last command
     # of a list is an error, which would abort the run on the first sample.
     if ((max_samples > 0)) && ((sample >= max_samples)); then
         break
+    fi
+    # Sleep until this sample's absolute slot. Sleeping a whole `interval` after
+    # the work instead lets the work add to every period: at `--interval 1` a
+    # sample costs ~70ms, so a 60s window yielded 56 samples and failed the
+    # coverage check at the bottom for arithmetic rather than for anything it
+    # measured. Sleeping until `next` keeps the cadence while the slots are
+    # reachable; if one sample costs more than `interval`, the loop runs back to
+    # back and the check still sees the shortfall.
+    now=$SECONDS
+    if ((next > now)); then
+        if ((next >= end)); then
+            break
+        fi
+        sleep $((next - now))
     fi
     sample=$((sample + 1))
     rss="$(rss_of "$rinit_pid")"
@@ -305,7 +325,7 @@ while ((SECONDS < end)); do
         tail -40 "$log" >&2
         exit 1
     }
-    sleep "$interval"
+    next=$((next + interval))
 done
 
 # Steady state is everything after the warmup: boot, the first allocations and
@@ -356,7 +376,13 @@ fi
 
 # A clock step, a signal or any other early exit must not be able to turn a
 # short window into a pass: the samples have to cover what was asked for.
+# `--max-samples` shortens the window on purpose, so it lowers the expectation
+# with it; otherwise every debugging run capped below `seconds/interval` fails
+# for arithmetic rather than for anything it measured.
 expected=$((seconds / interval))
+if ((max_samples > 0)) && ((expected > max_samples)); then
+    expected=$max_samples
+fi
 if ((sample < expected * 95 / 100)); then
     echo "FAIL: only ${sample} samples for a ${seconds}s window at ${interval}s (expected ~${expected}): the window is too short to assert anything" >&2
     fail=1
