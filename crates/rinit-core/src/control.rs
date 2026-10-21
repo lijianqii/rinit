@@ -16,7 +16,7 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use crate::unit::UnitName;
+use crate::unit::{MAX_UNIT_NAME_BYTES, UnitName};
 
 /// Wire version. Bump on any incompatible change; `rctl` and rinit refuse to
 /// talk across a mismatch rather than degrade (plan §1.3(10)).
@@ -42,9 +42,6 @@ pub const CONTROL_DIR: &str = "/run/rinit";
 
 /// The control socket path.
 pub const CONTROL_SOCKET: &str = "/run/rinit/control.sock";
-
-/// Largest unit name accepted in a request, matching the name limit.
-const MAX_UNIT_NAME_BYTES: usize = 255;
 
 /// A request from `rctl`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -381,6 +378,10 @@ pub fn decode_response(body: &[u8]) -> Result<(Status, String), ProtocolError> {
 
 fn put_unit(out: &mut Vec<u8>, unit: &UnitName) {
     let name = unit.canonical();
+    // `UnitName::parse` rejects anything longer, so this cannot truncate; the
+    // assertion is here because a silent `as u8` would send a *different* unit
+    // name, which is the one failure mode a debug assertion can still catch.
+    debug_assert!(name.len() <= MAX_UNIT_NAME_BYTES);
     out.push(name.len() as u8);
     out.extend_from_slice(name.as_bytes());
 }
@@ -474,6 +475,15 @@ mod tests {
     fn round_trip(request: Request) {
         let body = encode_request(&request);
         assert_eq!(decode_request(&body), Ok(request.clone()), "body: {body:?}");
+    }
+
+    #[test]
+    fn the_longest_wire_name_round_trips() {
+        let longest = format!(
+            "{}.service",
+            "a".repeat(MAX_UNIT_NAME_BYTES - ".service".len())
+        );
+        round_trip(Request::Start(name(&longest)));
     }
 
     #[test]

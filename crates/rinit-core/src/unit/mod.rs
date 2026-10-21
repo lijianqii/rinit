@@ -75,6 +75,14 @@ impl fmt::Display for UnitType {
     }
 }
 
+/// The longest unit name the control protocol can carry.
+///
+/// [`crate::control`] frames a unit name with a one-byte length, so a longer
+/// canonical name cannot be sent at all - and an encoder that cast the length
+/// to `u8` would silently send a *different* name. Enforcing the bound where
+/// every name is validated is what keeps the wire honest.
+pub(crate) const MAX_UNIT_NAME_BYTES: usize = 255;
+
 /// A validated unit name with its resolved type.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct UnitName {
@@ -87,8 +95,14 @@ impl UnitName {
     ///
     /// A name ending in `.service` / `.target` keeps that suffix; any other
     /// name is treated as a service and canonicalised with a `.service` suffix
-    /// (plan §1.1 "依赖名解析"). An empty name, an empty stem, or a name with
-    /// characters outside `[A-Za-z0-9:_.@-]` is rejected.
+    /// (plan §1.1 "依赖名解析"). An empty name, an empty stem, a name with
+    /// characters outside `[A-Za-z0-9:_.@-]`, or a canonical name longer than
+    /// [`MAX_UNIT_NAME_BYTES`] is rejected.
+    ///
+    /// The length limit is on the *canonical* name, because that is what the
+    /// control protocol carries: a 250-byte bare name becomes 258 bytes once
+    /// `.service` is appended and is rejected here rather than truncated on the
+    /// wire.
     ///
     /// Suffix matching is exact and case-sensitive: `foo.SERVICE` is *not* a
     /// recognised suffix and therefore canonicalises to `foo.SERVICE.service`.
@@ -115,6 +129,10 @@ impl UnitName {
             canonical.push_str(UnitType::Service.suffix());
             (canonical, UnitType::Service)
         };
+
+        if canonical.len() > MAX_UNIT_NAME_BYTES {
+            return Err(CoreError::InvalidUnitName(canonical));
+        }
 
         Ok(UnitName { canonical, ty })
     }
@@ -201,6 +219,40 @@ mod tests {
     use super::*;
     use alloc::format;
     use alloc::vec::Vec;
+
+    #[test]
+    fn a_name_at_the_wire_limit_is_accepted() {
+        let name = format!(
+            "{}.service",
+            "a".repeat(MAX_UNIT_NAME_BYTES - ".service".len())
+        );
+        let unit = UnitName::parse(&name).expect("255 bytes still fits the wire");
+        assert_eq!(unit.canonical().len(), MAX_UNIT_NAME_BYTES);
+    }
+
+    #[test]
+    fn a_name_past_the_wire_limit_is_rejected() {
+        let name = format!(
+            "{}.service",
+            "a".repeat(MAX_UNIT_NAME_BYTES - ".service".len() + 1)
+        );
+        assert!(UnitName::parse(&name).is_err());
+    }
+
+    /// The suffix is part of the canonical name, so a bare name that fits can
+    /// still exceed the limit once `.service` is appended.
+    #[test]
+    fn the_appended_suffix_counts_against_the_limit() {
+        let boundary = "a".repeat(MAX_UNIT_NAME_BYTES - ".service".len());
+        assert_eq!(
+            UnitName::parse(&boundary)
+                .expect("247 + 8 = 255")
+                .canonical(),
+            format!("{boundary}.service")
+        );
+        let over = "a".repeat(MAX_UNIT_NAME_BYTES - ".service".len() + 1);
+        assert!(UnitName::parse(&over).is_err());
+    }
 
     #[test]
     fn parses_service_with_suffix() {

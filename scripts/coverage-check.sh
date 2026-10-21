@@ -60,6 +60,7 @@ fi
 read -r overall core overall_covered overall_total core_covered core_total < <(
     awk '
         NR == 1 { next }
+        $1 == "TOTAL" { next }
         {
             lines = $8 + 0
             missed = $9 + 0

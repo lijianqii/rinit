@@ -58,6 +58,9 @@ KERNEL_SRC       := $(SRC_DIR)/linux-$(KERNEL_VERSION)
 BUSYBOX_SRC      := $(SRC_DIR)/busybox-$(BUSYBOX_VERSION)
 KERNEL_IMAGE     := $(KERNEL_SRC)/arch/arm64/boot/Image
 BUSYBOX_BIN      := $(BUSYBOX_SRC)/busybox
+# Installed into the image as /etc/fstab and read by rinit's second mount wave,
+# so a change to it has to repack the image just like a unit file does.
+FSTAB            := fstab
 INITRAMFS        := $(OUT_DIR)/initramfs-$(TARGET).cpio.gz
 # The acceptance image: the same root plus units/demo/. `make run` boots the
 # image above, `make test-system` this one - see the packing rules below.
@@ -186,11 +189,11 @@ INITRAMFS_SCRIPTS := $(SCRIPTS)/build-initramfs.sh $(SCRIPTS)/mkinitramfs.sh
 # packed only into the one the system test boots. `make run` is the development
 # loop - boot, get a console, look at a service - and fourteen units that exist
 # to be started one at a time from the console are not part of that.
-$(INITRAMFS): $(RINIT_BIN) $(RCTL_BIN) $(BUSYBOX_BIN) $(BOOT_UNIT_FILES) $(INITRAMFS_SCRIPTS)
+$(INITRAMFS): $(RINIT_BIN) $(RCTL_BIN) $(BUSYBOX_BIN) $(BOOT_UNIT_FILES) $(FSTAB) $(INITRAMFS_SCRIPTS)
 	$(SCRIPTS)/build-initramfs.sh $(TARGET) --busybox-src $(BUSYBOX_SRC) --out $@
 
 $(INITRAMFS_DEMO): $(RINIT_BIN) $(RCTL_BIN) $(BUSYBOX_BIN) $(BOOT_UNIT_FILES) \
-                   $(DEMO_UNIT_FILES) $(INITRAMFS_SCRIPTS)
+                   $(DEMO_UNIT_FILES) $(FSTAB) $(INITRAMFS_SCRIPTS)
 	$(SCRIPTS)/build-initramfs.sh $(TARGET) --busybox-src $(BUSYBOX_SRC) --demo-units --out $@
 
 # The guest boots units/, so nothing is put on the kernel cmdline: any token
