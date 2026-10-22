@@ -35,8 +35,11 @@ pub const ENV_NOTIFY_DIR: &str = "RINIT_NOTIFY_DIR";
 const DIR_MODE: u32 = 0o755;
 /// The socket mode: writable only by its owner (the unit's user, or root).
 const SOCKET_MODE: u32 = 0o660;
-/// The `umask` used around `bind`, chosen so `0777 & ~umask == 0660`.
-const BIND_UMASK: u32 = 0o117;
+/// The `umask` used around `bind`: the socket is created owner-only, never
+/// wider than [`SOCKET_MODE`], and the owner's execute bit stays set so a
+/// directory created by a parallel test thread remains traversable. `arm` sets
+/// the final `0660` after the bind.
+const BIND_UMASK: u32 = 0o077;
 /// The largest datagram rinit will read. sd_notify messages are tiny; anything
 /// larger is truncated by the kernel anyway.
 const MAX_DATAGRAM: usize = 4096;
@@ -226,10 +229,10 @@ fn remove_if_present(path: &Path, what: &'static str) -> Result<(), RuntimeError
 /// Bind a datagram socket at `path`, never exposing it more permissively than
 /// [`SOCKET_MODE`].
 ///
-/// `bind(2)` creates the socket node with `0777 & ~umask`, so the mode is set
-/// *through the umask* here rather than by a later `chmod`: that closes the
-/// window in which another process could connect before the `chmod` ran
-/// (plan §1.3(12)).
+/// `bind(2)` creates the socket node with `0777 & ~umask`; the mask makes it
+/// owner-only while it is created, and `arm` applies [`SOCKET_MODE`] after the
+/// bind. The window is narrower than the final mode, never wider (plan
+/// §1.3(12)).
 fn bind_private(path: &Path) -> Result<UnixDatagram, RuntimeError> {
     let previous = fs::umask(BIND_UMASK);
     let bound = UnixDatagram::bind(path);

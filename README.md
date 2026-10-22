@@ -913,7 +913,7 @@ command through the same spawn path a unit uses.
 
 The packed images (`build/out/initramfs-aarch64-unknown-linux-gnu.cpio.gz` and
 `…-demo.cpio.gz`: static busybox + rinit + rctl + the unit directory + the
-`/etc`/`/var` skeleton) are 2.30 MiB (2 415 549 B) and 2.31 MiB (2 422 376 B)
+`/etc`/`/var` skeleton) are 2.30 MiB (2 415 543 B) and 2.31 MiB (2 422 373 B)
 gzipped. The difference is the fourteen files in `units/demo/`, which only the
 second one carries. The packing is
 reproducible - `scripts/mkinitramfs.sh` zeroes the mtimes and inode numbers the

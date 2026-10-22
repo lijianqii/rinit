@@ -113,10 +113,13 @@ impl ControlServer {
         // EADDRINUSE; nothing else is supposed to be at this path.
         let _ = std::fs::remove_file(&path);
 
-        // Close the permission window: `bind` creates the socket as
-        // `0666 & ~umask`, so rinit sets the umask for exactly that call
-        // (plan §1.3(10)) and restores it afterwards.
-        let previous = fs::umask(0o177);
+        // Close the permission window: `bind` creates the socket through the
+        // process umask, so rinit sets it for exactly that call (plan §1.3(10))
+        // and restores it afterwards. Keep the owner's execute bit in the mask:
+        // the test suite runs these tests in parallel, and a directory created
+        // by another thread inside this window has to stay traversable. The
+        // socket is 0600 either way, and the explicit chmod below is the belt.
+        let previous = fs::umask(0o077);
         let listener = UnixListener::bind(&path);
         fs::umask(previous);
         let listener = listener.map_err(|e| RuntimeError::Io {
