@@ -881,15 +881,68 @@ impl UnitManager {
             rt.pid = None;
             rt.state = UnitState::Failed(FailedReason::StartFailure);
         }
-        let dependents = self.requires_dependents(unit);
-        for dependent in &dependents {
-            if let Some(rt) = self.units.get_mut(dependent)
-                && rt.pid.is_none()
-            {
-                rt.state = UnitState::Failed(FailedReason::StartFailure);
+
+        // `Requires=` is transitive: a target that hard-requires another target
+        // must fail when the service underneath it fails, not only when the
+        // immediate dependent does. Walk the reverse edges breadth-first. A
+        // dependent with a process is left alone (the documented "running
+        // dependents are not cascaded" decision), and a visited set keeps a
+        // malformed cycle from looping forever.
+        let mut failed = Vec::new();
+        let mut visited = std::collections::BTreeSet::new();
+        let mut queue = vec![unit.clone()];
+        visited.insert(unit.clone());
+        while let Some(current) = queue.pop() {
+            for dependent in self.requires_dependents(&current) {
+                let Some(rt) = self.units.get_mut(&dependent) else {
+                    continue;
+                };
+                if rt.pid.is_some() {
+                    continue;
+                }
+                if !matches!(rt.state, UnitState::Failed(_)) {
+                    rt.state = UnitState::Failed(FailedReason::StartFailure);
+                    failed.push(dependent.clone());
+                }
+                if visited.insert(dependent.clone()) {
+                    queue.push(dependent);
+                }
             }
         }
-        dependents
+        failed
+    }
+
+    /// Mark a process-less target as reached after its level has settled.
+    ///
+    /// Targets are filtered out of [`commands_in_level`](crate::manager::commands_in_level)
+    /// because they spawn nothing, so the boot loop has to complete them
+    /// explicitly (plan §7.2). A target whose hard dependency already failed is
+    /// left `Failed` rather than being overwritten with `Active`; failing it
+    /// again propagates to anything that requires the target.
+    pub fn reach_target(&mut self, unit: &UnitName) -> UnitState {
+        let failed = match self.units.get(unit) {
+            Some(rt) => {
+                debug_assert!(rt.config.is_target(), "{unit} is not a target");
+                matches!(rt.state, UnitState::Failed(_))
+                    || rt
+                        .config
+                        .deps
+                        .requires
+                        .iter()
+                        .any(|dependency| self.is_failed(dependency))
+            }
+            None => return UnitState::Inactive,
+        };
+
+        if failed {
+            self.fail_start(unit);
+            return UnitState::Failed(FailedReason::StartFailure);
+        }
+
+        if let Some(rt) = self.units.get_mut(unit) {
+            rt.state = UnitState::Active;
+        }
+        UnitState::Active
     }
 
     /// Whether `unit` is in a failure state.
@@ -1757,9 +1810,23 @@ impl UnitManager {
             let state = rt.state;
             // No restart is coming, so this is where the unit came to rest.
             self.cgroup.cleanup(&unit);
+            // A service that failed at run time has to fail whatever hard
+            // `Requires=` it just the same as a failed start does (plan §1.3(13),
+            // §7.2). Targets have no process, so `fail_start` covers them.
+            if matches!(state, UnitState::Failed(_)) {
+                for dependent in self.fail_start(&unit) {
+                    rlog!("error: {dependent} requires {unit}, which failed");
+                }
+            }
             return Some(Outcome::Exited { unit, state });
         }
-        Some(self.schedule_restart(&unit, now))
+        let outcome = self.schedule_restart(&unit, now);
+        if matches!(outcome, Outcome::StartLimitTripped { .. }) {
+            for dependent in self.fail_start(&unit) {
+                rlog!("error: {dependent} requires {unit}, which failed");
+            }
+        }
+        Some(outcome)
     }
 
     /// Arm the backoff for `unit`, unless the breaker forbids it.

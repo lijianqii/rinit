@@ -1198,13 +1198,29 @@ async fn start_units(
 
         // Targets spawn no process (plan §7.2); reaching one means its
         // dependencies are up, which is what releases the next level.
-        let targets: Vec<&str> = level
+        let targets: Vec<&UnitName> = level
             .iter()
             .filter(|name| manager::config_of(&plan, name).is_some_and(|c| c.is_target()))
-            .map(|name| name.canonical())
             .collect();
         if !targets.is_empty() {
-            rlog!("level {index} reached: {} active", targets.join(", "));
+            let mut active = Vec::new();
+            let mut failed = Vec::new();
+            // Targets spawn nothing, so the level loop has to settle their
+            // state explicitly (plan §7.2). `reach_target` refuses to overwrite
+            // a Failed that `fail_start` already propagated from a dependency.
+            for name in targets {
+                match units.reach_target(name) {
+                    UnitState::Active => active.push(name.canonical()),
+                    UnitState::Failed(_) => failed.push(name.canonical()),
+                    _ => {}
+                }
+            }
+            if !active.is_empty() {
+                rlog!("level {index} reached: {} active", active.join(", "));
+            }
+            if !failed.is_empty() {
+                rlog!("level {index} failed: {} failed", failed.join(", "));
+            }
         }
     }
 

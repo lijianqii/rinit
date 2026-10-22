@@ -282,6 +282,90 @@ fn a_unit_without_restart_is_left_down() {
     );
 }
 
+/// Plan §7.2: a target spawns no process, but a completed boot has to leave it
+/// `Active` - the boot log already says so, and `rctl` must agree.
+#[test]
+fn a_target_reaches_active_after_boot() {
+    let dir = TempDir::new("target-active");
+    dir.write(
+        "app.service",
+        "[Unit]\n[Service]\nType=simple\nExecStart=/bin/sleep 30\n",
+    );
+    dir.write(
+        "all.target",
+        "[Unit]\nType=target\nRequires=app.service\nAfter=app.service\n",
+    );
+
+    let target = rinit_core::UnitName::parse("all.target").expect("target name");
+    let (log, status) = boot_units_inspect(&dir, "all.target", libc::SIGTERM, &[], |socket, _| {
+        control(
+            socket,
+            rinit_core::Request::Status {
+                unit: Some(target.clone()),
+                tail: 0,
+            },
+        )
+        .1
+    });
+
+    assert!(
+        log.contains("level 1 reached: all.target active"),
+        "the boot log must say the target was reached:\n{log}"
+    );
+    assert!(
+        status.contains("state: active"),
+        "rctl must report the target active, got:\n{status}"
+    );
+}
+
+/// Plan §1.3(13) / §7.2: a service that fails after a successful boot must fail
+/// the target that hard-requires it, not leave it claiming to be active.
+#[test]
+fn a_runtime_failure_fails_a_requires_target() {
+    let dir = TempDir::new("target-runtime-fail");
+    dir.write(
+        "app.service",
+        "[Unit]\n[Service]\nType=simple\n\
+         ExecStart=/bin/sh -c \"sleep 2; exit 1\"\nRestart=no\n",
+    );
+    dir.write(
+        "all.target",
+        "[Unit]\nType=target\nRequires=app.service\nAfter=app.service\n",
+    );
+
+    let target = rinit_core::UnitName::parse("all.target").expect("target name");
+    let (log, status) = boot_units_inspect(&dir, "all.target", libc::SIGTERM, &[], |socket, _| {
+        wait_for(Duration::from_secs(10), "all.target to fail", || {
+            control(
+                socket,
+                rinit_core::Request::Status {
+                    unit: Some(target.clone()),
+                    tail: 0,
+                },
+            )
+            .1
+            .contains("state: failed")
+        });
+        control(
+            socket,
+            rinit_core::Request::Status {
+                unit: Some(target.clone()),
+                tail: 0,
+            },
+        )
+        .1
+    });
+
+    assert!(
+        log.contains("all.target requires app.service, which failed"),
+        "the failed dependency must be named:\n{log}"
+    );
+    assert!(
+        status.contains("state: failed"),
+        "the target must be failed, got:\n{status}"
+    );
+}
+
 /// Plan §1.1: `Environment=`, `EnvironmentFile=` and `WorkingDirectory=` must
 /// actually reach the child, with `Environment=` beating the file.
 #[test]

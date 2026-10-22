@@ -153,6 +153,11 @@ await_log() {
     await_log 10 'default via 10\.0\.2\.2' || true
     await_log 10 'nameserver 10\.0\.2\.3' || true
 
+    # Plan §7.2: the default target has no process, but reaching it must leave
+    # it `active` in the control interface, not merely in the boot log.
+    printf 't=$(rctl status multi-user.target | grep state); echo boot-target-$t\n' >&3
+    await_log 10 'boot-target-state: active' || true
+
     # Plan §0.1's memory column: rinit's own RSS at boot, read out of the kernel
     # rather than out of rinit. This is the *idle* number, so it is measured here,
     # before anything on this console starts another unit.
@@ -589,6 +594,7 @@ expect "network.service is active" "net-state: active"
 expect "the guest got its address from DHCP" "inet 10.0.2.15/24"
 expect "the DHCP default route is installed" "default via 10.0.2.2"
 expect "the DHCP DNS server reached /etc/resolv.conf" "nameserver 10.0.2.3"
+expect "the default target is active" "boot-target-state: active"
 
 # M3 acceptance (plan §3): the guest's own `rctl` drives the running system and
 # reads its logs back. `list`/`status`/`start`/`log`/`stop`/`reset-failed` are
