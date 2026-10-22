@@ -553,8 +553,9 @@ make ARCH=arm64 run-disk
 make ARCH=arm32 run-disk
 ```
 
-第一次运行会生成 `build/.../out/rinit-<target>.ext4`（64 MiB），内容来自同一套
-rootfs，加上 `units/device/` 和 dropbear，然后用
+第一次运行会生成 `build/.../out/rinit-<target>.ext4`（至少 64 MiB；默认 32 MiB
+swap 文件时约 65 MiB），内容来自同一套 rootfs，加上 `units/device/`、dropbear
+和 swap 文件，然后用
 `root=/dev/vda rw rootfstype=ext4 init=/sbin/rinit -- --default device.target`
 启动内核，不再使用 initramfs。**镜像存在时不会重建**，所以客户机里的修改能跨重启
 保留；`make disk-image` 才是显式的破坏性重建。
@@ -567,6 +568,7 @@ rootfs，加上 `units/device/` 和 dropbear，然后用
 - `seedrng.service`（持久化 `/var/lib/seedrng`）；
 - `time-sync.service`（busybox `ntpd`）；
 - `mdev.service`（busybox 热插拔守护进程；启动时已有的节点仍由 devtmpfs 创建）；
+- `swap.service`（启用镜像内的 `/swapfile`）；
 - `sshd.service`（dropbear）。
 
 在任何 unit 启动前，rinit 的第二波挂载会读取 `/etc/fstab`；镜像在这里把
@@ -576,6 +578,11 @@ rootfs，加上 `units/device/` 和 dropbear，然后用
 镜像还会安装 `/etc/mdev.conf`。mdev 在未配置时的默认权限是 `0660` root:root，
 初始扫描后会把 `/dev/null` 等节点收窄；这份配置保证标准字符设备仍可供非 root
 进程使用。
+
+`make disk-image` 会创建 32 MiB 的 `/swapfile` 并执行 `mkswap`，开机时由
+`swap.service` 执行 `swapon /swapfile`。可以用
+`make SWAP_SIZE_MB=64 disk-image` 修改大小；`run-disk` 复用的旧镜像不会自动
+更新 swap 文件，必须等下一次破坏性重建。
 
 Dropbear 只允许密钥登录（`-s`）。qemu 把宿主机 2222 转发到客户机 22
 （可用 `DISK_HOSTFWD` 覆盖），配置好公钥后：
@@ -596,7 +603,7 @@ dropbear 源码缓存在 `build/dl/dropbear-2026.94.tar.bz2`；离线环境把�
 镜像不要使用它。`run-disk` 会复用已有 ext4 镜像，因此在这条 fstab 配置加入之前
 构建的镜像，必须先执行 `make disk-image` 重建，再测试交互式 SSH。
 
-镜像构建需要 `e2fsprogs`（`mke2fs -d`）；内核需要 `CONFIG_EXT4_FS`、
+镜像构建需要 `e2fsprogs`（`mke2fs -d`）和 `util-linux`（`mkswap`）；内核需要 `CONFIG_EXT4_FS`、
 `CONFIG_VIRTIO_BLK`，并且 `CONFIG_DEVTMPFS_MOUNT` 必须关闭（由 rinit 自己挂载
 `/dev`，否则真实 rootfs 上第一次挂载会 `EBUSY`）。当前还没有防火墙/nftables
 服务：镜像里没有 `nft`/`iptables`，不要把设备直接暴露在不可信网络上。
@@ -835,8 +842,9 @@ M0 的 bring-up 辅助程序 `rinit-testservice` 已经删除：没有东西再�
 打包后的镜像（`build/out/initramfs-aarch64-unknown-linux-gnu.cpio.gz` 和
 `…-demo.cpio.gz`：静态 busybox + rinit + rctl + 单元目录 + `/etc`/`/var` 骨架）
 gzip 后分别是 2.31 MiB（2 419 117 B）和 2.31 MiB（2 423 284 B）；arm32 的两个镜像
-分别是 2.04 MiB（2 136 598 B）和 2.04 MiB（2 143 555 B）。`run-disk` 的镜像
-是 64 MiB ext4（首次启动前实际使用约 7-10 MiB），不放进 initramfs。差值就是 `units/demo/`
+分别是 2.04 MiB（2 136 598 B）和 2.04 MiB（2 143 555 B）。`run-disk` 的镜像是
+至少 64 MiB 的 ext4（首次启动前实际使用约 38-40 MiB，其中默认 swap 文件占
+32 MiB），不放进 initramfs。差值就是 `units/demo/`
 里的十四个文件，只有第二个镜像带它们。打包是可复现的——`scripts/mkinitramfs.sh` 把归档
 本来会记录的 mtime 和 inode 号归零，所以同样的二进制重复打包得到同样的字节，这才让
 这个数字可核对，而不只是"重新测了一遍"。例外是*强制*重建 busybox（`make -B`）：

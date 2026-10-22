@@ -650,8 +650,9 @@ make ARCH=arm64 run-disk
 make ARCH=arm32 run-disk
 ```
 
-The first invocation creates `build/.../out/rinit-<target>.ext4` (64 MiB) from
-the same rootfs tree plus `units/device/` and dropbear, then boots the kernel
+The first invocation creates `build/.../out/rinit-<target>.ext4` (at least
+64 MiB; about 65 MiB with the default 32 MiB swap file) from
+the same rootfs tree plus `units/device/`, dropbear and the swap file, then boots the kernel
 with `root=/dev/vda rw rootfstype=ext4 init=/sbin/rinit -- --default
 device.target`. There is no initramfs. The image is **reused if it exists**, so
 changes made in the guest survive the next boot; `make disk-image` is the
@@ -665,6 +666,7 @@ explicit destructive rebuild.
 - `seedrng.service` (persistent `/var/lib/seedrng`);
 - `time-sync.service` (busybox `ntpd`);
 - `mdev.service` (busybox hotplug daemon; devtmpfs still creates boot-time nodes);
+- `swap.service` (activates the image's `/swapfile`);
 - `sshd.service` (dropbear).
 
 Before any unit starts, rinit's second mount wave reads `/etc/fstab`; the image
@@ -674,6 +676,11 @@ mounts `devpts` on `/dev/pts` there. It uses the default devpts instance, so
 The image also ships `/etc/mdev.conf`. mdev's built-in fallback mode is `0660`
 root:root, which would narrow `/dev/null` and friends after its initial scan; the
 config keeps the standard character devices usable by non-root processes.
+
+`make disk-image` creates a 32 MiB `/swapfile` with `mkswap` and
+`swap.service` runs `swapon /swapfile` at boot. Change the size with
+`make SWAP_SIZE_MB=64 disk-image`; an existing image reused by `run-disk` keeps
+its current swap file until the next destructive rebuild.
 
 Dropbear is key-only (`-s`). QEMU forwards host port 2222 to guest 22
 (`DISK_HOSTFWD` can be overridden), so after provisioning a key:
@@ -699,7 +706,7 @@ that needs interactive SSH. The ext4 image is reused by `run-disk`, so an image
 built before this fstab entry existed must be rebuilt with `make disk-image`
 before testing interactive SSH again.
 
-The image needs `e2fsprogs` (`mke2fs -d`); the kernel needs `CONFIG_EXT4_FS`,
+The image needs `e2fsprogs` (`mke2fs -d`) and `util-linux` (`mkswap`); the kernel needs `CONFIG_EXT4_FS`,
 `CONFIG_VIRTIO_BLK` and `CONFIG_DEVTMPFS_MOUNT` **off** (rinit mounts `/dev`
 itself; otherwise the first-wave `/dev` mount fails with `EBUSY` on a real
 rootfs). A firewall/nftables service is not included yet: the image has no
@@ -994,8 +1001,9 @@ The packed images (`build/out/initramfs-aarch64-unknown-linux-gnu.cpio.gz` and
 `…-demo.cpio.gz`: static busybox + rinit + rctl + the unit directory + the
 `/etc`/`/var` skeleton) are 2.31 MiB (2 419 117 B) and 2.31 MiB (2 423 284 B)
 gzipped. The arm32 pair is 2.04 MiB (2 136 598 B) and 2.04 MiB (2 143 555 B).
-The `run-disk` images are 64 MiB ext4 files (roughly 7-10 MiB used before the
-first boot); they are not shipped in the initramfs. The difference is the
+The `run-disk` images are ext4 files of at least 64 MiB (roughly 38-40 MiB used
+before the first boot, including the default 32 MiB swap file); they are not
+shipped in the initramfs. The difference is the
 fourteen files in `units/demo/`, which only the second initramfs carries. The packing is
 reproducible - `scripts/mkinitramfs.sh` zeroes the mtimes and inode numbers the
 archive would otherwise record, so repacking the same binaries gives the same

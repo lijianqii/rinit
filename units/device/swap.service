@@ -1,0 +1,13 @@
+# Enable the swap file baked into the persistent ext4 image.
+#
+# The image builder creates /swapfile with mkswap; this unit only activates it.
+# The kernel must have CONFIG_SWAP (the image's kernel does). A oneshot has no
+# process to stop, so this deliberately has no ExecStop=; the swap file is
+# released when the kernel reboots or powers off.
+[Unit]
+Description=Enable swap file
+After=rinit-init.target
+
+[Service]
+Type=oneshot
+ExecStart=/sbin/swapon /swapfile

@@ -21,6 +21,7 @@ script puts in the image, so the kernel has to hand it a few things:
 | a NIC driver (`VIRTIO_NET` + `VIRTIO_MMIO` on qemu's `virt`) | `units/network.service` runs `udhcpc` on `eth0`; without a NIC `udhcpc` fails and the unit is left failed, but `multi-user.target` only `Wants=` it | `make kernel-config-check` |
 | `CONFIG_WATCHDOG_SYSFS` | only so the *test* can read back the timeout rinit set; rinit itself does not need it | same |
 | `CONFIG_TMPFS` | `/run` and `/tmp` | `mounts.rs` |
+| `CONFIG_SWAP` | `swap.service` activates the image's `/swapfile` | `units/device/swap.service` |
 | signals that the kernel delivers normally (`SIGCHLD`, `SIGTERM`, ...) | rinit catches them with `sigaction` handlers and a self-pipe - no `signalfd`, no configuration | `crates/rinit-runtime/src/signals.rs` |
 | `CONFIG_BINFMT_ELF` and whatever the image's busybox needs | the services themselves | - |
 
@@ -164,9 +165,10 @@ auto-mount makes that first-wave mount fail with `EBUSY`.
 
 The image is populated with `mke2fs -d` from a tar whose entries are explicitly
 `root:root` (a directory populated as the build user would otherwise leave every
-file owned by that uid). `units/device/` provides `hostname`, `network-online`
+file owned by that uid); `util-linux`'s `mkswap` creates the embedded swap file. `units/device/` provides `hostname`, `network-online`
 (DHCP lease, not just udhcpc exec), `syslog`/`klogd`, `seedrng`, `time-sync`,
-`mdev` (busybox hotplug daemon) and `sshd`; `/etc/fstab` mounts `devpts` on
+`mdev` (busybox hotplug daemon), `swap` (activates `/swapfile`) and `sshd`;
+`/etc/fstab` mounts `devpts` on
 `/dev/pts` in the second wave, before
 any unit starts. dropbear is static and key-only (`-s`), with host keys generated
 on first connection under `/etc/dropbear`. `/root/.ssh/authorized_keys` starts
@@ -176,7 +178,9 @@ keeps the PTY master open until the slave becomes the controlling terminal. The
 qemu user-net host-forward is `2222 -> 22` by default (`DISK_HOSTFWD`), so
 provisioning a key is what makes `ssh -p 2222 root@...` work. `/etc`, `/var`,
 host keys, logs and the RNG seed persist across boots because the ext4 image is
-reused; `make disk-image` is what wipes them.
+reused; `make disk-image` is what wipes them. That rebuild also creates a 32 MiB
+`/swapfile` by default (`SWAP_SIZE_MB=` changes it); the image needs about
+38-40 MiB before its first boot and is at least 64 MiB.
 
 ## 5. Differences from systemd to expect
 

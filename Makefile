@@ -68,6 +68,9 @@ BUSYBOX_URLS     ?= $(MIRROR)/busybox/busybox-$(BUSYBOX_VERSION).tar.bz2 \
 
 JOBS             ?= $(shell nproc 2>/dev/null || echo 2)
 QEMU_MEM         ?= 128M
+# The persistent device image gets a swap file of this size. It is created only
+# by `make disk-image`; an existing image keeps its original file.
+SWAP_SIZE_MB     ?= 32
 DROPBEAR_VERSION ?= 2026.94
 # Host-side SSH access to `run-disk`: ssh -p 2222 root@localhost.
 DISK_HOSTFWD     ?= tcp::2222-:22
@@ -75,7 +78,7 @@ DISK_HOSTFWD     ?= tcp::2222-:22
 # Everything the guest's acceptance tests need the kernel to provide.
 KERNEL_REQUIRED_OPTS := CGROUP_SCHED FAIR_GROUP_SCHED CFS_BANDWIDTH MEMCG \
                         CGROUP_PIDS I6300ESB_WDT WATCHDOG_SYSFS VIRTIO_NET \
-                        VIRTIO_MMIO EXT4_FS VIRTIO_BLK
+                        VIRTIO_MMIO EXT4_FS VIRTIO_BLK SWAP
 ifeq ($(KERNEL_ARCH),arm)
 KERNEL_REQUIRED_OPTS += ARCH_VIRT PCI_HOST_GENERIC
 endif
@@ -259,9 +262,10 @@ qemu run: $(KERNEL_IMAGE) $(INITRAMFS)
 # next `make run-disk`; `make disk-image` is the explicit destructive rebuild.
 disk-image: rinit $(DROPBEAR_BIN_DIR)/dropbear $(BOOT_UNIT_FILES) \
             $(DEVICE_UNIT_FILES) $(FSTAB) $(MDEV_CONF) $(INITRAMFS_SCRIPTS) \
-            $(SCRIPTS)/mkdisk.sh
+            $(SCRIPTS)/mkdisk.sh $(SCRIPTS)/mkswapfile.sh
 	$(SCRIPTS)/build-initramfs.sh $(TARGET) --busybox-src $(BUSYBOX_SRC) \
 	    --device-units --dropbear-bin $(DROPBEAR_BIN_DIR) --rootfs $(ROOTFS_DIR)
+	$(SCRIPTS)/mkswapfile.sh $(ROOTFS_DIR)/swapfile $(SWAP_SIZE_MB)
 	$(SCRIPTS)/mkdisk.sh $(ROOTFS_DIR) $(DISK_IMAGE)
 
 $(DISK_IMAGE):
