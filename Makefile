@@ -96,6 +96,7 @@ BUSYBOX_BIN      := $(BUSYBOX_SRC)/busybox
 # Installed into the image as /etc/fstab and read by rinit's second mount wave,
 # so a change to it has to repack the image just like a unit file does.
 FSTAB            := fstab
+MDEV_CONF        := mdev.conf
 INITRAMFS        := $(OUT_DIR)/initramfs-$(TARGET).cpio.gz
 # The acceptance image: the same root plus units/demo/. `make run` boots the
 # image above, `make test-system` this one - see the packing rules below.
@@ -234,11 +235,12 @@ INITRAMFS_SCRIPTS := $(SCRIPTS)/build-initramfs.sh $(SCRIPTS)/mkinitramfs.sh
 # packed only into the one the system test boots. `make run` is the development
 # loop - boot, get a console, look at a service - and fourteen units that exist
 # to be started one at a time from the console are not part of that.
-$(INITRAMFS): $(RINIT_BIN) $(RCTL_BIN) $(BUSYBOX_BIN) $(BOOT_UNIT_FILES) $(FSTAB) $(INITRAMFS_SCRIPTS)
+$(INITRAMFS): $(RINIT_BIN) $(RCTL_BIN) $(BUSYBOX_BIN) $(BOOT_UNIT_FILES) $(FSTAB) \
+              $(MDEV_CONF) $(INITRAMFS_SCRIPTS)
 	$(SCRIPTS)/build-initramfs.sh $(TARGET) --busybox-src $(BUSYBOX_SRC) --out $@
 
 $(INITRAMFS_DEMO): $(RINIT_BIN) $(RCTL_BIN) $(BUSYBOX_BIN) $(BOOT_UNIT_FILES) \
-                   $(DEMO_UNIT_FILES) $(FSTAB) $(INITRAMFS_SCRIPTS)
+                   $(DEMO_UNIT_FILES) $(FSTAB) $(MDEV_CONF) $(INITRAMFS_SCRIPTS)
 	$(SCRIPTS)/build-initramfs.sh $(TARGET) --busybox-src $(BUSYBOX_SRC) --demo-units --out $@
 
 # The guest boots units/, so nothing is put on the kernel cmdline: any token
@@ -256,7 +258,8 @@ qemu run: $(KERNEL_IMAGE) $(INITRAMFS)
 # image is built only when missing, so changes made in the guest survive the
 # next `make run-disk`; `make disk-image` is the explicit destructive rebuild.
 disk-image: rinit $(DROPBEAR_BIN_DIR)/dropbear $(BOOT_UNIT_FILES) \
-            $(DEVICE_UNIT_FILES) $(FSTAB) $(INITRAMFS_SCRIPTS) $(SCRIPTS)/mkdisk.sh
+            $(DEVICE_UNIT_FILES) $(FSTAB) $(MDEV_CONF) $(INITRAMFS_SCRIPTS) \
+            $(SCRIPTS)/mkdisk.sh
 	$(SCRIPTS)/build-initramfs.sh $(TARGET) --busybox-src $(BUSYBOX_SRC) \
 	    --device-units --dropbear-bin $(DROPBEAR_BIN_DIR) --rootfs $(ROOTFS_DIR)
 	$(SCRIPTS)/mkdisk.sh $(ROOTFS_DIR) $(DISK_IMAGE)

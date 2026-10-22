@@ -566,11 +566,16 @@ rootfs，加上 `units/device/` 和 dropbear，然后用
 - `syslog.service` / `klogd.service`（持久化 `/var/log/messages`）；
 - `seedrng.service`（持久化 `/var/lib/seedrng`）；
 - `time-sync.service`（busybox `ntpd`）；
+- `mdev.service`（busybox 热插拔守护进程；启动时已有的节点仍由 devtmpfs 创建）；
 - `sshd.service`（dropbear）。
 
 在任何 unit 启动前，rinit 的第二波挂载会读取 `/etc/fstab`；镜像在这里把
 `devpts` 挂到 `/dev/pts`。这里使用默认 devpts 实例，`/dev/ptmx` 仍是 devtmpfs
 节点，不需要创建符号链接。
+
+镜像还会安装 `/etc/mdev.conf`。mdev 在未配置时的默认权限是 `0660` root:root，
+初始扫描后会把 `/dev/null` 等节点收窄；这份配置保证标准字符设备仍可供非 root
+进程使用。
 
 Dropbear 只允许密钥登录（`-s`）。qemu 把宿主机 2222 转发到客户机 22
 （可用 `DISK_HOSTFWD` 覆盖），配置好公钥后：

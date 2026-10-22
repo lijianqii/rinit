@@ -53,7 +53,9 @@ still boots with every unit unlimited.
   the boot continuing - rinit creates each mountpoint, as it does for the first
   wave. `--fstab <PATH>` moves the file, which is also the test seam. The device
   image uses this table for `devpts` on `/dev/pts`; keep the default devpts
-  instance so the devtmpfs `/dev/ptmx` node continues to work.
+  instance so the devtmpfs `/dev/ptmx` node continues to work. The image also
+  ships `/etc/mdev.conf` because mdev's fallback mode is `0660` root:root; the
+  config preserves the standard character-device permissions.
 - `/etc/passwd` and `/etc/group` if any unit uses `User=`/`Group=`. rinit parses
   them itself (no NSS, no `libnss_files.so`), so a minimal
   `name:passwd:uid:gid:...` file is enough.
@@ -163,8 +165,9 @@ auto-mount makes that first-wave mount fail with `EBUSY`.
 The image is populated with `mke2fs -d` from a tar whose entries are explicitly
 `root:root` (a directory populated as the build user would otherwise leave every
 file owned by that uid). `units/device/` provides `hostname`, `network-online`
-(DHCP lease, not just udhcpc exec), `syslog`/`klogd`, `seedrng`, `time-sync`
-and `sshd`; `/etc/fstab` mounts `devpts` on `/dev/pts` in the second wave, before
+(DHCP lease, not just udhcpc exec), `syslog`/`klogd`, `seedrng`, `time-sync`,
+`mdev` (busybox hotplug daemon) and `sshd`; `/etc/fstab` mounts `devpts` on
+`/dev/pts` in the second wave, before
 any unit starts. dropbear is static and key-only (`-s`), with host keys generated
 on first connection under `/etc/dropbear`. `/root/.ssh/authorized_keys` starts
 empty by design. `scripts/build-dropbear.sh` applies

@@ -664,11 +664,16 @@ explicit destructive rebuild.
 - `syslog.service`/`klogd.service` (persistent `/var/log/messages`);
 - `seedrng.service` (persistent `/var/lib/seedrng`);
 - `time-sync.service` (busybox `ntpd`);
+- `mdev.service` (busybox hotplug daemon; devtmpfs still creates boot-time nodes);
 - `sshd.service` (dropbear).
 
 Before any unit starts, rinit's second mount wave reads `/etc/fstab`; the image
 mounts `devpts` on `/dev/pts` there. It uses the default devpts instance, so
 `/dev/ptmx` remains the devtmpfs node and no symlink is needed.
+
+The image also ships `/etc/mdev.conf`. mdev's built-in fallback mode is `0660`
+root:root, which would narrow `/dev/null` and friends after its initial scan; the
+config keeps the standard character devices usable by non-root processes.
 
 Dropbear is key-only (`-s`). QEMU forwards host port 2222 to guest 22
 (`DISK_HOSTFWD` can be overridden), so after provisioning a key:

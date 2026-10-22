@@ -112,6 +112,9 @@ install -m 0755 "${bin_dir}/rctl" "${work}/bin/rctl"
 # at run time would be too late - and it is the repo's `fstab` verbatim so the
 # guest's evidence points at a file instead of at the packing script.
 install -m 0644 "${repo_root}/fstab" "${work}/etc/fstab"
+# mdev's fallback mode is 0660 root:root; this keeps the standard character
+# devices usable by non-root processes after the hotplug daemon's initial scan.
+install -m 0644 "${repo_root}/mdev.conf" "${work}/etc/mdev.conf"
 
 # The rest of the skeleton. rinit reads none of these: they belong to the login
 # shell and the tools an operator runs after it. Keeping them in the image means

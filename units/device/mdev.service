@@ -1,0 +1,16 @@
+# BusyBox mdev as a hotplug daemon.
+#
+# devtmpfs creates the nodes that exist at boot; mdev listens on the kernel's
+# uevent netlink socket for devices added or removed later and applies
+# /etc/mdev.conf when present. `-f` keeps it in the foreground so rinit is the
+# supervisor; without it mdev would daemonize and this Type=simple unit would
+# look dead.
+[Unit]
+Description=BusyBox mdev hotplug daemon
+After=rinit-init.target
+
+[Service]
+Type=simple
+ExecStart=/sbin/mdev -d -f
+Restart=on-failure
+RestartSec=2
