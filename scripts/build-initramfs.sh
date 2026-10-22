@@ -270,7 +270,13 @@ if [[ -n "${busybox_src}" ]]; then
     # `User=`/`Group=` has to be seen dropping to a user that is *not* root, and
     # 65534 is the conventional id for that user. It is a name rather than a
     # number so the test exercises the `/etc/passwd`/`/etc/group` lookup too.
-    printf 'root::0:0:root:/root:/bin/sh\nnobody:x:65534:65534:nobody:/nonexistent:/sbin/nologin\n' >"${work}/etc/passwd"
+    # `x` means the password is in /etc/shadow. The default is deliberate:
+    # root/toor is a development credential, not a production one - change it
+    # (or switch to key-only access) before deploying. The hash is a fixed
+    # SHA-512 crypt of "toor" with salt "rinit"; busybox's login supports it.
+    printf 'root:x:0:0:root:/root:/bin/sh\nnobody:x:65534:65534:nobody:/nonexistent:/sbin/nologin\n' >"${work}/etc/passwd"
+    printf 'root:$6$rinit$h.sfVK5a75HqcCQ8mjFVlpyRSK5rin/8GpC7okbfq82BH16wN0lJDJUvCd.0bpt2/q/MtfkobUfMxtG72uIuj.:0:0:99999:7:::\nnobody:!:65534:0:99999:7:::\n' >"${work}/etc/shadow"
+    chmod 0600 "${work}/etc/shadow"
     printf 'root:x:0:\nnogroup:x:65534:\n' >"${work}/etc/group"
 fi
 

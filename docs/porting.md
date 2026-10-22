@@ -55,6 +55,9 @@ still boots with every unit unlimited.
 - `/etc/passwd` and `/etc/group` if any unit uses `User=`/`Group=`. rinit parses
   them itself (no NSS, no `libnss_files.so`), so a minimal
   `name:passwd:uid:gid:...` file is enough.
+- `/etc/shadow` for `getty`/`login`; the development image ships `root`/`toor`
+  (SHA-512 crypt) and mode `0600`. Change it before deployment; dropbear is
+  key-only and does not use this password.
 - a small FHS skeleton: `/var/log`, `/var/tmp`, `/var/run -> ../run`, `/mnt`,
   `/home`, `/opt`, `/srv`, `/usr/local`, and `/etc/profile`, `/etc/hostname`,
   `/etc/hosts`, `/etc/resolv.conf`, `/etc/motd`. rinit reads none of them; they

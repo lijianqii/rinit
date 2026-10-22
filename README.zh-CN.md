@@ -509,15 +509,16 @@ make KERNEL_VERSION=6.6.158 BUSYBOX_VERSION=1.36.1 ...   # pin versions
 
 ### 在客户机里拿到 shell
 
-`make run` 启动 `units/getty.service`，它在串口控制台上给出登录提示。输入 `root`
-回车即可——`/etc/passwd` 里的密码字段是空的，之后什么都不用输。上面的记录就是那个
-提示符。登录后 `/etc/motd` 会打印常用命令（`rctl list`、`rctl status getty.service`、
+`make run` 启动 `units/getty.service`，它在串口控制台上给出登录提示。输入 `root`，
+密码是 `/etc/shadow` 里的默认值 `toor`。上面的记录就是那个提示符。登录后
+`/etc/motd` 会打印常用命令（`rctl list`、`rctl status getty.service`、
 `rctl log getty.service`、`poweroff -f`），`/etc/profile` 会设置 `PATH` 并应用
 `/etc/hostname`。`network.service` 运行 DHCP 客户端：qemu 的用户态网络给客户机分配
 `10.0.2.15/24`、网关 `10.0.2.2` 和 DNS `10.0.2.3`，所以接口无需手工配置。
 
-这刻意不是一个安全边界：能碰到串口的人已经拥有这台机器，而开发用 initramfs 不是放
-真实凭据的地方。给 root 设密码意味着要写 `/etc/shadow`，而它没有被打包。
+这刻意不是一个安全边界：能碰到串口的人已经拥有这台机器。镜像里打包了
+`/etc/shadow`，默认凭据是 `root`/`toor`，仅用于开发；部署前请改掉它，或者使用
+只允许密钥的 `sshd.service`。
 
 `units/shell.service` 是替代方案：它完全跳过 `login`，所以直接得到 `~ #` 提示符，
 不用输用户名。两个单元都要 `ttyAMA0`，一个控制台上跑两个进程都会出问题，所以它们是
@@ -817,8 +818,8 @@ M0 的 bring-up 辅助程序 `rinit-testservice` 已经删除：没有东西再�
 
 打包后的镜像（`build/out/initramfs-aarch64-unknown-linux-gnu.cpio.gz` 和
 `…-demo.cpio.gz`：静态 busybox + rinit + rctl + 单元目录 + `/etc`/`/var` 骨架）
-gzip 后分别是 2.31 MiB（2 417 747 B）和 2.31 MiB（2 423 326 B）；arm32 的两个镜像
-分别是 2.04 MiB（2 136 470 B）和 2.04 MiB（2 143 380 B）。`run-disk` 的镜像
+gzip 后分别是 2.31 MiB（2 419 117 B）和 2.31 MiB（2 423 284 B）；arm32 的两个镜像
+分别是 2.04 MiB（2 136 598 B）和 2.04 MiB（2 143 555 B）。`run-disk` 的镜像
 是 64 MiB ext4（首次启动前实际使用约 7-10 MiB），不放进 initramfs。差值就是 `units/demo/`
 里的十四个文件，只有第二个镜像带它们。打包是可复现的——`scripts/mkinitramfs.sh` 把归档
 本来会记录的 mtime 和 inode 号归零，所以同样的二进制重复打包得到同样的字节，这才让

@@ -8,7 +8,7 @@
 # What it does:
 #   1. boots the guest from its unit directory (units/multi-user.target), which
 #      starts getty.service and gives an interactive root login;
-#   2. types at that login to prove a passwordless root shell is reachable,
+#   2. types at that login to prove the shadow-password root shell is reachable,
 #      following the console prompts rather than guessing at delays;
 #   3. kills that console service and checks rinit restarts it (M2);
 #   4. captures the serial console to a log file;
@@ -133,13 +133,12 @@ await_log() {
 (
     exec 3>"${fifo}"
 
-    # getty shows `login:`, so answer with the username. The password field in
-    # /etc/passwd is empty, so an empty line must be accepted - that is the
-    # property under test, and `id` afterwards proves it.
+    # getty shows `login:`, so answer with the username and the default password
+    # from /etc/shadow. `id` afterwards proves the shadow/login path worked.
     await_log 40 'login:' || true
     printf 'root\n' >&3
     sleep 1
-    printf '\n' >&3
+    printf 'toor\n' >&3
     sleep 1
     printf 'id\n' >&3
     await_log 10 'uid=0\(root\)' || true
@@ -581,9 +580,8 @@ else
     fail "boot should have started exactly 2 units (got: '${boot_line:-missing}')"
 fi
 
-# Logging in must work, and with an empty password field there is nothing to
-# type after the username. `uid=0(root)` is the proof that the whole path -
-# getty, login, /etc/passwd - actually worked.
+# Logging in must work with the root password from /etc/shadow. `uid=0(root)`
+# is the proof that the whole path - getty, login, shadow - actually worked.
 expect "getty presents a login prompt" "login:"
 expect "login succeeded and gave a root shell" "uid=0(root)"
 

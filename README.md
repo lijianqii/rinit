@@ -599,9 +599,8 @@ that image and leaves the run image alone.
 ### Getting a shell in the guest
 
 `make run` boots `units/getty.service`, which puts a login prompt on the serial
-console. Type `root` and press enter — the password field in `/etc/passwd` is
-empty, so there is nothing to type after that. The transcript above is that
-prompt. After login `/etc/motd` prints the commands that matter (`rctl list`,
+console. Type `root`, then the default password `toor` from `/etc/shadow`. The
+transcript above is that prompt. After login `/etc/motd` prints the commands that matter (`rctl list`,
 `rctl status getty.service`, `rctl log getty.service`, `poweroff -f`), and
 `/etc/profile` sets `PATH` and applies `/etc/hostname`. `network.service` runs
 the DHCP client: qemu's user-mode network gives the guest `10.0.2.15/24`,
@@ -609,9 +608,9 @@ gateway `10.0.2.2` and DNS `10.0.2.3`, so the interface is configured without a
 manual step.
 
 This is deliberately not a security boundary: anyone who can reach the serial
-port already has the machine, and a development initramfs is not the place for
-real credentials. Giving root a password would mean writing `/etc/shadow`,
-which is not shipped.
+port already has the machine. The image ships `/etc/shadow` with the default
+`root`/`toor` credential for development; change it (or use the key-only
+`sshd.service` path) before deploying.
 
 `units/shell.service` is the alternative: it skips `login` entirely, so you get
 a `~ #` prompt with no username to type. Both units want `ttyAMA0` and two
@@ -974,8 +973,8 @@ command through the same spawn path a unit uses.
 
 The packed images (`build/out/initramfs-aarch64-unknown-linux-gnu.cpio.gz` and
 `…-demo.cpio.gz`: static busybox + rinit + rctl + the unit directory + the
-`/etc`/`/var` skeleton) are 2.31 MiB (2 417 747 B) and 2.31 MiB (2 423 326 B)
-gzipped. The arm32 pair is 2.04 MiB (2 136 470 B) and 2.04 MiB (2 143 380 B).
+`/etc`/`/var` skeleton) are 2.31 MiB (2 419 117 B) and 2.31 MiB (2 423 284 B)
+gzipped. The arm32 pair is 2.04 MiB (2 136 598 B) and 2.04 MiB (2 143 555 B).
 The `run-disk` images are 64 MiB ext4 files (roughly 7-10 MiB used before the
 first boot); they are not shipped in the initramfs. The difference is the
 fourteen files in `units/demo/`, which only the second initramfs carries. The packing is
