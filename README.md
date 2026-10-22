@@ -1,12 +1,12 @@
 # rinit
 
 A lightweight, systemd-like PID 1 init and service manager written in Rust,
-targeted at resource-constrained embedded Linux (aarch64). See
+targeted at resource-constrained embedded Linux (aarch64 and armv7). See
 [`rinit-开发计划.md`](rinit-开发计划.md) for the full development plan; this
 README tracks implementation status. A Chinese translation of this file lives at
 [`README.zh-CN.md`](README.zh-CN.md); this English version is the authoritative one.
 
-## Status: M0–M5 implemented — verified on aarch64
+## Status: M0–M5 implemented — verified on aarch64 and armv7
 
 Every milestone's scope and every item of the plan's extension list (§7.1–§7.11)
 is implemented and proven: the [Acceptance](#acceptance-plan-6s-checklist) section
@@ -301,6 +301,7 @@ cargo clippy --offline --all-targets
 
 # embedded target (static, default per plan §2 risk mitigation)
 cargo build --offline --release --target aarch64-unknown-linux-gnu
+cargo build --offline --release --target armv7-unknown-linux-gnueabihf
 ```
 
 ## Testing
@@ -310,7 +311,7 @@ Five layers, cheapest first:
 ```bash
 make check          # fmt + clippy -D warnings + host tests  (no cross toolchain)
 make soak           # 60s of sustained churn; watches RSS/fds/zombies
-make test-system    # boot aarch64 qemu and assert the acceptance list
+make test-system    # boot the selected ARCH in qemu and assert the acceptance list
 make test           # check + test-system
 make gates          # acceptance gates: binary size + coverage thresholds
 ```
@@ -355,7 +356,7 @@ redundant:
   verdict, and both thresholds are arguments so the gate's own arithmetic can be
   tested;
 - **the guest system test** (`scripts/system-test.sh`, plan §4.3): boots the real
-  initramfs on aarch64 qemu, types at the console to prove a root shell is
+  initramfs on the selected ARCH in qemu, types at the console to prove a root shell is
   reachable, drives `rctl` against the running system, and asserts 98 things -
   including that levels run in dependency order, that no target is ever exec'd,
   the §7.4 privilege-drop outcomes, the §7.3 limits read back out of the guest's
@@ -512,13 +513,13 @@ repository or a measurement in this README:
 
 | plan §6 | where it stands |
 | ------- | --------------- |
-| boots as PID 1 in qemu (128M) with no kernel panic | `make test-system`: 98 assertions, including "no rinit panic" and four kernel-log checks |
+| boots as PID 1 in qemu (128M) with no kernel panic | `make test-system`: 98 assertions on aarch64 and armv7, including "no rinit panic" and four kernel-log checks |
 | 20 services in parallel, visibly faster than serial | **19.2x**: `make parallel` - 20 `oneshot` services that each sleep 1 s finish in 1065 ms together and 20 424 ms chained |
 | crash-restart, breaker, health checks | `make test-system` ("a crashed service is scheduled for restart", "the breaker tripped on the failing unit") and `crates/rinit/tests/m2_lifecycle.rs` |
 | `rctl` can start, stop, query and read logs | `make test-system`'s M3 block and `crates/rctl/tests/control.rs` |
 | graceful shutdown, no zombies, no fd leak | `make soak` samples descriptors, threads and zombie children through restart churn, and asserts each comes back to its baseline |
 | 72 h soak with stable RSS | **running now**, eighth segment, started 2026-10-22 09:17 with its work directory under `build/` rather than `/tmp`; it runs as a systemd user service with lingering enabled, so closing the SSH session cannot tear it down, and the window ends 2026-10-25 09:17 when the numbers land in this row. The log is `build/soak-charts/soak-72h-seg8.log`. The seventh segment was cut short at 2026-10-22 03:10 after 570 samples (9.5 h), not by an assertion: it had been launched with `setsid nohup`, but still inherited the SSH session's cgroup, and systemd removed that session slice when the connection closed, sending SIGTERM to `make`; its curve and log are kept as `soak-72h-seg7.log` and `soak-seg7.note`. The sixth segment was stopped by hand after 1 h 50 m (109 samples), not by an assertion, once the harness itself was fixed: at `--interval 1` a sample cost ~70 ms, the loop slept a full interval *after* the work, and the default 60 s gate therefore collected 56 of 60 samples and failed its own coverage check (21 before the zombie scan became a single awk pass); the loop now sleeps until the next absolute slot and `make soak` collects 60/60. Earlier segments were all ended by something other than an assertion: **8.92 hours** (535 samples, 18 519 600 restarts) with RSS 5116 → 5116 kB peak per half, descriptors 14 → 14 at their lowest and zero zombies; **44.6 hours** (2587 samples) whose RSS moved between 3892 and 3960 kB in ~16 kB plateaus that went up *and* down - the second-half slope was −1.28 kB/h - with descriptors 13-14 at their lowest in every hour and zero zombies, ended by a host reboot that took the curves with it because the work directory was on tmpfs; and **43 minutes**, stopped by the harness's own free-space floor when something else on the machine filled the shared 978 MB `/tmp` - which is why the run now keeps its ~100 KB work directory on the repository's filesystem instead; and **13.6 hours** (796 samples, 2026-10-20 06:09 → 19:46), ended by the reboot that this time did not take the curve with it, because the work directory had already moved: RSS stepped down twice after boot, hourly means 5068-5087 kB for the first three hours, 4381-4443 kB for the next five and 4202-4252 kB for the last six, with last sample 4296 kB, descriptors 14-28, one thread and zero zombies. Four things changed because of these runs: the descriptor check compares the *lowest* count in each half rather than the peak (a peak is a coin flip once a run is long enough - the 8.92-hour segment's peaks read 25 → 24 while its lows were 14 → 14), rinit rate limits its own console, which is the sink that filled the disk a run died on, and the restart count the harness prints is a rate-limited lower bound - the line it counts is capped at 40 per 5 s per call site, so `churn: N restarts` reads ~8/s while the real churn, measured independently as the host's `fork` rate, is ~545/s; and the sampler sleeps until its next absolute slot, because sleeping a full `interval` after each sample made a 60 s run collect 56 of 60 samples and fail a coverage check it had already met |
-| binaries ≤2 MB dynamic / ≤4 MB static | [Measurements](#measurements-plan-01-calibration-point): 1.57 MiB static aarch64, checked by `make size-check` |
+| binaries ≤2 MB dynamic / ≤4 MB static | [Measurements](#measurements-plan-01-calibration-point): 1.57 MiB static arm64 / 1.26 MiB armv7, checked by `make size-check` |
 | unit test coverage ≥80% overall, ≥90% in the core | **92.32%** and **97.76%** (`make coverage-check`, [above](#testing)) |
 | documentation: architecture, unit format, `rctl`, porting | this README (architecture, status, measurements), [`docs/units.md`](docs/units.md) (every directive, its value syntax and its default), [`docs/porting.md`](docs/porting.md) (kernel, userspace, build, differences from systemd), and `rinit-开发计划.md` |
 
@@ -528,34 +529,40 @@ RSS, measured *in the guest* out of `/proc/1/status` rather than on the host -
 and 6 MB. The growth is the interesting part: twenty more units cost under 200 kB,
 because a unit is a config, a state and a few timers rather than a thread.
 
-## Running: `make run` (aarch64, full pipeline)
+## Running: `make run` (arm64 default, arm32 supported)
 
-The one-shot target downloads, builds and boots everything for aarch64
-(Linux **6.6.158** + busybox stable) from the Tsinghua mirror:
+The one-shot target downloads, builds and boots everything for the selected
+architecture (Linux **6.6.158** + busybox stable) from the Tsinghua mirror:
 
 ```bash
-make run                 # default; builds rinit, kernel, busybox, initramfs, boots qemu
+make ARCH=arm64 run      # default; aarch64
+make ARCH=arm32 run      # ARMv7 hard-float, qemu virt / Cortex-A15
 ```
 
-> Requires network access (for the source tarballs) and the aarch64 cross
-> toolchain: `gcc-aarch64-linux-gnu qemu-system-arm bc flex bison libssl-dev`.
-> Downloads are cached under `build/dl/`.
+> Requires network access (for the source tarballs) and the matching cross
+> toolchain: `gcc-aarch64-linux-gnu` for arm64, `gcc-arm-linux-gnueabihf` for
+> arm32, plus `qemu-system-arm bc flex bison libssl-dev`. Downloads are cached
+> under `build/dl/`; arm32 builds under `build/arm32/` so the two trees never
+> share a kernel or busybox config.
 
 What it does, in order (see [Makefile](Makefile)):
 
-1. `cargo build --release --target aarch64-unknown-linux-gnu` (static rinit).
+1. `cargo build --release --target <target>` (static rinit/rctl).
 2. Fetch `linux-6.6.158.tar.xz` from
-   `mirrors.tuna.tsinghua.edu.cn/kernel/v6.x/` and build `arch/arm64/boot/Image`.
+   `mirrors.tuna.tsinghua.edu.cn/kernel/v6.x/` and build `arch/arm64/boot/Image`
+   (arm64) or `arch/arm/boot/zImage` (arm32).
 3. Fetch `busybox-1.36.1.tar.bz2` and build a **static** busybox with the
    applets the initramfs needs.
 4. Assemble `build/out/initramfs-<target>.cpio.gz` (busybox + rinit + rctl +
    `units/`, plus the `/etc` and `/var` skeleton the login shell expects). The
-   acceptance image `build/out/initramfs-<target>-demo.cpio.gz` is
-   the same root plus `units/demo/`, and is what `make test-system` boots.
-5. Boot it in `qemu-system-aarch64 -machine virt -cpu cortex-a57 -m 128M` with
-   `-device i6300esb`, the watchdog rinit arms (plan §7.5), and qemu's user-mode
-   network (`-netdev user` plus `virtio-net-device`), which is what the DHCP
-   client runs on.
+   arm32 tree lives under `build/arm32/out/`. The acceptance image
+   `...-demo.cpio.gz` is the same root plus `units/demo/`, and is what
+   `make test-system` boots.
+5. Boot it in `qemu-system-aarch64 -machine virt -cpu cortex-a57 -m 128M`
+   (arm64) or `qemu-system-arm -machine virt -cpu cortex-a15 -m 128M` (arm32),
+   with `-device i6300esb`, the watchdog rinit arms (plan §7.5), and qemu's
+   user-mode network (`-netdev user` plus `virtio-net-device`), which is what
+   the DHCP client runs on.
 
 There is nothing to configure: `make run` always builds whatever is out of date
 and boots the unit directory. Re-running it does no downloading and no
@@ -566,8 +573,9 @@ symbols §7.3 and §7.5 need is a guest where a limit or the watchdog silently
 does not exist.
 
 ```bash
-make run            # build if needed, boot → interactive root shell
-make kernel         # kernel only
+make ARCH=arm64 run # build if needed, boot → interactive root shell
+make ARCH=arm32 run # the same for ARMv7 (qemu virt, Cortex-A15)
+make kernel         # kernel only (Image or zImage for the selected ARCH)
 make busybox        # busybox only
 make initramfs      # rinit + initramfs only
 make initramfs-demo # the same, plus units/demo/ (what the system test boots)
@@ -620,7 +628,7 @@ Re-running it after a successful build does no downloading and no compiling —
 it just boots. In particular:
 
 - a cached tarball in `build/dl/` is reused (no re-download);
-- `linux-6.6.158/arch/arm64/boot/Image` present → kernel is not rebuilt;
+- `linux-6.6.158/arch/<arch>/boot/{Image,zImage}` present → kernel is not rebuilt;
 - `busybox-1.36.1/busybox` present → busybox is not rebuilt;
 - `target/.../release/rinit` newer than the sources → `cargo build` is not
   re-run;
@@ -631,8 +639,8 @@ Because that already holds, there is no `SKIP_BUILD` knob to forget to pass.
 
 ## Running in qemu (host/x86 verification only)
 
-The `make run` pipeline is aarch64-only. To sanity-check rinit as PID 1 on the
-build host without downloading an aarch64 kernel, build the musl binary and boot
+The `make run` pipeline covers arm64 and arm32. To sanity-check rinit as PID 1
+on the build host without downloading an ARM kernel, build the musl binary and boot
 the Debian host kernel. This image has no NIC: `network.service` exits 0 and the
 state machine leaves it `failed`, but `multi-user.target` only `Wants=` it, so
 the rest of the boot is unaffected.
@@ -897,10 +905,11 @@ byte counts as `ls -l` reports them:
 | target                               | binary              | size                    | in an image |
 | ------------------------------------ | ------------------- | ----------------------- | ----------- |
 | `aarch64-unknown-linux-gnu` (static) | `rinit`             | 1.57 MiB (1 649 744 B)  | yes         |
+| `armv7-unknown-linux-gnueabihf` (static) | `rinit`         | 1.26 MiB (1 317 252 B)  | yes         |
 | `x86_64-unknown-linux-musl` (static) | `rinit`             | 1.05 MiB (1 098 688 B)  | yes         |
 
-`rctl` is 994 152 B on aarch64 and 406 200 B on musl; both are inside the
-initramfs. `make size-check` is the gate, and it checks the two aarch64 binaries
+`rctl` is 994 152 B on aarch64, 727 256 B on armv7 and 406 200 B on musl; they are inside the
+initramfs. `make size-check` is the gate, and it checks the two binaries of the selected ARCH
 against plan §0.1's 4 MiB static budget. The musl figures are a manual build
 (`cargo build --release --target x86_64-unknown-linux-musl`), which is how that
 target came to be broken for a while without anyone noticing: `ioctl`'s request
@@ -916,7 +925,8 @@ command through the same spawn path a unit uses.
 The packed images (`build/out/initramfs-aarch64-unknown-linux-gnu.cpio.gz` and
 `…-demo.cpio.gz`: static busybox + rinit + rctl + the unit directory + the
 `/etc`/`/var` skeleton) are 2.31 MiB each (2 419 127 B and 2 423 404 B)
-gzipped. The difference is the fourteen files in `units/demo/`, which only the
+gzipped. The arm32 pair is 2.04 MiB (2 136 613 B) and 2.04 MiB (2 143 445 B).
+The difference is the fourteen files in `units/demo/`, which only the
 second one carries. The packing is
 reproducible - `scripts/mkinitramfs.sh` zeroes the mtimes and inode numbers the
 archive would otherwise record, so repacking the same binaries gives the same

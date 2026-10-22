@@ -30,7 +30,7 @@
 #   3  qemu itself could not be started
 #
 # This is the automated form of the manual verification in plan §4.3. It
-# needs qemu-system-aarch64 and prebuilt artifacts (see the Makefile's
+# needs `qemu-system-<arch>` and prebuilt artifacts (see the Makefile's
 # `test-system` target, which builds them first when needed).
 set -euo pipefail
 

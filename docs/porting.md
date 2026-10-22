@@ -1,7 +1,8 @@
 # Porting rinit to another board
 
 rinit targets resource-constrained embedded Linux and is developed against
-aarch64 (`qemu-system-aarch64 -machine virt`). This is what a port involves, in
+aarch64 (`qemu-system-aarch64 -machine virt`) and ARMv7
+(`qemu-system-arm -machine virt,highmem=off -cpu cortex-a15`). This is what a port involves, in
 the order the pieces depend on each other. Everything here is checkable against
 the repository: the numbers and paths are the ones the Makefile and the scripts
 use, not a wish list.
@@ -69,28 +70,48 @@ search, and the failure looks like a missing binary.
 
 ```bash
 cargo build --offline --release --target aarch64-unknown-linux-gnu
+cargo build --offline --release --target armv7-unknown-linux-gnueabihf
 ```
 
 The release profile is part of the contract, not a preference: `panic="abort"`
 (a panic in PID 1 must not unwind into a half-dead system), `overflow-checks` and
 `lto`. `make rinit` wraps this and asserts both binaries exist.
 
+The Makefile selects the whole pipeline with `ARCH`:
+
+```bash
+make ARCH=arm64 run
+make ARCH=arm32 run
+```
+
+`arm32` uses the hard-float ARMv7 target, Linux's `multi_v7_defconfig`,
+`arch/arm/boot/zImage` and `qemu-system-arm -machine virt,highmem=off -cpu
+cortex-a15`. `highmem=off` keeps the PCI ECAM below 4G; without it the 32-bit
+kernel's `pci-host-generic` probe fails with `EOVERFLOW` and `i6300esb` never
+appears. The Debian armhf toolchain has no `rcrt1.o`, so `.cargo/config.toml`
+links ARMv7 as a plain static (non-PIE) binary rather than static-PIE; both forms
+have no `ld.so`/`libc.so` dependency.
+
 Nothing in the Rust source is architecture-specific. A new architecture needs
 three things changed, and they are all in the scripts:
 
-1. `TARGET` and `CROSS_COMPILE` (`make TARGET=riscv64gc-unknown-linux-gnu
-   CROSS_COMPILE=riscv64-linux-gnu- ...`);
+1. an `ARCH` case in the Makefile that sets `TARGET`, `CROSS_COMPILE`,
+   `KERNEL_ARCH`, `KERNEL_DEFCONFIG`, the Image/zImage path and the qemu arch;
 2. a case in `scripts/build-initramfs.sh`, which maps the target triple to the
    cross prefix and to busybox's own `ARCH` spelling - without it the busybox
    `install` step silently recompiles with the *host* compiler;
 3. a qemu command line in `scripts/run-qemu.sh`: the machine, the console, and
-   the watchdog device. `-device i6300esb` is what gives the aarch64 `virt`
-   machine a watchdog to test plan §7.5 against; another board will have its own.
+   the watchdog device. `-device i6300esb` is what gives the aarch64 and arm32
+   `virt` machines a watchdog to test plan §7.5 against; another board will have
+   its own.
 
-The kernel config the Makefile applies (`CONFIG_CFS_BANDWIDTH`,
-`CONFIG_I6300ESB_WDT`, `CONFIG_WATCHDOG_SYSFS`) is `sed`-ed into a `defconfig`,
-so it needs each symbol to exist for that architecture - `kernel-config-check`
-says so at build time rather than at boot.
+The kernel config the Makefile applies (the cgroup controllers, `VIRTIO_NET`,
+`VIRTIO_MMIO`, `I6300ESB_WDT` and `WATCHDOG_SYSFS`) is `sed`-ed into the
+selected defconfig, then `olddefconfig` resolves dependencies. ARM's
+`multi_v7_defconfig` needs a second pass because `CFS_BANDWIDTH` depends on
+`FAIR_GROUP_SCHED`, which the first pass has not defaulted yet; the Makefile
+does both passes. `kernel-config-check` says at build time rather than at boot
+whether a symbol disappeared.
 
 ## 4. Running it on the target
 
@@ -165,7 +186,9 @@ instead of silently losing a setting. The common ones:
 make check         # fmt, clippy, and the host test suite
 make parallel      # 20 services in parallel vs chained: the scheduler's speedup
 make soak          # restart churn, watching RSS, descriptors and zombies
-make test-system   # boots the guest and asserts plan §6's list
+make test-system   # boots the selected ARCH and asserts plan §6's list
+make ARCH=arm32 test-system  # the ARMv7 guest
+make ARCH=arm64 test-system  # the default aarch64 guest
 make gates         # the two numeric acceptance items: size and coverage
 ```
 

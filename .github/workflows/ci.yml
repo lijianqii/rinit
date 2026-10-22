@@ -94,6 +94,44 @@ jobs:
             echo "$bin: $(du -h "$path" | cut -f1) (static)"
           done
 
+  arm32:
+    name: cross-compile (armv7, static)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain and target
+        run: |
+          rustup component add rustfmt clippy
+          rustup target add armv7-unknown-linux-gnueabihf
+
+      - name: Cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-linux-gnueabihf
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: arm32
+
+      - name: Fetch dependencies
+        run: cargo fetch --locked
+
+      - name: Build
+        run: cargo build --offline --locked --release --target armv7-unknown-linux-gnueabihf
+
+      - name: Verify the binaries are really static
+        run: |
+          for bin in rinit rctl; do
+            path="target/armv7-unknown-linux-gnueabihf/release/${bin}"
+            test -x "$path" || { echo "missing $path"; exit 1; }
+            if readelf -d "$path" 2>/dev/null | grep -q NEEDED; then
+              echo "::error::$bin is dynamically linked; PID 1 must be static"
+              exit 1
+            fi
+            echo "$bin: $(du -h "$path" | cut -f1) (static, armv7)"
+          done
+
   guest:
     name: qemu system test (aarch64)
     runs-on: ubuntu-latest

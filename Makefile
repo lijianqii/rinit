@@ -1,9 +1,10 @@
 # ============================================================================
-# rinit aarch64 bring-up pipeline
+# rinit arm64/arm32 bring-up pipeline
 #
-#   make run         download + build kernel & busybox + rinit, pack the
-#                    initramfs, and boot it in qemu (default goal)
-#   make kernel      build the Linux kernel Image only
+#   make ARCH=arm64 run   download + build kernel & busybox + rinit, pack the
+#                         initramfs, and boot it in qemu (default; ARCH=arm64)
+#   make ARCH=arm32 run   the same for ARMv7 (qemu virt, Cortex-A15)
+#   make kernel      build the Linux kernel Image/zImage only
 #   make busybox     build busybox only
 #   make initramfs   build rinit and assemble the initramfs
 #   make initramfs-demo  the same image plus units/demo/ (what `make test-system` boots)
@@ -20,14 +21,35 @@
 #   make clean       remove build outputs (keeps downloads)
 #   make distclean   remove everything, including downloads
 #
-# Everything targets aarch64. Sources come from the Tsinghua mirror first, with
-# upstream fallbacks (see scripts/fetch.sh). Any step whose output already
-# exists is skipped automatically, so re-running `make run` only boots.
+# ARCH selects the target family: arm64 (default) or arm32. The kernel's own
+# spelling is KERNEL_ARCH; keeping the two separate lets `make ARCH=arm32 run`
+# be the command-line switch while the existing aarch64 artifacts keep their
+# paths. Sources come from the Tsinghua mirror first, with upstream fallbacks
+# (see scripts/fetch.sh). Any step whose output already exists is skipped.
 # ============================================================================
 
 ARCH             ?= arm64
-TARGET           ?= aarch64-unknown-linux-gnu
-CROSS_COMPILE    ?= aarch64-linux-gnu-
+ifeq ($(ARCH),arm64)
+  TARGET           ?= aarch64-unknown-linux-gnu
+  CROSS_COMPILE    ?= aarch64-linux-gnu-
+  KERNEL_ARCH      := arm64
+  KERNEL_DEFCONFIG := defconfig
+  KERNEL_IMAGE_REL := arch/arm64/boot/Image
+  KERNEL_BOOT_TARGET := Image
+  BUSYBOX_ARCH     ?= arm64
+  QEMU_ARCH        := aarch64
+else ifeq ($(ARCH),arm32)
+  TARGET           ?= armv7-unknown-linux-gnueabihf
+  CROSS_COMPILE    ?= arm-linux-gnueabihf-
+  KERNEL_ARCH      := arm
+  KERNEL_DEFCONFIG := multi_v7_defconfig
+  KERNEL_IMAGE_REL := arch/arm/boot/zImage
+  KERNEL_BOOT_TARGET := zImage
+  BUSYBOX_ARCH     ?= arm
+  QEMU_ARCH        := arm
+else
+  $(error ARCH must be arm64 or arm32)
+endif
 
 KERNEL_VERSION   ?= 6.6.158
 # 1.36.1 is the latest patch release of the busybox 1.36 line.
@@ -41,22 +63,29 @@ BUSYBOX_URLS     ?= $(MIRROR)/busybox/busybox-$(BUSYBOX_VERSION).tar.bz2 \
                     https://busybox.net/downloads/busybox-$(BUSYBOX_VERSION).tar.bz2 \
                     https://busybox.net/downloads/busybox-$(BUSYBOX_VERSION).tar.gz
 
-# busybox's own ARCH spelling (kernel-style); overridable if your tree differs.
-BUSYBOX_ARCH     ?= arm64
-
 JOBS             ?= $(shell nproc 2>/dev/null || echo 2)
 QEMU_MEM         ?= 128M
 
+# Everything the guest's acceptance tests need the kernel to provide.
+KERNEL_REQUIRED_OPTS := CGROUP_SCHED FAIR_GROUP_SCHED CFS_BANDWIDTH MEMCG \
+                        CGROUP_PIDS I6300ESB_WDT WATCHDOG_SYSFS VIRTIO_NET \
+                        VIRTIO_MMIO
+ifeq ($(KERNEL_ARCH),arm)
+KERNEL_REQUIRED_OPTS += ARCH_VIRT PCI_HOST_GENERIC
+endif
+
 BUILD_DIR        := build
 DL_DIR           := $(BUILD_DIR)/dl
-SRC_DIR          := $(BUILD_DIR)/src
-OUT_DIR          := $(BUILD_DIR)/out
+# arm64 keeps the original source/output paths; arm32 gets its own tree so
+# switching ARCH cannot reuse a kernel or busybox built for the other word size.
+SRC_DIR          := $(if $(filter arm64,$(ARCH)),$(BUILD_DIR)/src,$(BUILD_DIR)/$(ARCH)/src)
+OUT_DIR          := $(if $(filter arm64,$(ARCH)),$(BUILD_DIR)/out,$(BUILD_DIR)/$(ARCH)/out)
 
 KERNEL_TARBALL   := $(DL_DIR)/linux-$(KERNEL_VERSION).tar.xz
 BUSYBOX_TARBALL  := $(DL_DIR)/busybox-$(BUSYBOX_VERSION).tar.bz2
 KERNEL_SRC       := $(SRC_DIR)/linux-$(KERNEL_VERSION)
 BUSYBOX_SRC      := $(SRC_DIR)/busybox-$(BUSYBOX_VERSION)
-KERNEL_IMAGE     := $(KERNEL_SRC)/arch/arm64/boot/Image
+KERNEL_IMAGE     := $(KERNEL_SRC)/$(KERNEL_IMAGE_REL)
 BUSYBOX_BIN      := $(BUSYBOX_SRC)/busybox
 # Installed into the image as /etc/fstab and read by rinit's second mount wave,
 # so a change to it has to repack the image just like a unit file does.
@@ -67,7 +96,7 @@ INITRAMFS        := $(OUT_DIR)/initramfs-$(TARGET).cpio.gz
 INITRAMFS_DEMO   := $(OUT_DIR)/initramfs-$(TARGET)-demo.cpio.gz
 
 SCRIPTS          := scripts
-MAKE_KERNEL      := $(MAKE) -C $(KERNEL_SRC) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE)
+MAKE_KERNEL      := $(MAKE) -C $(KERNEL_SRC) ARCH=$(KERNEL_ARCH) CROSS_COMPILE=$(CROSS_COMPILE)
 MAKE_BUSYBOX     := $(MAKE) -C $(BUSYBOX_SRC) ARCH=$(BUSYBOX_ARCH) CROSS_COMPILE=$(CROSS_COMPILE)
 
 .DEFAULT_GOAL    := run
@@ -78,7 +107,7 @@ MAKE_BUSYBOX     := $(MAKE) -C $(BUSYBOX_SRC) ARCH=$(BUSYBOX_ARCH) CROSS_COMPILE
 help:
 	@sed -n '2,/^# ====/p' $(MAKEFILE_LIST) | sed '$$d' | sed 's/^# \{0,1\}//'
 
-# --- rinit (static aarch64 binaries) --------------------------------------
+# --- rinit (static target binaries) ---------------------------------------
 RINIT_BIN        := target/$(TARGET)/release/rinit
 RCTL_BIN         := target/$(TARGET)/release/rctl
 RINIT_SRCS       := $(shell find crates -name '*.rs' 2>/dev/null) Cargo.toml Cargo.lock
@@ -99,27 +128,24 @@ $(KERNEL_TARBALL):
 $(KERNEL_SRC)/.config: $(KERNEL_TARBALL)
 	mkdir -p $(SRC_DIR)
 	tar -C $(SRC_DIR) -xf $(KERNEL_TARBALL)
-	$(MAKE_KERNEL) defconfig
-	# The generic defconfig leaves CPU bandwidth provisioning off, and it is
-	# what `cpu.max` hangs off: the cgroup v2 file set is built inside
-	# `#ifdef CONFIG_CFS_BANDWIDTH` (kernel/sched/core.c, `cpu_files[]`), so a
-	# kernel without it has the `cpu` controller and `cpu.weight` but no
-	# `cpu.max` at all - and `CgroupCPUMax=` (plan §7.3) would have nothing to
-	# write. Plan §7.3 puts exactly this in M5's hands: "否则 M5 需检查内核
-	# config". `CONFIG_FAIR_GROUP_SCHED`, which it depends on, is already on.
-	sed -i -e 's/^# CONFIG_CFS_BANDWIDTH is not set$$/CONFIG_CFS_BANDWIDTH=y/' \
-	       $(KERNEL_SRC)/.config
-	# Plan §7.5 needs a watchdog the *guest* has: the defconfig has no
-	# watchdog driver at all, so the guest would only ever exercise the
-	# "no hardware" path. `-device i6300esb` on the qemu command line (see
-	# run-qemu.sh) provides the PCI device, this provides the driver, and
-	# `watchdog%d`'s legacy misc node is what makes `/dev/watchdog` appear
-	# in the devtmpfs rinit mounts. `CONFIG_WATCHDOG_SYSFS` is what lets the
-	# guest read back the timeout rinit asked for, which is how the ioctl is
-	# checked against a real driver rather than a stand-in file.
-	sed -i -e 's/^# CONFIG_I6300ESB_WDT is not set$$/CONFIG_I6300ESB_WDT=y/' \
-	       -e 's/^# CONFIG_WATCHDOG_SYSFS is not set$$/CONFIG_WATCHDOG_SYSFS=y/' \
-	       $(KERNEL_SRC)/.config
+	$(MAKE_KERNEL) $(KERNEL_DEFCONFIG)
+	# A defconfig deliberately leaves out pieces this guest needs. ARM's
+	# `multi_v7_defconfig` has `ARCH_VIRT`/virtio but no cgroup controllers,
+	# watchdog driver or generic PCI host; aarch64's defconfig has the cgroup
+	# controllers but no watchdog. Turn on everything the acceptance tests use,
+	# then let olddefconfig resolve dependencies. A symbol that still disappears
+	# is caught by kernel-config-check below.
+	@for opt in $(KERNEL_REQUIRED_OPTS); do \
+	    sed -i "s/^# CONFIG_$$opt is not set$$/CONFIG_$$opt=y/" $(KERNEL_SRC)/.config; \
+	done
+	$(MAKE_KERNEL) olddefconfig
+	# Kconfig evaluates dependencies in symbol order: a symbol enabled in the
+	# first pass can be dropped before the symbol it depends on (FAIR_GROUP_SCHED
+	# for CFS_BANDWIDTH on ARM) has been defaulted. Re-apply after the graph has
+	# settled, then resolve once more.
+	@for opt in $(KERNEL_REQUIRED_OPTS); do \
+	    sed -i "s/^# CONFIG_$$opt is not set$$/CONFIG_$$opt=y/" $(KERNEL_SRC)/.config; \
+	done
 	$(MAKE_KERNEL) olddefconfig
 
 # The symbols the guest's acceptance tests depend on, checked on every
@@ -128,29 +154,19 @@ $(KERNEL_SRC)/.config: $(KERNEL_TARBALL)
 # would turn into a guest boot where a limit, or the watchdog, silently does not
 # exist - which is the one failure mode these checks exist to prevent.
 kernel-config-check: $(KERNEL_SRC)/.config
-	@for opt in CGROUP_SCHED CFS_BANDWIDTH MEMCG CGROUP_PIDS; do \
+	@for opt in $(KERNEL_REQUIRED_OPTS); do \
 	    grep -q "^CONFIG_$$opt=y$$" $(KERNEL_SRC)/.config || { \
-	        echo "kernel config: CONFIG_$$opt is not set (plan §7.3 needs it)" >&2; \
-	        exit 1; }; \
-	done
-	@for opt in I6300ESB_WDT WATCHDOG_SYSFS; do \
-	    grep -q "^CONFIG_$$opt=y$$" $(KERNEL_SRC)/.config || { \
-	        echo "kernel config: CONFIG_$$opt is not set (plan §7.5 needs it)" >&2; \
-	        exit 1; }; \
-	done
-	@for opt in VIRTIO_NET VIRTIO_MMIO; do \
-	    grep -q "^CONFIG_$$opt=y$$" $(KERNEL_SRC)/.config || { \
-	        echo "kernel config: CONFIG_$$opt is not set (the guest's NIC needs it)" >&2; \
+	        echo "kernel config: CONFIG_$$opt is not set (ARCH=$(ARCH) needs it)" >&2; \
 	        exit 1; }; \
 	done
 
 kernel: kernel-config-check $(KERNEL_IMAGE)
 
 $(KERNEL_IMAGE): $(KERNEL_SRC)/.config
-	$(MAKE_KERNEL) -j$(JOBS) Image
+	$(MAKE_KERNEL) -j$(JOBS) $(KERNEL_BOOT_TARGET)
 	@echo "kernel image: $@"
 
-# --- busybox (static aarch64) --------------------------------------------
+# --- busybox (static target) ----------------------------------------------
 $(BUSYBOX_TARBALL):
 	$(SCRIPTS)/fetch.sh $@ $(BUSYBOX_URLS)
 
@@ -166,10 +182,11 @@ $(BUSYBOX_SRC)/.config: $(BUSYBOX_TARBALL)
 	# be static) and the tc applet (networking/tc.c does not compile against
 	# current kernel UAPI headers: struct tc_cbq_wrropt was removed upstream).
 	# The cross prefix makes every busybox make in the tree (notably the
-	# `install` step in build-initramfs.sh) compile for aarch64 by default.
+	# `install` step in build-initramfs.sh) compile for the selected target
+	# by default.
 	sed -i -e 's/^# CONFIG_STATIC is not set$$/CONFIG_STATIC=y/' \
 	       -e 's/^CONFIG_TC=y$$/# CONFIG_TC is not set/' \
-	       -e 's/^CONFIG_CROSS_COMPILER_PREFIX=""$$/CONFIG_CROSS_COMPILER_PREFIX="aarch64-linux-gnu-"/' \
+	       -e "s/^CONFIG_CROSS_COMPILER_PREFIX=\"\"$$/CONFIG_CROSS_COMPILER_PREFIX=\"$(CROSS_COMPILE)\"/" \
 	       $(BUSYBOX_SRC)/.config
 
 busybox: $(BUSYBOX_BIN)
@@ -206,7 +223,7 @@ $(INITRAMFS_DEMO): $(RINIT_BIN) $(RCTL_BIN) $(BUSYBOX_BIN) $(BOOT_UNIT_FILES) \
 # start. Everything is rebuilt by the file targets above whenever a source is
 # newer, so there is no "skip the build" switch - running `make run` twice just
 # boots the second time.
-QEMU_CMD = $(SCRIPTS)/run-qemu.sh --arch aarch64 --kernel $(KERNEL_IMAGE) \
+QEMU_CMD = $(SCRIPTS)/run-qemu.sh --arch $(QEMU_ARCH) --kernel $(KERNEL_IMAGE) \
 	--initrd $(INITRAMFS) --mem $(QEMU_MEM)
 
 qemu run: $(KERNEL_IMAGE) $(INITRAMFS)
@@ -220,7 +237,7 @@ check:
 	cargo clippy --offline --all-targets -- -D warnings
 	cargo test --offline --workspace
 
-# `test` = `check` plus the qemu system test, which needs the aarch64
+# `test` = `check` plus the qemu system test, which needs the target
 # artifacts.
 test: check
 	$(MAKE) test-system
@@ -230,7 +247,7 @@ test: check
 # It boots the acceptance image: the §7.x units it drives from the console are
 # in `units/demo/`, which `make run`'s image does not carry.
 test-system: $(KERNEL_IMAGE) $(INITRAMFS_DEMO)
-	$(SCRIPTS)/system-test.sh --kernel $(KERNEL_IMAGE) --initrd $(INITRAMFS_DEMO)
+	$(SCRIPTS)/system-test.sh --arch $(QEMU_ARCH) --kernel $(KERNEL_IMAGE) --initrd $(INITRAMFS_DEMO)
 
 # `soak` is the M4 long-run leak check: sustained restart churn plus a loop
 # driving the control socket, watching RSS, descriptors and zombies. The default
@@ -248,7 +265,7 @@ soak:
 # release, or the acceptance pass, runs.
 #
 # Plan §0.1's size budget: <=2 MB for a dynamic binary, <=4 MB for a static one.
-# Both shipped binaries are static aarch64, and they are what the initramfs
+# Both shipped binaries are static and are what the initramfs
 # packs (`scripts/build-initramfs.sh`).
 SIZE_BUDGET_STATIC := 4194304
 

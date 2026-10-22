@@ -8,6 +8,15 @@
 linker = "aarch64-linux-gnu-gcc"
 rustflags = ["-C", "target-feature=+crt-static"]
 
+# ARMv7 hard-float, the 32-bit target the arm32 build selects. The same
+# static-link rule as the 64-bit target: the initramfs has no ld.so/libc.
+[target.armv7-unknown-linux-gnueabihf]
+linker = "arm-linux-gnueabihf-gcc"
+# The Debian armhf toolchain has no `rcrt1.o`, so its static-PIE link fails;
+# this target uses a plain static (non-PIE) link instead. The initramfs only
+# needs "no ld.so and no libc.so dependency", which both forms provide.
+rustflags = ["-C", "target-feature=+crt-static", "-C", "relocation-model=static"]
+
 # Host/qemu-x86_64 verification build (plan §4.2): use the musl target, which
 # is statically linked by default, so the same initramfs approach works without
 # bundling a host glibc of the exact version. (Setting `crt-static` on the GNU

@@ -231,6 +231,7 @@ if [[ -n "${busybox_src}" ]]; then
     bbox_arch=""
     case "${triple}" in
         aarch64-*) cross="aarch64-linux-gnu-"; bbox_arch="arm64" ;;
+        armv7-*)   cross="arm-linux-gnueabihf-"; bbox_arch="arm" ;;
     esac
     if [[ -n "${cross}" ]]; then
         make -C "${busybox_src}" CONFIG_PREFIX="${work}" CROSS_COMPILE="${cross}" ARCH="${bbox_arch}" install >/dev/null

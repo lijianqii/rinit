@@ -2,7 +2,7 @@
 # Boot rinit as PID 1 in qemu (plan §4.3).
 #
 # Usage:
-#   scripts/run-qemu.sh --arch <aarch64|x86_64> --kernel <Image|vmlinuz> --initrd <cpio.gz>
+#   scripts/run-qemu.sh --arch <aarch64|arm|x86_64> --kernel <Image|zImage|vmlinuz> --initrd <cpio.gz>
 #                       [--mem 128M] [--service "<cmd> [args...]"]
 #                       [--kernel-args "<tokens>"]
 #
@@ -19,13 +19,14 @@
 # Examples:
 #   # embedded target
 #   scripts/run-qemu.sh --arch aarch64 --kernel Image --initrd initramfs-aarch64-unknown-linux-gnu.cpio.gz
+#   scripts/run-qemu.sh --arch arm --kernel zImage --initrd initramfs-armv7-unknown-linux-gnueabihf.cpio.gz
 #   # host/qemu-x86 verification (uses an amd64 vmlinuz)
 #   scripts/run-qemu.sh --arch x86_64 --kernel /boot/vmlinuz-6.12.111+deb13-amd64 \
 #       --initrd initramfs-x86_64-unknown-linux-musl.cpio.gz
 #
-# The aarch64 machine also gets qemu's user-mode network: DHCP hands the guest
-# 10.0.2.15/24, gateway 10.0.2.2 and DNS 10.0.2.3, and `units/network.service`
-# configures the interface from the lease.
+# The aarch64 and arm32 machines also get qemu's user-mode network: DHCP hands
+# the guest 10.0.2.15/24, gateway 10.0.2.2 and DNS 10.0.2.3, and
+# `units/network.service` configures the interface from the lease.
 #
 # Exit from the guest: send SIGTERM/SIGINT to PID 1 (rinit reboots), or Ctrl-A X
 # in qemu to quit.
@@ -47,7 +48,7 @@ while [[ $# -gt 0 ]]; do
         --mem) mem="${2:?}"; shift 2 ;;
         --service) service="${2:?}"; shift 2 ;;
         --kernel-args) kernel_args="${2:?}"; shift 2 ;;
-        -h | --help) sed -n '2,31p' "$0"; exit 0 ;;
+        -h | --help) sed -n '2,32p' "$0"; exit 0 ;;
         --) shift; extra=("$@"); break ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
@@ -74,6 +75,24 @@ case "${arch}" in
         # mmio transport built in, both checked by `make kernel-config-check`.
         exec qemu-system-aarch64 \
             -machine virt -cpu cortex-a57 -m "${mem}" \
+            -kernel "${kernel}" -initrd "${initrd}" \
+            -append "${append}" \
+            -netdev user,id=net0 \
+            -device virtio-net-device,netdev=net0 \
+            -device i6300esb \
+            -nographic "${extra[@]}"
+        ;;
+    arm)
+        append="console=ttyAMA0 rdinit=/sbin/rinit"
+        [[ -n "${service}" ]] && append="${append} ${service}"
+        [[ -n "${kernel_args}" ]] && append="${append} ${kernel_args}"
+        # 32-bit ARM `virt`: the same virtio-mmio NIC and PCI i6300esb as the
+        # aarch64 machine, with a PL011 console. The kernel is a zImage and
+        # qemu supplies the device tree for this machine. `highmem=off` keeps
+        # the PCI ECAM below 4G; without it the 32-bit kernel's
+        # pci-host-generic probe fails with EOVERFLOW and there is no watchdog.
+        exec qemu-system-arm \
+            -machine virt,highmem=off -cpu cortex-a15 -m "${mem}" \
             -kernel "${kernel}" -initrd "${initrd}" \
             -append "${append}" \
             -netdev user,id=net0 \
