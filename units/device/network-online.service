@@ -1,0 +1,13 @@
+# Wait for a DHCP lease, not merely for udhcpc to be exec'd.
+#
+# `network.service` is Type=simple, so it is Active as soon as udhcpc starts.
+# Services that need an address (NTP, SSH) order themselves after this one.
+[Unit]
+Description=Wait for a DHCP lease on eth0
+Requires=network.service
+After=network.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c "until /sbin/ip addr show dev eth0 | /bin/grep -q 'inet '; do /bin/sleep 1; done"
+TimeoutStartSec=30

@@ -1,0 +1,10 @@
+# Apply /etc/hostname at boot rather than waiting for the first login.
+[Unit]
+Description=Set the hostname from /etc/hostname
+Requires=rinit-init.target
+After=rinit-init.target
+Before=network.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/hostname -F /etc/hostname

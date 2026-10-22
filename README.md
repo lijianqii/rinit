@@ -287,7 +287,8 @@ units/                # the boot set: the two targets, getty.service (the consol
                       # shell.service, its alternative
 units/demo/           # the §7.x acceptance units; packed only into the image
                       # `make test-system` boots, and started from the console
-scripts/              # fetch/kernel/busybox/initramfs/qemu/system-test/soak
+units/device/         # deployable-device services; packed into `run-disk`
+scripts/              # fetch/kernel/busybox/dropbear/initramfs/disk/qemu/tests/soak
 ```
 
 ## Building
@@ -575,6 +576,8 @@ does not exist.
 ```bash
 make ARCH=arm64 run # build if needed, boot → interactive root shell
 make ARCH=arm32 run # the same for ARMv7 (qemu virt, Cortex-A15)
+make ARCH=arm64 run-disk  # persistent ext4 root filesystem + device services
+make disk-image     # force a destructive rebuild of that ext4 image
 make kernel         # kernel only (Image or zImage for the selected ARCH)
 make busybox        # busybox only
 make initramfs      # rinit + initramfs only
@@ -636,6 +639,53 @@ it just boots. In particular:
   acceptance image, `units/demo/`), or one of the packing scripts changes.
 
 Because that already holds, there is no `SKIP_BUILD` knob to forget to pass.
+
+### Persistent device image (`run-disk`)
+
+`make run` boots an initramfs, so `/etc`, `/var` and everything written at run
+time disappear on reboot. The `run-disk` target builds a real ext4 root
+filesystem instead:
+
+```bash
+make ARCH=arm64 run-disk
+make ARCH=arm32 run-disk
+```
+
+The first invocation creates `build/.../out/rinit-<target>.ext4` (64 MiB) from
+the same rootfs tree plus `units/device/` and dropbear, then boots the kernel
+with `root=/dev/vda rw rootfstype=ext4 init=/sbin/rinit -- --default
+device.target`. There is no initramfs. The image is **reused if it exists**, so
+changes made in the guest survive the next boot; `make disk-image` is the
+explicit destructive rebuild.
+
+`device.target` starts:
+
+- `hostname.service` and `network-online.service` (required; the latter waits
+  for the DHCP lease, not just for `udhcpc` to be exec'd);
+- `syslog.service`/`klogd.service` (persistent `/var/log/messages`);
+- `seedrng.service` (persistent `/var/lib/seedrng`);
+- `time-sync.service` (busybox `ntpd`);
+- `sshd.service` (dropbear).
+
+Dropbear is key-only (`-s`). QEMU forwards host port 2222 to guest 22
+(`DISK_HOSTFWD` can be overridden), so after provisioning a key:
+
+```bash
+ssh -p 2222 root@localhost
+```
+
+`/root/.ssh/authorized_keys` starts empty; add a key through the serial console
+(or before the first boot), because no default credential is shipped. Host keys
+are generated on the first connection in `/etc/dropbear` and persist in the ext4
+image. The dropbear source is cached at
+`build/dl/dropbear-2026.94.tar.bz2`; if the build host is offline, put that
+tarball there and rerun `make disk-image`.
+
+The image needs `e2fsprogs` (`mke2fs -d`); the kernel needs `CONFIG_EXT4_FS`,
+`CONFIG_VIRTIO_BLK` and `CONFIG_DEVTMPFS_MOUNT` **off** (rinit mounts `/dev`
+itself; otherwise the first-wave `/dev` mount fails with `EBUSY` on a real
+rootfs). A firewall/nftables service is not included yet: the image has no
+`nft`/`iptables` binary, so do not expose it directly to an untrusted network.
 
 ## Running in qemu (host/x86 verification only)
 
@@ -924,10 +974,11 @@ command through the same spawn path a unit uses.
 
 The packed images (`build/out/initramfs-aarch64-unknown-linux-gnu.cpio.gz` and
 `…-demo.cpio.gz`: static busybox + rinit + rctl + the unit directory + the
-`/etc`/`/var` skeleton) are 2.31 MiB (2 417 747 B) and 2.31 MiB (2 423 319 B)
-gzipped. The arm32 pair is 2.04 MiB (2 136 470 B) and 2.04 MiB (2 143 387 B).
-The difference is the fourteen files in `units/demo/`, which only the
-second one carries. The packing is
+`/etc`/`/var` skeleton) are 2.31 MiB (2 417 747 B) and 2.31 MiB (2 423 326 B)
+gzipped. The arm32 pair is 2.04 MiB (2 136 470 B) and 2.04 MiB (2 143 380 B).
+The `run-disk` images are 64 MiB ext4 files (roughly 7-10 MiB used before the
+first boot); they are not shipped in the initramfs. The difference is the
+fourteen files in `units/demo/`, which only the second initramfs carries. The packing is
 reproducible - `scripts/mkinitramfs.sh` zeroes the mtimes and inode numbers the
 archive would otherwise record, so repacking the same binaries gives the same
 bytes, which is what makes the number checkable rather than merely re-measured. A

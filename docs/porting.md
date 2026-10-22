@@ -136,7 +136,35 @@ The boot target's *closure* is what starts. A unit that nothing references is
 loaded and listed by `rctl` but never started - that is where the demo units in
 `units/demo/` sit, and `rctl start <unit>` is how they come up. (`units/` itself
 is the boot set: the two targets, `getty.service`, `network.service` and
-`shell.service`.)
+`shell.service`. The deployable-device services live in `units/device/` and are
+packed only into the disk image.)
+
+### Persistent disk image
+
+`make ARCH=... run-disk` builds an ext4 root filesystem and boots it directly:
+
+```bash
+make ARCH=arm64 run-disk
+make ARCH=arm32 run-disk
+make disk-image          # destructive rebuild; run-disk reuses an existing image
+```
+
+The kernel command line is `root=/dev/vda rw rootfstype=ext4 init=/sbin/rinit
+-- --default device.target`; there is no initramfs. The kernel needs
+`CONFIG_EXT4_FS`, `CONFIG_VIRTIO_BLK`, `CONFIG_VIRTIO_MMIO`, and
+`CONFIG_DEVTMPFS_MOUNT` **off** - rinit mounts `/dev` itself, and a kernel
+auto-mount makes that first-wave mount fail with `EBUSY`.
+
+The image is populated with `mke2fs -d` from a tar whose entries are explicitly
+`root:root` (a directory populated as the build user would otherwise leave every
+file owned by that uid). `units/device/` provides `hostname`, `network-online`
+(DHCP lease, not just udhcpc exec), `syslog`/`klogd`, `seedrng`, `time-sync`
+and `sshd`; dropbear is static and key-only (`-s`), with host keys generated on
+first connection under `/etc/dropbear`. `/root/.ssh/authorized_keys` starts
+empty by design. The qemu user-net host-forward is `2222 -> 22` by default
+(`DISK_HOSTFWD`), so provisioning a key is what makes `ssh -p 2222 root@...`
+work. `/etc`, `/var`, host keys, logs and the RNG seed persist across boots
+because the ext4 image is reused; `make disk-image` is what wipes them.
 
 ## 5. Differences from systemd to expect
 
@@ -189,6 +217,8 @@ make soak          # restart churn, watching RSS, descriptors and zombies
 make test-system   # boots the selected ARCH and asserts plan §6's list
 make ARCH=arm32 test-system  # the ARMv7 guest
 make ARCH=arm64 test-system  # the default aarch64 guest
+make ARCH=arm32 run-disk     # ARMv7 ext4/device boot
+make ARCH=arm64 run-disk     # aarch64 ext4/device boot
 make gates         # the two numeric acceptance items: size and coverage
 ```
 

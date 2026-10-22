@@ -1,0 +1,9 @@
+# Deployable-device aggregation point. `make ARCH=... run-disk` boots with
+# `--default device.target`; the normal `make run` image keeps multi-user.target
+# and does not pull these services in.
+[Unit]
+Description=Deployable device
+Type=target
+Requires=rinit-init.target multi-user.target hostname.service network-online.service
+Wants=seedrng.service syslog.service klogd.service time-sync.service sshd.service
+After=multi-user.target network-online.service

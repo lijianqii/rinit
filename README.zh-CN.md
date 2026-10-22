@@ -260,7 +260,8 @@ units/                # 启动集：两个 target、getty.service（`make run` �
                       # 控制台登录）、network.service（DHCP）和替代品 shell.service
 units/demo/           # §7.x 的验收单元；只打进 `make test-system` 启动的镜像，
                       # 并从控制台手动启动
-scripts/              # fetch/kernel/busybox/initramfs/qemu/system-test/soak
+units/device/         # 可部署设备服务；只打进 `run-disk` 的 ext4 镜像
+scripts/              # fetch/kernel/busybox/dropbear/initramfs/disk/qemu/tests/soak
 ```
 
 ## 构建
@@ -487,6 +488,8 @@ make ARCH=arm32 run      # ARMv7 hard-float, qemu virt / Cortex-A15
 ```bash
 make ARCH=arm64 run # build if needed, boot → interactive root shell
 make ARCH=arm32 run # the same for ARMv7 (qemu virt, Cortex-A15)
+make ARCH=arm64 run-disk  # persistent ext4 root filesystem + device services
+make disk-image     # force a destructive rebuild of that ext4 image
 make kernel         # kernel only
 make busybox        # busybox only
 make initramfs      # rinit + initramfs only
@@ -538,6 +541,48 @@ make KERNEL_VERSION=6.6.158 BUSYBOX_VERSION=1.36.1 ...   # pin versions
   打包脚本变化时，重新打包 initramfs。
 
 既然这些已经成立，就不需要一个会被忘记传的 `SKIP_BUILD` 开关。
+
+### 持久化设备镜像（`run-disk`）
+
+`make run` 启动的是 initramfs，`/etc`、`/var` 和运行期写入的内容重启都会丢。
+`run-disk` 改为构建真实 ext4 根文件系统：
+
+```bash
+make ARCH=arm64 run-disk
+make ARCH=arm32 run-disk
+```
+
+第一次运行会生成 `build/.../out/rinit-<target>.ext4`（64 MiB），内容来自同一套
+rootfs，加上 `units/device/` 和 dropbear，然后用
+`root=/dev/vda rw rootfstype=ext4 init=/sbin/rinit -- --default device.target`
+启动内核，不再使用 initramfs。**镜像存在时不会重建**，所以客户机里的修改能跨重启
+保留；`make disk-image` 才是显式的破坏性重建。
+
+`device.target` 会启动：
+
+- `hostname.service` 和 `network-online.service`（必需；后者等 DHCP 租约，而不是
+  只等 `udhcpc` 被 exec）；
+- `syslog.service` / `klogd.service`（持久化 `/var/log/messages`）；
+- `seedrng.service`（持久化 `/var/lib/seedrng`）；
+- `time-sync.service`（busybox `ntpd`）；
+- `sshd.service`（dropbear）。
+
+Dropbear 只允许密钥登录（`-s`）。qemu 把宿主机 2222 转发到客户机 22
+（可用 `DISK_HOSTFWD` 覆盖），配置好公钥后：
+
+```bash
+ssh -p 2222 root@localhost
+```
+
+`/root/.ssh/authorized_keys` 初始为空；请通过串口或首次启动前自行加入公钥，镜像
+不提供默认凭据。主机密钥在第一次连接时生成到 `/etc/dropbear`，并随 ext4 镜像持久化。
+dropbear 源码缓存在 `build/dl/dropbear-2026.94.tar.bz2`；离线环境把这个 tarball
+放进去再跑 `make disk-image` 即可。
+
+镜像构建需要 `e2fsprogs`（`mke2fs -d`）；内核需要 `CONFIG_EXT4_FS`、
+`CONFIG_VIRTIO_BLK`，并且 `CONFIG_DEVTMPFS_MOUNT` 必须关闭（由 rinit 自己挂载
+`/dev`，否则真实 rootfs 上第一次挂载会 `EBUSY`）。当前还没有防火墙/nftables
+服务：镜像里没有 `nft`/`iptables`，不要把设备直接暴露在不可信网络上。
 
 ## 在 qemu 中运行（仅主机 x86 验证）
 
@@ -772,8 +817,9 @@ M0 的 bring-up 辅助程序 `rinit-testservice` 已经删除：没有东西再�
 
 打包后的镜像（`build/out/initramfs-aarch64-unknown-linux-gnu.cpio.gz` 和
 `…-demo.cpio.gz`：静态 busybox + rinit + rctl + 单元目录 + `/etc`/`/var` 骨架）
-gzip 后分别是 2.31 MiB（2 417 747 B）和 2.31 MiB（2 423 319 B）；arm32 的两个镜像
-分别是 2.04 MiB（2 136 470 B）和 2.04 MiB（2 143 387 B）。差值就是 `units/demo/`
+gzip 后分别是 2.31 MiB（2 417 747 B）和 2.31 MiB（2 423 326 B）；arm32 的两个镜像
+分别是 2.04 MiB（2 136 470 B）和 2.04 MiB（2 143 380 B）。`run-disk` 的镜像
+是 64 MiB ext4（首次启动前实际使用约 7-10 MiB），不放进 initramfs。差值就是 `units/demo/`
 里的十四个文件，只有第二个镜像带它们。打包是可复现的——`scripts/mkinitramfs.sh` 把归档
 本来会记录的 mtime 和 inode 号归零，所以同样的二进制重复打包得到同样的字节，这才让
 这个数字可核对，而不只是"重新测了一遍"。例外是*强制*重建 busybox（`make -B`）：

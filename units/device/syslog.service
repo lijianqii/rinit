@@ -1,0 +1,12 @@
+# Persistent service log. rinit's own ring/file mirror remains the primary
+# source for `rctl log`; this is the syslog socket used by daemons such as
+# dropbear and by klogd.
+[Unit]
+Description=Persistent syslog
+After=rinit-init.target
+
+[Service]
+Type=simple
+ExecStart=/sbin/syslogd -n -O /var/log/messages -s 512
+Restart=on-failure
+RestartSec=2

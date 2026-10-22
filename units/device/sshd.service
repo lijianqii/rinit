@@ -1,0 +1,15 @@
+# Dropbear SSH server, key-only.
+#
+# `-R` generates the host keys in /etc/dropbear on first start; the ext4 disk
+# image keeps them. `-s` disables password logins, so client access is through
+# /root/.ssh/authorized_keys (empty by default; provision it deliberately).
+[Unit]
+Description=Dropbear SSH server
+After=network-online.service seedrng.service
+Wants=seedrng.service
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/dropbear -F -R -s -p 22
+Restart=on-failure
+RestartSec=2

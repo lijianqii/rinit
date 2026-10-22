@@ -1,0 +1,11 @@
+# Keep the clock reasonable for TLS, certificate checks and log timestamps.
+[Unit]
+Description=NTP time sync
+Wants=network-online.service
+After=network-online.service
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/ntpd -n -p pool.ntp.org
+Restart=on-failure
+RestartSec=5

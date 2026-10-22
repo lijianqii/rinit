@@ -1,0 +1,11 @@
+# Forward kernel messages to syslog, so a post-mortem has them on disk.
+[Unit]
+Description=Kernel log forwarder
+Requires=syslog.service
+After=syslog.service
+
+[Service]
+Type=simple
+ExecStart=/sbin/klogd -n
+Restart=on-failure
+RestartSec=2

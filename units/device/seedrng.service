@@ -1,0 +1,11 @@
+# Restore the persistent random seed before anything generates long-lived keys.
+# The disk image keeps /var/lib/seedrng across boots; an initramfs image does
+# not, which is one reason this unit is in the device set only.
+[Unit]
+Description=Seed the kernel RNG
+After=rinit-init.target
+Before=sshd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/seedrng

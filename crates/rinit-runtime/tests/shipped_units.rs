@@ -37,11 +37,15 @@ fn demo_dir() -> PathBuf {
     units_dir().join("demo")
 }
 
-/// Both directories, concatenated, as the image sees them.
+fn device_dir() -> PathBuf {
+    units_dir().join("device")
+}
+
+/// All shipped unit directories, concatenated as the disk image sees them.
 fn load_shipped() -> (Vec<UnitFile>, Vec<String>) {
     let mut files = Vec::new();
     let mut warnings = Vec::new();
-    for dir in [units_dir(), demo_dir()] {
+    for dir in [units_dir(), demo_dir(), device_dir()] {
         let (mut found, mut warned) =
             load_unit_files(&dir).unwrap_or_else(|e| panic!("load {}: {e}", dir.display()));
         files.append(&mut found);
@@ -81,21 +85,35 @@ fn the_boot_set_is_what_make_run_packs() {
 fn no_unit_name_is_in_both_directories() {
     let (boot, _) = load_unit_files(&units_dir()).expect("load units/");
     let (demo, warnings) = load_unit_files(&demo_dir()).expect("load units/demo/");
+    let (device, device_warnings) = load_unit_files(&device_dir()).expect("load units/device/");
     assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    assert!(
+        device_warnings.is_empty(),
+        "unexpected warnings: {device_warnings:?}"
+    );
     assert!(
         demo.len() >= 5,
         "units/demo/ should hold the acceptance units, found {}",
         demo.len()
     );
+    assert!(
+        !device.is_empty(),
+        "units/device/ should hold the device services"
+    );
 
-    for shipped in &boot {
-        assert!(
-            !demo
-                .iter()
-                .any(|d| d.name.canonical() == shipped.name.canonical()),
-            "{} is in both units/ and units/demo/",
-            shipped.name.canonical()
-        );
+    for (a, b, where_) in [
+        (&boot, &demo, "units/ and units/demo/"),
+        (&boot, &device, "units/ and units/device/"),
+        (&demo, &device, "units/demo/ and units/device/"),
+    ] {
+        for shipped in a {
+            assert!(
+                !b.iter()
+                    .any(|d| d.name.canonical() == shipped.name.canonical()),
+                "{} is in both {where_}",
+                shipped.name.canonical()
+            );
+        }
     }
 }
 

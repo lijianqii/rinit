@@ -2,9 +2,15 @@
 # Boot rinit as PID 1 in qemu (plan §4.3).
 #
 # Usage:
-#   scripts/run-qemu.sh --arch <aarch64|arm|x86_64> --kernel <Image|zImage|vmlinuz> --initrd <cpio.gz>
-#                       [--mem 128M] [--service "<cmd> [args...]"]
+#   scripts/run-qemu.sh --arch <aarch64|arm|x86_64> --kernel <Image|zImage|vmlinuz>
+#                       (--initrd <cpio.gz> | --disk <img> --root <dev>)
+#                       [--mem 128M] [--hostfwd tcp::2222-:22]
+#                       [--service "<cmd> [args...]"]
 #                       [--kernel-args "<tokens>"]
+#
+# --disk attaches a raw ext4 image as virtio-blk. With --root the kernel mounts
+# that image itself and executes /sbin/rinit from it, so there is no initramfs:
+# this is the persistent `make run-disk` path.
 #
 # --service appends the hardcoded service command to the kernel cmdline; the
 # kernel passes those tokens to rinit as argv (M0 has no config parsing yet).
@@ -35,6 +41,9 @@ set -euo pipefail
 arch=""
 kernel=""
 initrd=""
+disk=""
+root=""
+hostfwd=""
 mem="128M"
 service=""
 kernel_args=""
@@ -45,10 +54,13 @@ while [[ $# -gt 0 ]]; do
         --arch) arch="${2:?}"; shift 2 ;;
         --kernel) kernel="${2:?}"; shift 2 ;;
         --initrd) initrd="${2:?}"; shift 2 ;;
+        --disk) disk="${2:?}"; shift 2 ;;
+        --root) root="${2:?}"; shift 2 ;;
+        --hostfwd) hostfwd="${2:?}"; shift 2 ;;
         --mem) mem="${2:?}"; shift 2 ;;
         --service) service="${2:?}"; shift 2 ;;
         --kernel-args) kernel_args="${2:?}"; shift 2 ;;
-        -h | --help) sed -n '2,32p' "$0"; exit 0 ;;
+        -h | --help) sed -n '2,/^set -euo pipefail$/p' "$0" | sed '$d'; exit 0 ;;
         --) shift; extra=("$@"); break ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
@@ -56,11 +68,30 @@ done
 
 : "${arch:?--arch required}"
 : "${kernel:?--kernel required}"
-: "${initrd:?--initrd required}"
+if [[ -z "${initrd}" && -z "${disk}" ]]; then
+    echo "error: --initrd or --disk is required" >&2
+    exit 2
+fi
+if [[ -n "${root}" && -z "${disk}" ]]; then
+    echo "error: --root requires --disk" >&2
+    exit 2
+fi
+
+boot_args=(-kernel "${kernel}")
+[[ -n "${initrd}" ]] && boot_args+=(-initrd "${initrd}")
+[[ -n "${disk}" ]] && boot_args+=(-drive "file=${disk},format=raw,if=virtio")
+
+netdev="user,id=net0"
+[[ -n "${hostfwd}" ]] && netdev="${netdev},hostfwd=${hostfwd}"
 
 case "${arch}" in
     aarch64)
-        append="console=ttyAMA0 rdinit=/sbin/rinit"
+        append="console=ttyAMA0"
+        if [[ -n "${root}" ]]; then
+            append="${append} root=${root} rw rootfstype=ext4 init=/sbin/rinit"
+        else
+            append="${append} rdinit=/sbin/rinit"
+        fi
         [[ -n "${service}" ]] && append="${append} ${service}"
         [[ -n "${kernel_args}" ]] && append="${append} ${kernel_args}"
         # Plan §7.5's watchdog. The arm64 `virt` machine has no watchdog of its
@@ -75,15 +106,20 @@ case "${arch}" in
         # mmio transport built in, both checked by `make kernel-config-check`.
         exec qemu-system-aarch64 \
             -machine virt -cpu cortex-a57 -m "${mem}" \
-            -kernel "${kernel}" -initrd "${initrd}" \
+            "${boot_args[@]}" \
             -append "${append}" \
-            -netdev user,id=net0 \
+            -netdev "${netdev}" \
             -device virtio-net-device,netdev=net0 \
             -device i6300esb \
             -nographic "${extra[@]}"
         ;;
     arm)
-        append="console=ttyAMA0 rdinit=/sbin/rinit"
+        append="console=ttyAMA0"
+        if [[ -n "${root}" ]]; then
+            append="${append} root=${root} rw rootfstype=ext4 init=/sbin/rinit"
+        else
+            append="${append} rdinit=/sbin/rinit"
+        fi
         [[ -n "${service}" ]] && append="${append} ${service}"
         [[ -n "${kernel_args}" ]] && append="${append} ${kernel_args}"
         # 32-bit ARM `virt`: the same virtio-mmio NIC and PCI i6300esb as the
@@ -93,20 +129,25 @@ case "${arch}" in
         # pci-host-generic probe fails with EOVERFLOW and there is no watchdog.
         exec qemu-system-arm \
             -machine virt,highmem=off -cpu cortex-a15 -m "${mem}" \
-            -kernel "${kernel}" -initrd "${initrd}" \
+            "${boot_args[@]}" \
             -append "${append}" \
-            -netdev user,id=net0 \
+            -netdev "${netdev}" \
             -device virtio-net-device,netdev=net0 \
             -device i6300esb \
             -nographic "${extra[@]}"
         ;;
     x86_64)
-        append="console=ttyS0 rdinit=/sbin/rinit"
+        append="console=ttyS0"
+        if [[ -n "${root}" ]]; then
+            append="${append} root=${root} rw rootfstype=ext4 init=/sbin/rinit"
+        else
+            append="${append} rdinit=/sbin/rinit"
+        fi
         [[ -n "${service}" ]] && append="${append} ${service}"
         [[ -n "${kernel_args}" ]] && append="${append} ${kernel_args}"
         exec qemu-system-x86_64 \
             -machine q35 -m "${mem}" \
-            -kernel "${kernel}" -initrd "${initrd}" \
+            "${boot_args[@]}" \
             -append "${append}" \
             -nographic "${extra[@]}"
         ;;

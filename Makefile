@@ -4,6 +4,9 @@
 #   make ARCH=arm64 run   download + build kernel & busybox + rinit, pack the
 #                         initramfs, and boot it in qemu (default; ARCH=arm64)
 #   make ARCH=arm32 run   the same for ARMv7 (qemu virt, Cortex-A15)
+#   make ARCH=... run-disk  build an ext4 rootfs (dropbear + device units) and
+#                         boot it as a persistent virtio disk
+#   make disk-image    force a destructive rebuild of that ext4 image
 #   make kernel      build the Linux kernel Image/zImage only
 #   make busybox     build busybox only
 #   make initramfs   build rinit and assemble the initramfs
@@ -65,11 +68,14 @@ BUSYBOX_URLS     ?= $(MIRROR)/busybox/busybox-$(BUSYBOX_VERSION).tar.bz2 \
 
 JOBS             ?= $(shell nproc 2>/dev/null || echo 2)
 QEMU_MEM         ?= 128M
+DROPBEAR_VERSION ?= 2026.94
+# Host-side SSH access to `run-disk`: ssh -p 2222 root@localhost.
+DISK_HOSTFWD     ?= tcp::2222-:22
 
 # Everything the guest's acceptance tests need the kernel to provide.
 KERNEL_REQUIRED_OPTS := CGROUP_SCHED FAIR_GROUP_SCHED CFS_BANDWIDTH MEMCG \
                         CGROUP_PIDS I6300ESB_WDT WATCHDOG_SYSFS VIRTIO_NET \
-                        VIRTIO_MMIO
+                        VIRTIO_MMIO EXT4_FS VIRTIO_BLK
 ifeq ($(KERNEL_ARCH),arm)
 KERNEL_REQUIRED_OPTS += ARCH_VIRT PCI_HOST_GENERIC
 endif
@@ -95,14 +101,19 @@ INITRAMFS        := $(OUT_DIR)/initramfs-$(TARGET).cpio.gz
 # image above, `make test-system` this one - see the packing rules below.
 INITRAMFS_DEMO   := $(OUT_DIR)/initramfs-$(TARGET)-demo.cpio.gz
 
+DEVICE_UNIT_FILES := $(wildcard units/device/*.service) $(wildcard units/device/*.target)
+DROPBEAR_BIN_DIR  := $(SRC_DIR)/dropbear-bin
+ROOTFS_DIR        := $(OUT_DIR)/rootfs
+DISK_IMAGE        := $(OUT_DIR)/rinit-$(TARGET).ext4
+
 SCRIPTS          := scripts
 MAKE_KERNEL      := $(MAKE) -C $(KERNEL_SRC) ARCH=$(KERNEL_ARCH) CROSS_COMPILE=$(CROSS_COMPILE)
 MAKE_BUSYBOX     := $(MAKE) -C $(BUSYBOX_SRC) ARCH=$(BUSYBOX_ARCH) CROSS_COMPILE=$(CROSS_COMPILE)
 
 .DEFAULT_GOAL    := run
-.PHONY: run kernel kernel-config-check busybox rinit initramfs initramfs-demo qemu \
-        help clean distclean check test test-system soak parallel gates \
-        size-check coverage-check
+.PHONY: run run-disk kernel kernel-config-check busybox dropbear rinit \
+        initramfs initramfs-demo disk-image qemu help clean distclean check \
+        test test-system soak parallel gates size-check coverage-check
 
 help:
 	@sed -n '2,/^# ====/p' $(MAKEFILE_LIST) | sed '$$d' | sed 's/^# \{0,1\}//'
@@ -138,6 +149,10 @@ $(KERNEL_SRC)/.config: $(KERNEL_TARBALL)
 	@for opt in $(KERNEL_REQUIRED_OPTS); do \
 	    sed -i "s/^# CONFIG_$$opt is not set$$/CONFIG_$$opt=y/" $(KERNEL_SRC)/.config; \
 	done
+	# On a real root filesystem the kernel's devtmpfs auto-mount would make
+	# rinit's first-wave /dev mount fail with EBUSY. rinit mounts /dev itself.
+	sed -i 's/^CONFIG_DEVTMPFS_MOUNT=y$$/# CONFIG_DEVTMPFS_MOUNT is not set/' \
+	    $(KERNEL_SRC)/.config
 	$(MAKE_KERNEL) olddefconfig
 	# Kconfig evaluates dependencies in symbol order: a symbol enabled in the
 	# first pass can be dropped before the symbol it depends on (FAIR_GROUP_SCHED
@@ -194,6 +209,13 @@ busybox: $(BUSYBOX_BIN)
 $(BUSYBOX_BIN): $(BUSYBOX_SRC)/.config
 	$(MAKE_BUSYBOX) -j$(JOBS)
 
+# --- dropbear -------------------------------------------------------------
+dropbear: $(DROPBEAR_BIN_DIR)/dropbear
+
+$(DROPBEAR_BIN_DIR)/dropbear: $(SCRIPTS)/build-dropbear.sh
+	DROPBEAR_VERSION=$(DROPBEAR_VERSION) \
+	    $(SCRIPTS)/build-dropbear.sh $(TARGET) $(DROPBEAR_BIN_DIR)
+
 # --- initramfs ------------------------------------------------------------
 initramfs: $(INITRAMFS)
 initramfs-demo: $(INITRAMFS_DEMO)
@@ -228,6 +250,24 @@ QEMU_CMD = $(SCRIPTS)/run-qemu.sh --arch $(QEMU_ARCH) --kernel $(KERNEL_IMAGE) \
 
 qemu run: $(KERNEL_IMAGE) $(INITRAMFS)
 	$(QEMU_CMD)
+
+# The persistent variant: an ext4 root filesystem instead of an initramfs. The
+# image is built only when missing, so changes made in the guest survive the
+# next `make run-disk`; `make disk-image` is the explicit destructive rebuild.
+disk-image: rinit $(DROPBEAR_BIN_DIR)/dropbear $(BOOT_UNIT_FILES) \
+            $(DEVICE_UNIT_FILES) $(FSTAB) $(INITRAMFS_SCRIPTS) $(SCRIPTS)/mkdisk.sh
+	$(SCRIPTS)/build-initramfs.sh $(TARGET) --busybox-src $(BUSYBOX_SRC) \
+	    --device-units --dropbear-bin $(DROPBEAR_BIN_DIR) --rootfs $(ROOTFS_DIR)
+	$(SCRIPTS)/mkdisk.sh $(ROOTFS_DIR) $(DISK_IMAGE)
+
+$(DISK_IMAGE):
+	$(MAKE) disk-image
+
+run-disk: $(KERNEL_IMAGE) $(DISK_IMAGE)
+	$(SCRIPTS)/run-qemu.sh --arch $(QEMU_ARCH) --kernel $(KERNEL_IMAGE) \
+	    --disk $(DISK_IMAGE) --root /dev/vda --mem $(QEMU_MEM) \
+	    --hostfwd "$(DISK_HOSTFWD)" \
+	    --kernel-args "-- --default device.target"
 
 # --- gates ----------------------------------------------------------------
 # `check` is the pre-commit gate (plan §4.1 "每个 commit 必跑"): formatting,

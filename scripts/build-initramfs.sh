@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
-# Assemble a gzipped cpio initramfs containing rinit (plan §4.3).
+# Assemble a gzipped cpio initramfs, or populate a rootfs directory, for rinit
+# (plan §4.3).
 #
 # Usage:
 #   scripts/build-initramfs.sh <target-triple> [--busybox-src DIR] [--out FILE]
-#                                                    [--demo-units]
+#                                                    [--demo-units] [--device-units]
+#                                                    [--dropbear-bin DIR]
+#                                                    [--rootfs DIR]
 #
 # Options:
 #   --busybox-src DIR  install the given *built* busybox source tree
@@ -13,6 +16,10 @@
 #   --demo-units       also pack units/demo/, the §7.x acceptance units. Without
 #                      it the image carries the boot set only, which is what
 #                      `make run` wants; `make test-system` passes it.
+#   --device-units     also pack units/device/, the deployable-device services.
+#   --dropbear-bin DIR install dropbear/dropbearkey from DIR.
+#   --rootfs DIR       populate DIR as a root filesystem and stop (no cpio).
+#                      Used by `make run-disk` before mke2fs.
 #
 # Examples:
 #   scripts/build-initramfs.sh aarch64-unknown-linux-gnu --busybox-src build/src/busybox-1.36.1
@@ -30,18 +37,24 @@ triple=""
 busybox_src=""
 output=""
 demo_units=""
+device_units=""
+dropbear_bin=""
+rootfs_out=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --busybox-src) busybox_src="${2:?}"; shift 2 ;;
         --out) output="${2:?}"; shift 2 ;;
         --demo-units) demo_units=1; shift ;;
-        -h | --help) sed -n '2,23p' "$0"; exit 0 ;;
+        --device-units) device_units=1; shift ;;
+        --dropbear-bin) dropbear_bin="${2:?}"; shift 2 ;;
+        --rootfs) rootfs_out="${2:?}"; shift 2 ;;
+        -h | --help) sed -n '2,29p' "$0"; exit 0 ;;
         -*) echo "unknown option: $1" >&2; exit 2 ;;
         *) triple="$1"; shift ;;
     esac
 done
 
-: "${triple:?usage: build-initramfs.sh <target-triple> [--busybox-src DIR] [--out FILE] [--demo-units]}"
+: "${triple:?usage: build-initramfs.sh <target-triple> [--busybox-src DIR] [--out FILE] [--demo-units] [--device-units] [--dropbear-bin DIR] [--rootfs DIR]}"
 [[ -n "${output}" ]] || output="${repo_root}/build/out/initramfs-${triple}.cpio.gz"
 
 bin_dir="${repo_root}/target/${triple}/release"
@@ -54,8 +67,16 @@ if [[ ! -x "${bin_dir}/rctl" ]]; then
     exit 1
 fi
 
-work="$(mktemp -d)"
-trap 'rm -rf "${work}"' EXIT
+if [[ -n "${rootfs_out}" ]]; then
+    # Absolute path: busybox's `make install` runs with -C its source tree, so
+    # a relative CONFIG_PREFIX would resolve against that tree, not the repo.
+    work="$(realpath -m "${rootfs_out}")"
+    rm -rf "${work}"
+    mkdir -p "${work}"
+else
+    work="$(mktemp -d)"
+    trap 'rm -rf "${work}"' EXIT
+fi
 
 # The work directory *is* the image's root directory, and `mktemp -d` creates it
 # as `0700`. That is invisible while everything in the guest runs as root - root
@@ -73,7 +94,7 @@ chmod 0755 "${work}"
 # `/mnt`, `/home`, `/opt`, `/srv` and `/usr/local` for an operator, and `/var/run`
 # pointing at the `/run` tmpfs rinit mounts over the image's own directory.
 install -d "${work}"/{sbin,bin,etc/rinit/units,etc/udhcpc,proc,sys,dev,run,usr/local/bin,usr/local/sbin}
-install -d "${work}"/{var/log/rinit,var/spool,mnt,media,home,opt,srv}
+install -d "${work}"/{var/log/rinit,var/spool,var/lib/seedrng,mnt,media,home,opt,srv}
 install -d -m 0700 "${work}/root"
 install -d -m 1777 "${work}/tmp" "${work}/var/tmp"
 ln -s ../run "${work}/var/run"
@@ -194,6 +215,9 @@ unit_dirs=("${repo_root}/units")
 if [[ -n "${demo_units}" ]]; then
     unit_dirs+=("${repo_root}/units/demo")
 fi
+if [[ -n "${device_units}" ]]; then
+    unit_dirs+=("${repo_root}/units/device")
+fi
 declare -A unit_from=()
 for dir in "${unit_dirs[@]}"; do
     for glob in "${dir}"/*.service "${dir}"/*.target; do
@@ -250,4 +274,22 @@ if [[ -n "${busybox_src}" ]]; then
     printf 'root:x:0:\nnogroup:x:65534:\n' >"${work}/etc/group"
 fi
 
-"${here}/mkinitramfs.sh" "${work}" "${output}"
+# Dropbear is only installed for the disk/device image. It generates its host
+# keys into /etc/dropbear on first start (`-R`), so that directory has to be
+# persistent; the rootfs image provides that. `authorized_keys` starts empty:
+# provisioning a client key is an operator decision, and an empty file is safer
+# than a default credential.
+if [[ -n "${dropbear_bin}" ]]; then
+    install -d -m 0755 "${work}/usr/sbin" "${work}/usr/bin"
+    install -d -m 0700 "${work}/etc/dropbear" "${work}/root/.ssh"
+    install -m 0755 "${dropbear_bin}/dropbear" "${work}/usr/sbin/dropbear"
+    install -m 0755 "${dropbear_bin}/dropbearkey" "${work}/usr/bin/dropbearkey"
+    : >"${work}/root/.ssh/authorized_keys"
+    chmod 0600 "${work}/root/.ssh/authorized_keys"
+fi
+
+if [[ -n "${rootfs_out}" ]]; then
+    echo "rootfs: ${work}"
+else
+    "${here}/mkinitramfs.sh" "${work}" "${output}"
+fi
