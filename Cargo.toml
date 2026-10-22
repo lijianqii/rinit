@@ -23,9 +23,11 @@ license = "MIT OR Apache-2.0"
 # fully offline (see plan §2 risk mitigation / environment constraints).
 [workspace.dependencies]
 libc = "0.2.190"
+# `signal` is deliberately absent: rinit's handlers write to its own
+# non-blocking self-pipe (see `crates/rinit-runtime/src/signals.rs`), so tokio's
+# signal driver would be an unused dependency.
 tokio = { version = "1.53.3", default-features = false, features = [
     "rt",
-    "signal",
     "time",
     "net",
     "sync",

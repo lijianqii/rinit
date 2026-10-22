@@ -894,8 +894,8 @@ byte counts as `ls -l` reports them:
 
 | target                               | binary              | size                    | in an image |
 | ------------------------------------ | ------------------- | ----------------------- | ----------- |
-| `aarch64-unknown-linux-gnu` (static) | `rinit`             | 1.57 MiB (1 649 776 B)  | yes         |
-| `x86_64-unknown-linux-musl` (static) | `rinit`             | 1.05 MiB (1 098 720 B)  | yes         |
+| `aarch64-unknown-linux-gnu` (static) | `rinit`             | 1.57 MiB (1 649 744 B)  | yes         |
+| `x86_64-unknown-linux-musl` (static) | `rinit`             | 1.05 MiB (1 098 688 B)  | yes         |
 
 `rctl` is 994 152 B on aarch64 and 406 200 B on musl; both are inside the
 initramfs. `make size-check` is the gate, and it checks the two aarch64 binaries
@@ -913,9 +913,9 @@ command through the same spawn path a unit uses.
 
 The packed images (`build/out/initramfs-aarch64-unknown-linux-gnu.cpio.gz` and
 `…-demo.cpio.gz`: static busybox + rinit + rctl + the unit directory + the
-`/etc`/`/var` skeleton) are 2.31 MiB each (2 418 529 B and 2 425 440 B) gzipped.
-The difference is the fourteen files in `units/demo/`, which only the second one
-carries. The packing is
+`/etc`/`/var` skeleton) are 2.30 MiB (2 415 549 B) and 2.31 MiB (2 422 376 B)
+gzipped. The difference is the fourteen files in `units/demo/`, which only the
+second one carries. The packing is
 reproducible - `scripts/mkinitramfs.sh` zeroes the mtimes and inode numbers the
 archive would otherwise record, so repacking the same binaries gives the same
 bytes, which is what makes the number checkable rather than merely re-measured. A

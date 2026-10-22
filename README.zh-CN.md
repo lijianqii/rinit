@@ -746,8 +746,8 @@ rinit 对**自己的**控制台输出限流，按调用点：每 5 秒 40 行，
 
 | 目标                                 | 二进制              | 大小                    | 在镜像里 |
 | ------------------------------------ | ------------------- | ----------------------- | ----------- |
-| `aarch64-unknown-linux-gnu`（静态）  | `rinit`             | 1.57 MiB (1 649 776 B)  | 是         |
-| `x86_64-unknown-linux-musl`（静态）  | `rinit`             | 1.05 MiB (1 098 720 B)  | 是         |
+| `aarch64-unknown-linux-gnu`（静态）  | `rinit`             | 1.57 MiB (1 649 744 B)  | 是         |
+| `x86_64-unknown-linux-musl`（静态）  | `rinit`             | 1.05 MiB (1 098 688 B)  | 是         |
 
 `rctl` 在 aarch64 上是 994 152 B，在 musl 上是 406 200 B；两者都在 initramfs 里。
 `make size-check` 是门禁，它按计划 §0.1 的 4 MiB 静态预算检查两个 aarch64 二进制。
@@ -763,7 +763,7 @@ M0 的 bring-up 辅助程序 `rinit-testservice` 已经删除：没有东西再�
 
 打包后的镜像（`build/out/initramfs-aarch64-unknown-linux-gnu.cpio.gz` 和
 `…-demo.cpio.gz`：静态 busybox + rinit + rctl + 单元目录 + `/etc`/`/var` 骨架）
-gzip 后都是 2.31 MiB（分别为 2 418 529 B 和 2 425 440 B）。差值就是 `units/demo/`
+gzip 后分别是 2.30 MiB（2 415 549 B）和 2.31 MiB（2 422 376 B）。差值就是 `units/demo/`
 里的十四个文件，只有第二个镜像带它们。打包是可复现的——`scripts/mkinitramfs.sh` 把归档
 本来会记录的 mtime 和 inode 号归零，所以同样的二进制重复打包得到同样的字节，这才让
 这个数字可核对，而不只是"重新测了一遍"。例外是*强制*重建 busybox（`make -B`）：
