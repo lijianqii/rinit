@@ -1,12 +1,14 @@
 //! Thin, audited wrappers over the raw `libc` syscalls rinit needs (plan §2.3).
 //!
 //! Most of rinit's `unsafe` is here and in [`crate::signals`] (the `sigaction`
-//! handlers and the self-pipe). The rest is three deliberate single call sites,
-//! each with its own SAFETY note: two `AsyncFd::register` calls (the safe
-//! `AsyncFd::new` is deprecated as *unsound*, because it cannot know the caller
-//! keeps the descriptor valid) and the `kill(pid, 0)` existence probe. Everything
-//! else - `mounts`, `fstab`, `units`, and the whole of `rinit-core` (which is
-//! `#![forbid(unsafe_code)]`) - is safe code. Every wrapper here returns
+//! handlers and the self-pipe). The other audited call sites, each with its own
+//! SAFETY note, are three `AsyncFd::register` calls (`crate::signals`,
+//! `rinit/src/logs.rs`, `rinit/src/activation.rs`) - the safe `AsyncFd::new` is
+//! deprecated as *unsound*, because it cannot know the caller keeps the
+//! descriptor valid - and the `kill(pid, 0)` existence probe in
+//! `rinit/src/unit_manager.rs`. Everything else - `mounts`, `fstab`, `units`, and
+//! the whole of `rinit-core` (which is `#![forbid(unsafe_code)]`) - is safe code.
+//! Every wrapper here returns
 //! `Result<_, SyscallError>` and records the `errno` on failure, so business logic
 //! (`manager`, `unit`, `boot`) never sees a raw errno it has to remember.
 

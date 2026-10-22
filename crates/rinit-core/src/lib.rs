@@ -6,9 +6,11 @@
 //! binary unchanged. All state is passed explicitly: no `static mut`, no
 //! `lazy_static` (plan §0.2 principle 2).
 //!
-//! M0 scope: error types and unit-name modelling. M1 adds the unit-file
-//! parser, the dependency graph and the unit data model; the state machine and
-//! manager land in M2 (plan §3).
+//! The crate holds the unit-file parser and data model, the dependency graph,
+//! the restart policy and state machine, the job queue, the control protocol,
+//! the log ring and rate limiter, user and capability parsing, and the cgroup,
+//! sandbox and notify models. The syscall layer, runtime and PID 1 orchestration
+//! live in `rinit-runtime` and `rinit`.
 #![no_std]
 #![forbid(unsafe_code)]
 // Production code must not panic. rinit does not unwind, and a panic in PID 1

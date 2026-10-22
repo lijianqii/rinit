@@ -14,7 +14,7 @@ answers plan §6's checklist line by line, with one exception - the 72 h soak, w
 is a deployment-time run of `make soak` rather than a feature.
 
 What is in place, and what it is proven by. Every claim below is either a host
-test (`make check`) or a guest assertion (`make test-system`, 97 of them in
+test (`make check`) or a guest assertion (`make test-system`, 98 of them in
 `scripts/system-test.sh`); "proven on the host" always means the fake-runtime or
 `--dev` form of the same code path, and the guest means the real one.
 
@@ -22,7 +22,7 @@ test (`make check`) or a guest assertion (`make test-system`, 97 of them in
 | --------- | ------- | -------- |
 | M0 | PID 1 via `rdinit=`, first-wave mounts (`/run` → `/proc` → `/sys` → `/dev` → `/tmp` → `/sys/fs/cgroup`) with fatal/degradable rules per plan §1.3(9), the second wave (`/etc/fstab`, plan §1.3(9)) in file order with failures logged and the boot continuing, `SIGCHLD` + `waitpid(-1, WNOHANG)` reaping, panic hook to `/dev/kmsg` | guest: "mounted /run…", "mounted /sys/fs/cgroup", "mounted /data (fstab)", "fstab-tmpfs /data tmpfs", "no rinit panic"; host: `crates/rinit-runtime/src/fstab.rs` (6), `crates/rinit/tests/smoke.rs` |
 | M1 | unit files parsed from `/etc/rinit/units`, dependency graph resolved, units started level by level with each level in parallel | guest: "resolved a boot plan", "startup levels run in dependency order", "no target was exec'd" |
-| M2 | supervision (spawn, track, reap, two-stage stop), restart policy with backoff and a circuit breaker, health probes, `Type=notify` readiness, the in-memory log ring and its optional file mirror (plan §1.3(7)) | guest: "a crashed service is scheduled for restart", "the breaker tripped on the failing unit"; host: `crates/rinit/tests/m2_lifecycle.rs` (43 tests) |
+| M2 | supervision (spawn, track, reap, two-stage stop), restart policy with backoff and a circuit breaker, health probes, `Type=notify` readiness, the in-memory log ring and its optional file mirror (plan §1.3(7)) | guest: "a crashed service is scheduled for restart", "the breaker tripped on the failing unit"; host: `crates/rinit/tests/m2_lifecycle.rs` (45 tests) |
 | M3 | control socket + `rctl` (`list`, `status`, `start`, `stop`, `restart`, `reset-failed`, `log`, `reload`), with a documented exit-code contract | guest: "rctl list reached the control socket" and the five assertions after it; host: `crates/rctl/tests/control.rs` (9 tests) |
 | M4 | soak harness for sustained churn (`make soak`), leak and descriptor fixes, `--dev` control-socket peer relaxation | `scripts/soak.sh` (see [Testing](#testing)); `crates/rinit-core/tests/allocations.rs` |
 | M5 | **§7.3–§7.11 done.** cgroup v2: `CgroupCPUMax=`, `CgroupMemoryMax=`, `CgroupMemoryHigh=`, `CgroupTasksMax=` under `rinit/<unit>`, the process placing itself, stop-flow signalling of the cgroup's members, `rmdir` cleanup, and OOM-kill detection into the restart policy. Sandboxing: `User=`, `Group=`, `NoNewPrivileges=`, `CapabilityBoundingSet=`, `AmbientCapabilities=`. Hardware watchdog: `/dev/watchdog` armed at boot, fed from the supervisor loop's health checkpoint, magic-closed on shutdown. Reload: `rctl reload` re-reads the unit directory, adds, changes, defers and removes, and refuses a directory that does not resolve. Legacy daemons: `Type=forking` with `PIDFile=`, located through the file or the unit's own cgroup. Terminals: `TTYPath=`/`TTYReset=` give a service a controlling terminal (plan §7.11). Templates: `worker@.service` with `%i`/`%n`/`%p` expanded at instantiation (plan §7.7). Sockets as dependencies: `Sockets=`/`NeedsSocket=`, resolved to a hard edge and a wait for the path (plan §7.8). Socket activation: `SocketActivate=`/`IdleTimeoutSec=`, rinit binding the socket and the connection starting the service (plan §7.9). With that, **every item of the plan's extension list (§7.1–§7.11) is implemented** | guest: "a limited unit was placed in its own cgroup", "the memory hard and soft limits were written in bytes", "a stopped unit's cgroup was removed", "the kernel OOM-killed a process inside the unit's cgroup", "rinit armed the guest's watchdog device", "the driver took the timeout rinit set", "the guest outlived the watchdog timeout with the device armed", "an added unit the boot target does not need was not started", "a changed unit that is running kept it for the next start", "a directory that does not resolve was refused whole", "the unit is active with the daemon the PIDFile named", "stopping a forking unit stopped the daemon it took over", "a TTYPath that is not a terminal fails the start", "a template is not a unit to start", "every specifier was expanded before the command ran", "a socket consumer waited for the path before starting", "a socket that never appears fails the start, naming it", "rinit bound the socket before any unit started", "starting it hands the service the listening socket", "a de-privileged service ran as nobody:nogroup with NoNewPrivs", "an empty CapabilityBoundingSet left a root service with no capabilities", "ambient capabilities reached a de-privileged service"; host: `crates/rinit/src/cgroup.rs` (19 tests), `crates/rinit-core/src/unit/cgroup.rs` (9), `crates/rinit-runtime/src/syscall/cgroup.rs` (14), `crates/rinit/src/watchdog.rs` (6), `crates/rinit-runtime/src/syscall/watchdog.rs` (6), `crates/rinit/src/unit_manager.rs` (5 for the reload itself, `reload.rs` is policy over them), `crates/rinit/tests/m2_lifecycle.rs` (11, end to end), `crates/rinit/src/sandbox.rs` (14), `crates/rinit-core/src/unit/sandbox.rs` (9), `crates/rinit-runtime/src/syscall/cred.rs` (14) |
@@ -76,7 +76,7 @@ Note that the plan resolves **5 units** and starts **2**: `units/` is the boot s
 - the two targets, the console and its alternative, and the DHCP client - and only
 the boot target's closure is started. `shell.service` is parsed and ordered but
 not activated, because it would fight `getty.service` for `ttyAMA0`.
-`network.service` is in the closure: `multi-user.target` requires it, and qemu's
+`network.service` is in the closure: `multi-user.target` pulls it in with `Wants=` (a board without a NIC must not fail the target), and qemu's
 user-mode DHCP gives the guest `10.0.2.15/24`, gateway `10.0.2.2` and DNS
 `10.0.2.3`. The §7.x acceptance units
 live in `units/demo/`, which `make test-system` packs and `make run` does not:
@@ -315,18 +315,18 @@ make test           # check + test-system
 make gates          # acceptance gates: binary size + coverage thresholds
 ```
 
-`cargo test --offline --workspace` (what `make check` runs last) executes **735
+`cargo test --offline --workspace` (what `make check` runs last) executes **731
 tests** across ten test binaries. The five shapes, and why each is not
 redundant:
 
-- **unit tests** next to the code (core 329, rinit 197, rinit-runtime 110,
+- **unit tests** next to the code (core 329, rinit 197, rinit-runtime 104,
   rctl 14), including `proptest` properties over the parser;
 - **integration tests** in `crates/*/tests/`: the syscall layer against the real
   kernel (`rinit-runtime` 22: run unprivileged, they assert that each drop is
   *refused* rather than silently skipped - `EPERM` from `setuid(0)`, `setgroups`,
   `PR_CAPBSET_DROP`, `capset` and the ambient raise, each naming the call that
   failed - with the root-only success paths deferred to the guest), the
-  lifecycle end to end in `--dev` mode (`rinit/tests/m2_lifecycle.rs` 43), the
+  lifecycle end to end in `--dev` mode (`rinit/tests/m2_lifecycle.rs` 45), the
   control CLI (`rctl/tests/control.rs` 9), the smoke test that runs the real
   binary (`rinit/tests/smoke.rs` 2), the allocation guard
   (`rinit-core/tests/allocations.rs` 2), and `shipped_units.rs` 7 - every unit in
@@ -356,7 +356,7 @@ redundant:
   tested;
 - **the guest system test** (`scripts/system-test.sh`, plan §4.3): boots the real
   initramfs on aarch64 qemu, types at the console to prove a root shell is
-  reachable, drives `rctl` against the running system, and asserts 97 things -
+  reachable, drives `rctl` against the running system, and asserts 98 things -
   including that levels run in dependency order, that no target is ever exec'd,
   the §7.4 privilege-drop outcomes, the §7.3 limits read back out of the guest's
   own kernel, rinit's own RSS at boot and under 20 services read out of
@@ -402,10 +402,10 @@ they are measured on the tree as it stands rather than copied from one run:
 | crate            | line coverage | functions |
 | ---------------- | ------------- | --------- |
 | `rinit-core`     | **97.76%**    | 576/587   |
-| `rinit-runtime`  | 84.93%        | 294/339   |
-| `rinit`          | 91.13%        | 619/665   |
+| `rinit-runtime`  | 84.77%        | 282/326   |
+| `rinit`          | 91.10%        | 620/666   |
 | `rctl`           | 95.56%        | 32/38     |
-| **total**        | **92.34%**    | 1521/1629 |
+| **total**        | **92.32%**    | 1510/1617 |
 
 The plan's checklist asks for ≥80% overall and ≥90% in the core, so these are the
 numbers that answer it rather than a shape:
@@ -512,14 +512,14 @@ repository or a measurement in this README:
 
 | plan §6 | where it stands |
 | ------- | --------------- |
-| boots as PID 1 in qemu (128M) with no kernel panic | `make test-system`: 97 assertions, including "no rinit panic" and four kernel-log checks |
+| boots as PID 1 in qemu (128M) with no kernel panic | `make test-system`: 98 assertions, including "no rinit panic" and four kernel-log checks |
 | 20 services in parallel, visibly faster than serial | **19.2x**: `make parallel` - 20 `oneshot` services that each sleep 1 s finish in 1065 ms together and 20 424 ms chained |
 | crash-restart, breaker, health checks | `make test-system` ("a crashed service is scheduled for restart", "the breaker tripped on the failing unit") and `crates/rinit/tests/m2_lifecycle.rs` |
 | `rctl` can start, stop, query and read logs | `make test-system`'s M3 block and `crates/rctl/tests/control.rs` |
 | graceful shutdown, no zombies, no fd leak | `make soak` samples descriptors, threads and zombie children through restart churn, and asserts each comes back to its baseline |
 | 72 h soak with stable RSS | **running now**, eighth segment, started 2026-10-22 09:17 with its work directory under `build/` rather than `/tmp`; it runs as a systemd user service with lingering enabled, so closing the SSH session cannot tear it down, and the window ends 2026-10-25 09:17 when the numbers land in this row. The log is `build/soak-charts/soak-72h-seg8.log`. The seventh segment was cut short at 2026-10-22 03:10 after 570 samples (9.5 h), not by an assertion: it had been launched with `setsid nohup`, but still inherited the SSH session's cgroup, and systemd removed that session slice when the connection closed, sending SIGTERM to `make`; its curve and log are kept as `soak-72h-seg7.log` and `soak-seg7.note`. The sixth segment was stopped by hand after 1 h 50 m (109 samples), not by an assertion, once the harness itself was fixed: at `--interval 1` a sample cost ~70 ms, the loop slept a full interval *after* the work, and the default 60 s gate therefore collected 56 of 60 samples and failed its own coverage check (21 before the zombie scan became a single awk pass); the loop now sleeps until the next absolute slot and `make soak` collects 60/60. Earlier segments were all ended by something other than an assertion: **8.92 hours** (535 samples, 18 519 600 restarts) with RSS 5116 → 5116 kB peak per half, descriptors 14 → 14 at their lowest and zero zombies; **44.6 hours** (2587 samples) whose RSS moved between 3892 and 3960 kB in ~16 kB plateaus that went up *and* down - the second-half slope was −1.28 kB/h - with descriptors 13-14 at their lowest in every hour and zero zombies, ended by a host reboot that took the curves with it because the work directory was on tmpfs; and **43 minutes**, stopped by the harness's own free-space floor when something else on the machine filled the shared 978 MB `/tmp` - which is why the run now keeps its ~100 KB work directory on the repository's filesystem instead; and **13.6 hours** (796 samples, 2026-10-20 06:09 → 19:46), ended by the reboot that this time did not take the curve with it, because the work directory had already moved: RSS stepped down twice after boot, hourly means 5068-5087 kB for the first three hours, 4381-4443 kB for the next five and 4202-4252 kB for the last six, with last sample 4296 kB, descriptors 14-28, one thread and zero zombies. Four things changed because of these runs: the descriptor check compares the *lowest* count in each half rather than the peak (a peak is a coin flip once a run is long enough - the 8.92-hour segment's peaks read 25 → 24 while its lows were 14 → 14), rinit rate limits its own console, which is the sink that filled the disk a run died on, and the restart count the harness prints is a rate-limited lower bound - the line it counts is capped at 40 per 5 s per call site, so `churn: N restarts` reads ~8/s while the real churn, measured independently as the host's `fork` rate, is ~545/s; and the sampler sleeps until its next absolute slot, because sleeping a full `interval` after each sample made a 60 s run collect 56 of 60 samples and fail a coverage check it had already met |
 | binaries ≤2 MB dynamic / ≤4 MB static | [Measurements](#measurements-plan-01-calibration-point): 1.57 MiB static aarch64, checked by `make size-check` |
-| unit test coverage ≥80% overall, ≥90% in the core | **92.34%** and **97.76%** (`make coverage-check`, [above](#testing)) |
+| unit test coverage ≥80% overall, ≥90% in the core | **92.32%** and **97.76%** (`make coverage-check`, [above](#testing)) |
 | documentation: architecture, unit format, `rctl`, porting | this README (architecture, status, measurements), [`docs/units.md`](docs/units.md) (every directive, its value syntax and its default), [`docs/porting.md`](docs/porting.md) (kernel, userspace, build, differences from systemd), and `rinit-开发计划.md` |
 
 One number the checklist does not ask for, but plan §0.1's design goals do: rinit's
@@ -633,7 +633,9 @@ Because that already holds, there is no `SKIP_BUILD` knob to forget to pass.
 
 The `make run` pipeline is aarch64-only. To sanity-check rinit as PID 1 on the
 build host without downloading an aarch64 kernel, build the musl binary and boot
-the Debian host kernel:
+the Debian host kernel. This image has no NIC: `network.service` exits 0 and the
+state machine leaves it `failed`, but `multi-user.target` only `Wants=` it, so
+the rest of the boot is unaffected.
 
 ```bash
 cargo build --offline --release --target x86_64-unknown-linux-musl
@@ -913,7 +915,7 @@ command through the same spawn path a unit uses.
 
 The packed images (`build/out/initramfs-aarch64-unknown-linux-gnu.cpio.gz` and
 `…-demo.cpio.gz`: static busybox + rinit + rctl + the unit directory + the
-`/etc`/`/var` skeleton) are 2.30 MiB (2 415 543 B) and 2.31 MiB (2 422 373 B)
+`/etc`/`/var` skeleton) are 2.31 MiB each (2 419 127 B and 2 423 404 B)
 gzipped. The difference is the fourteen files in `units/demo/`, which only the
 second one carries. The packing is
 reproducible - `scripts/mkinitramfs.sh` zeroes the mtimes and inode numbers the

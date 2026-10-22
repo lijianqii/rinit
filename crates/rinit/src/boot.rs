@@ -105,7 +105,9 @@ pub async fn run(cfg: Config) -> Result<(), RuntimeError> {
     // Install signal handlers BEFORE starting anything so no SIGCHLD is lost,
     // and make the ignore set explicit (plan §7.1).
     for &signal in IGNORED_SIGNALS {
-        signal::ignore(signal);
+        if let Err(e) = signal::ignore(signal) {
+            rlog!("warning: cannot ignore signal {signal}: {e}");
+        }
     }
     let mut signals = SignalSet::new(&Signal::ALL).map_err(RuntimeError::from)?;
 

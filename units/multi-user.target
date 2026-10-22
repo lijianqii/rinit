@@ -37,5 +37,7 @@ Requires=rinit-init.target
 # Requires=shell.service
 Requires=getty.service
 # The DHCP client is part of the closure: `make run` gives the guest a NIC and
-# qemu's user-mode network answers the lease.
-Requires=network.service
+# qemu's user-mode network answers the lease. It is `Wants=`, not `Requires=`:
+# a board without a NIC has nothing to configure, and that must not fail the
+# whole target.
+Wants=network.service

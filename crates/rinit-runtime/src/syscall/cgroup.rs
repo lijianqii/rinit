@@ -273,10 +273,9 @@ pub fn remove(dir: &Path) -> Result<(), SyscallError> {
 ///
 /// The file must already exist (see the module docs): a cgroup attribute is
 /// either there because its controller is enabled, or absent because it is not,
-/// and those two must not look alike. The write is flushed explicitly rather
-/// than relying on `Drop`, because a limit takes effect when the write reaches
-/// the kernel - a short write that only surfaced at close would leave a limit
-/// that never applied.
+/// and those two must not look alike. `write_all` returns only after the kernel
+/// accepted the whole value; `File::flush` is a no-op and would not add a
+/// guarantee.
 fn write_file(path: &Path, value: &str, op: &'static str) -> Result<(), SyscallError> {
     let mut file = std::fs::OpenOptions::new()
         .write(true)
@@ -286,8 +285,7 @@ fn write_file(path: &Path, value: &str, op: &'static str) -> Result<(), SyscallE
     // The attribute parser in the kernel reads the whole buffer; a partial write
     // would be a truncated number, so a short write is an error, not a retry.
     file.write_all(value.as_bytes())
-        .map_err(|e| SyscallError::from_io(op, &e))?;
-    file.flush().map_err(|e| SyscallError::from_io(op, &e))
+        .map_err(|e| SyscallError::from_io(op, &e))
 }
 
 /// A throwaway directory for a test, removed on drop.

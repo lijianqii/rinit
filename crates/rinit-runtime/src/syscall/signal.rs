@@ -1,18 +1,27 @@
 //! Signal disposition helpers (plan §7.1).
 //!
-//! Handled signals (SIGCHLD/SIGTERM/...) are registered through
-//! `tokio::signal` in the boot logic. These helpers are for *explicitly*
-//! ignoring signals the plan says to ignore, so dispositions are unambiguous.
+//! Handled signals are delivered through rinit's own non-blocking self-pipe
+//! (`crate::signals`). These helpers are for *explicitly* ignoring signals the
+//! plan says to ignore, so dispositions are unambiguous.
+
+use crate::error::SyscallError;
 
 /// Set `signal` to be ignored (`SIG_IGN`).
 ///
 /// Wired up in M4 (plan §7.1): signals rinit must not act on are explicitly
 /// ignored rather than left at their default, so the disposition is auditable
 /// from one place instead of being implicit in the kernel.
-pub fn ignore(signal: libc::c_int) {
+///
+/// # Errors
+/// [`SyscallError`] with the kernel's errno if `signal(2)` returns `SIG_ERR`
+/// (an invalid signal number).
+pub fn ignore(signal: libc::c_int) -> Result<(), SyscallError> {
     // SAFETY: installing a standard disposition via `signal(2)`.
-    unsafe {
-        libc::signal(signal, libc::SIG_IGN);
+    let previous = unsafe { libc::signal(signal, libc::SIG_IGN) };
+    if previous == libc::SIG_ERR {
+        Err(SyscallError::last_os_error("signal(SIG_IGN)"))
+    } else {
+        Ok(())
     }
 }
 
@@ -42,7 +51,7 @@ mod tests {
             0
         );
 
-        ignore(signal);
+        ignore(signal).expect("a valid signal must be ignored");
         let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
         // SAFETY: `current` is a valid out-parameter.
         assert_eq!(

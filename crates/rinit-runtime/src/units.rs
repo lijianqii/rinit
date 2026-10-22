@@ -58,8 +58,10 @@ pub fn load_unit_files(dir: &Path) -> Result<(Vec<UnitFile>, Vec<String>), Runti
         };
         let path = entry.path();
 
-        // Only regular files with a recognised suffix are units; this skips
-        // editor backups, dotfiles and anything else that lives there.
+        // Entries with a recognised suffix are unit candidates; editor backups,
+        // dotfiles and other names are skipped here. A candidate that cannot be
+        // read - including a directory whose name ends in a unit suffix - is
+        // skipped with a warning rather than failing the whole load.
         let Some(name) = unit_name_of(&path) else {
             continue;
         };

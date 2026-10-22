@@ -6,8 +6,10 @@
 # `multi-user.target` requires it so the unit is part of the boot closure.
 #
 # `/etc/udhcpc/start.sh` exits 0 when there is no eth0 (the x86_64 verification
-# image boots without a NIC), which leaves the unit inactive instead of tripping
-# the start-limit breaker.
+# image boots without a NIC). A simple service that exits without a restart is
+# left `failed` by the state machine, not `inactive`, but it does not trip the
+# start-limit breaker; `multi-user.target` only `Wants=` this unit, so the rest
+# of the boot is unaffected.
 [Unit]
 Description=DHCP client on eth0
 Requires=rinit-init.target

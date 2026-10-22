@@ -230,6 +230,10 @@ pub fn keep_capabilities() -> Result<(), SyscallError> {
 ///
 /// glibc has no wrapper for `capget`/`capset`, so the kernel ABI is spelled out
 /// here: version 3 of the header, two 32-bit words of sets.
+///
+/// The read-modify-write is deliberately unlocked: it runs in the child between
+/// fork and exec, where there is exactly one thread and no concurrent `capset`
+/// that could lose the previous bits.
 pub fn set_inheritable(caps: &[u32]) -> Result<(), SyscallError> {
     let mut data = capability_sets()?;
     for cap in caps {
