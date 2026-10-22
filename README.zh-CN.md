@@ -14,7 +14,7 @@
 soak，它是部署期跑一次 `make soak`，而不是一个功能。
 
 下面列出现有的能力，以及各自的证据。每一条结论要么来自宿主测试（`make check`），
-要么来自客户机断言（`make test-system`，`scripts/system-test.sh` 里共 98 条）；
+要么来自客户机断言（`make test-system`，`scripts/system-test.sh` 里共 100 条）；
 "在宿主机上验证"始终指同一段代码的 fake-runtime 或 `--dev` 形态，"客户机"指真实形态。
 
 | 里程碑 | 内容 | 证据 |
@@ -321,7 +321,7 @@ make gates          # acceptance gates: binary size + coverage thresholds
   这样门禁自己的算术也能被测；
 - **客户机系统测试**（`scripts/system-test.sh`，计划 §4.3）：在所选架构的 qemu 上启动
   真实的 initramfs，在控制台上输入以证明 root shell 可达，对运行中的系统驱动
-  `rctl`，并断言 98 件事——包括层级按依赖顺序运行、target 从不被 exec、§7.4 的
+  `rctl`，并断言 100 件事——包括层级按依赖顺序运行、target 从不被 exec、§7.4 的
   降权结果、§7.3 的限额从客户机自己的内核里读回、rinit 自己在启动时和 20 个服务下的
   RSS（从 `/proc/1/status` 读）、§4.3 的启动耗时（取自内核时钟）、qemu 真实挂载的
   设备上的 §7.5 看门狗、DHCP 客户端拿到的地址/路由/DNS、针对客户机自己的（可写的
@@ -435,7 +435,7 @@ cargo llvm-cov --offline --workspace --html                  # target/llvm-cov/h
 
 | 计划 §6 | 现状 |
 | ------- | --------------- |
-| 在 qemu（128M）里作为 PID 1 启动，内核无 panic | `make test-system`：aarch64 与 armv7 各 98 条断言，包括 "no rinit panic" 和四条内核日志检查 |
+| 在 qemu（128M）里作为 PID 1 启动，内核无 panic | `make test-system`：aarch64 与 armv7 各 100 条断言，包括 "no rinit panic" 和四条内核日志检查 |
 | 20 个服务并行，明显快于串行 | **19.2x**：`make parallel`——20 个各睡 1 s 的 `oneshot` 服务，并行总耗时 1065 ms，串行 20 424 ms |
 | 崩溃重启、熔断、健康检查 | `make test-system`（"a crashed service is scheduled for restart"、"the breaker tripped on the failing unit"）和 `crates/rinit/tests/m2_lifecycle.rs` |
 | `rctl` 能启动、停止、查询、读日志 | `make test-system` 的 M3 段和 `crates/rctl/tests/control.rs` |
@@ -566,8 +566,11 @@ rootfs，加上 `units/device/` 和 dropbear，然后用
 - `syslog.service` / `klogd.service`（持久化 `/var/log/messages`）；
 - `seedrng.service`（持久化 `/var/lib/seedrng`）；
 - `time-sync.service`（busybox `ntpd`）；
-- `devpts.service`（挂载 `/dev/pts`，并把 `/dev/ptmx` 指向 `pts/ptmx`）；
-- `sshd.service`（dropbear；依赖 `devpts.service`）。
+- `sshd.service`（dropbear）。
+
+在任何 unit 启动前，rinit 的第二波挂载会读取 `/etc/fstab`；镜像在这里把
+`devpts` 挂到 `/dev/pts`。这里使用默认 devpts 实例，`/dev/ptmx` 仍是 devtmpfs
+节点，不需要创建符号链接。
 
 Dropbear 只允许密钥登录（`-s`）。qemu 把宿主机 2222 转发到客户机 22
 （可用 `DISK_HOSTFWD` 覆盖），配置好公钥后：
@@ -582,10 +585,11 @@ dropbear 源码缓存在 `build/dl/dropbear-2026.94.tar.bz2`；离线环境把�
 放进去再跑 `make disk-image` 即可。`scripts/build-dropbear.sh` 会应用
 `scripts/dropbear-pty.patch`，保证重新解压源码后仍保留 PTY 修复。
 
-交互式 SSH 需要 PTY。`devpts.service` 提供 `/dev/pts` 和 `/dev/ptmx` 链接；缺少它时
-Dropbear 会报 `PTY allocation request failed` 并关闭会话。`run-disk` 会复用已有
-ext4 镜像，所以在此服务加入之前构建的镜像，必须先执行 `make disk-image` 重建，
-再测试交互式 SSH。
+交互式 SSH 需要 PTY。镜像的 `/etc/fstab` 会在 unit 启动前把 `devpts` 挂到
+`/dev/pts`；缺少这条配置时 Dropbear 会报 `PTY allocation request failed` 并关闭
+会话。内核命令行上的 `nofstab` 会禁用整个第二波挂载，所以需要交互式 SSH 的设备
+镜像不要使用它。`run-disk` 会复用已有 ext4 镜像，因此在这条 fstab 配置加入之前
+构建的镜像，必须先执行 `make disk-image` 重建，再测试交互式 SSH。
 
 镜像构建需要 `e2fsprogs`（`mke2fs -d`）；内核需要 `CONFIG_EXT4_FS`、
 `CONFIG_VIRTIO_BLK`，并且 `CONFIG_DEVTMPFS_MOUNT` 必须关闭（由 rinit 自己挂载

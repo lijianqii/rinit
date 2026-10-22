@@ -1,8 +1,7 @@
 # The second-wave mount table the guest image ships (plan §1.3(9)).
 #
-# The initramfs has no real partitions to mount, so what this proves is the
-# mechanism end to end: rinit reads this file *after* the first wave, creates the
-# mountpoint, and mounts a tmpfs there. The guest asserts it by reading
+# rinit reads this file *after* the first wave, creates each mountpoint, and
+# mounts the entries in file order. The guest asserts them by reading
 # `/proc/mounts` - the kernel's own table - rather than by trusting the line rinit
 # logged about it, because "rinit tried" and "there is a filesystem there" are
 # different claims.
@@ -10,4 +9,11 @@
 # `mode=` and `size=` are filesystem options, so they are passed to `mount(2)` as
 # data; an option like `nosuid` would instead become an `MS_*` flag, which is the
 # one piece of judgement the parser makes.
+#
+# `/dev/pts` is an API filesystem, not a data partition, but keeping it in this
+# table makes the mount options visible with the rest of the image's mounts and
+# lets rinit create the mountpoint like any other fstab target. Keep the default
+# devpts instance: `/dev/ptmx` is the devtmpfs node, so no PTY multiplexer
+# symlink is needed.
+devpts  /dev/pts  devpts  mode=0620,ptmxmode=0666  0 0
 tmpfs  /data  tmpfs  mode=0755,size=1m  0 0

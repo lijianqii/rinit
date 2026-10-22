@@ -163,12 +163,14 @@ await_log() {
     printf 'v=$(grep VmRSS /proc/1/status); echo idle-$v\n' >&3
     await_log 10 'idle-VmRSS:' || true
 
-    # Plan §1.3(9): the second wave. The image ships an `/etc/fstab` with one
-    # entry (a `tmpfs` on `/data`), so what is asserted is the kernel's mount
-    # table rather than rinit's log line - one is a claim about the filesystem,
-    # the other about intent.
+    # Plan §1.3(9): the second wave. The image ships an `/etc/fstab` with two
+    # entries (`devpts` on `/dev/pts` and a `tmpfs` on `/data`), so what is
+    # asserted is the kernel's mount table rather than rinit's log line - one is
+    # a claim about the filesystem, the other about intent.
     printf 'm=$(grep " /data " /proc/mounts); echo fstab-$m\n' >&3
     await_log 10 'fstab-tmpfs /data tmpfs' || true
+    printf 'p=$(grep " /dev/pts " /proc/mounts); echo fstab-$p\n' >&3
+    await_log 10 'fstab-devpts /dev/pts devpts' || true
 
     # M3: drive rinit from the guest console. Each step waits for output that
     # only that command can produce, so a failure surfaces as a timeout rather
@@ -519,6 +521,11 @@ expect "mounted /tmp" "rinit: mounted /tmp"
 # the filesystem there afterwards - `/proc/mounts` is the kernel's answer.
 expect "rinit mounted an /etc/fstab entry" "rinit: mounted /data (fstab)"
 expect "and the kernel has a filesystem on it" "fstab-tmpfs /data tmpfs"
+# The device image gets its PTY mountpoint from this same table. Checking it in
+# the initramfs proves the shipped fstab line is readable and actually mounted,
+# not just present in the rootfs tree.
+expect "rinit mounted devpts from /etc/fstab" "rinit: mounted /dev/pts (fstab)"
+expect "and the kernel has devpts on /dev/pts" "fstab-devpts /dev/pts devpts"
 
 # M1: a real boot comes from the unit directory, not a hardcoded service.
 # Plan §4.3: how long the boot took, measured on the kernel's own clock - the

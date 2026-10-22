@@ -51,7 +51,9 @@ still boots with every unit unlimited.
   the kernel command line means the same. Entries are six fields, `noauto` is
   skipped, UUID/LABEL are *not* resolved, and a failing entry is a warning with
   the boot continuing - rinit creates each mountpoint, as it does for the first
-  wave. `--fstab <PATH>` moves the file, which is also the test seam.
+  wave. `--fstab <PATH>` moves the file, which is also the test seam. The device
+  image uses this table for `devpts` on `/dev/pts`; keep the default devpts
+  instance so the devtmpfs `/dev/ptmx` node continues to work.
 - `/etc/passwd` and `/etc/group` if any unit uses `User=`/`Group=`. rinit parses
   them itself (no NSS, no `libnss_files.so`), so a minimal
   `name:passwd:uid:gid:...` file is enough.
@@ -161,17 +163,17 @@ auto-mount makes that first-wave mount fail with `EBUSY`.
 The image is populated with `mke2fs -d` from a tar whose entries are explicitly
 `root:root` (a directory populated as the build user would otherwise leave every
 file owned by that uid). `units/device/` provides `hostname`, `network-online`
-(DHCP lease, not just udhcpc exec), `syslog`/`klogd`, `seedrng`, `time-sync`,
-`devpts` (mounts `/dev/pts` and links `/dev/ptmx` to `pts/ptmx`) and `sshd`;
-dropbear is static and key-only (`-s`), with host keys generated on first
-connection under `/etc/dropbear`. `/root/.ssh/authorized_keys` starts empty by
-design. `scripts/build-dropbear.sh` applies `scripts/dropbear-pty.patch` before
-compiling, so an interactive SSH session keeps the PTY master open until the
-slave becomes the controlling terminal. The qemu user-net host-forward is
-`2222 -> 22` by default (`DISK_HOSTFWD`), so provisioning a key is what makes
-`ssh -p 2222 root@...` work. `/etc`, `/var`, host keys, logs and the RNG seed
-persist across boots because the ext4 image is reused; `make disk-image` is
-what wipes them.
+(DHCP lease, not just udhcpc exec), `syslog`/`klogd`, `seedrng`, `time-sync`
+and `sshd`; `/etc/fstab` mounts `devpts` on `/dev/pts` in the second wave, before
+any unit starts. dropbear is static and key-only (`-s`), with host keys generated
+on first connection under `/etc/dropbear`. `/root/.ssh/authorized_keys` starts
+empty by design. `scripts/build-dropbear.sh` applies
+`scripts/dropbear-pty.patch` before compiling, so an interactive SSH session
+keeps the PTY master open until the slave becomes the controlling terminal. The
+qemu user-net host-forward is `2222 -> 22` by default (`DISK_HOSTFWD`), so
+provisioning a key is what makes `ssh -p 2222 root@...` work. `/etc`, `/var`,
+host keys, logs and the RNG seed persist across boots because the ext4 image is
+reused; `make disk-image` is what wipes them.
 
 ## 5. Differences from systemd to expect
 

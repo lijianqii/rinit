@@ -14,7 +14,7 @@ answers plan §6's checklist line by line, with one exception - the 72 h soak, w
 is a deployment-time run of `make soak` rather than a feature.
 
 What is in place, and what it is proven by. Every claim below is either a host
-test (`make check`) or a guest assertion (`make test-system`, 98 of them in
+test (`make check`) or a guest assertion (`make test-system`, 100 of them in
 `scripts/system-test.sh`); "proven on the host" always means the fake-runtime or
 `--dev` form of the same code path, and the guest means the real one.
 
@@ -358,7 +358,7 @@ redundant:
   tested;
 - **the guest system test** (`scripts/system-test.sh`, plan §4.3): boots the real
   initramfs on the selected ARCH in qemu, types at the console to prove a root shell is
-  reachable, drives `rctl` against the running system, and asserts 98 things -
+  reachable, drives `rctl` against the running system, and asserts 100 things -
   including that levels run in dependency order, that no target is ever exec'd,
   the §7.4 privilege-drop outcomes, the §7.3 limits read back out of the guest's
   own kernel, rinit's own RSS at boot and under 20 services read out of
@@ -514,7 +514,7 @@ repository or a measurement in this README:
 
 | plan §6 | where it stands |
 | ------- | --------------- |
-| boots as PID 1 in qemu (128M) with no kernel panic | `make test-system`: 98 assertions on aarch64 and armv7, including "no rinit panic" and four kernel-log checks |
+| boots as PID 1 in qemu (128M) with no kernel panic | `make test-system`: 100 assertions on aarch64 and armv7, including "no rinit panic" and four kernel-log checks |
 | 20 services in parallel, visibly faster than serial | **19.2x**: `make parallel` - 20 `oneshot` services that each sleep 1 s finish in 1065 ms together and 20 424 ms chained |
 | crash-restart, breaker, health checks | `make test-system` ("a crashed service is scheduled for restart", "the breaker tripped on the failing unit") and `crates/rinit/tests/m2_lifecycle.rs` |
 | `rctl` can start, stop, query and read logs | `make test-system`'s M3 block and `crates/rctl/tests/control.rs` |
@@ -664,8 +664,11 @@ explicit destructive rebuild.
 - `syslog.service`/`klogd.service` (persistent `/var/log/messages`);
 - `seedrng.service` (persistent `/var/lib/seedrng`);
 - `time-sync.service` (busybox `ntpd`);
-- `devpts.service` (mounts `/dev/pts` and points `/dev/ptmx` at `pts/ptmx`);
-- `sshd.service` (dropbear; requires `devpts.service`).
+- `sshd.service` (dropbear).
+
+Before any unit starts, rinit's second mount wave reads `/etc/fstab`; the image
+mounts `devpts` on `/dev/pts` there. It uses the default devpts instance, so
+`/dev/ptmx` remains the devtmpfs node and no symlink is needed.
 
 Dropbear is key-only (`-s`). QEMU forwards host port 2222 to guest 22
 (`DISK_HOSTFWD` can be overridden), so after provisioning a key:
@@ -683,10 +686,12 @@ tarball there and rerun `make disk-image`. `scripts/build-dropbear.sh` applies
 `scripts/dropbear-pty.patch` so a fresh source extraction also keeps the PTY
 master open until `TIOCSCTTY` has succeeded.
 
-An interactive SSH session needs a PTY. `devpts.service` provides `/dev/pts`
-and the `/dev/ptmx` link; without it Dropbear reports `PTY allocation request
-failed` and closes the session. The ext4 image is reused by `run-disk`, so an
-image built before this service existed must be rebuilt with `make disk-image`
+An interactive SSH session needs a PTY. The image's `/etc/fstab` mounts
+`devpts` on `/dev/pts` before units start; without that entry Dropbear reports
+`PTY allocation request failed` and closes the session. `nofstab` on the kernel
+command line disables the whole second wave, so do not use it on a device image
+that needs interactive SSH. The ext4 image is reused by `run-disk`, so an image
+built before this fstab entry existed must be rebuilt with `make disk-image`
 before testing interactive SSH again.
 
 The image needs `e2fsprogs` (`mke2fs -d`); the kernel needs `CONFIG_EXT4_FS`,
