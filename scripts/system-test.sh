@@ -163,9 +163,10 @@ await_log() {
     printf 'v=$(grep VmRSS /proc/1/status); echo idle-$v\n' >&3
     await_log 10 'idle-VmRSS:' || true
 
-    # Plan §1.3(9): the second wave. The image ships an `/etc/fstab` with two
-    # entries (`devpts` on `/dev/pts` and a `tmpfs` on `/data`), so what is
-    # asserted is the kernel's mount table rather than rinit's log line - one is
+    # Plan §1.3(9): the second wave. The image ships an `/etc/fstab` with three
+    # entries (`devpts` on `/dev/pts`, the swap file, and a `tmpfs` on `/data`);
+    # the swap entry is parsed but not mounted, so the two filesystem checks
+    # below read the kernel's mount table rather than rinit's log line - one is
     # a claim about the filesystem, the other about intent.
     printf 'm=$(grep " /data " /proc/mounts); echo fstab-$m\n' >&3
     await_log 10 'fstab-tmpfs /data tmpfs' || true

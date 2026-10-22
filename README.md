@@ -677,10 +677,11 @@ The image also ships `/etc/mdev.conf`. mdev's built-in fallback mode is `0660`
 root:root, which would narrow `/dev/null` and friends after its initial scan; the
 config keeps the standard character devices usable by non-root processes.
 
-`make disk-image` creates a 32 MiB `/swapfile` with `mkswap` and
-`swap.service` runs `swapon /swapfile` at boot. Change the size with
-`make SWAP_SIZE_MB=64 disk-image`; an existing image reused by `run-disk` keeps
-its current swap file until the next destructive rebuild.
+`make disk-image` creates a 32 MiB `/swapfile` with `mkswap`, and `/etc/fstab`
+declares it as `/swapfile none swap sw 0 0`. `swap.service` runs `swapon -a`,
+the standard fstab consumer; rinit parses the entry but does not try to mount it.
+Change the size with `make SWAP_SIZE_MB=64 disk-image`; an existing image reused
+by `run-disk` keeps its current swap file until the next destructive rebuild.
 
 Dropbear is key-only (`-s`). QEMU forwards host port 2222 to guest 22
 (`DISK_HOSTFWD` can be overridden), so after provisioning a key:

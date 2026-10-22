@@ -579,10 +579,11 @@ swap 文件时约 65 MiB），内容来自同一套 rootfs，加上 `units/devic
 初始扫描后会把 `/dev/null` 等节点收窄；这份配置保证标准字符设备仍可供非 root
 进程使用。
 
-`make disk-image` 会创建 32 MiB 的 `/swapfile` 并执行 `mkswap`，开机时由
-`swap.service` 执行 `swapon /swapfile`。可以用
-`make SWAP_SIZE_MB=64 disk-image` 修改大小；`run-disk` 复用的旧镜像不会自动
-更新 swap 文件，必须等下一次破坏性重建。
+`make disk-image` 会创建 32 MiB 的 `/swapfile` 并执行 `mkswap`，`/etc/fstab`
+用 `/swapfile none swap sw 0 0` 声明它。开机时由 `swap.service` 执行
+`swapon -a`，也就是标准的 fstab 消费者；rinit 会解析这条记录，但不会把它当
+挂载点处理。可以用 `make SWAP_SIZE_MB=64 disk-image` 修改大小；`run-disk` 复用的
+旧镜像不会自动更新 swap 文件，必须等下一次破坏性重建。
 
 Dropbear 只允许密钥登录（`-s`）。qemu 把宿主机 2222 转发到客户机 22
 （可用 `DISK_HOSTFWD` 覆盖），配置好公钥后：

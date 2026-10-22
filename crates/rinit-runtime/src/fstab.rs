@@ -5,6 +5,8 @@
 //! six-field parser, `noauto` entries ignored, no UUID/LABEL resolution, no
 //! generator and no `.mount` units - the entries are mounted in file order with
 //! `mount(2)`, and one that fails is a warning rather than a stopped boot.
+//! `swap` entries are the deliberate exception: they are parsed and left for
+//! `swapon -a` instead of being passed to `mount(2)`.
 //!
 //! That shape is the point. A data partition that will not mount (`/data` on a
 //! board whose eMMC is missing) is a degraded system, not a dead one, and
@@ -27,9 +29,10 @@ use crate::mounts::MountOps;
 /// are parsed only so that a line with them is not mistaken for a malformed one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
-    /// The device, a `PARTUUID=`, or `none` - passed to `mount(2)` as written.
+    /// The device, a `PARTUUID=`, or `none` - passed to `mount(2)` as written,
+    /// or to `swapon -a` for a swap entry.
     pub device: String,
-    /// Where it goes. An absolute path.
+    /// Where it goes. An absolute path, except for swap entries (`none`).
     pub mountpoint: PathBuf,
     /// The filesystem type, passed through as written.
     pub fstype: String,
@@ -122,7 +125,11 @@ pub fn parse(text: &str) -> (Vec<Entry>, Vec<String>) {
             ));
             continue;
         };
-        if !mountpoint.starts_with('/') {
+        // Swap entries use `none` as their (non-)mountpoint. They are kept in
+        // the parsed list so callers can see them, but `mount_with` does not
+        // pass them to mount(2); busybox `swapon -a` activates them from this
+        // same file.
+        if fstype != "swap" && !mountpoint.starts_with('/') {
             warnings.push(format!(
                 "/etc/fstab:{}: mountpoint '{mountpoint}' is not absolute, skipping",
                 index + 1
@@ -166,11 +173,11 @@ pub fn enabled(cmdline: &str) -> bool {
     !cmdline.split_whitespace().any(|token| token == "nofstab")
 }
 
-/// Mount every entry of `text`, in order, through `ops`.
+/// Mount every non-swap entry of `text`, in order, through `ops`.
 ///
-/// A failure is collected and the next entry is still attempted: the plan's
-/// "失败记日志并继续", and the reason the second wave is not expressed as
-/// dependencies.
+/// Swap entries are skipped: `swapon -a` consumes the same file. A failure is
+/// collected and the next entry is still attempted: the plan's "失败记日志并继续",
+/// and the reason the second wave is not expressed as dependencies.
 ///
 /// The mountpoint is created if it does not exist, as the first wave's are: an
 /// fstab line names where a filesystem *goes*, and a board whose `/data` is empty
@@ -179,6 +186,11 @@ pub fn mount_with(ops: &mut impl MountOps, text: &str) -> FstabReport {
     let (entries, mut warnings) = parse(text);
     let mut mounted = Vec::new();
     for entry in entries {
+        // Swap is not a mount. It is activated by `swapon -a`, which reads the
+        // same /etc/fstab line; rinit must not try to mount it on `none`.
+        if entry.fstype == "swap" {
+            continue;
+        }
         let point = entry.mountpoint.to_string_lossy().into_owned();
         if let Err(e) = ops.mkdir_p(&entry.mountpoint) {
             warnings.push(format!("cannot create {point}: {e}"));
@@ -310,6 +322,25 @@ mod tests {
         assert_eq!(warnings.len(), 2, "{warnings:?}");
         assert!(warnings[0].contains("four fields"), "{warnings:?}");
         assert!(warnings[1].contains("not absolute"), "{warnings:?}");
+    }
+
+    /// Swap entries are legal fstab entries even though `none` is not an
+    /// absolute mountpoint. They stay in the parsed list for callers to see,
+    /// but the mount pass leaves them to `swapon -a`.
+    #[test]
+    fn swap_entries_parse_but_are_not_mounted() {
+        let text = "/swapfile none swap sw 0 0\n";
+        let (entries, warnings) = parse(text);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].device, "/swapfile");
+        assert_eq!(entries[0].fstype, "swap");
+
+        let mut ops = Recorder::default();
+        let report = mount_with(&mut ops, text);
+        assert!(report.mounted.is_empty());
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        assert!(ops.calls.is_empty(), "{:?}", ops.calls);
     }
 
     /// The one piece of judgement in the file: VFS options that *must* become

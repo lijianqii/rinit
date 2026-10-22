@@ -54,9 +54,11 @@ still boots with every unit unlimited.
   the boot continuing - rinit creates each mountpoint, as it does for the first
   wave. `--fstab <PATH>` moves the file, which is also the test seam. The device
   image uses this table for `devpts` on `/dev/pts`; keep the default devpts
-  instance so the devtmpfs `/dev/ptmx` node continues to work. The image also
-  ships `/etc/mdev.conf` because mdev's fallback mode is `0660` root:root; the
-  config preserves the standard character-device permissions.
+  instance so the devtmpfs `/dev/ptmx` node continues to work. Swap entries
+  (`/swapfile none swap sw`) are parsed but not mounted; `swap.service` runs
+  `swapon -a` on that same table. The image also ships `/etc/mdev.conf` because
+  mdev's fallback mode is `0660` root:root; the config preserves the standard
+  character-device permissions.
 - `/etc/passwd` and `/etc/group` if any unit uses `User=`/`Group=`. rinit parses
   them itself (no NSS, no `libnss_files.so`), so a minimal
   `name:passwd:uid:gid:...` file is enough.
@@ -167,9 +169,9 @@ The image is populated with `mke2fs -d` from a tar whose entries are explicitly
 `root:root` (a directory populated as the build user would otherwise leave every
 file owned by that uid); `util-linux`'s `mkswap` creates the embedded swap file. `units/device/` provides `hostname`, `network-online`
 (DHCP lease, not just udhcpc exec), `syslog`/`klogd`, `seedrng`, `time-sync`,
-`mdev` (busybox hotplug daemon), `swap` (activates `/swapfile`) and `sshd`;
-`/etc/fstab` mounts `devpts` on
-`/dev/pts` in the second wave, before
+`mdev` (busybox hotplug daemon), `swap` (runs `swapon -a` on the fstab entry)
+and `sshd`; `/etc/fstab` mounts `devpts` on `/dev/pts` and declares
+`/swapfile none swap sw` in the second wave, before
 any unit starts. dropbear is static and key-only (`-s`), with host keys generated
 on first connection under `/etc/dropbear`. `/root/.ssh/authorized_keys` starts
 empty by design. `scripts/build-dropbear.sh` applies
@@ -179,8 +181,9 @@ qemu user-net host-forward is `2222 -> 22` by default (`DISK_HOSTFWD`), so
 provisioning a key is what makes `ssh -p 2222 root@...` work. `/etc`, `/var`,
 host keys, logs and the RNG seed persist across boots because the ext4 image is
 reused; `make disk-image` is what wipes them. That rebuild also creates a 32 MiB
-`/swapfile` by default (`SWAP_SIZE_MB=` changes it); the image needs about
-38-40 MiB before its first boot and is at least 64 MiB.
+`/swapfile` by default (`SWAP_SIZE_MB=` changes it); its fstab entry is
+`/swapfile none swap sw`, and `swap.service` activates it with `swapon -a`. The
+image needs about 38-40 MiB before its first boot and is at least 64 MiB.
 
 ## 5. Differences from systemd to expect
 

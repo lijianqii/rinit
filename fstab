@@ -8,7 +8,8 @@
 #
 # `mode=` and `size=` are filesystem options, so they are passed to `mount(2)` as
 # data; an option like `nosuid` would instead become an `MS_*` flag, which is the
-# one piece of judgement the parser makes.
+# one piece of judgement the parser makes. Swap entries are kept for `swapon -a`
+# and deliberately not passed to mount(2) by rinit.
 #
 # `/dev/pts` is an API filesystem, not a data partition, but keeping it in this
 # table makes the mount options visible with the rest of the image's mounts and
@@ -16,4 +17,5 @@
 # devpts instance: `/dev/ptmx` is the devtmpfs node, so no PTY multiplexer
 # symlink is needed.
 devpts  /dev/pts  devpts  mode=0620,ptmxmode=0666  0 0
+/swapfile  none  swap  sw  0 0
 tmpfs  /data  tmpfs  mode=0755,size=1m  0 0
