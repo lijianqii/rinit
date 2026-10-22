@@ -38,7 +38,7 @@ Usage: rctl <COMMAND> [ARGS]
 Control the rinit PID 1 service manager.
 
 Commands:
-  list                    List all known units
+  list [--format FMT]     List all known units (default: table)
   status [UNIT] [--tail N] [--format FMT]
                             Show unit status (default format: systemd)
   start <UNIT>            Start a unit
@@ -51,11 +51,13 @@ Commands:
 Options:
   -h, --help              Show this help and exit
   -V, --version           Show version and exit
-  --format=FMT            status format: systemd, plain, short, json, card
+  --format=FMT            list: table|plain|short|json
+                          status: systemd|plain|short|json|card
   --json                  alias for --format=json
   --plain                 alias for --format=plain (stable key: value)
   --short                 alias for --format=short
-  --card                  alias for --format=card
+  --card                  status alias for --format=card
+  --table                 list alias for --format=table
   --tail N                include N recent log lines with status
 
 Exit codes:

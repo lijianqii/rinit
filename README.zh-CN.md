@@ -14,7 +14,7 @@
 soak，它是部署期跑一次 `make soak`，而不是一个功能。
 
 下面列出现有的能力，以及各自的证据。每一条结论要么来自宿主测试（`make check`），
-要么来自客户机断言（`make test-system`，`scripts/system-test.sh` 里共 102 条）；
+要么来自客户机断言（`make test-system`，`scripts/system-test.sh` 里共 104 条）；
 "在宿主机上验证"始终指同一段代码的 fake-runtime 或 `--dev` 形态，"客户机"指真实形态。
 
 | 里程碑 | 内容 | 证据 |
@@ -291,9 +291,9 @@ make gates          # acceptance gates: binary size + coverage thresholds
 ```
 
 `cargo test --offline --workspace`（`make check` 最后一步跑的就是它）在十个测试
-二进制里执行 **735 个测试**。五种形态，以及为什么每种都不是多余的：
+二进制里执行 **737 个测试**。五种形态，以及为什么每种都不是多余的：
 
-- **单元测试**紧挨着代码（core 329、rinit 197、rinit-runtime 104、rctl 14），
+- **单元测试**紧挨着代码（core 331、rinit 199、rinit-runtime 105、rctl 15），
   包括解析器上的 `proptest` 属性测试；
 - **集成测试**在 `crates/*/tests/`：系统调用层面对真实内核（`rinit-runtime` 22 个：
   以非特权身份运行，断言每次降权都*被拒绝*而不是被静默跳过——`setuid(0)`、
@@ -321,7 +321,7 @@ make gates          # acceptance gates: binary size + coverage thresholds
   这样门禁自己的算术也能被测；
 - **客户机系统测试**（`scripts/system-test.sh`，计划 §4.3）：在所选架构的 qemu 上启动
   真实的 initramfs，在控制台上输入以证明 root shell 可达，对运行中的系统驱动
-  `rctl`，并断言 102 件事——包括层级按依赖顺序运行、target 从不被 exec、§7.4 的
+  `rctl`，并断言 104 件事——包括层级按依赖顺序运行、target 从不被 exec、§7.4 的
   降权结果、§7.3 的限额从客户机自己的内核里读回、rinit 自己在启动时和 20 个服务下的
   RSS（从 `/proc/1/status` 读）、§4.3 的启动耗时（取自内核时钟）、qemu 真实挂载的
   设备上的 §7.5 看门狗、DHCP 客户端拿到的地址/路由/DNS、针对客户机自己的（可写的
@@ -435,7 +435,7 @@ cargo llvm-cov --offline --workspace --html                  # target/llvm-cov/h
 
 | 计划 §6 | 现状 |
 | ------- | --------------- |
-| 在 qemu（128M）里作为 PID 1 启动，内核无 panic | `make test-system`：aarch64 与 armv7 各 102 条断言，包括 "no rinit panic" 和四条内核日志检查 |
+| 在 qemu（128M）里作为 PID 1 启动，内核无 panic | `make test-system`：aarch64 与 armv7 各 104 条断言，包括 "no rinit panic" 和四条内核日志检查 |
 | 20 个服务并行，明显快于串行 | **19.2x**：`make parallel`——20 个各睡 1 s 的 `oneshot` 服务，并行总耗时 1065 ms，串行 20 424 ms |
 | 崩溃重启、熔断、健康检查 | `make test-system`（"a crashed service is scheduled for restart"、"the breaker tripped on the failing unit"）和 `crates/rinit/tests/m2_lifecycle.rs` |
 | `rctl` 能启动、停止、查询、读日志 | `make test-system` 的 M3 段和 `crates/rctl/tests/control.rs` |
@@ -668,7 +668,7 @@ rinit 划分。显式给出 `--cgroup-root` 时以它为准。
 ```
 rctl <COMMAND> [ARGS]
 
-  list                    List all known units
+  list [--format FMT]     List all known units (default: table)
   status [UNIT] [--tail N] [--format FMT]
                           Show unit status (default: systemd)
   start <UNIT>            Start a unit
@@ -687,6 +687,9 @@ Exit codes: 0 success  1 error  2 usage  3 no such unit  4 operation conflict
 内存、累计 CPU 时间和任务数（单元有自己的 cgroup 时读 cgroup，否则读
 `/proc/<pid>`）：`rctl status --plain sshd.service` 会显示 `memory:`、`cpu:` 和
 `tasks:`。
+
+`rctl list` 默认输出带 `MEM` 和 `CPU` 列的对齐表格。`--plain` 保留旧的
+`unit: state pid` 行，`--short` 为紧凑单行，`--json` 输出对象数组。
 
 默认的 systemd 视图类似：
 

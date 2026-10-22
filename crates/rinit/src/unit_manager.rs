@@ -112,6 +112,27 @@ pub struct ResourceUsage {
     pub tasks: Option<u64>,
 }
 
+/// One row of `rctl list`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnitListEntry {
+    /// Canonical unit name.
+    pub name: String,
+    /// `service`, `target`, or `template`.
+    pub kind: &'static str,
+    /// Current state, or `template`.
+    pub state: String,
+    /// Main process, when one exists.
+    pub pid: Option<libc::pid_t>,
+    /// Requested target, or `-` when no job exists.
+    pub target: &'static str,
+    /// Resident memory, when available.
+    pub memory_bytes: Option<u64>,
+    /// Cumulative CPU time, when available.
+    pub cpu_usec: Option<u64>,
+    /// Process/thread count, when available.
+    pub tasks: Option<u64>,
+}
+
 /// Everything rinit knows about one running unit.
 #[derive(Debug)]
 pub struct UnitRuntime {
@@ -1889,10 +1910,6 @@ impl UnitManager {
         due
     }
 
-    /// A human-readable summary line per unit, for the boot log and `rctl`.
-    ///
-    /// Retired units are left out: a reload removed them, and `rctl list` must
-    /// agree with `rctl start` about which units exist (plan §7.6).
     /// Memory/CPU counters for one unit.
     ///
     /// A unit with its own cgroup gets the whole-unit numbers. Everything else
@@ -1914,6 +1931,53 @@ impl UnitManager {
         }
     }
 
+    /// Rows for the table/JSON `rctl list` views, sorted by name.
+    pub fn list_entries(&self) -> Vec<UnitListEntry> {
+        let mut entries: Vec<UnitListEntry> = self
+            .units
+            .values()
+            .filter(|rt| !rt.retired)
+            .map(|rt| {
+                let target = match self.target_of(&rt.config.name) {
+                    Some(JobTarget::Started) => "started",
+                    Some(JobTarget::Stopped) => "stopped",
+                    None => "-",
+                };
+                let usage = self.resource_usage(&rt.config.name);
+                UnitListEntry {
+                    name: rt.config.name.canonical().to_string(),
+                    kind: if rt.config.is_target() {
+                        "target"
+                    } else {
+                        "service"
+                    },
+                    state: rt.state.to_string(),
+                    pid: rt.pid,
+                    target,
+                    memory_bytes: usage.memory_bytes,
+                    cpu_usec: usage.cpu_usec,
+                    tasks: usage.tasks,
+                }
+            })
+            .collect();
+        entries.extend(self.templates.keys().map(|name| UnitListEntry {
+            name: name.clone(),
+            kind: "template",
+            state: "template".to_string(),
+            pid: None,
+            target: "-",
+            memory_bytes: None,
+            cpu_usec: None,
+            tasks: None,
+        }));
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        entries
+    }
+
+    /// A human-readable summary line per unit, for the boot log and `rctl`.
+    ///
+    /// Retired units are left out: a reload removed them, and `rctl list` must
+    /// agree with `rctl start` about which units exist (plan §7.6).
     pub fn summary(&self) -> Vec<String> {
         let templates = self
             .templates

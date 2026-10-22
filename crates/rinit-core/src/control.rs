@@ -48,6 +48,11 @@ pub const CONTROL_SOCKET: &str = "/run/rinit/control.sock";
 pub enum Request {
     /// List every known unit.
     List,
+    /// List every known unit in a caller-selected presentation format.
+    ListFormatted {
+        /// How the server should render the reply.
+        format: ListFormat,
+    },
     /// Show one unit, or a one-line summary of all of them.
     Status {
         /// The unit to describe, or `None` for the summary.
@@ -91,6 +96,7 @@ impl Request {
     pub const fn command(&self) -> Command {
         match self {
             Request::List => Command::List,
+            Request::ListFormatted { .. } => Command::ListFormatted,
             Request::Status { .. } => Command::Status,
             Request::StatusFormatted { .. } => Command::StatusFormatted,
             Request::Start(_) => Command::Start,
@@ -105,7 +111,7 @@ impl Request {
     /// A one-line description for rinit's log.
     pub fn describe(&self) -> String {
         match self {
-            Request::List => "list".to_string(),
+            Request::List | Request::ListFormatted { .. } => "list".to_string(),
             Request::Status { unit, .. } | Request::StatusFormatted { unit, .. } => match unit {
                 Some(unit) => format!("status {unit}"),
                 None => "status".to_string(),
@@ -171,6 +177,50 @@ impl StatusFormat {
     }
 }
 
+/// Presentation selected by `rctl list --format`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum ListFormat {
+    /// Aligned human-readable table.
+    #[default]
+    Table = 0,
+    /// Stable `unit: state [pid]` lines for scripts.
+    Plain = 1,
+    /// One compact line per unit.
+    Short = 2,
+    /// Machine-readable JSON array.
+    Json = 3,
+}
+
+impl ListFormat {
+    /// Parse the command-line spelling.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "table" => Some(ListFormat::Table),
+            "plain" => Some(ListFormat::Plain),
+            "short" => Some(ListFormat::Short),
+            "json" => Some(ListFormat::Json),
+            _ => None,
+        }
+    }
+
+    /// The wire code.
+    pub const fn byte(self) -> u8 {
+        self as u8
+    }
+
+    /// Decode a wire code.
+    pub const fn from_byte(byte: u8) -> Option<ListFormat> {
+        match byte {
+            0 => Some(ListFormat::Table),
+            1 => Some(ListFormat::Plain),
+            2 => Some(ListFormat::Short),
+            3 => Some(ListFormat::Json),
+            _ => None,
+        }
+    }
+}
+
 /// The command codes on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -193,6 +243,8 @@ pub enum Command {
     Reload = 8,
     /// `rctl status --format=...`.
     StatusFormatted = 9,
+    /// `rctl list --format=...`.
+    ListFormatted = 10,
 }
 
 impl Command {
@@ -213,6 +265,7 @@ impl Command {
             7 => Some(Command::Log),
             8 => Some(Command::Reload),
             9 => Some(Command::StatusFormatted),
+            10 => Some(Command::ListFormatted),
             _ => None,
         }
     }
@@ -354,6 +407,7 @@ pub fn encode_request(request: &Request) -> Vec<u8> {
     out.push(request.command().byte());
     match request {
         Request::List => {}
+        Request::ListFormatted { format } => out.push(format.byte()),
         Request::Status { unit, tail } => {
             put_opt_unit(&mut out, unit.as_ref());
             out.extend_from_slice(&tail.to_le_bytes());
@@ -396,6 +450,12 @@ pub fn decode_request(body: &[u8]) -> Result<Request, ProtocolError> {
 
     let request = match command {
         Command::List => Request::List,
+        Command::ListFormatted => {
+            let format_byte = decoder.u8()?;
+            let format = ListFormat::from_byte(format_byte)
+                .ok_or(ProtocolError::UnknownCode { byte: format_byte })?;
+            Request::ListFormatted { format }
+        }
         Command::Status => {
             let unit = decoder.opt_unit()?;
             let tail = decoder.u32()?;
@@ -566,6 +626,14 @@ mod tests {
     #[test]
     fn every_request_round_trips() {
         round_trip(Request::List);
+        for format in [
+            ListFormat::Table,
+            ListFormat::Plain,
+            ListFormat::Short,
+            ListFormat::Json,
+        ] {
+            round_trip(Request::ListFormatted { format });
+        }
         round_trip(Request::Status {
             unit: None,
             tail: 0,
@@ -630,6 +698,22 @@ mod tests {
         }
         assert_eq!(StatusFormat::parse("xml"), None);
         assert_eq!(StatusFormat::from_byte(9), None);
+    }
+
+    #[test]
+    fn list_formats_have_stable_names_and_codes() {
+        for (name, format, byte) in [
+            ("table", ListFormat::Table, 0),
+            ("plain", ListFormat::Plain, 1),
+            ("short", ListFormat::Short, 2),
+            ("json", ListFormat::Json, 3),
+        ] {
+            assert_eq!(ListFormat::parse(name), Some(format));
+            assert_eq!(format.byte(), byte);
+            assert_eq!(ListFormat::from_byte(byte), Some(format));
+        }
+        assert_eq!(ListFormat::parse("cards"), None);
+        assert_eq!(ListFormat::from_byte(4), None);
     }
 
     #[test]

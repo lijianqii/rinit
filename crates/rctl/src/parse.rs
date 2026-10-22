@@ -3,7 +3,7 @@
 //! Pure and separate from `main` so every subcommand, every missing argument
 //! and every `--tail` spelling is unit-tested without a socket.
 
-use rinit_core::{Request, StatusFormat, UnitName};
+use rinit_core::{ListFormat, Request, StatusFormat, UnitName};
 
 /// What a command line asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,8 +30,8 @@ pub fn command_line(args: &[String]) -> Result<Parsed, String> {
         "-h" | "--help" => Ok(Parsed::Help),
         "-V" | "--version" => Ok(Parsed::Version),
         "list" => {
-            ensure_no_arguments(rest)?;
-            Ok(Parsed::Request(Request::List))
+            let format = parse_list(rest)?;
+            Ok(Parsed::Request(Request::ListFormatted { format }))
         }
         "status" => {
             let (unit, tail, format) = parse_status(rest)?;
@@ -92,6 +92,40 @@ fn parse_optional_unit_and_tail(rest: &[String]) -> Result<(Option<UnitName>, u3
         index += 1;
     }
     Ok((unit, tail))
+}
+
+/// `list` takes an optional presentation format and no unit name.
+fn parse_list(rest: &[String]) -> Result<ListFormat, String> {
+    let mut format = ListFormat::Table;
+    let mut index = 0;
+    while let Some(arg) = rest.get(index) {
+        if let Some(value) = arg.strip_prefix("--format=") {
+            format = parse_list_format(value)?;
+        } else if arg == "--format" {
+            let value = rest
+                .get(index + 1)
+                .ok_or_else(|| "--format needs a value".to_string())?;
+            format = parse_list_format(value)?;
+            index += 1;
+        } else if arg == "--table" {
+            format = ListFormat::Table;
+        } else if arg == "--plain" {
+            format = ListFormat::Plain;
+        } else if arg == "--short" {
+            format = ListFormat::Short;
+        } else if arg == "--json" {
+            format = ListFormat::Json;
+        } else {
+            return Err(format!("unexpected argument '{arg}'"));
+        }
+        index += 1;
+    }
+    Ok(format)
+}
+
+fn parse_list_format(value: &str) -> Result<ListFormat, String> {
+    ListFormat::parse(value)
+        .ok_or_else(|| format!("unknown list format '{value}' (try table, plain, short, json)"))
 }
 
 /// `status` takes the same optional unit and `--tail`, plus a presentation
@@ -189,8 +223,33 @@ mod tests {
     }
 
     #[test]
-    fn list_takes_nothing() {
-        assert_eq!(parse(&["list"]), Ok(Parsed::Request(Request::List)));
+    fn list_defaults_to_the_table_and_takes_formats() {
+        assert_eq!(
+            parse(&["list"]),
+            Ok(Parsed::Request(Request::ListFormatted {
+                format: ListFormat::Table
+            }))
+        );
+        for args in [
+            ["list", "--format=plain"].as_slice(),
+            ["list", "--format", "plain"].as_slice(),
+            ["list", "--plain"].as_slice(),
+        ] {
+            assert_eq!(
+                parse(args),
+                Ok(Parsed::Request(Request::ListFormatted {
+                    format: ListFormat::Plain
+                })),
+                "{args:?}"
+            );
+        }
+        assert_eq!(
+            parse(&["list", "--json"]),
+            Ok(Parsed::Request(Request::ListFormatted {
+                format: ListFormat::Json
+            }))
+        );
+        assert!(parse(&["list", "--format=xml"]).is_err());
         assert!(parse(&["list", "extra"]).is_err());
     }
 

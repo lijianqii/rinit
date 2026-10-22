@@ -317,12 +317,12 @@ make test           # check + test-system
 make gates          # acceptance gates: binary size + coverage thresholds
 ```
 
-`cargo test --offline --workspace` (what `make check` runs last) executes **735
+`cargo test --offline --workspace` (what `make check` runs last) executes **737
 tests** across ten test binaries. The five shapes, and why each is not
 redundant:
 
-- **unit tests** next to the code (core 329, rinit 197, rinit-runtime 104,
-  rctl 14), including `proptest` properties over the parser;
+- **unit tests** next to the code (core 331, rinit 199, rinit-runtime 105,
+  rctl 15), including `proptest` properties over the parser;
 - **integration tests** in `crates/*/tests/`: the syscall layer against the real
   kernel (`rinit-runtime` 22: run unprivileged, they assert that each drop is
   *refused* rather than silently skipped - `EPERM` from `setuid(0)`, `setgroups`,
@@ -358,7 +358,7 @@ redundant:
   tested;
 - **the guest system test** (`scripts/system-test.sh`, plan §4.3): boots the real
   initramfs on the selected ARCH in qemu, types at the console to prove a root shell is
-  reachable, drives `rctl` against the running system, and asserts 102 things -
+  reachable, drives `rctl` against the running system, and asserts 104 things -
   including that levels run in dependency order, that no target is ever exec'd,
   the §7.4 privilege-drop outcomes, the §7.3 limits read back out of the guest's
   own kernel, rinit's own RSS at boot and under 20 services read out of
@@ -514,7 +514,7 @@ repository or a measurement in this README:
 
 | plan §6 | where it stands |
 | ------- | --------------- |
-| boots as PID 1 in qemu (128M) with no kernel panic | `make test-system`: 102 assertions on aarch64 and armv7, including "no rinit panic" and four kernel-log checks |
+| boots as PID 1 in qemu (128M) with no kernel panic | `make test-system`: 104 assertions on aarch64 and armv7, including "no rinit panic" and four kernel-log checks |
 | 20 services in parallel, visibly faster than serial | **19.2x**: `make parallel` - 20 `oneshot` services that each sleep 1 s finish in 1065 ms together and 20 424 ms chained |
 | crash-restart, breaker, health checks | `make test-system` ("a crashed service is scheduled for restart", "the breaker tripped on the failing unit") and `crates/rinit/tests/m2_lifecycle.rs` |
 | `rctl` can start, stop, query and read logs | `make test-system`'s M3 block and `crates/rctl/tests/control.rs` |
@@ -779,7 +779,7 @@ reaches rinit and `--watchdog-timeout=10` does not.
 ```
 rctl <COMMAND> [ARGS]
 
-  list                    List all known units
+  list [--format FMT]     List all known units (default: table)
   status [UNIT] [--tail N] [--format FMT]
                           Show unit status (default: systemd)
   start <UNIT>            Start a unit
@@ -798,6 +798,10 @@ Exit codes: 0 success  1 error  2 usage  3 no such unit  4 operation conflict
 includes the main process's memory, cumulative CPU time and task count (from the
 unit cgroup when it has one, otherwise from `/proc/<pid>`):
 `rctl status --plain sshd.service` prints `memory:`, `cpu:` and `tasks:`.
+
+`rctl list` defaults to an aligned table with `MEM` and `CPU` columns. `--plain`
+keeps the old `unit: state pid` lines, `--short` is compact, and `--json` emits
+an array of objects.
 
 The systemd view is:
 

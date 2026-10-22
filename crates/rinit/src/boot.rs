@@ -12,8 +12,8 @@
 use std::os::fd::AsRawFd;
 
 use rinit_core::{
-    Effect, ExitOutcome, JobTarget, Request, RequestSource, ServiceKind, Status, StatusFormat,
-    UnitName, UnitState,
+    Effect, ExitOutcome, JobTarget, ListFormat, Request, RequestSource, ServiceKind, Status,
+    StatusFormat, UnitName, UnitState,
 };
 use rinit_runtime::syscall::{process, reboot, signal};
 use rinit_runtime::{RuntimeError, Signal, SignalSet};
@@ -29,8 +29,8 @@ use crate::notify::NotifyHub;
 use crate::readiness;
 use crate::service::{ServiceSet, reap_and_log, shutdown, spawn_service_in_group};
 use crate::unit_manager::{
-    Outcome, ResourceUsage, RestartPlan, UnitManager, UnitRuntime, build_service_env,
-    reap_into_manager,
+    Outcome, ResourceUsage, RestartPlan, UnitListEntry, UnitManager, UnitRuntime,
+    build_service_env, reap_into_manager,
 };
 use crate::watchdog::Watchdog;
 
@@ -734,6 +734,7 @@ async fn handle_control(
         Request::List | Request::Status { unit: None, .. } => {
             (Status::Ok, manager.summary().join("\n"))
         }
+        Request::ListFormatted { format } => (Status::Ok, render_list(manager, *format)),
         Request::Status {
             unit: Some(unit),
             tail,
@@ -984,6 +985,120 @@ fn describe_unit(manager: &UnitManager, unit: &UnitName) -> Option<String> {
         out.push_str(&format!("healthy: {healthy}\n"));
     }
     Some(out)
+}
+
+/// Render `rctl list` in its selected format.
+fn render_list(manager: &UnitManager, format: ListFormat) -> String {
+    let entries = manager.list_entries();
+    match format {
+        ListFormat::Plain => manager.summary().join("\n"),
+        ListFormat::Short => entries
+            .iter()
+            .map(|entry| {
+                format!(
+                    "{}  {}  pid={}  target={}  mem={}  cpu={}",
+                    entry.name,
+                    entry.state,
+                    entry
+                        .pid
+                        .map_or_else(|| "-".to_string(), |pid| pid.to_string()),
+                    entry.target,
+                    memory_value(entry.memory_bytes),
+                    cpu_value(entry.cpu_usec)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        ListFormat::Json => {
+            let rows: Vec<String> = entries.iter().map(list_entry_json).collect();
+            format!("[{}]", rows.join(","))
+        }
+        ListFormat::Table => render_list_table(&entries),
+    }
+}
+
+fn render_list_table(entries: &[UnitListEntry]) -> String {
+    let headers = ["UNIT", "TYPE", "STATE", "PID", "TARGET", "MEM", "CPU"];
+    let rows: Vec<[String; 7]> = entries
+        .iter()
+        .map(|entry| {
+            [
+                entry.name.clone(),
+                entry.kind.to_string(),
+                entry.state.clone(),
+                entry
+                    .pid
+                    .map_or_else(|| "-".to_string(), |pid| pid.to_string()),
+                entry.target.to_string(),
+                memory_value(entry.memory_bytes),
+                cpu_value(entry.cpu_usec),
+            ]
+        })
+        .collect();
+
+    let mut widths = headers.map(str::len);
+    for row in &rows {
+        for (width, value) in widths.iter_mut().zip(row.iter()) {
+            *width = (*width).max(value.chars().count());
+        }
+    }
+
+    let header = headers
+        .iter()
+        .zip(widths.iter())
+        .map(|(value, width)| format!("{value:<width$}", width = *width))
+        .collect::<Vec<_>>()
+        .join("  ");
+    let body = rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .zip(widths.iter())
+                .map(|(value, width)| format!("{value:<width$}", width = *width))
+                .collect::<Vec<_>>()
+                .join("  ")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if body.is_empty() {
+        header
+    } else {
+        format!("{header}\n{body}")
+    }
+}
+
+fn list_entry_json(entry: &UnitListEntry) -> String {
+    format!(
+        "{{\"unit\":{},\"type\":{},\"state\":{},\"pid\":{},\"target\":{},\"memory_bytes\":{},\"cpu_usec\":{},\"tasks\":{}}}",
+        json_string(&entry.name),
+        json_string(entry.kind),
+        json_string(&entry.state),
+        entry
+            .pid
+            .map_or_else(|| "null".to_string(), |pid| pid.to_string()),
+        json_string(entry.target),
+        json_num(entry.memory_bytes),
+        json_num(entry.cpu_usec),
+        json_num(entry.tasks)
+    )
+}
+
+fn json_num(value: Option<u64>) -> String {
+    value.map_or_else(|| "null".to_string(), |value| value.to_string())
+}
+
+fn memory_value(bytes: Option<u64>) -> String {
+    memory_text(ResourceUsage {
+        memory_bytes: bytes,
+        ..ResourceUsage::default()
+    })
+}
+
+fn cpu_value(usec: Option<u64>) -> String {
+    cpu_text(ResourceUsage {
+        cpu_usec: usec,
+        ..ResourceUsage::default()
+    })
 }
 
 /// Render one unit in the format selected by `rctl status --format`.
@@ -1781,6 +1896,25 @@ mod tests {
             unit: Some(unit.clone()),
             tail: 0,
         }
+    }
+
+    #[test]
+    fn formatted_list_has_a_table_and_machine_readable_shapes() {
+        let manager = manager_with("app.service");
+        let table = render_list(&manager, ListFormat::Table);
+        assert!(table.starts_with("UNIT"), "{table}");
+        for header in ["TYPE", "STATE", "PID", "TARGET", "MEM", "CPU"] {
+            assert!(table.contains(header), "{table}");
+        }
+        assert!(table.contains("app.service"), "{table}");
+
+        let plain = render_list(&manager, ListFormat::Plain);
+        assert!(plain.contains("app.service: inactive"), "{plain}");
+
+        let json = render_list(&manager, ListFormat::Json);
+        assert!(json.starts_with('[') && json.ends_with(']'), "{json}");
+        assert!(json.contains("\"unit\":\"app.service\""), "{json}");
+        assert!(json.contains("\"memory_bytes\":null"), "{json}");
     }
 
     #[test]

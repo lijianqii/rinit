@@ -176,8 +176,11 @@ await_log() {
     # M3: drive rinit from the guest console. Each step waits for output that
     # only that command can produce, so a failure surfaces as a timeout rather
     # than as a race.
-    printf 'rctl list\n' >&3
+    printf 'rctl list --plain\n' >&3
     await_log 10 'logdemo.service: inactive' || true
+    printf 'rctl list\n' >&3
+    await_log 10 'MEM' || true
+    await_log 10 'CPU' || true
     printf 'rctl status --plain getty.service\n' >&3
     await_log 10 'target: started' || true
     printf 'rctl status getty.service\n' >&3
@@ -610,6 +613,8 @@ expect "the default target is active" "boot-target-state: active"
 # all exercised from the console above; the assertions check the output each one
 # is the only possible source of.
 expect "rctl list reached the control socket" "logdemo.service: inactive"
+expect "rctl list table has a memory column" "MEM"
+expect "rctl list table has a CPU column" "CPU"
 expect "rctl status described the console unit" "target: started"
 expect "rctl status showed process memory" "Memory:"
 expect "rctl status showed process CPU" "CPU:"
