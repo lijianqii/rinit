@@ -139,18 +139,10 @@ Units live in /etc/rinit/units; this image carries the boot set only.
 The acceptance image (make test-system) adds units/demo/.
 EOF
 
-# The DHCP client is a real unit (`units/network.service`); these two files are
-# what it runs. `start.sh` keeps a host-verification image without a NIC quiet,
-# and the event script does the actual address/route/DNS work.
-write_script "${work}/etc/udhcpc/start.sh" <<'EOF'
-#!/bin/sh
-# rinit starts this as network.service. The aarch64 qemu machine always has the
-# virtio NIC; a host-verification boot without one leaves the unit inactive
-# rather than filling the log with restart failures.
-[ -e /sys/class/net/eth0 ] || exit 0
-
-exec /sbin/udhcpc -i eth0 -f -s /etc/udhcpc/default.script
-EOF
+# The DHCP client is a real unit (`units/network.service`) whose `ExecStart` is
+# `udhcpc` directly. This is the client's *lease event* script (`-s`), not a
+# startup wrapper: it applies the address, route and resolver when a lease
+# arrives and clears the address when it is deconfigured.
 write_script "${work}/etc/udhcpc/default.script" <<'EOF'
 #!/bin/sh
 # udhcpc event script for the development image. busybox exports the prefix

@@ -641,9 +641,9 @@ Because that already holds, there is no `SKIP_BUILD` knob to forget to pass.
 
 The `make run` pipeline covers arm64 and arm32. To sanity-check rinit as PID 1
 on the build host without downloading an ARM kernel, build the musl binary and boot
-the Debian host kernel. This image has no NIC: `network.service` exits 0 and the
-state machine leaves it `failed`, but `multi-user.target` only `Wants=` it, so
-the rest of the boot is unaffected.
+the Debian host kernel. This image has no NIC: `udhcpc` exits nonzero, the state
+machine leaves `network.service` `failed`, but `multi-user.target` only `Wants=`
+it, so the rest of the boot is unaffected.
 
 ```bash
 cargo build --offline --release --target x86_64-unknown-linux-musl
@@ -924,8 +924,8 @@ command through the same spawn path a unit uses.
 
 The packed images (`build/out/initramfs-aarch64-unknown-linux-gnu.cpio.gz` and
 `…-demo.cpio.gz`: static busybox + rinit + rctl + the unit directory + the
-`/etc`/`/var` skeleton) are 2.31 MiB each (2 419 127 B and 2 423 404 B)
-gzipped. The arm32 pair is 2.04 MiB (2 136 613 B) and 2.04 MiB (2 143 445 B).
+`/etc`/`/var` skeleton) are 2.31 MiB (2 417 747 B) and 2.31 MiB (2 423 319 B)
+gzipped. The arm32 pair is 2.04 MiB (2 136 470 B) and 2.04 MiB (2 143 387 B).
 The difference is the fourteen files in `units/demo/`, which only the
 second one carries. The packing is
 reproducible - `scripts/mkinitramfs.sh` zeroes the mtimes and inode numbers the

@@ -1,15 +1,15 @@
 # DHCP client for the development image's qemu NIC.
 #
 # This is a normal rinit service rather than an init script: `Type=simple`
-# because `udhcpc -f` stays in the foreground for the life of the lease,
-# `Restart=on-failure` because a DHCP client that dies has to come back, and
-# `multi-user.target` requires it so the unit is part of the boot closure.
+# because `udhcpc -f` stays in the foreground for the life of the lease, and
+# `Restart=on-failure` because a DHCP client that dies has to come back.
+# `multi-user.target` pulls it in with `Wants=` so a board without a NIC does
+# not fail the target.
 #
-# `/etc/udhcpc/start.sh` exits 0 when there is no eth0 (the x86_64 verification
-# image boots without a NIC). A simple service that exits without a restart is
-# left `failed` by the state machine, not `inactive`, but it does not trip the
-# start-limit breaker; `multi-user.target` only `Wants=` this unit, so the rest
-# of the boot is unaffected.
+# `ExecStart` is `udhcpc` itself, not a wrapper. `/etc/udhcpc/default.script`
+# is the client's lease event handler (`-s`), not a startup script. The x86_64
+# verification image has no eth0: `udhcpc` exits nonzero and the state machine
+# leaves the unit failed; the target is unaffected because it only wants it.
 [Unit]
 Description=DHCP client on eth0
 Requires=rinit-init.target
@@ -17,6 +17,6 @@ After=rinit-init.target
 
 [Service]
 Type=simple
-ExecStart=/etc/udhcpc/start.sh
+ExecStart=/sbin/udhcpc -i eth0 -f -s /etc/udhcpc/default.script
 Restart=on-failure
 RestartSec=2

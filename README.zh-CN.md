@@ -543,7 +543,7 @@ make KERNEL_VERSION=6.6.158 BUSYBOX_VERSION=1.36.1 ...   # pin versions
 
 `make run` 流水线覆盖 arm64 和 arm32。要在构建宿主机上不下载 ARM 内核就验证 rinit
 作为 PID 1 的行为，可以构建 musl 二进制并启动 Debian 宿主机内核。这个镜像没有
-NIC：`network.service` 以 0 退出，状态机会把它留在 `failed`，但
+NIC：`udhcpc` 以非 0 退出，状态机会把 `network.service` 留在 `failed`，但
 `multi-user.target` 只用 `Wants=` 拉入它，所以其余启动不受影响：
 
 ```bash
@@ -772,8 +772,8 @@ M0 的 bring-up 辅助程序 `rinit-testservice` 已经删除：没有东西再�
 
 打包后的镜像（`build/out/initramfs-aarch64-unknown-linux-gnu.cpio.gz` 和
 `…-demo.cpio.gz`：静态 busybox + rinit + rctl + 单元目录 + `/etc`/`/var` 骨架）
-gzip 后都是 2.31 MiB（分别为 2 419 127 B 和 2 423 404 B）；arm32 的两个镜像
-分别是 2.04 MiB（2 136 613 B）和 2.04 MiB（2 143 445 B）。差值就是 `units/demo/`
+gzip 后分别是 2.31 MiB（2 417 747 B）和 2.31 MiB（2 423 319 B）；arm32 的两个镜像
+分别是 2.04 MiB（2 136 470 B）和 2.04 MiB（2 143 387 B）。差值就是 `units/demo/`
 里的十四个文件，只有第二个镜像带它们。打包是可复现的——`scripts/mkinitramfs.sh` 把归档
 本来会记录的 mtime 和 inode 号归零，所以同样的二进制重复打包得到同样的字节，这才让
 这个数字可核对，而不只是"重新测了一遍"。例外是*强制*重建 busybox（`make -B`）：

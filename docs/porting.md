@@ -18,7 +18,7 @@ script puts in the image, so the kernel has to hand it a few things:
 | `CONFIG_PROC_FS`, `CONFIG_SYSFS` | `/proc` and `/sys`; `/proc` is what `rctl status` and reaping read | same |
 | a cgroup v2 hierarchy: `CGROUP_SCHED`, `CFS_BANDWIDTH`, `MEMCG`, `CGROUP_PIDS` | the `Cgroup*=` limits (plan §7.3); without one of them the kernel answers `ENOENT` for that attribute and rinit skips the limit with a warning | `make kernel-config-check` |
 | a watchdog driver (`WATCHDOG_CORE` + your hardware's) | plan §7.5; the Makefile builds `I6300ESB_WDT` because that is what qemu's `virt` machine can attach | `make kernel-config-check` |
-| a NIC driver (`VIRTIO_NET` + `VIRTIO_MMIO` on qemu's `virt`) | `units/network.service` runs `udhcpc` on `eth0`; without a NIC the unit exits and is left failed, but `multi-user.target` only `Wants=` it | `make kernel-config-check` |
+| a NIC driver (`VIRTIO_NET` + `VIRTIO_MMIO` on qemu's `virt`) | `units/network.service` runs `udhcpc` on `eth0`; without a NIC `udhcpc` fails and the unit is left failed, but `multi-user.target` only `Wants=` it | `make kernel-config-check` |
 | `CONFIG_WATCHDOG_SYSFS` | only so the *test* can read back the timeout rinit set; rinit itself does not need it | same |
 | `CONFIG_TMPFS` | `/run` and `/tmp` | `mounts.rs` |
 | signals that the kernel delivers normally (`SIGCHLD`, `SIGTERM`, ...) | rinit catches them with `sigaction` handlers and a self-pipe - no `signalfd`, no configuration | `crates/rinit-runtime/src/signals.rs` |
