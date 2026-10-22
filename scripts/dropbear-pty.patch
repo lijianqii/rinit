@@ -1,0 +1,15 @@
+--- a/src/svr-chansession.c
++++ b/src/svr-chansession.c
+@@ -847,9 +847,10 @@
+ 		}
+ 		
+ 		/* redirect stdin/stdout/stderr */
+-		close(chansess->master);
+-
++		/* Keep the master open until the slave is the controlling tty; on
++		 * devpts, closing the child's copy first makes TIOCSCTTY fail. */
+ 		pty_make_controlling_tty(&chansess->slave, chansess->tty);
++		close(chansess->master);
+ 		
+ 		if ((dup2(chansess->slave, STDIN_FILENO) < 0) ||
+ 			(dup2(chansess->slave, STDOUT_FILENO) < 0)) {

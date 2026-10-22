@@ -566,7 +566,8 @@ rootfs，加上 `units/device/` 和 dropbear，然后用
 - `syslog.service` / `klogd.service`（持久化 `/var/log/messages`）；
 - `seedrng.service`（持久化 `/var/lib/seedrng`）；
 - `time-sync.service`（busybox `ntpd`）；
-- `sshd.service`（dropbear）。
+- `devpts.service`（挂载 `/dev/pts`，并把 `/dev/ptmx` 指向 `pts/ptmx`）；
+- `sshd.service`（dropbear；依赖 `devpts.service`）。
 
 Dropbear 只允许密钥登录（`-s`）。qemu 把宿主机 2222 转发到客户机 22
 （可用 `DISK_HOSTFWD` 覆盖），配置好公钥后：
@@ -578,7 +579,13 @@ ssh -p 2222 root@localhost
 `/root/.ssh/authorized_keys` 初始为空；请通过串口或首次启动前自行加入公钥，镜像
 不提供默认凭据。主机密钥在第一次连接时生成到 `/etc/dropbear`，并随 ext4 镜像持久化。
 dropbear 源码缓存在 `build/dl/dropbear-2026.94.tar.bz2`；离线环境把这个 tarball
-放进去再跑 `make disk-image` 即可。
+放进去再跑 `make disk-image` 即可。`scripts/build-dropbear.sh` 会应用
+`scripts/dropbear-pty.patch`，保证重新解压源码后仍保留 PTY 修复。
+
+交互式 SSH 需要 PTY。`devpts.service` 提供 `/dev/pts` 和 `/dev/ptmx` 链接；缺少它时
+Dropbear 会报 `PTY allocation request failed` 并关闭会话。`run-disk` 会复用已有
+ext4 镜像，所以在此服务加入之前构建的镜像，必须先执行 `make disk-image` 重建，
+再测试交互式 SSH。
 
 镜像构建需要 `e2fsprogs`（`mke2fs -d`）；内核需要 `CONFIG_EXT4_FS`、
 `CONFIG_VIRTIO_BLK`，并且 `CONFIG_DEVTMPFS_MOUNT` 必须关闭（由 rinit 自己挂载

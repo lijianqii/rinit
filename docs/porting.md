@@ -161,13 +161,17 @@ auto-mount makes that first-wave mount fail with `EBUSY`.
 The image is populated with `mke2fs -d` from a tar whose entries are explicitly
 `root:root` (a directory populated as the build user would otherwise leave every
 file owned by that uid). `units/device/` provides `hostname`, `network-online`
-(DHCP lease, not just udhcpc exec), `syslog`/`klogd`, `seedrng`, `time-sync`
-and `sshd`; dropbear is static and key-only (`-s`), with host keys generated on
-first connection under `/etc/dropbear`. `/root/.ssh/authorized_keys` starts
-empty by design. The qemu user-net host-forward is `2222 -> 22` by default
-(`DISK_HOSTFWD`), so provisioning a key is what makes `ssh -p 2222 root@...`
-work. `/etc`, `/var`, host keys, logs and the RNG seed persist across boots
-because the ext4 image is reused; `make disk-image` is what wipes them.
+(DHCP lease, not just udhcpc exec), `syslog`/`klogd`, `seedrng`, `time-sync`,
+`devpts` (mounts `/dev/pts` and links `/dev/ptmx` to `pts/ptmx`) and `sshd`;
+dropbear is static and key-only (`-s`), with host keys generated on first
+connection under `/etc/dropbear`. `/root/.ssh/authorized_keys` starts empty by
+design. `scripts/build-dropbear.sh` applies `scripts/dropbear-pty.patch` before
+compiling, so an interactive SSH session keeps the PTY master open until the
+slave becomes the controlling terminal. The qemu user-net host-forward is
+`2222 -> 22` by default (`DISK_HOSTFWD`), so provisioning a key is what makes
+`ssh -p 2222 root@...` work. `/etc`, `/var`, host keys, logs and the RNG seed
+persist across boots because the ext4 image is reused; `make disk-image` is
+what wipes them.
 
 ## 5. Differences from systemd to expect
 

@@ -664,7 +664,8 @@ explicit destructive rebuild.
 - `syslog.service`/`klogd.service` (persistent `/var/log/messages`);
 - `seedrng.service` (persistent `/var/lib/seedrng`);
 - `time-sync.service` (busybox `ntpd`);
-- `sshd.service` (dropbear).
+- `devpts.service` (mounts `/dev/pts` and points `/dev/ptmx` at `pts/ptmx`);
+- `sshd.service` (dropbear; requires `devpts.service`).
 
 Dropbear is key-only (`-s`). QEMU forwards host port 2222 to guest 22
 (`DISK_HOSTFWD` can be overridden), so after provisioning a key:
@@ -678,7 +679,15 @@ ssh -p 2222 root@localhost
 are generated on the first connection in `/etc/dropbear` and persist in the ext4
 image. The dropbear source is cached at
 `build/dl/dropbear-2026.94.tar.bz2`; if the build host is offline, put that
-tarball there and rerun `make disk-image`.
+tarball there and rerun `make disk-image`. `scripts/build-dropbear.sh` applies
+`scripts/dropbear-pty.patch` so a fresh source extraction also keeps the PTY
+master open until `TIOCSCTTY` has succeeded.
+
+An interactive SSH session needs a PTY. `devpts.service` provides `/dev/pts`
+and the `/dev/ptmx` link; without it Dropbear reports `PTY allocation request
+failed` and closes the session. The ext4 image is reused by `run-disk`, so an
+image built before this service existed must be rebuilt with `make disk-image`
+before testing interactive SSH again.
 
 The image needs `e2fsprogs` (`mke2fs -d`); the kernel needs `CONFIG_EXT4_FS`,
 `CONFIG_VIRTIO_BLK` and `CONFIG_DEVTMPFS_MOUNT` **off** (rinit mounts `/dev`

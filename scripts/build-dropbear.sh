@@ -51,6 +51,16 @@ if [[ ! -d "${src}" ]]; then
     tar -C "${src_root}" -xf "${tarball}"
 fi
 
+# Dropbear closes the child's copy of the pty master before it calls
+# TIOCSCTTY. On this devpts setup that makes the slave unavailable, so the
+# first interactive SSH connection fails with "PTY allocation request failed".
+# Keep the master open until the controlling tty has been established; the
+# parent still owns its copy and closes it when the channel ends.
+if ! grep -q 'Keep the master open until the slave is the controlling tty' \
+        "${src}/src/svr-chansession.c"; then
+    (cd "${src}" && patch -p1 --batch --forward <"${here}/dropbear-pty.patch")
+fi
+
 cd "${src}"
 # No zlib/PAM/NSS helpers: the image is static and has no shared NSS modules.
 # Password auth is compiled out (`-s` at runtime is not enough: the ARM

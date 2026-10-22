@@ -212,7 +212,8 @@ $(BUSYBOX_BIN): $(BUSYBOX_SRC)/.config
 # --- dropbear -------------------------------------------------------------
 dropbear: $(DROPBEAR_BIN_DIR)/dropbear
 
-$(DROPBEAR_BIN_DIR)/dropbear: $(SCRIPTS)/build-dropbear.sh
+$(DROPBEAR_BIN_DIR)/dropbear: $(SCRIPTS)/build-dropbear.sh \
+                              $(SCRIPTS)/dropbear-pty.patch
 	DROPBEAR_VERSION=$(DROPBEAR_VERSION) \
 	    $(SCRIPTS)/build-dropbear.sh $(TARGET) $(DROPBEAR_BIN_DIR)
 

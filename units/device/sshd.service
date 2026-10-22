@@ -5,7 +5,8 @@
 # /root/.ssh/authorized_keys (empty by default; provision it deliberately).
 [Unit]
 Description=Dropbear SSH server
-After=network-online.service seedrng.service
+Requires=devpts.service
+After=devpts.service network-online.service seedrng.service
 Wants=seedrng.service
 
 [Service]
