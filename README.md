@@ -176,7 +176,7 @@ the one kind of unit whose process is not the process rinit started:
 ~ # rctl start forking.service
 rinit: started forking.service as pid 122
 rinit: forking.service: main process exited; daemon is pid 123
-~ # rctl status forking.service
+~ # rctl status --plain forking.service
 unit: forking.service
 state: active (pid 123)
 ~ # rctl stop forking.service
@@ -220,7 +220,7 @@ rinit: started sockc.service as pid 145
 sockc.service: socket-present
 ~ # test -S /run/api.sock && echo api-socket-bound
 api-socket-bound
-~ # s=$(rctl status api.service | grep state); echo api-state=$s
+~ # s=$(rctl status --plain api.service | grep state); echo api-state=$s
 api-state=state: inactive
 ~ # rctl start api.service            # the socket rinit bound, handed over on fd 3
 ~ # rctl log api.service
@@ -317,7 +317,7 @@ make test           # check + test-system
 make gates          # acceptance gates: binary size + coverage thresholds
 ```
 
-`cargo test --offline --workspace` (what `make check` runs last) executes **731
+`cargo test --offline --workspace` (what `make check` runs last) executes **735
 tests** across ten test binaries. The five shapes, and why each is not
 redundant:
 
@@ -358,7 +358,7 @@ redundant:
   tested;
 - **the guest system test** (`scripts/system-test.sh`, plan §4.3): boots the real
   initramfs on the selected ARCH in qemu, types at the console to prove a root shell is
-  reachable, drives `rctl` against the running system, and asserts 100 things -
+  reachable, drives `rctl` against the running system, and asserts 102 things -
   including that levels run in dependency order, that no target is ever exec'd,
   the §7.4 privilege-drop outcomes, the §7.3 limits read back out of the guest's
   own kernel, rinit's own RSS at boot and under 20 services read out of
@@ -514,7 +514,7 @@ repository or a measurement in this README:
 
 | plan §6 | where it stands |
 | ------- | --------------- |
-| boots as PID 1 in qemu (128M) with no kernel panic | `make test-system`: 100 assertions on aarch64 and armv7, including "no rinit panic" and four kernel-log checks |
+| boots as PID 1 in qemu (128M) with no kernel panic | `make test-system`: 102 assertions on aarch64 and armv7, including "no rinit panic" and four kernel-log checks |
 | 20 services in parallel, visibly faster than serial | **19.2x**: `make parallel` - 20 `oneshot` services that each sleep 1 s finish in 1065 ms together and 20 424 ms chained |
 | crash-restart, breaker, health checks | `make test-system` ("a crashed service is scheduled for restart", "the breaker tripped on the failing unit") and `crates/rinit/tests/m2_lifecycle.rs` |
 | `rctl` can start, stop, query and read logs | `make test-system`'s M3 block and `crates/rctl/tests/control.rs` |
@@ -780,7 +780,8 @@ reaches rinit and `--watchdog-timeout=10` does not.
 rctl <COMMAND> [ARGS]
 
   list                    List all known units
-  status [UNIT] [--tail N] Show unit status (optionally with recent log)
+  status [UNIT] [--tail N] [--format FMT]
+                          Show unit status (default: systemd)
   start <UNIT>            Start a unit
   stop <UNIT>             Stop a unit
   restart <UNIT>          Restart a unit
@@ -789,6 +790,30 @@ rctl <COMMAND> [ARGS]
   reload                  Re-read the unit directory and apply the difference
 
 Exit codes: 0 success  1 error  2 usage  3 no such unit  4 operation conflict
+```
+
+`rctl status` defaults to a systemd-like panel. `--plain` keeps the stable
+`unit:`/`state:`/`target:` key-value form for scripts; `--short` is one line;
+`--json` is machine-readable; `--card` is a boxed interactive view. The detail
+includes the main process's memory, cumulative CPU time and task count (from the
+unit cgroup when it has one, otherwise from `/proc/<pid>`):
+`rctl status --plain sshd.service` prints `memory:`, `cpu:` and `tasks:`.
+
+The systemd view is:
+
+```text
+● sshd.service - Dropbear SSH server
+     Type: service (simple)
+   Active: active (pid 123)
+   Target: started
+ Main PID: 123
+   Memory: 1.1 MiB
+      CPU: 290.0 ms
+    Tasks: 1
+ Restarts: 0
+  Restart: on-failure (2s)
+     User: root
+  Command: /usr/sbin/dropbear -F -R -s -p 22
 ```
 
 rinit rate limits its **own** console output, per call site: 40 lines per 5 s,

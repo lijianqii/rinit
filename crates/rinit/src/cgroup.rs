@@ -46,6 +46,21 @@ use rinit_runtime::syscall::process;
 
 use crate::log::rlog;
 
+/// Resource counters read from a unit's cgroup.
+///
+/// `None` means the counter is not available, not zero. A unit without its own
+/// cgroup has no cgroup counters at all; the status renderer then falls back to
+/// `/proc/<pid>` for the main process.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CgroupUsage {
+    /// `memory.current`, in bytes.
+    pub memory_bytes: Option<u64>,
+    /// `cpu.stat`'s `usage_usec`, in microseconds.
+    pub cpu_usec: Option<u64>,
+    /// `pids.current`.
+    pub tasks: Option<u64>,
+}
+
 /// The cgroup side of the unit manager: a hierarchy root, or nothing at all.
 ///
 /// `Default` is disabled, which is what every unit test that does not care
@@ -188,6 +203,22 @@ impl Cgroup {
                 .join(" ")
         );
         Ok(Some(dir.join("cgroup.procs")))
+    }
+
+    /// Read the counters behind `rctl status`'s memory/CPU line.
+    ///
+    /// These are best-effort diagnostics: a missing file means the unit has no
+    /// cgroup of its own, or the kernel does not provide that controller, and
+    /// is represented as `None` rather than failing the status request.
+    pub fn usage(&self, unit: &UnitName) -> CgroupUsage {
+        let Some(dir) = self.dir(unit) else {
+            return CgroupUsage::default();
+        };
+        CgroupUsage {
+            memory_bytes: read_u64(dir.join("memory.current")),
+            cpu_usec: read_cpu_usage(dir.join("cpu.stat")),
+            tasks: read_u64(dir.join("pids.current")),
+        }
     }
 
     /// How many times the cgroup OOM killer has killed a process in this unit's
@@ -408,6 +439,17 @@ fn enable_controllers(dir: &Path) {
             dir.display()
         );
     }
+}
+
+fn read_u64(path: PathBuf) -> Option<u64> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+fn read_cpu_usage(path: PathBuf) -> Option<u64> {
+    let text = std::fs::read_to_string(path).ok()?;
+    text.lines()
+        .find_map(|line| line.strip_prefix("usage_usec "))
+        .and_then(|value| value.trim().parse().ok())
 }
 
 #[cfg(test)]

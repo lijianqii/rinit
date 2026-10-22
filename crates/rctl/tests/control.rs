@@ -87,9 +87,10 @@ fn a_successful_command_prints_the_reply_and_exits_zero() {
     assert!(stdout.contains("app.service: active"), "got: {stdout}");
     assert_eq!(
         server.join().expect("server"),
-        Request::Status {
+        Request::StatusFormatted {
             unit: Some(rinit_core::UnitName::parse("app.service").unwrap()),
-            tail: 0
+            tail: 0,
+            format: rinit_core::StatusFormat::Systemd
         }
     );
 }

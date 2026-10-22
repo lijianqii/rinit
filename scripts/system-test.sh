@@ -146,7 +146,7 @@ await_log() {
     # The boot set's DHCP client. qemu's user-mode network answers the lease, so
     # the interface, the default route and the resolver all have to be set by
     # the unit - not by anything the test typed.
-    printf 'n=$(rctl status network.service | grep state); echo net-$n; ip addr show dev eth0 | grep "inet "; ip route | grep default; grep nameserver /etc/resolv.conf\n' >&3
+    printf 'n=$(rctl status --plain network.service | grep state); echo net-$n; ip addr show dev eth0 | grep "inet "; ip route | grep default; grep nameserver /etc/resolv.conf\n' >&3
     await_log 10 'net-state: active' || true
     await_log 10 'inet 10\.0\.2\.15/24' || true
     await_log 10 'default via 10\.0\.2\.2' || true
@@ -154,7 +154,7 @@ await_log() {
 
     # Plan §7.2: the default target has no process, but reaching it must leave
     # it `active` in the control interface, not merely in the boot log.
-    printf 't=$(rctl status multi-user.target | grep state); echo boot-target-$t\n' >&3
+    printf 't=$(rctl status --plain multi-user.target | grep state); echo boot-target-$t\n' >&3
     await_log 10 'boot-target-state: active' || true
 
     # Plan §0.1's memory column: rinit's own RSS at boot, read out of the kernel
@@ -178,8 +178,11 @@ await_log() {
     # than as a race.
     printf 'rctl list\n' >&3
     await_log 10 'logdemo.service: inactive' || true
-    printf 'rctl status getty.service\n' >&3
+    printf 'rctl status --plain getty.service\n' >&3
     await_log 10 'target: started' || true
+    printf 'rctl status getty.service\n' >&3
+    await_log 10 'Memory:' || true
+    await_log 10 'CPU:' || true
     printf 'rctl start logdemo.service\n' >&3
     await_log 10 'started logdemo.service' || true
     # Give the oneshot a moment to run and its output to reach the buffer.
@@ -342,7 +345,7 @@ await_log() {
     await_log 15 'forking.service: main process exited; daemon is pid' || true
     printf 'd=$(cat /run/forking.pid); echo forking-daemon=$d\n' >&3
     await_log 10 'forking-daemon=' || true
-    printf 'rctl status forking.service\n' >&3
+    printf 'rctl status --plain forking.service\n' >&3
     await_log 10 'state: active' || true
 
     # And the fail-closed half of the plan's boundary, on a unit written at
@@ -356,7 +359,7 @@ await_log() {
     await_log 15 'registered badfork.service' || true
     printf 'rctl start badfork.service\n' >&3
     await_log 15 'cannot locate the daemon' || true
-    printf 's=$(rctl status badfork.service | grep state); echo bf-state=$s\n' >&3
+    printf 's=$(rctl status --plain badfork.service | grep state); echo bf-state=$s\n' >&3
     await_log 10 'bf-state=' || true
 
     # M5 §7.11: the terminal path. The guest has no spare tty - the console is
@@ -373,7 +376,7 @@ await_log() {
     # which is the second way in - hands the service the *listening* socket.
     printf 'test -S /run/api.sock && echo api-socket-bound || echo api-socket-missing\n' >&3
     await_log 10 'api-socket-bound' || true
-    printf 's=$(rctl status api.service | grep state); echo api-state=$s\n' >&3
+    printf 's=$(rctl status --plain api.service | grep state); echo api-state=$s\n' >&3
     await_log 10 'api-state=' || true
     printf 'rctl start api.service\n' >&3
     await_log 15 'started api.service' || true
@@ -608,6 +611,8 @@ expect "the default target is active" "boot-target-state: active"
 # is the only possible source of.
 expect "rctl list reached the control socket" "logdemo.service: inactive"
 expect "rctl status described the console unit" "target: started"
+expect "rctl status showed process memory" "Memory:"
+expect "rctl status showed process CPU" "CPU:"
 expect "rctl started a unit on demand" "started logdemo.service"
 expect "rctl log returned captured service output" "rinit-log-marker"
 expect "rctl stop stopped a unit" "stopped logdemo.service"

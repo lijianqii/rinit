@@ -14,7 +14,7 @@
 soak，它是部署期跑一次 `make soak`，而不是一个功能。
 
 下面列出现有的能力，以及各自的证据。每一条结论要么来自宿主测试（`make check`），
-要么来自客户机断言（`make test-system`，`scripts/system-test.sh` 里共 100 条）；
+要么来自客户机断言（`make test-system`，`scripts/system-test.sh` 里共 102 条）；
 "在宿主机上验证"始终指同一段代码的 fake-runtime 或 `--dev` 形态，"客户机"指真实形态。
 
 | 里程碑 | 内容 | 证据 |
@@ -161,7 +161,7 @@ rinit: reload: 0 added (0 started), 1 changed (1 deferred), 1 removed (0 stopped
 ~ # rctl start forking.service
 rinit: started forking.service as pid 122
 rinit: forking.service: main process exited; daemon is pid 123
-~ # rctl status forking.service
+~ # rctl status --plain forking.service
 unit: forking.service
 state: active (pid 123)
 ~ # rctl stop forking.service
@@ -199,7 +199,7 @@ rinit: started sockc.service as pid 145
 sockc.service: socket-present
 ~ # test -S /run/api.sock && echo api-socket-bound
 api-socket-bound
-~ # s=$(rctl status api.service | grep state); echo api-state=$s
+~ # s=$(rctl status --plain api.service | grep state); echo api-state=$s
 api-state=state: inactive
 ~ # rctl start api.service            # the socket rinit bound, handed over on fd 3
 ~ # rctl log api.service
@@ -291,7 +291,7 @@ make gates          # acceptance gates: binary size + coverage thresholds
 ```
 
 `cargo test --offline --workspace`（`make check` 最后一步跑的就是它）在十个测试
-二进制里执行 **731 个测试**。五种形态，以及为什么每种都不是多余的：
+二进制里执行 **735 个测试**。五种形态，以及为什么每种都不是多余的：
 
 - **单元测试**紧挨着代码（core 329、rinit 197、rinit-runtime 104、rctl 14），
   包括解析器上的 `proptest` 属性测试；
@@ -321,7 +321,7 @@ make gates          # acceptance gates: binary size + coverage thresholds
   这样门禁自己的算术也能被测；
 - **客户机系统测试**（`scripts/system-test.sh`，计划 §4.3）：在所选架构的 qemu 上启动
   真实的 initramfs，在控制台上输入以证明 root shell 可达，对运行中的系统驱动
-  `rctl`，并断言 100 件事——包括层级按依赖顺序运行、target 从不被 exec、§7.4 的
+  `rctl`，并断言 102 件事——包括层级按依赖顺序运行、target 从不被 exec、§7.4 的
   降权结果、§7.3 的限额从客户机自己的内核里读回、rinit 自己在启动时和 20 个服务下的
   RSS（从 `/proc/1/status` 读）、§4.3 的启动耗时（取自内核时钟）、qemu 真实挂载的
   设备上的 §7.5 看门狗、DHCP 客户端拿到的地址/路由/DNS、针对客户机自己的（可写的
@@ -435,7 +435,7 @@ cargo llvm-cov --offline --workspace --html                  # target/llvm-cov/h
 
 | 计划 §6 | 现状 |
 | ------- | --------------- |
-| 在 qemu（128M）里作为 PID 1 启动，内核无 panic | `make test-system`：aarch64 与 armv7 各 100 条断言，包括 "no rinit panic" 和四条内核日志检查 |
+| 在 qemu（128M）里作为 PID 1 启动，内核无 panic | `make test-system`：aarch64 与 armv7 各 102 条断言，包括 "no rinit panic" 和四条内核日志检查 |
 | 20 个服务并行，明显快于串行 | **19.2x**：`make parallel`——20 个各睡 1 s 的 `oneshot` 服务，并行总耗时 1065 ms，串行 20 424 ms |
 | 崩溃重启、熔断、健康检查 | `make test-system`（"a crashed service is scheduled for restart"、"the breaker tripped on the failing unit"）和 `crates/rinit/tests/m2_lifecycle.rs` |
 | `rctl` 能启动、停止、查询、读日志 | `make test-system` 的 M3 段和 `crates/rctl/tests/control.rs` |
@@ -669,7 +669,8 @@ rinit 划分。显式给出 `--cgroup-root` 时以它为准。
 rctl <COMMAND> [ARGS]
 
   list                    List all known units
-  status [UNIT] [--tail N] Show unit status (optionally with recent log)
+  status [UNIT] [--tail N] [--format FMT]
+                          Show unit status (default: systemd)
   start <UNIT>            Start a unit
   stop <UNIT>             Stop a unit
   restart <UNIT>          Restart a unit
@@ -678,6 +679,30 @@ rctl <COMMAND> [ARGS]
   reload                  Re-read the unit directory and apply the difference
 
 Exit codes: 0 success  1 error  2 usage  3 no such unit  4 operation conflict
+```
+
+`rctl status` 默认输出 systemd 风格的面板。`--plain` 保留稳定的
+`unit:`/`state:`/`target:` key-value 形式，供脚本使用；`--short` 是单行；
+`--json` 输出机器可读 JSON；`--card` 输出带边框的交互式视图。详情中包含主进程的
+内存、累计 CPU 时间和任务数（单元有自己的 cgroup 时读 cgroup，否则读
+`/proc/<pid>`）：`rctl status --plain sshd.service` 会显示 `memory:`、`cpu:` 和
+`tasks:`。
+
+默认的 systemd 视图类似：
+
+```text
+● sshd.service - Dropbear SSH server
+     Type: service (simple)
+   Active: active (pid 123)
+   Target: started
+ Main PID: 123
+   Memory: 1.1 MiB
+      CPU: 290.0 ms
+    Tasks: 1
+ Restarts: 0
+  Restart: on-failure (2s)
+     User: root
+  Command: /usr/sbin/dropbear -F -R -s -p 22
 ```
 
 rinit 对**自己的**控制台输出限流，按调用点：每 5 秒 40 行，超出后统计丢弃了多少，

@@ -3,7 +3,7 @@
 //! Pure and separate from `main` so every subcommand, every missing argument
 //! and every `--tail` spelling is unit-tested without a socket.
 
-use rinit_core::{Request, UnitName};
+use rinit_core::{Request, StatusFormat, UnitName};
 
 /// What a command line asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,8 +34,12 @@ pub fn command_line(args: &[String]) -> Result<Parsed, String> {
             Ok(Parsed::Request(Request::List))
         }
         "status" => {
-            let (unit, tail) = parse_optional_unit_and_tail(rest)?;
-            Ok(Parsed::Request(Request::Status { unit, tail }))
+            let (unit, tail, format) = parse_status(rest)?;
+            Ok(Parsed::Request(Request::StatusFormatted {
+                unit,
+                tail,
+                format,
+            }))
         }
         "log" => {
             let (unit, tail) = parse_optional_unit_and_tail(rest)?;
@@ -88,6 +92,57 @@ fn parse_optional_unit_and_tail(rest: &[String]) -> Result<(Option<UnitName>, u3
         index += 1;
     }
     Ok((unit, tail))
+}
+
+/// `status` takes the same optional unit and `--tail`, plus a presentation
+/// format. The aliases are intentional: `--json` is easier to type than
+/// `--format=json`, and `--plain` is the escape hatch for existing scripts.
+fn parse_status(rest: &[String]) -> Result<(Option<UnitName>, u32, StatusFormat), String> {
+    let mut unit: Option<UnitName> = None;
+    let mut tail: u32 = 0;
+    let mut format = StatusFormat::Systemd;
+    let mut index = 0;
+    while let Some(arg) = rest.get(index) {
+        if let Some(value) = arg.strip_prefix("--tail=") {
+            tail = parse_tail(value)?;
+        } else if arg == "--tail" {
+            let value = rest
+                .get(index + 1)
+                .ok_or_else(|| "--tail needs a line count".to_string())?;
+            tail = parse_tail(value)?;
+            index += 1;
+        } else if let Some(value) = arg.strip_prefix("--format=") {
+            format = parse_status_format(value)?;
+        } else if arg == "--format" {
+            let value = rest
+                .get(index + 1)
+                .ok_or_else(|| "--format needs a value".to_string())?;
+            format = parse_status_format(value)?;
+            index += 1;
+        } else if arg == "--json" {
+            format = StatusFormat::Json;
+        } else if arg == "--plain" {
+            format = StatusFormat::Plain;
+        } else if arg == "--short" {
+            format = StatusFormat::Short;
+        } else if arg == "--card" {
+            format = StatusFormat::Card;
+        } else if arg.starts_with('-') {
+            return Err(format!("unknown option '{arg}'"));
+        } else if unit.is_none() {
+            unit = Some(parse_unit(arg)?);
+        } else {
+            return Err(format!("unexpected extra argument '{arg}'"));
+        }
+        index += 1;
+    }
+    Ok((unit, tail, format))
+}
+
+fn parse_status_format(value: &str) -> Result<StatusFormat, String> {
+    StatusFormat::parse(value).ok_or_else(|| {
+        format!("unknown status format '{value}' (try systemd, plain, short, json, card)")
+    })
 }
 
 fn parse_tail(value: &str) -> Result<u32, String> {
@@ -181,16 +236,18 @@ mod tests {
     fn status_and_log_take_an_optional_unit() {
         assert_eq!(
             parse(&["status"]),
-            Ok(Parsed::Request(Request::Status {
+            Ok(Parsed::Request(Request::StatusFormatted {
                 unit: None,
-                tail: 0
+                tail: 0,
+                format: StatusFormat::Systemd
             }))
         );
         assert_eq!(
             parse(&["status", "app"]),
-            Ok(Parsed::Request(Request::Status {
+            Ok(Parsed::Request(Request::StatusFormatted {
                 unit: Some(unit("app.service")),
-                tail: 0
+                tail: 0,
+                format: StatusFormat::Systemd
             }))
         );
         assert_eq!(
@@ -213,9 +270,10 @@ mod tests {
         ] {
             assert_eq!(
                 parse(args),
-                Ok(Parsed::Request(Request::Status {
+                Ok(Parsed::Request(Request::StatusFormatted {
                     unit: Some(unit("app.service")),
-                    tail: 5
+                    tail: 5,
+                    format: StatusFormat::Systemd
                 })),
                 "{args:?}"
             );
@@ -227,6 +285,47 @@ mod tests {
                 tail: 100
             }))
         );
+    }
+
+    #[test]
+    fn status_formats_are_aliases_or_values() {
+        for args in [
+            ["status", "--format=plain"].as_slice(),
+            ["status", "--format", "plain"].as_slice(),
+            ["status", "--plain"].as_slice(),
+        ] {
+            assert_eq!(
+                parse(args),
+                Ok(Parsed::Request(Request::StatusFormatted {
+                    unit: None,
+                    tail: 0,
+                    format: StatusFormat::Plain
+                })),
+                "{args:?}"
+            );
+        }
+        for (args, format) in [
+            (["status", "--json"].as_slice(), StatusFormat::Json),
+            (["status", "--short"].as_slice(), StatusFormat::Short),
+            (["status", "--card"].as_slice(), StatusFormat::Card),
+            (
+                ["status", "--format=systemd"].as_slice(),
+                StatusFormat::Systemd,
+            ),
+        ] {
+            assert_eq!(
+                parse(args),
+                Ok(Parsed::Request(Request::StatusFormatted {
+                    unit: None,
+                    tail: 0,
+                    format
+                })),
+                "{args:?}"
+            );
+        }
+        assert!(parse(&["status", "--format=json", "app"]).is_ok());
+        assert!(parse(&["status", "--format=xml"]).is_err());
+        assert!(parse(&["status", "--format"]).is_err());
     }
 
     #[test]

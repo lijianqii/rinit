@@ -97,6 +97,21 @@ pub enum RestartPlan {
     NotApplicable,
 }
 
+/// Best-effort resource counters for `rctl status`.
+///
+/// A unit with its own cgroup reports the whole unit; otherwise the status
+/// renderer falls back to the main process in `/proc`. `None` means "not
+/// available", never "zero".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ResourceUsage {
+    /// Resident memory, in bytes.
+    pub memory_bytes: Option<u64>,
+    /// Cumulative CPU time, in microseconds.
+    pub cpu_usec: Option<u64>,
+    /// Number of processes/tasks.
+    pub tasks: Option<u64>,
+}
+
 /// Everything rinit knows about one running unit.
 #[derive(Debug)]
 pub struct UnitRuntime {
@@ -1878,6 +1893,27 @@ impl UnitManager {
     ///
     /// Retired units are left out: a reload removed them, and `rctl list` must
     /// agree with `rctl start` about which units exist (plan §7.6).
+    /// Memory/CPU counters for one unit.
+    ///
+    /// A unit with its own cgroup gets the whole-unit numbers. Everything else
+    /// falls back to the main process in `/proc`, which is the only thing rinit
+    /// can attribute to the unit without a cgroup. Missing files are normal:
+    /// a oneshot has no process, and dev mode has no hierarchy.
+    pub fn resource_usage(&self, unit: &UnitName) -> ResourceUsage {
+        let cgroup = self.cgroup.usage(unit);
+        let process = self
+            .units
+            .get(unit)
+            .and_then(|rt| rt.pid)
+            .map(proc_usage)
+            .unwrap_or_default();
+        ResourceUsage {
+            memory_bytes: cgroup.memory_bytes.or(process.memory_bytes),
+            cpu_usec: cgroup.cpu_usec.or(process.cpu_usec),
+            tasks: cgroup.tasks.or(process.tasks),
+        }
+    }
+
     pub fn summary(&self) -> Vec<String> {
         let templates = self
             .templates
@@ -2010,6 +2046,39 @@ pub fn reap_into_manager(manager: &mut UnitManager) -> Vec<Outcome> {
         }
     }
     out
+}
+
+fn proc_usage(pid: libc::pid_t) -> ResourceUsage {
+    let memory_bytes = std::fs::read_to_string(format!("/proc/{pid}/statm"))
+        .ok()
+        .and_then(|text| text.split_whitespace().nth(1)?.parse::<u64>().ok())
+        .and_then(|pages| {
+            // SAFETY: sysconf is a pure query with no pointers or lifetime.
+            let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+            (page > 0).then(|| pages * page as u64)
+        });
+
+    let cpu_usec = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|text| {
+            let rest = text.rsplit_once(')')?.1.trim();
+            let fields: Vec<&str> = rest.split_whitespace().collect();
+            let utime = fields.get(11)?.parse::<u64>().ok()?;
+            let stime = fields.get(12)?.parse::<u64>().ok()?;
+            // SAFETY: sysconf is a pure query with no pointers or lifetime.
+            let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+            (hz > 0).then(|| (utime + stime) * 1_000_000 / hz as u64)
+        });
+
+    let tasks = std::fs::read_dir(format!("/proc/{pid}/task"))
+        .ok()
+        .map(|entries| entries.filter_map(Result::ok).count() as u64);
+
+    ResourceUsage {
+        memory_bytes,
+        cpu_usec,
+        tasks,
+    }
 }
 
 #[cfg(test)]

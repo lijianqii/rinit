@@ -49,8 +49,8 @@ pub mod users;
 
 pub use control::{
     CONTROL_DIR, CONTROL_SOCKET, Command, ENV_CONTROL_DIR, LENGTH_PREFIX_BYTES, MAX_FRAME_BYTES,
-    PROTOCOL_VERSION, ProtocolError, Request, Status, decode_request, decode_response,
-    encode_request, encode_response, frame, frame_len,
+    PROTOCOL_VERSION, ProtocolError, Request, Status, StatusFormat, decode_request,
+    decode_response, encode_request, encode_response, frame, frame_len,
 };
 pub use error::CoreError;
 pub use logger::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINE_BYTES, LogBuffer, LogLine};

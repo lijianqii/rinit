@@ -12,8 +12,8 @@
 use std::os::fd::AsRawFd;
 
 use rinit_core::{
-    Effect, ExitOutcome, JobTarget, Request, RequestSource, ServiceKind, Status, UnitName,
-    UnitState,
+    Effect, ExitOutcome, JobTarget, Request, RequestSource, ServiceKind, Status, StatusFormat,
+    UnitName, UnitState,
 };
 use rinit_runtime::syscall::{process, reboot, signal};
 use rinit_runtime::{RuntimeError, Signal, SignalSet};
@@ -29,7 +29,8 @@ use crate::notify::NotifyHub;
 use crate::readiness;
 use crate::service::{ServiceSet, reap_and_log, shutdown, spawn_service_in_group};
 use crate::unit_manager::{
-    Outcome, RestartPlan, UnitManager, build_service_env, reap_into_manager,
+    Outcome, ResourceUsage, RestartPlan, UnitManager, UnitRuntime, build_service_env,
+    reap_into_manager,
 };
 use crate::watchdog::Watchdog;
 
@@ -752,6 +753,48 @@ async fn handle_control(
             }
             None => (Status::NoSuchUnit, format!("no such unit: {unit}")),
         },
+        Request::StatusFormatted {
+            unit: Some(unit),
+            tail,
+            format,
+        } => match describe_unit_formatted(manager, unit, *format) {
+            Some(mut text) => {
+                if *tail > 0 {
+                    let logs_text = render_logs(logs, Some(unit), *tail);
+                    if !logs_text.is_empty() {
+                        if *format == StatusFormat::Json {
+                            // The JSON reply is one object; a textual log block
+                            // would make it invalid. Drop the object's closing
+                            // brace, add the field, and close it again.
+                            if text.ends_with('}') {
+                                text.pop();
+                            }
+                            text.push_str(",\"log\":");
+                            text.push_str(&json_string(&logs_text));
+                            text.push('}');
+                        } else {
+                            text.push_str("log:\n");
+                            text.push_str(&logs_text);
+                            text.push('\n');
+                        }
+                    }
+                }
+                (Status::Ok, text)
+            }
+            None => (Status::NoSuchUnit, format!("no such unit: {unit}")),
+        },
+        Request::StatusFormatted {
+            unit: None, format, ..
+        } => {
+            let lines = manager.summary();
+            let text = if *format == StatusFormat::Json {
+                let items: Vec<String> = lines.iter().map(|line| json_string(line)).collect();
+                format!("[{}]", items.join(","))
+            } else {
+                lines.join("\n")
+            };
+            (Status::Ok, text)
+        }
         Request::Start(unit) => control_start(manager, notify, logs, unit).await,
         Request::Stop(unit) => control_stop(manager, notify, logs, unit).await,
         Request::Restart(unit) => control_restart(manager, notify, logs, unit).await,
@@ -941,6 +984,314 @@ fn describe_unit(manager: &UnitManager, unit: &UnitName) -> Option<String> {
         out.push_str(&format!("healthy: {healthy}\n"));
     }
     Some(out)
+}
+
+/// Render one unit in the format selected by `rctl status --format`.
+fn describe_unit_formatted(
+    manager: &UnitManager,
+    unit: &UnitName,
+    format: StatusFormat,
+) -> Option<String> {
+    if !manager.exists(unit) {
+        return None;
+    }
+    let rt = manager.get(unit)?;
+    let target = match manager.target_of(unit) {
+        Some(JobTarget::Started) => "started",
+        Some(JobTarget::Stopped) => "stopped",
+        None => "none",
+    };
+    let usage = manager.resource_usage(unit);
+    Some(match format {
+        StatusFormat::Plain => render_plain(rt, target, usage),
+        StatusFormat::Systemd => render_systemd(rt, target, usage),
+        StatusFormat::Short => render_short(rt, target, usage),
+        StatusFormat::Json => render_json(rt, target, usage),
+        StatusFormat::Card => render_card(rt, target, usage),
+    })
+}
+
+fn render_plain(rt: &UnitRuntime, target: &str, usage: ResourceUsage) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("unit: {}\n", rt.config.name));
+    if !rt.config.description.is_empty() {
+        out.push_str(&format!("description: {}\n", rt.config.description));
+    }
+    out.push_str(&format!("type: {}\n", unit_type_text(rt)));
+    out.push_str(&format!("state: {}\n", state_text(rt)));
+    out.push_str(&format!("target: {target}\n"));
+    out.push_str(&format!(
+        "restarts: {}\n",
+        rt.backoff.consecutive_restarts()
+    ));
+    out.push_str(&format!("memory: {}\n", memory_text(usage)));
+    out.push_str(&format!("cpu: {}\n", cpu_text(usage)));
+    if let Some(tasks) = usage.tasks {
+        out.push_str(&format!("tasks: {tasks}\n"));
+    }
+    out.push_str(&format!("restart-policy: {}\n", restart_text(rt)));
+    out.push_str(&format!("user: {}\n", user_text(rt)));
+    out.push_str(&format!("exec-start: {}\n", exec_text(rt)));
+    if let Some(status) = &rt.status {
+        out.push_str(&format!("status: {status}\n"));
+    }
+    if let Some(healthy) = rt.healthy {
+        out.push_str(&format!("healthy: {healthy}\n"));
+    }
+    if let Some(outcome) = outcome_text(rt.last_outcome) {
+        out.push_str(&format!("last-exit: {outcome}\n"));
+    }
+    out
+}
+
+fn render_systemd(rt: &UnitRuntime, target: &str, usage: ResourceUsage) -> String {
+    let name = &rt.config.name;
+    let description = if rt.config.description.is_empty() {
+        name.canonical()
+    } else {
+        rt.config.description.as_str()
+    };
+    let mut out = format!("● {name} - {description}\n");
+    out.push_str(&format!("     Type: {}\n", unit_type_text(rt)));
+    out.push_str(&format!("   Active: {}\n", state_text(rt)));
+    out.push_str(&format!("   Target: {target}\n"));
+    out.push_str(&format!(
+        " Main PID: {}\n",
+        rt.pid
+            .map_or_else(|| "-".to_string(), |pid| pid.to_string())
+    ));
+    out.push_str(&format!("   Memory: {}\n", memory_text(usage)));
+    out.push_str(&format!("      CPU: {}\n", cpu_text(usage)));
+    if let Some(tasks) = usage.tasks {
+        out.push_str(&format!("    Tasks: {tasks}\n"));
+    }
+    out.push_str(&format!(
+        " Restarts: {}\n",
+        rt.backoff.consecutive_restarts()
+    ));
+    out.push_str(&format!("  Restart: {}\n", restart_text(rt)));
+    out.push_str(&format!("     User: {}\n", user_text(rt)));
+    out.push_str(&format!("  Command: {}\n", exec_text(rt)));
+    if let Some(status) = &rt.status {
+        out.push_str(&format!("   Status: {status}\n"));
+    }
+    if let Some(healthy) = rt.healthy {
+        out.push_str(&format!("   Health: {healthy}\n"));
+    }
+    if let Some(outcome) = outcome_text(rt.last_outcome) {
+        out.push_str(&format!(" Last exit: {outcome}\n"));
+    }
+    out
+}
+
+fn render_short(rt: &UnitRuntime, target: &str, usage: ResourceUsage) -> String {
+    format!(
+        "{}  {}  pid={}  target={}  mem={}  cpu={}",
+        rt.config.name,
+        rt.state,
+        rt.pid
+            .map_or_else(|| "-".to_string(), |pid| pid.to_string()),
+        target,
+        memory_text(usage),
+        cpu_text(usage)
+    )
+}
+
+fn render_json(rt: &UnitRuntime, target: &str, usage: ResourceUsage) -> String {
+    let pid = rt
+        .pid
+        .map_or_else(|| "null".to_string(), |pid| pid.to_string());
+    let memory = usage
+        .memory_bytes
+        .map_or_else(|| "null".to_string(), |value| value.to_string());
+    let cpu = usage
+        .cpu_usec
+        .map_or_else(|| "null".to_string(), |value| value.to_string());
+    let tasks = usage
+        .tasks
+        .map_or_else(|| "null".to_string(), |value| value.to_string());
+    format!(
+        "{{\"unit\":{},\"description\":{},\"type\":{},\"state\":{},\"pid\":{},\"target\":{},\"restarts\":{},\"memory_bytes\":{},\"cpu_usec\":{},\"tasks\":{},\"restart_policy\":{},\"user\":{},\"exec_start\":{},\"status\":{},\"healthy\":{},\"last_exit\":{}}}",
+        json_string(rt.config.name.canonical()),
+        json_string(&rt.config.description),
+        json_string(&unit_type_text(rt)),
+        json_string(&state_text(rt)),
+        pid,
+        json_string(target),
+        rt.backoff.consecutive_restarts(),
+        memory,
+        cpu,
+        tasks,
+        json_string(&restart_text(rt)),
+        json_string(&user_text(rt)),
+        json_string(&exec_text(rt)),
+        json_opt(&rt.status),
+        json_bool(rt.healthy),
+        json_opt(&outcome_text(rt.last_outcome))
+    )
+}
+
+fn render_card(rt: &UnitRuntime, target: &str, usage: ResourceUsage) -> String {
+    let width: usize = 62;
+    let name = rt.config.name.canonical();
+    let description = if rt.config.description.is_empty() {
+        "-".to_string()
+    } else {
+        rt.config.description.clone()
+    };
+    let mut out = String::new();
+    out.push_str(&format!(
+        "╭─ {} {}╮\n",
+        name,
+        "─".repeat(width.saturating_sub(name.len()))
+    ));
+    out.push_str(&format!("│ {} │\n", fit(&description, width)));
+    out.push_str(&format!(
+        "│ {} │\n",
+        fit(&format!("● {}", state_text(rt)), width)
+    ));
+    out.push_str(&format!(
+        "│ {} │\n",
+        fit(
+            &format!(
+                "target: {target}   restarts: {}   tasks: {}",
+                rt.backoff.consecutive_restarts(),
+                usage
+                    .tasks
+                    .map_or_else(|| "-".to_string(), |tasks| tasks.to_string())
+            ),
+            width
+        )
+    ));
+    out.push_str(&format!(
+        "│ {} │\n",
+        fit(
+            &format!("memory: {}   cpu: {}", memory_text(usage), cpu_text(usage)),
+            width
+        )
+    ));
+    out.push_str(&format!(
+        "│ {} │\n",
+        fit(
+            &format!("restart: {}   user: {}", restart_text(rt), user_text(rt)),
+            width
+        )
+    ));
+    out.push_str(&format!("╰{}╯\n", "─".repeat(width + 2)));
+    out
+}
+
+fn unit_type_text(rt: &UnitRuntime) -> String {
+    if rt.config.is_target() {
+        "target".to_string()
+    } else {
+        format!("service ({})", service_kind_text(rt.config.service_kind))
+    }
+}
+
+fn service_kind_text(kind: ServiceKind) -> &'static str {
+    match kind {
+        ServiceKind::Simple => "simple",
+        ServiceKind::Oneshot => "oneshot",
+        ServiceKind::Notify => "notify",
+        ServiceKind::Forking => "forking",
+    }
+}
+
+fn state_text(rt: &UnitRuntime) -> String {
+    match rt.pid {
+        Some(pid) => format!("{} (pid {pid})", rt.state),
+        None => rt.state.to_string(),
+    }
+}
+
+fn restart_text(rt: &UnitRuntime) -> String {
+    let policy = match rt.config.restart {
+        rinit_core::unit::config::RestartPolicy::No => "no",
+        rinit_core::unit::config::RestartPolicy::Always => "always",
+        rinit_core::unit::config::RestartPolicy::OnSuccess => "on-success",
+        rinit_core::unit::config::RestartPolicy::OnFailure => "on-failure",
+        rinit_core::unit::config::RestartPolicy::OnAbnormal => "on-abnormal",
+    };
+    format!("{policy} ({}s)", rt.config.restart_sec)
+}
+
+fn user_text(rt: &UnitRuntime) -> String {
+    if rt.config.user.is_empty() {
+        "root".to_string()
+    } else {
+        rt.config.user.clone()
+    }
+}
+
+fn exec_text(rt: &UnitRuntime) -> String {
+    let argv = rt.config.exec_start.argv();
+    if argv.is_empty() {
+        "-".to_string()
+    } else {
+        argv.join(" ")
+    }
+}
+
+fn outcome_text(outcome: Option<ExitOutcome>) -> Option<String> {
+    match outcome {
+        Some(ExitOutcome::Success) => Some("success".to_string()),
+        Some(ExitOutcome::Failure(code)) => Some(format!("exit {code}")),
+        Some(ExitOutcome::Signalled(signal)) => Some(format!("signal {signal}")),
+        Some(ExitOutcome::TimedOut) => Some("timeout".to_string()),
+        None => None,
+    }
+}
+
+fn memory_text(usage: ResourceUsage) -> String {
+    match usage.memory_bytes {
+        None => "-".to_string(),
+        Some(bytes) if bytes < 1024 => format!("{bytes} B"),
+        Some(bytes) if bytes < 1024 * 1024 => format!("{:.1} KiB", bytes as f64 / 1024.0),
+        Some(bytes) => format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0)),
+    }
+}
+
+fn cpu_text(usage: ResourceUsage) -> String {
+    match usage.cpu_usec {
+        None => "-".to_string(),
+        Some(usec) if usec < 1_000_000 => format!("{:.1} ms", usec as f64 / 1000.0),
+        Some(usec) => format!("{:.2} s", usec as f64 / 1_000_000.0),
+    }
+}
+
+fn json_string(value: &str) -> String {
+    let mut out = String::from("\"");
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            ch if ch < ' ' => out.push_str(&format!("\\u{:04x}", ch as u32)),
+            ch => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn json_opt(value: &Option<String>) -> String {
+    value
+        .as_deref()
+        .map_or_else(|| "null".to_string(), json_string)
+}
+
+fn json_bool(value: Option<bool>) -> String {
+    value.map_or_else(|| "null".to_string(), |value| value.to_string())
+}
+
+fn fit(value: &str, width: usize) -> String {
+    let mut out: String = value.chars().take(width).collect();
+    let used = out.chars().count();
+    out.push_str(&" ".repeat(width.saturating_sub(used)));
+    out
 }
 
 /// Wait for the paths a unit's `NeedsSocket=` names (plan §7.8).
@@ -1430,6 +1781,29 @@ mod tests {
             unit: Some(unit.clone()),
             tail: 0,
         }
+    }
+
+    #[test]
+    fn formatted_status_has_resource_fields_and_json_keys() {
+        let manager = manager_with("app.service");
+        let app = unit("app.service");
+
+        let systemd =
+            describe_unit_formatted(&manager, &app, StatusFormat::Systemd).expect("systemd");
+        assert!(systemd.contains("Memory:"), "{systemd}");
+        assert!(systemd.contains("CPU:"), "{systemd}");
+        assert!(systemd.contains("Restart:"), "{systemd}");
+
+        let plain = describe_unit_formatted(&manager, &app, StatusFormat::Plain).expect("plain");
+        assert!(plain.contains("memory:"), "{plain}");
+        assert!(plain.contains("cpu:"), "{plain}");
+        assert!(plain.contains("target: none"), "{plain}");
+
+        let json = describe_unit_formatted(&manager, &app, StatusFormat::Json).expect("json");
+        for key in ["\"memory_bytes\"", "\"cpu_usec\"", "\"tasks\""] {
+            assert!(json.contains(key), "{json}");
+        }
+        assert!(json.starts_with('{') && json.ends_with('}'), "{json}");
     }
 
     /// A request naming a unit rinit does not know is `NoSuchUnit` (exit 3),

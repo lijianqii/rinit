@@ -55,6 +55,18 @@ pub enum Request {
         /// Lines of buffered log to include.
         tail: u32,
     },
+    /// Show one unit in a caller-selected presentation format.
+    ///
+    /// This is additive: the original [`Request::Status`] still produces the
+    /// stable key-value response used by existing scripts.
+    StatusFormatted {
+        /// The unit to describe, or `None` for the summary.
+        unit: Option<UnitName>,
+        /// Lines of buffered log to include.
+        tail: u32,
+        /// How the server should render the reply.
+        format: StatusFormat,
+    },
     /// Start a unit.
     Start(UnitName),
     /// Stop a unit.
@@ -80,6 +92,7 @@ impl Request {
         match self {
             Request::List => Command::List,
             Request::Status { .. } => Command::Status,
+            Request::StatusFormatted { .. } => Command::StatusFormatted,
             Request::Start(_) => Command::Start,
             Request::Stop(_) => Command::Stop,
             Request::Restart(_) => Command::Restart,
@@ -93,7 +106,7 @@ impl Request {
     pub fn describe(&self) -> String {
         match self {
             Request::List => "list".to_string(),
-            Request::Status { unit, .. } => match unit {
+            Request::Status { unit, .. } | Request::StatusFormatted { unit, .. } => match unit {
                 Some(unit) => format!("status {unit}"),
                 None => "status".to_string(),
             },
@@ -106,6 +119,54 @@ impl Request {
                 None => "log".to_string(),
             },
             Request::Reload => "reload".to_string(),
+        }
+    }
+}
+
+/// Presentation selected by `rctl status --format`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum StatusFormat {
+    /// Familiar labelled, multi-line output.
+    #[default]
+    Systemd = 0,
+    /// Stable `key: value` output for scripts.
+    Plain = 1,
+    /// One line per unit.
+    Short = 2,
+    /// Machine-readable JSON.
+    Json = 3,
+    /// Boxed human-readable panel.
+    Card = 4,
+}
+
+impl StatusFormat {
+    /// Parse the command-line spelling.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "systemd" => Some(StatusFormat::Systemd),
+            "plain" => Some(StatusFormat::Plain),
+            "short" => Some(StatusFormat::Short),
+            "json" => Some(StatusFormat::Json),
+            "card" => Some(StatusFormat::Card),
+            _ => None,
+        }
+    }
+
+    /// The wire code.
+    pub const fn byte(self) -> u8 {
+        self as u8
+    }
+
+    /// Decode a wire code.
+    pub const fn from_byte(byte: u8) -> Option<StatusFormat> {
+        match byte {
+            0 => Some(StatusFormat::Systemd),
+            1 => Some(StatusFormat::Plain),
+            2 => Some(StatusFormat::Short),
+            3 => Some(StatusFormat::Json),
+            4 => Some(StatusFormat::Card),
+            _ => None,
         }
     }
 }
@@ -130,6 +191,8 @@ pub enum Command {
     Log = 7,
     /// `rctl reload` (plan §7.6).
     Reload = 8,
+    /// `rctl status --format=...`.
+    StatusFormatted = 9,
 }
 
 impl Command {
@@ -149,6 +212,7 @@ impl Command {
             6 => Some(Command::ResetFailed),
             7 => Some(Command::Log),
             8 => Some(Command::Reload),
+            9 => Some(Command::StatusFormatted),
             _ => None,
         }
     }
@@ -294,6 +358,11 @@ pub fn encode_request(request: &Request) -> Vec<u8> {
             put_opt_unit(&mut out, unit.as_ref());
             out.extend_from_slice(&tail.to_le_bytes());
         }
+        Request::StatusFormatted { unit, tail, format } => {
+            put_opt_unit(&mut out, unit.as_ref());
+            out.extend_from_slice(&tail.to_le_bytes());
+            out.push(format.byte());
+        }
         Request::Start(unit)
         | Request::Stop(unit)
         | Request::Restart(unit)
@@ -331,6 +400,14 @@ pub fn decode_request(body: &[u8]) -> Result<Request, ProtocolError> {
             let unit = decoder.opt_unit()?;
             let tail = decoder.u32()?;
             Request::Status { unit, tail }
+        }
+        Command::StatusFormatted => {
+            let unit = decoder.opt_unit()?;
+            let tail = decoder.u32()?;
+            let format_byte = decoder.u8()?;
+            let format = StatusFormat::from_byte(format_byte)
+                .ok_or(ProtocolError::UnknownCode { byte: format_byte })?;
+            Request::StatusFormatted { unit, tail, format }
         }
         Command::Start => Request::Start(decoder.unit()?),
         Command::Stop => Request::Stop(decoder.unit()?),
@@ -497,6 +574,19 @@ mod tests {
             unit: Some(name("app.service")),
             tail: 42,
         });
+        for format in [
+            StatusFormat::Systemd,
+            StatusFormat::Plain,
+            StatusFormat::Short,
+            StatusFormat::Json,
+            StatusFormat::Card,
+        ] {
+            round_trip(Request::StatusFormatted {
+                unit: Some(name("app.service")),
+                tail: 7,
+                format,
+            });
+        }
         round_trip(Request::Start(name("app.service")));
         round_trip(Request::Stop(name("db.target")));
         round_trip(Request::Restart(name("net.service")));
@@ -523,6 +613,23 @@ mod tests {
         let body = encode_request(&Request::Reload);
         assert_eq!(body.len(), 3, "version (2) + command (1), and nothing else");
         assert!(decode_request(&body).is_ok());
+    }
+
+    #[test]
+    fn status_formats_have_stable_names_and_codes() {
+        for (name, format, byte) in [
+            ("systemd", StatusFormat::Systemd, 0),
+            ("plain", StatusFormat::Plain, 1),
+            ("short", StatusFormat::Short, 2),
+            ("json", StatusFormat::Json, 3),
+            ("card", StatusFormat::Card, 4),
+        ] {
+            assert_eq!(StatusFormat::parse(name), Some(format));
+            assert_eq!(format.byte(), byte);
+            assert_eq!(StatusFormat::from_byte(byte), Some(format));
+        }
+        assert_eq!(StatusFormat::parse("xml"), None);
+        assert_eq!(StatusFormat::from_byte(9), None);
     }
 
     #[test]
