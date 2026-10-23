@@ -2,8 +2,9 @@
 #
 # Three layers, cheapest first:
 #   host    - fmt + clippy + the full host test suite; runs on every push/PR
-#   aarch64 - cross-compiles the static binaries (plan §2 risk 6b)
-#   guest   - boots qemu and asserts the M0 acceptance list on the serial log
+#   aarch64 - cross-compiles the dynamic tool binaries
+#   guest   - boots qemu with the packaged loader/libc and asserts the M0
+#             acceptance list on the serial log
 #
 # The guest job reuses the Makefile pipeline, so what CI verifies is exactly
 # what `make test-system` verifies locally.
@@ -17,10 +18,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # Do not set RUSTFLAGS globally: for the aarch64 target, `.cargo/config.toml`
-  # puts `+crt-static` in `target.*.rustflags`, and a global RUSTFLAGS overrides
-  # those target flags - which is exactly what made the first CI build
-  # dynamically linked. Clippy below passes `-D warnings` explicitly.
+  # Do not set RUSTFLAGS globally: it overrides per-target linker and feature
+  # flags from `.cargo/config.toml`. Clippy below passes `-D warnings`
+  # explicitly instead.
 
 jobs:
   host:
@@ -55,7 +55,7 @@ jobs:
         run: cargo doc --offline --locked --workspace --no-deps
 
   aarch64:
-    name: cross-compile (aarch64, static)
+    name: cross-compile (aarch64, dynamic)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -80,22 +80,27 @@ jobs:
       - name: Build
         run: cargo build --offline --locked --release --target aarch64-unknown-linux-gnu
 
-      - name: Verify the binaries are really static
-        # Plan §5 risk 6b: a dynamic build against a mismatched sysroot is a
-        # black screen at boot, so assert statically at CI time.
+      - name: Verify the own tools are dynamically linked
+        # rinit/rctl/processes are dynamic by design; the image builder copies
+        # the matching loader and libc into the initramfs. A static binary here
+        # means the target config or the build flags regressed.
         run: |
-          for bin in rinit rctl; do
+          for bin in rinit rctl processes; do
             path="target/aarch64-unknown-linux-gnu/release/${bin}"
             test -x "$path" || { echo "missing $path"; exit 1; }
-            if readelf -d "$path" 2>/dev/null | grep -q NEEDED; then
-              echo "::error::$bin is dynamically linked; PID 1 must be static"
+            if ! readelf -d "$path" 2>/dev/null | grep -q NEEDED; then
+              echo "::error::$bin is statically linked; expected dynamic"
               exit 1
             fi
-            echo "$bin: $(du -h "$path" | cut -f1) (static)"
+            if ! readelf -l "$path" 2>/dev/null | grep -q 'Requesting program interpreter: /lib/ld-linux-aarch64.so.1'; then
+              echo "::error::$bin has an unexpected interpreter"
+              exit 1
+            fi
+            echo "$bin: $(du -h "$path" | cut -f1) (dynamic)"
           done
 
   arm32:
-    name: cross-compile (armv7, static)
+    name: cross-compile (armv7, dynamic)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -120,16 +125,20 @@ jobs:
       - name: Build
         run: cargo build --offline --locked --release --target armv7-unknown-linux-gnueabihf
 
-      - name: Verify the binaries are really static
+      - name: Verify the own tools are dynamically linked
         run: |
-          for bin in rinit rctl; do
+          for bin in rinit rctl processes; do
             path="target/armv7-unknown-linux-gnueabihf/release/${bin}"
             test -x "$path" || { echo "missing $path"; exit 1; }
-            if readelf -d "$path" 2>/dev/null | grep -q NEEDED; then
-              echo "::error::$bin is dynamically linked; PID 1 must be static"
+            if ! readelf -d "$path" 2>/dev/null | grep -q NEEDED; then
+              echo "::error::$bin is statically linked; expected dynamic"
               exit 1
             fi
-            echo "$bin: $(du -h "$path" | cut -f1) (static, armv7)"
+            if ! readelf -l "$path" 2>/dev/null | grep -q 'Requesting program interpreter: /lib/ld-linux-armhf.so.3'; then
+              echo "::error::$bin has an unexpected interpreter"
+              exit 1
+            fi
+            echo "$bin: $(du -h "$path" | cut -f1) (dynamic, armv7)"
           done
 
   guest:
