@@ -162,7 +162,7 @@ fn a_version_mismatch_is_reported() {
     let (_, server) = serve_one(
         &dir,
         Status::VersionMismatch,
-        "protocol version 2 does not match 1; rebuild rctl",
+        "protocol version 1 does not match 2; rebuild rctl",
     );
 
     let output = run_rctl(&dir, &["list"]);

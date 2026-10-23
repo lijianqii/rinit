@@ -20,7 +20,7 @@ use crate::unit::{MAX_UNIT_NAME_BYTES, UnitName};
 
 /// Wire version. Bump on any incompatible change; `rctl` and rinit refuse to
 /// talk across a mismatch rather than degrade (plan §1.3(10)).
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Largest frame body accepted, in bytes.
 ///
@@ -184,7 +184,7 @@ pub enum ListFormat {
     /// Aligned human-readable table.
     #[default]
     Table = 0,
-    /// Stable `unit: state [pid]` lines for scripts.
+    /// Stable `unit: state pid N` lines for scripts.
     Plain = 1,
     /// One compact line per unit.
     Short = 2,
@@ -741,6 +741,21 @@ mod tests {
             decode_request(&body),
             Err(ProtocolError::VersionMismatch {
                 found: foreign,
+                expected: PROTOCOL_VERSION
+            })
+        );
+    }
+
+    /// The command-code extension bumped the wire version. A pre-2 client must
+    /// get the version diagnostic, not a per-command `unknown code`.
+    #[test]
+    fn the_pre_extension_version_is_refused() {
+        let mut body = encode_request(&Request::List);
+        body[..2].copy_from_slice(&1u16.to_le_bytes());
+        assert_eq!(
+            decode_request(&body),
+            Err(ProtocolError::VersionMismatch {
+                found: 1,
                 expected: PROTOCOL_VERSION
             })
         );

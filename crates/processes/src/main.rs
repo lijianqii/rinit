@@ -5,12 +5,32 @@
 //! `--long` or `--json`. Parent/child relationships come from the PPID in
 //! `/proc/<pid>/stat`.
 
+// Production code must not panic: a bad command line is a usage error, not a
+// crash with exit code 101. Tests are exempt.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing
+    )
+)]
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
+// Linux exposes `/proc/<pid>/stat`'s rss in pages and utime/stime in USER_HZ
+// ticks. USER_HZ is the userspace ABI value (100) and does not follow
+// CONFIG_HZ. All supported rinit targets use 4 KiB pages; a 64 KiB-page kernel
+// would need this read from the system rather than hardcoded.
 const PAGE_SIZE: u64 = 4096;
 const CLOCK_TICKS: u64 = 100;
 
@@ -25,7 +45,8 @@ Options:
   --json                 Emit a JSON array
   --sort=KEY             pid, ppid, cpu, rss, vsz, name (default: pid)
   --reverse              Reverse the sort
-  --limit=N              Only show the first N rows
+  --limit=N              Only show the first N rows (with --tree, a cut can
+                          leave a visible parent without its children)
   --pid=LIST             Comma-separated PIDs
   --user=USER            Filter by user name or numeric uid
   --no-header            Omit the table header
@@ -124,7 +145,15 @@ struct Process {
 }
 
 fn main() {
-    let opts = match parse_args(std::env::args().skip(1)) {
+    let args = match collect_args(std::env::args_os().skip(1)) {
+        Ok(args) => args,
+        Err(argument) => {
+            eprintln!("processes: argument {argument:?} is not valid UTF-8\n\n{USAGE}");
+            std::process::exit(2);
+        }
+    };
+
+    let opts = match parse_args(args.into_iter()) {
         Ok(Some(opts)) => opts,
         Ok(None) => {
             print!("{USAGE}");
@@ -143,6 +172,10 @@ fn main() {
             std::process::exit(1);
         }
     }
+}
+
+fn collect_args(args: impl Iterator<Item = OsString>) -> Result<Vec<String>, OsString> {
+    args.map(OsString::into_string).collect()
 }
 
 fn run(opts: &Options) -> io::Result<()> {
@@ -735,6 +768,13 @@ fn json_string(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::ffi::OsStringExt;
+
+    #[test]
+    fn non_utf8_arguments_are_a_usage_error() {
+        let bad = OsString::from_vec(vec![b'x', 0xff]);
+        assert_eq!(collect_args(std::iter::once(bad.clone())), Err(bad));
+    }
 
     #[test]
     fn stat_is_parsed_without_being_confused_by_spaces_in_comm() {

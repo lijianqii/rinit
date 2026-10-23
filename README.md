@@ -317,12 +317,12 @@ make test           # check + test-system
 make gates          # acceptance gates: binary size + coverage thresholds
 ```
 
-`cargo test --offline --workspace` (what `make check` runs last) executes **741
+`cargo test --offline --workspace` (what `make check` runs last) executes **744
 tests** across eleven test binaries. The five shapes, and why each is not
 redundant:
 
-- **unit tests** next to the code (core 331, rinit 199, rinit-runtime 105,
-  rctl 15, processes 4), including `proptest` properties over the parser;
+- **unit tests** next to the code (core 332, rinit 199, rinit-runtime 105,
+  rctl 15, processes 5), including `proptest` properties over the parser;
 - **integration tests** in `crates/*/tests/`: the syscall layer against the real
   kernel (`rinit-runtime` 22: run unprivileged, they assert that each drop is
   *refused* rather than silently skipped - `EPERM` from `setuid(0)`, `setgroups`,
@@ -403,11 +403,12 @@ they are measured on the tree as it stands rather than copied from one run:
 
 | crate            | line coverage | functions |
 | ---------------- | ------------- | --------- |
-| `rinit-core`     | **97.76%**    | 576/587   |
-| `rinit-runtime`  | 84.77%        | 282/326   |
-| `rinit`          | 91.10%        | 620/666   |
-| `rctl`           | 95.56%        | 32/38     |
-| **total**        | **92.32%**    | 1510/1617 |
+| `rinit-core`     | **97.82%**    | 585/596   |
+| `rinit-runtime`  | 84.71%        | 283/327   |
+| `rinit`          | 88.46%        | 663/743   |
+| `rctl`           | 94.05%        | 40/48     |
+| `processes`      | 25.00%        | 22/80     |
+| **total**        | **88.48%**    | 1593/1794 |
 
 The plan's checklist asks for ≥80% overall and ≥90% in the core, so these are the
 numbers that answer it rather than a shape:
@@ -521,7 +522,7 @@ repository or a measurement in this README:
 | graceful shutdown, no zombies, no fd leak | `make soak` samples descriptors, threads and zombie children through restart churn, and asserts each comes back to its baseline |
 | 72 h soak with stable RSS | **running now**, eighth segment, started 2026-10-22 09:17 with its work directory under `build/` rather than `/tmp`; it runs as a systemd user service with lingering enabled, so closing the SSH session cannot tear it down, and the window ends 2026-10-25 09:17 when the numbers land in this row. The log is `build/soak-charts/soak-72h-seg8.log`. The seventh segment was cut short at 2026-10-22 03:10 after 570 samples (9.5 h), not by an assertion: it had been launched with `setsid nohup`, but still inherited the SSH session's cgroup, and systemd removed that session slice when the connection closed, sending SIGTERM to `make`; its curve and log are kept as `soak-72h-seg7.log` and `soak-seg7.note`. The sixth segment was stopped by hand after 1 h 50 m (109 samples), not by an assertion, once the harness itself was fixed: at `--interval 1` a sample cost ~70 ms, the loop slept a full interval *after* the work, and the default 60 s gate therefore collected 56 of 60 samples and failed its own coverage check (21 before the zombie scan became a single awk pass); the loop now sleeps until the next absolute slot and `make soak` collects 60/60. Earlier segments were all ended by something other than an assertion: **8.92 hours** (535 samples, 18 519 600 restarts) with RSS 5116 → 5116 kB peak per half, descriptors 14 → 14 at their lowest and zero zombies; **44.6 hours** (2587 samples) whose RSS moved between 3892 and 3960 kB in ~16 kB plateaus that went up *and* down - the second-half slope was −1.28 kB/h - with descriptors 13-14 at their lowest in every hour and zero zombies, ended by a host reboot that took the curves with it because the work directory was on tmpfs; and **43 minutes**, stopped by the harness's own free-space floor when something else on the machine filled the shared 978 MB `/tmp` - which is why the run now keeps its ~100 KB work directory on the repository's filesystem instead; and **13.6 hours** (796 samples, 2026-10-20 06:09 → 19:46), ended by the reboot that this time did not take the curve with it, because the work directory had already moved: RSS stepped down twice after boot, hourly means 5068-5087 kB for the first three hours, 4381-4443 kB for the next five and 4202-4252 kB for the last six, with last sample 4296 kB, descriptors 14-28, one thread and zero zombies. Four things changed because of these runs: the descriptor check compares the *lowest* count in each half rather than the peak (a peak is a coin flip once a run is long enough - the 8.92-hour segment's peaks read 25 → 24 while its lows were 14 → 14), rinit rate limits its own console, which is the sink that filled the disk a run died on, and the restart count the harness prints is a rate-limited lower bound - the line it counts is capped at 40 per 5 s per call site, so `churn: N restarts` reads ~8/s while the real churn, measured independently as the host's `fork` rate, is ~545/s; and the sampler sleeps until its next absolute slot, because sleeping a full `interval` after each sample made a 60 s run collect 56 of 60 samples and fail a coverage check it had already met |
 | binaries ≤2 MB dynamic / ≤4 MB static | [Measurements](#measurements-plan-01-calibration-point): 0.88 MiB dynamic arm64 / 0.94 MiB armv7, checked by `make size-check` |
-| unit test coverage ≥80% overall, ≥90% in the core | **92.32%** and **97.76%** (`make coverage-check`, [above](#testing)) |
+| unit test coverage ≥80% overall, ≥90% in the core | **88.48%** and **97.82%** (`make coverage-check`, [above](#testing)) |
 | documentation: architecture, unit format, `rctl`, porting | this README (architecture, status, measurements), [`docs/units.md`](docs/units.md) (every directive, its value syntax and its default), [`docs/porting.md`](docs/porting.md) (kernel, userspace, build, differences from systemd), and `rinit-开发计划.md` |
 
 One number the checklist does not ask for, but plan §0.1's design goals do: rinit's
@@ -1017,6 +1018,13 @@ open. All are noted here so they are not mistaken for drift:
     signals the unit's process *group* and then the pid itself - a daemon
     inherited its group from whatever forked it, so the group signal can address
     a group that no longer exists while the daemon is alive.
+21. **A target only propagates `Requires=` failures; `After=` is ordering, not
+    readiness.** Plan §7.2 literally says a target is ready when its `After=`
+    dependencies are terminal and none failed. rinit follows systemd instead:
+    `Wants=`/`After=` services may fail without failing the target, while a
+    failed `Requires=` does fail it. This is what keeps `multi-user.target`
+    usable on a board with no NIC. The `a_wanted_after_failure_does_not_fail_the_target`
+    regression test pins the distinction.
 
 ## Measurements (plan §0.1 calibration point)
 

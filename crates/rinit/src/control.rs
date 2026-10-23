@@ -127,8 +127,16 @@ impl ControlServer {
             source: e,
         })?;
         // Belt and braces: the umask already produced 0600, and this also
-        // covers a socket left behind with a wider mode.
-        fs::chmod(path.to_str().unwrap_or_default(), 0o600)?;
+        // covers a socket left behind with a wider mode. A non-UTF-8 path is a
+        // caller error, named as such rather than reported as ENOENT on "".
+        let path_str = path.to_str().ok_or_else(|| RuntimeError::Io {
+            op: "control socket path",
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "control socket path is not valid UTF-8",
+            ),
+        })?;
+        fs::chmod(path_str, 0o600)?;
 
         let (sender, receiver) = mpsc::unbounded_channel();
         let task_sender = sender.clone();

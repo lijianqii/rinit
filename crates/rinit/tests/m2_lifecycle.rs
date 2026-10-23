@@ -366,6 +366,46 @@ fn a_runtime_failure_fails_a_requires_target() {
     );
 }
 
+/// A `Wants= + After=` dependency is ordering, not failure propagation. This
+/// is the systemd-compatible choice documented in the README's deviations: a
+/// failed optional service leaves the target `active`.
+#[test]
+fn a_wanted_after_failure_does_not_fail_the_target() {
+    let dir = TempDir::new("target-wants-after-fail");
+    dir.write(
+        "app.service",
+        "[Unit]\n[Service]\nType=simple\n\
+         ExecStart=/bin/sh -c \"sleep 2; exit 1\"\nRestart=no\n",
+    );
+    dir.write(
+        "all.target",
+        "[Unit]\nType=target\nWants=app.service\nAfter=app.service\n",
+    );
+
+    let target = rinit_core::UnitName::parse("all.target").expect("target name");
+    let (log, status) =
+        boot_units_inspect(&dir, "all.target", libc::SIGTERM, &[], |socket, console| {
+            console.wait_for("app.service exited: failed", Duration::from_secs(10));
+            control(
+                socket,
+                rinit_core::Request::Status {
+                    unit: Some(target.clone()),
+                    tail: 0,
+                },
+            )
+            .1
+        });
+
+    assert!(
+        status.contains("state: active"),
+        "a wanted/after failure must not fail the target, got:\n{status}"
+    );
+    assert!(
+        log.contains("boot complete"),
+        "the boot must still complete:\n{log}"
+    );
+}
+
 /// Plan §1.1: `Environment=`, `EnvironmentFile=` and `WorkingDirectory=` must
 /// actually reach the child, with `Environment=` beating the file.
 #[test]

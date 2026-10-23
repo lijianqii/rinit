@@ -2002,10 +2002,6 @@ impl Default for UnitManager {
     }
 }
 
-/// Reap every exited child and feed the results to the manager.
-///
-/// Returns what each exit meant, in reap order. A pid rinit does not own is
-/// skipped: it was reaped by someone else, or already accounted for.
 /// Send `signal` to a unit's process: its process group, or the pid itself.
 ///
 /// Both are needed, and `Type=forking` (plan §7.10) is why: the daemon a forking
@@ -2090,6 +2086,10 @@ fn find_daemon(
     Ok(pid)
 }
 
+/// Reap every exited child and feed the results to the manager.
+///
+/// Returns what each exit meant, in reap order. A pid rinit does not own is
+/// skipped: it was reaped by someone else, or already accounted for.
 pub fn reap_into_manager(manager: &mut UnitManager) -> Vec<Outcome> {
     let mut out = Vec::new();
     for ev in wait::reap_children() {

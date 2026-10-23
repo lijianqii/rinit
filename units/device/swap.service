@@ -1,8 +1,9 @@
 # Activate the swap entries declared in /etc/fstab.
 #
 # The image builder creates /swapfile with mkswap and the fstab line names it;
-# busybox `swapon -a` is the standard consumer of that entry. The kernel must
-# have CONFIG_SWAP (the image's kernel does). A oneshot has no process to stop,
+# busybox `swapon -a` is the standard consumer of that entry; like rinit, it
+# skips entries carrying `noauto`. The kernel must have CONFIG_SWAP (the image's
+# kernel does). A oneshot has no process to stop,
 # so this deliberately has no ExecStop=; the swap file is released when the
 # kernel reboots or powers off.
 [Unit]

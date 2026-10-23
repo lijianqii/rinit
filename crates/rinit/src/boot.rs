@@ -989,31 +989,35 @@ fn describe_unit(manager: &UnitManager, unit: &UnitName) -> Option<String> {
 
 /// Render `rctl list` in its selected format.
 fn render_list(manager: &UnitManager, format: ListFormat) -> String {
-    let entries = manager.list_entries();
     match format {
+        // Plain is the stable compatibility path: it must not pay for the
+        // per-unit resource reads that the richer views need.
         ListFormat::Plain => manager.summary().join("\n"),
-        ListFormat::Short => entries
-            .iter()
-            .map(|entry| {
-                format!(
-                    "{}  {}  pid={}  target={}  mem={}  cpu={}",
-                    entry.name,
-                    entry.state,
-                    entry
-                        .pid
-                        .map_or_else(|| "-".to_string(), |pid| pid.to_string()),
-                    entry.target,
-                    memory_value(entry.memory_bytes),
-                    cpu_value(entry.cpu_usec)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
+        ListFormat::Short => {
+            let entries = manager.list_entries();
+            entries
+                .iter()
+                .map(|entry| {
+                    format!(
+                        "{}  {}  pid={}  target={}  mem={}  cpu={}",
+                        entry.name,
+                        entry.state,
+                        entry
+                            .pid
+                            .map_or_else(|| "-".to_string(), |pid| pid.to_string()),
+                        entry.target,
+                        memory_value(entry.memory_bytes),
+                        cpu_value(entry.cpu_usec)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
         ListFormat::Json => {
-            let rows: Vec<String> = entries.iter().map(list_entry_json).collect();
+            let rows: Vec<String> = manager.list_entries().iter().map(list_entry_json).collect();
             format!("[{}]", rows.join(","))
         }
-        ListFormat::Table => render_list_table(&entries),
+        ListFormat::Table => render_list_table(&manager.list_entries()),
     }
 }
 
