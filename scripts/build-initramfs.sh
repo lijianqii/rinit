@@ -93,8 +93,31 @@ chmod 0755 "${work}"
 # skeleton a login expects to find: `/var/log` for the log mirror and wtmp,
 # `/mnt`, `/home`, `/opt`, `/srv` and `/usr/local` for an operator, and `/var/run`
 # pointing at the `/run` tmpfs rinit mounts over the image's own directory.
-install -d "${work}"/{sbin,bin,etc/rinit/units,etc/udhcpc,proc,sys,dev,run,usr/local/bin,usr/local/sbin}
+install -d "${work}"/{sbin,bin,lib,etc/rinit/units,etc/udhcpc,proc,sys,dev,run,usr/bin,usr/local/bin,usr/local/sbin}
 install -d "${work}"/{var/log/rinit,var/spool,var/lib/seedrng,mnt,media,home,opt,srv}
+
+# rinit, rctl and processes are dynamically linked. The loader and runtime
+# libraries live in the image, not in a host rootfs, so copy the exact toolchain
+# ones. BusyBox and Dropbear remain static.
+case "${triple}" in
+    aarch64-*)
+        runtime_lib_dir="/usr/aarch64-linux-gnu/lib"
+        runtime_libs=(ld-linux-aarch64.so.1 libc.so.6 libgcc_s.so.1)
+        ;;
+    armv7-*)
+        runtime_lib_dir="/usr/arm-linux-gnueabihf/lib"
+        runtime_libs=(ld-linux-armhf.so.3 libc.so.6 libgcc_s.so.1)
+        ;;
+    *)
+        runtime_lib_dir=""
+        runtime_libs=()
+        ;;
+esac
+if [[ -n "${runtime_lib_dir}" ]]; then
+    for lib in "${runtime_libs[@]}"; do
+        install -m 0755 "${runtime_lib_dir}/${lib}" "${work}/lib/${lib}"
+    done
+fi
 install -d -m 0700 "${work}/root"
 install -d -m 1777 "${work}/tmp" "${work}/var/tmp"
 ln -s ../run "${work}/var/run"
@@ -106,6 +129,11 @@ install -m 0755 "${bin_dir}/rinit" "${work}/sbin/rinit"
 # socket rinit creates at boot (plan §1.3(10)), which is why the two ship
 # together.
 install -m 0755 "${bin_dir}/rctl" "${work}/bin/rctl"
+# `processes` is available for the target images. The host-only x86_64 build
+# path may not have it, so keep that path working.
+if [[ -x "${bin_dir}/processes" ]]; then
+    install -m 0755 "${bin_dir}/processes" "${work}/usr/bin/processes"
+fi
 
 # Plan §1.3(9)'s second wave: the mount table rinit reads after the first wave.
 # It ships in the image because the second wave runs at *boot* - a table written
@@ -158,6 +186,8 @@ Units live in /etc/rinit/units; this image carries the boot set only.
   rctl list                  known units
   rctl status getty.service  one unit in detail
   rctl log getty.service     its buffered output
+  processes                  process table (RSS, CPU, command)
+  processes --tree           parent/child process tree
   poweroff -f                stop the guest
 
 The acceptance image (make test-system) adds units/demo/.

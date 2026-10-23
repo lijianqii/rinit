@@ -1,0 +1,16 @@
+[package]
+name = "processes"
+description = "processes - /proc process viewer for rinit systems"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "processes"
+path = "src/main.rs"
+
+[dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"

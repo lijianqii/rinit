@@ -1,18 +1,10 @@
 //! Name-to-id lookup from `/etc/passwd` and `/etc/group` (plan §1.3(12), used
 //! again by the privilege drop in §7.4).
 //!
-//! rinit is built with `crt-static` (`.cargo/config.toml`), and a *static*
-//! glibc `getpwnam` still needs the NSS `libnss_files.so` at run time: it is
-//! `dlopen`ed, and a 2 MB initramfs does not carry it. The linker says as much
-//! on every aarch64 build:
-//!
-//! ```text
-//! warning: Using 'getpwnam' in statically linked applications requires at
-//! runtime the shared libraries from the glibc version used for linking
-//! ```
-//!
-//! So the two lookups `User=`/`Group=` need are parsed here instead, from the
-//! same files `login` already reads. Being pure, this is also the part that can
+//! The image carries dynamic glibc for `rinit`/`rctl`/`processes`, but it does
+//! not carry the NSS `libnss_files.so` module. A glibc `getpwnam` would need
+//! that module at run time, so the two lookups `User=`/`Group=` need are parsed
+//! here instead, from the same files `login` already reads. Being pure, this is also the part that can
 //! be tested without a system user database - the "files" backend of every
 //! NSS configuration, reduced to what an initramfs actually ships.
 

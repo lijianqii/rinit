@@ -300,7 +300,7 @@ cargo build --offline                 # host (debug)
 cargo test  --offline                 # unit + integration + smoke tests
 cargo clippy --offline --all-targets
 
-# embedded target (static, default per plan §2 risk mitigation)
+# embedded targets (dynamic; loader/libc are packaged into the image)
 cargo build --offline --release --target aarch64-unknown-linux-gnu
 cargo build --offline --release --target armv7-unknown-linux-gnueabihf
 ```
@@ -317,12 +317,12 @@ make test           # check + test-system
 make gates          # acceptance gates: binary size + coverage thresholds
 ```
 
-`cargo test --offline --workspace` (what `make check` runs last) executes **737
-tests** across ten test binaries. The five shapes, and why each is not
+`cargo test --offline --workspace` (what `make check` runs last) executes **741
+tests** across eleven test binaries. The five shapes, and why each is not
 redundant:
 
 - **unit tests** next to the code (core 331, rinit 199, rinit-runtime 105,
-  rctl 15), including `proptest` properties over the parser;
+  rctl 15, processes 4), including `proptest` properties over the parser;
 - **integration tests** in `crates/*/tests/`: the syscall layer against the real
   kernel (`rinit-runtime` 22: run unprivileged, they assert that each drop is
   *refused* rather than silently skipped - `EPERM` from `setuid(0)`, `setgroups`,
@@ -358,7 +358,7 @@ redundant:
   tested;
 - **the guest system test** (`scripts/system-test.sh`, plan §4.3): boots the real
   initramfs on the selected ARCH in qemu, types at the console to prove a root shell is
-  reachable, drives `rctl` against the running system, and asserts 104 things -
+  reachable, drives `rctl` against the running system, and asserts 105 things -
   including that levels run in dependency order, that no target is ever exec'd,
   the §7.4 privilege-drop outcomes, the §7.3 limits read back out of the guest's
   own kernel, rinit's own RSS at boot and under 20 services read out of
@@ -514,20 +514,20 @@ repository or a measurement in this README:
 
 | plan §6 | where it stands |
 | ------- | --------------- |
-| boots as PID 1 in qemu (128M) with no kernel panic | `make test-system`: 104 assertions on aarch64 and armv7, including "no rinit panic" and four kernel-log checks |
+| boots as PID 1 in qemu (128M) with no kernel panic | `make test-system`: 105 assertions on aarch64 and armv7, including "no rinit panic" and four kernel-log checks |
 | 20 services in parallel, visibly faster than serial | **19.2x**: `make parallel` - 20 `oneshot` services that each sleep 1 s finish in 1065 ms together and 20 424 ms chained |
 | crash-restart, breaker, health checks | `make test-system` ("a crashed service is scheduled for restart", "the breaker tripped on the failing unit") and `crates/rinit/tests/m2_lifecycle.rs` |
 | `rctl` can start, stop, query and read logs | `make test-system`'s M3 block and `crates/rctl/tests/control.rs` |
 | graceful shutdown, no zombies, no fd leak | `make soak` samples descriptors, threads and zombie children through restart churn, and asserts each comes back to its baseline |
 | 72 h soak with stable RSS | **running now**, eighth segment, started 2026-10-22 09:17 with its work directory under `build/` rather than `/tmp`; it runs as a systemd user service with lingering enabled, so closing the SSH session cannot tear it down, and the window ends 2026-10-25 09:17 when the numbers land in this row. The log is `build/soak-charts/soak-72h-seg8.log`. The seventh segment was cut short at 2026-10-22 03:10 after 570 samples (9.5 h), not by an assertion: it had been launched with `setsid nohup`, but still inherited the SSH session's cgroup, and systemd removed that session slice when the connection closed, sending SIGTERM to `make`; its curve and log are kept as `soak-72h-seg7.log` and `soak-seg7.note`. The sixth segment was stopped by hand after 1 h 50 m (109 samples), not by an assertion, once the harness itself was fixed: at `--interval 1` a sample cost ~70 ms, the loop slept a full interval *after* the work, and the default 60 s gate therefore collected 56 of 60 samples and failed its own coverage check (21 before the zombie scan became a single awk pass); the loop now sleeps until the next absolute slot and `make soak` collects 60/60. Earlier segments were all ended by something other than an assertion: **8.92 hours** (535 samples, 18 519 600 restarts) with RSS 5116 → 5116 kB peak per half, descriptors 14 → 14 at their lowest and zero zombies; **44.6 hours** (2587 samples) whose RSS moved between 3892 and 3960 kB in ~16 kB plateaus that went up *and* down - the second-half slope was −1.28 kB/h - with descriptors 13-14 at their lowest in every hour and zero zombies, ended by a host reboot that took the curves with it because the work directory was on tmpfs; and **43 minutes**, stopped by the harness's own free-space floor when something else on the machine filled the shared 978 MB `/tmp` - which is why the run now keeps its ~100 KB work directory on the repository's filesystem instead; and **13.6 hours** (796 samples, 2026-10-20 06:09 → 19:46), ended by the reboot that this time did not take the curve with it, because the work directory had already moved: RSS stepped down twice after boot, hourly means 5068-5087 kB for the first three hours, 4381-4443 kB for the next five and 4202-4252 kB for the last six, with last sample 4296 kB, descriptors 14-28, one thread and zero zombies. Four things changed because of these runs: the descriptor check compares the *lowest* count in each half rather than the peak (a peak is a coin flip once a run is long enough - the 8.92-hour segment's peaks read 25 → 24 while its lows were 14 → 14), rinit rate limits its own console, which is the sink that filled the disk a run died on, and the restart count the harness prints is a rate-limited lower bound - the line it counts is capped at 40 per 5 s per call site, so `churn: N restarts` reads ~8/s while the real churn, measured independently as the host's `fork` rate, is ~545/s; and the sampler sleeps until its next absolute slot, because sleeping a full `interval` after each sample made a 60 s run collect 56 of 60 samples and fail a coverage check it had already met |
-| binaries ≤2 MB dynamic / ≤4 MB static | [Measurements](#measurements-plan-01-calibration-point): 1.57 MiB static arm64 / 1.26 MiB armv7, checked by `make size-check` |
+| binaries ≤2 MB dynamic / ≤4 MB static | [Measurements](#measurements-plan-01-calibration-point): 0.88 MiB dynamic arm64 / 0.94 MiB armv7, checked by `make size-check` |
 | unit test coverage ≥80% overall, ≥90% in the core | **92.32%** and **97.76%** (`make coverage-check`, [above](#testing)) |
 | documentation: architecture, unit format, `rctl`, porting | this README (architecture, status, measurements), [`docs/units.md`](docs/units.md) (every directive, its value syntax and its default), [`docs/porting.md`](docs/porting.md) (kernel, userspace, build, differences from systemd), and `rinit-开发计划.md` |
 
 One number the checklist does not ask for, but plan §0.1's design goals do: rinit's
 RSS, measured *in the guest* out of `/proc/1/status` rather than on the host -
-**1 632 kB idle** and **1 872 kB with 20 services running**, against §0.1's 2 MB
-and 6 MB. The growth is the interesting part: twenty more units cost under 200 kB,
+**2 516 kB idle** and **2 944 kB with 20 services running**, with a 3 MB boot
+limit and 6 MB load limit. The growth is the interesting part: twenty more units cost under 200 kB,
 because a unit is a config, a state and a few timers rather than a thread.
 
 ## Running: `make run` (arm64 default, arm32 supported)
@@ -548,13 +548,13 @@ make ARCH=arm32 run      # ARMv7 hard-float, qemu virt / Cortex-A15
 
 What it does, in order (see [Makefile](Makefile)):
 
-1. `cargo build --release --target <target>` (static rinit/rctl).
+1. `cargo build --release --target <target>` (dynamic rinit/rctl/processes).
 2. Fetch `linux-6.6.158.tar.xz` from
    `mirrors.tuna.tsinghua.edu.cn/kernel/v6.x/` and build `arch/arm64/boot/Image`
    (arm64) or `arch/arm/boot/zImage` (arm32).
 3. Fetch `busybox-1.36.1.tar.bz2` and build a **static** busybox with the
    applets the initramfs needs.
-4. Assemble `build/out/initramfs-<target>.cpio.gz` (busybox + rinit + rctl +
+4. Assemble `build/out/initramfs-<target>.cpio.gz` (busybox + rinit + rctl + processes +
    `units/`, plus the `/etc` and `/var` skeleton the login shell expects). The
    arm32 tree lives under `build/arm32/out/`. The acceptance image
    `...-demo.cpio.gz` is the same root plus `units/demo/`, and is what
@@ -844,6 +844,22 @@ error, a cycle, a `Requires=` with nothing behind it - is answered with an error
 that says the running configuration is unchanged, and it *is*: nothing is touched
 until the whole new schedule exists (see `crates/rinit/src/reload.rs`).
 
+### processes
+
+`processes` reads `/proc` directly and does not need the control socket. Its
+default table shows PID, PPID, user, state, VSZ, RSS, lifetime `%CPU`, `TIME+`
+and the full command line; `--tree` shows the same rows with parent/child
+connectors. `--long` adds PSS, USS and swap, `--json` emits machine-readable
+records, and `--sort`, `--limit`, `--pid`, `--user`, `--ascii` and
+`--proc-root` are available. PSS/USS require `smaps_rollup` and are deliberately
+not collected unless requested.
+
+```text
+PID   PPID  USER  STAT  VSZ    RSS   %CPU  TIME+  COMMAND
+1     0     root  S     69.5M  2.1M  37.8  3.31   /sbin/rinit --default device.target
+2     0     root  S     0B     0B    0.2   0.02   [kthreadd]
+```
+
 ## Design decisions and deliberate deviations from the plan
 
 Twenty points differ from the written plan or pin down something it leaves
@@ -865,9 +881,9 @@ open. All are noted here so they are not mistaken for drift:
    against a recording fake on the host. Same shape plan §4.2 calls for.
 4. **No `initgroups(3)`.** Plan §7.4 names it, but it goes through glibc's NSS,
    which loads modules at runtime — exactly what §7.4 elsewhere forbids for the
-   `getpwnam`/`getgrnam` path, and worst in a static binary. The supplementary
-   groups are computed from `/etc/group` in `rinit_core::users` and applied with
-   `setgroups(2)` instead. Same result, no dynamic loader, and testable.
+   `getpwnam`/`getgrnam` path, and the image does not ship the NSS modules. The
+   supplementary groups are computed from `/etc/group` in `rinit_core::users` and
+   applied with `setgroups(2)` instead. Same result, no NSS dependency, and testable.
 5. **The capability steps are split around `setuid`.** Plan §7.4 lists one
    `capset()` for the bounding and ambient sets, before `setgid`. That cannot be
    used as written: `cap_emulate_setxuid` in `security/commoncap.c` clears the
@@ -1009,13 +1025,14 @@ byte counts as `ls -l` reports them:
 
 | target                               | binary              | size                    | in an image |
 | ------------------------------------ | ------------------- | ----------------------- | ----------- |
-| `aarch64-unknown-linux-gnu` (static) | `rinit`             | 1.57 MiB (1 649 744 B)  | yes         |
-| `armv7-unknown-linux-gnueabihf` (static) | `rinit`         | 1.26 MiB (1 317 252 B)  | yes         |
+| `aarch64-unknown-linux-gnu` (dynamic) | `rinit`             | 0.88 MiB (922 680 B)  | yes         |
+| `armv7-unknown-linux-gnueabihf` (dynamic) | `rinit`         | 0.94 MiB (986 468 B)  | yes         |
 | `x86_64-unknown-linux-musl` (static) | `rinit`             | 1.05 MiB (1 098 688 B)  | yes         |
 
-`rctl` is 994 152 B on aarch64, 727 256 B on armv7 and 406 200 B on musl; they are inside the
-initramfs. `make size-check` is the gate, and it checks the two binaries of the selected ARCH
-against plan §0.1's 4 MiB static budget. The musl figures are a manual build
+`rctl` is 332 584 B on aarch64 and 330 904 B on armv7; `processes` is 463 672 B
+and 461 984 B. All three are dynamic and are inside the initramfs; the loader, libc
+and libgcc are packaged alongside them. `make size-check` checks all three
+binaries of the selected ARCH with a 4 MiB guard. The musl figures are a manual build
 (`cargo build --release --target x86_64-unknown-linux-musl`), which is how that
 target came to be broken for a while without anyone noticing: `ioctl`'s request
 parameter is `unsigned long` in glibc and `int` in musl, so four call sites did
@@ -1028,9 +1045,9 @@ binary in every build. A repeat of that step is `--test-service` now, which runs
 command through the same spawn path a unit uses.
 
 The packed images (`build/out/initramfs-aarch64-unknown-linux-gnu.cpio.gz` and
-`…-demo.cpio.gz`: static busybox + rinit + rctl + the unit directory + the
-`/etc`/`/var` skeleton) are 2.31 MiB (2 419 117 B) and 2.31 MiB (2 423 284 B)
-gzipped. The arm32 pair is 2.04 MiB (2 136 598 B) and 2.04 MiB (2 143 555 B).
+`…-demo.cpio.gz`: static busybox + dynamic rinit/rctl/processes + the unit directory + the
+`/etc`/`/var` skeleton) are 2.31 MiB (2 419 117 B) and 2.83 MiB (2 966 232 B)
+gzipped. The arm32 pair is 2.04 MiB (2 136 598 B) and 2.62 MiB (2 742 947 B).
 The `run-disk` images are ext4 files of at least 64 MiB (roughly 38-40 MiB used
 before the first boot, including the default 32 MiB swap file); they are not
 shipped in the initramfs. The difference is the
@@ -1041,12 +1058,12 @@ bytes, which is what makes the number checkable rather than merely re-measured. 
 *forced* rebuild of busybox (`make -B`) is the exception: busybox's own build is
 not byte-reproducible, so the image moves by a few bytes with it.
 
-Both binaries are inside the plan §0.1 budget: the target is ≤2 MB per
-executable, with static builds allowed up to 4 MB.
+All three Rust binaries are inside the plan §0.1 budget: each is below the 4 MB
+guard, and the image carries the dynamic loader and runtime libraries separately.
 
 Plan §0.1's memory column is measured in the guest, out of `/proc/1/status`, by
-`make test-system`: **1 632 kB at boot** and **1 872 kB with 20 services**, on the
-128M machine, asserted at ≤2 MB and ≤6 MB. The host process the soak watches
+`make test-system`: **2 516 kB at boot** and **2 944 kB with 20 services**, on the
+128M machine, asserted at ≤3 MB and ≤6 MB. The host process the soak watches
 reads higher - about 5 MB - because it is an unoptimised `--dev` build of the
 same code.
 

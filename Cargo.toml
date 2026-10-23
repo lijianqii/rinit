@@ -5,12 +5,14 @@ members = [
     "crates/rinit-runtime",
     "crates/rinit",
     "crates/rctl",
+    "crates/processes",
 ]
 default-members = [
     "crates/rinit-core",
     "crates/rinit-runtime",
     "crates/rinit",
     "crates/rctl",
+    "crates/processes",
 ]
 
 [workspace.package]

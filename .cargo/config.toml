@@ -1,21 +1,16 @@
 # Cross-compilation config (plan §2 / §4.3).
 #
-# M0 builds rinit statically linked by default: PID 1 runs before the real
-# rootfs is available, so a dynamic glibc dependency (ld-linux + libc.so.6 with
-# a matching version) is a boot-hang risk. See plan §2 "risk mitigation".
+# rinit, rctl and processes are dynamically linked. The image builder copies the
+# matching loader, libc and libgcc into the initramfs/rootfs, so PID 1 can still
+# run before the real rootfs is mounted. BusyBox and Dropbear stay static.
 
 [target.aarch64-unknown-linux-gnu]
 linker = "aarch64-linux-gnu-gcc"
-rustflags = ["-C", "target-feature=+crt-static"]
 
-# ARMv7 hard-float, the 32-bit target the arm32 build selects. The same
-# static-link rule as the 64-bit target: the initramfs has no ld.so/libc.
+# ARMv7 hard-float, the 32-bit target the arm32 build selects. The loader and
+# runtime libraries are packaged by scripts/build-initramfs.sh.
 [target.armv7-unknown-linux-gnueabihf]
 linker = "arm-linux-gnueabihf-gcc"
-# The Debian armhf toolchain has no `rcrt1.o`, so its static-PIE link fails;
-# this target uses a plain static (non-PIE) link instead. The initramfs only
-# needs "no ld.so and no libc.so dependency", which both forms provide.
-rustflags = ["-C", "target-feature=+crt-static", "-C", "relocation-model=static"]
 
 # Host/qemu-x86_64 verification build (plan §4.2): use the musl target, which
 # is statically linked by default, so the same initramfs approach works without

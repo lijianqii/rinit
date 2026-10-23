@@ -9,6 +9,7 @@
 #   make disk-image    force a destructive rebuild of that ext4 image
 #   make kernel      build the Linux kernel Image/zImage only
 #   make busybox     build busybox only
+#   make processes   build the /proc process viewer only
 #   make initramfs   build rinit and assemble the initramfs
 #   make initramfs-demo  the same image plus units/demo/ (what `make test-system` boots)
 #   make qemu        alias for `make run`
@@ -115,26 +116,29 @@ MAKE_KERNEL      := $(MAKE) -C $(KERNEL_SRC) ARCH=$(KERNEL_ARCH) CROSS_COMPILE=$
 MAKE_BUSYBOX     := $(MAKE) -C $(BUSYBOX_SRC) ARCH=$(BUSYBOX_ARCH) CROSS_COMPILE=$(CROSS_COMPILE)
 
 .DEFAULT_GOAL    := run
-.PHONY: run run-disk kernel kernel-config-check busybox dropbear rinit \
+.PHONY: run run-disk kernel kernel-config-check busybox dropbear rinit processes \
         initramfs initramfs-demo disk-image qemu help clean distclean check \
         test test-system soak parallel gates size-check coverage-check
 
 help:
 	@sed -n '2,/^# ====/p' $(MAKEFILE_LIST) | sed '$$d' | sed 's/^# \{0,1\}//'
 
-# --- rinit (static target binaries) ---------------------------------------
+# --- rinit (dynamic target binaries) --------------------------------------
 RINIT_BIN        := target/$(TARGET)/release/rinit
 RCTL_BIN         := target/$(TARGET)/release/rctl
+PROCESSES_BIN    := target/$(TARGET)/release/processes
 RINIT_SRCS       := $(shell find crates -name '*.rs' 2>/dev/null) Cargo.toml Cargo.lock
 
-rinit: $(RINIT_BIN)
+rinit: $(RINIT_BIN) $(RCTL_BIN) $(PROCESSES_BIN)
+processes: $(PROCESSES_BIN)
 
-# Grouped target: one cargo invocation builds both binaries. Nothing happens
-# when they already exist and are newer than the sources.
-$(RINIT_BIN) $(RCTL_BIN) &: $(RINIT_SRCS)
+# Grouped target: one cargo invocation builds all three binaries. Nothing
+# happens when they already exist and are newer than the sources.
+$(RINIT_BIN) $(RCTL_BIN) $(PROCESSES_BIN) &: $(RINIT_SRCS)
 	cargo build --release --target $(TARGET)
 	@test -x $(RINIT_BIN) || { echo "rinit build failed"; exit 1; }
 	@test -x $(RCTL_BIN) || { echo "rctl build failed"; exit 1; }
+	@test -x $(PROCESSES_BIN) || { echo "processes build failed"; exit 1; }
 
 # --- Linux kernel ---------------------------------------------------------
 $(KERNEL_TARBALL):
@@ -238,12 +242,13 @@ INITRAMFS_SCRIPTS := $(SCRIPTS)/build-initramfs.sh $(SCRIPTS)/mkinitramfs.sh
 # packed only into the one the system test boots. `make run` is the development
 # loop - boot, get a console, look at a service - and fourteen units that exist
 # to be started one at a time from the console are not part of that.
-$(INITRAMFS): $(RINIT_BIN) $(RCTL_BIN) $(BUSYBOX_BIN) $(BOOT_UNIT_FILES) $(FSTAB) \
-              $(MDEV_CONF) $(INITRAMFS_SCRIPTS)
+$(INITRAMFS): $(RINIT_BIN) $(RCTL_BIN) $(PROCESSES_BIN) $(BUSYBOX_BIN) \
+              $(BOOT_UNIT_FILES) $(FSTAB) $(MDEV_CONF) $(INITRAMFS_SCRIPTS)
 	$(SCRIPTS)/build-initramfs.sh $(TARGET) --busybox-src $(BUSYBOX_SRC) --out $@
 
-$(INITRAMFS_DEMO): $(RINIT_BIN) $(RCTL_BIN) $(BUSYBOX_BIN) $(BOOT_UNIT_FILES) \
-                   $(DEMO_UNIT_FILES) $(FSTAB) $(MDEV_CONF) $(INITRAMFS_SCRIPTS)
+$(INITRAMFS_DEMO): $(RINIT_BIN) $(RCTL_BIN) $(PROCESSES_BIN) $(BUSYBOX_BIN) \
+                   $(BOOT_UNIT_FILES) $(DEMO_UNIT_FILES) $(FSTAB) $(MDEV_CONF) \
+                   $(INITRAMFS_SCRIPTS)
 	$(SCRIPTS)/build-initramfs.sh $(TARGET) --busybox-src $(BUSYBOX_SRC) --demo-units --out $@
 
 # The guest boots units/, so nothing is put on the kernel cmdline: any token
@@ -313,12 +318,13 @@ soak:
 # release, or the acceptance pass, runs.
 #
 # Plan §0.1's size budget: <=2 MB for a dynamic binary, <=4 MB for a static one.
-# Both shipped binaries are static and are what the initramfs
-# packs (`scripts/build-initramfs.sh`).
+# The Rust tools packed by the initramfs are dynamic; the image also carries
+# their loader/libc. Keep a 4 MB guard here so the check catches a regression
+# without depending on which link mode a developer used.
 SIZE_BUDGET_STATIC := 4194304
 
 size-check: rinit
-	@fail=0; for b in $(RINIT_BIN) $(RCTL_BIN); do \
+	@fail=0; for b in $(RINIT_BIN) $(RCTL_BIN) $(PROCESSES_BIN); do \
 	    size=$$(stat -c%s "$$b"); \
 	    printf 'size-check: %-46s %8d bytes (budget %d)\n' "$$b" "$$size" $(SIZE_BUDGET_STATIC); \
 	    if [ "$$size" -gt $(SIZE_BUDGET_STATIC) ]; then \

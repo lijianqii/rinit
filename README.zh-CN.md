@@ -14,7 +14,7 @@
 soak，它是部署期跑一次 `make soak`，而不是一个功能。
 
 下面列出现有的能力，以及各自的证据。每一条结论要么来自宿主测试（`make check`），
-要么来自客户机断言（`make test-system`，`scripts/system-test.sh` 里共 104 条）；
+要么来自客户机断言（`make test-system`，`scripts/system-test.sh` 里共 105 条）；
 "在宿主机上验证"始终指同一段代码的 fake-runtime 或 `--dev` 形态，"客户机"指真实形态。
 
 | 里程碑 | 内容 | 证据 |
@@ -273,7 +273,7 @@ cargo build --offline                 # host (debug)
 cargo test  --offline                 # unit + integration + smoke tests
 cargo clippy --offline --all-targets
 
-# embedded targets (static, default per plan §2 risk mitigation)
+# embedded targets（动态链接；loader/libc 打包进镜像）
 cargo build --offline --release --target aarch64-unknown-linux-gnu
 cargo build --offline --release --target armv7-unknown-linux-gnueabihf
 ```
@@ -290,10 +290,10 @@ make test           # check + test-system
 make gates          # acceptance gates: binary size + coverage thresholds
 ```
 
-`cargo test --offline --workspace`（`make check` 最后一步跑的就是它）在十个测试
-二进制里执行 **737 个测试**。五种形态，以及为什么每种都不是多余的：
+`cargo test --offline --workspace`（`make check` 最后一步跑的就是它）在十一个测试
+二进制里执行 **741 个测试**。五种形态，以及为什么每种都不是多余的：
 
-- **单元测试**紧挨着代码（core 331、rinit 199、rinit-runtime 105、rctl 15），
+- **单元测试**紧挨着代码（core 331、rinit 199、rinit-runtime 105、rctl 15、processes 4），
   包括解析器上的 `proptest` 属性测试；
 - **集成测试**在 `crates/*/tests/`：系统调用层面对真实内核（`rinit-runtime` 22 个：
   以非特权身份运行，断言每次降权都*被拒绝*而不是被静默跳过——`setuid(0)`、
@@ -321,7 +321,7 @@ make gates          # acceptance gates: binary size + coverage thresholds
   这样门禁自己的算术也能被测；
 - **客户机系统测试**（`scripts/system-test.sh`，计划 §4.3）：在所选架构的 qemu 上启动
   真实的 initramfs，在控制台上输入以证明 root shell 可达，对运行中的系统驱动
-  `rctl`，并断言 104 件事——包括层级按依赖顺序运行、target 从不被 exec、§7.4 的
+  `rctl`，并断言 105 件事——包括层级按依赖顺序运行、target 从不被 exec、§7.4 的
   降权结果、§7.3 的限额从客户机自己的内核里读回、rinit 自己在启动时和 20 个服务下的
   RSS（从 `/proc/1/status` 读）、§4.3 的启动耗时（取自内核时钟）、qemu 真实挂载的
   设备上的 §7.5 看门狗、DHCP 客户端拿到的地址/路由/DNS、针对客户机自己的（可写的
@@ -435,19 +435,19 @@ cargo llvm-cov --offline --workspace --html                  # target/llvm-cov/h
 
 | 计划 §6 | 现状 |
 | ------- | --------------- |
-| 在 qemu（128M）里作为 PID 1 启动，内核无 panic | `make test-system`：aarch64 与 armv7 各 104 条断言，包括 "no rinit panic" 和四条内核日志检查 |
+| 在 qemu（128M）里作为 PID 1 启动，内核无 panic | `make test-system`：aarch64 与 armv7 各 105 条断言，包括 "no rinit panic" 和四条内核日志检查 |
 | 20 个服务并行，明显快于串行 | **19.2x**：`make parallel`——20 个各睡 1 s 的 `oneshot` 服务，并行总耗时 1065 ms，串行 20 424 ms |
 | 崩溃重启、熔断、健康检查 | `make test-system`（"a crashed service is scheduled for restart"、"the breaker tripped on the failing unit"）和 `crates/rinit/tests/m2_lifecycle.rs` |
 | `rctl` 能启动、停止、查询、读日志 | `make test-system` 的 M3 段和 `crates/rctl/tests/control.rs` |
 | 优雅关闭、无僵尸、无 fd 泄漏 | `make soak` 在重启 churn 中采样描述符、线程和僵尸子进程，并断言各自回到基线 |
 | 72 小时 soak，RSS 稳定 | **正在运行**，第八段，2026-10-22 09:17 启动，工作目录放在 `build/` 而不是 `/tmp`；这次由启用了 linger 的 systemd 用户服务托管，关闭 SSH 会话不会把它杀掉，窗口在 2026-10-25 09:17 结束，届时数字写进本行。日志是 `build/soak-charts/soak-72h-seg8.log`。第七段在 2026-10-22 03:10 被提前终止，共 570 个采样（9.5 小时），不是断言失败：它虽然用 `setsid nohup` 启动，但仍继承了 SSH 会话的 cgroup，连接关闭时 systemd 清理 session slice，向 `make` 发出了 SIGTERM；曲线和日志保留为 `soak-72h-seg7.log` 与 `soak-seg7.note`。第六段在 1 小时 50 分（109 个采样）后由人工停止，而不是被断言终止：在 `--interval 1` 下每个采样约 70 ms，循环在采样后又完整睡一个 interval，于是默认 60 秒门禁只采到 60 个槽位中的 56 个，失败于它自己的采样覆盖检查（在僵尸扫描合并为单次 awk 之前只有 21 个）；现在循环睡到下一个绝对槽位，`make soak` 能采满 60/60。此前的每一段都不是被断言结束的：**8.92 小时**（535 个采样、18 519 600 次重启），前后半段 RSS 峰值均为 5116 kB，描述符最低值 14 → 14，僵尸 0；**44.6 小时**（2587 个采样），RSS 在 3892 到 3960 kB 之间以约 16 kB 的台阶上下移动——后半段斜率 −1.28 kB/h——每小时描述符最低值都在 13-14，僵尸 0，被一次主机重启终止，曲线也随 tmpfs 上的工作目录一起丢失；**43 分钟**，被 harness 自己的剩余空间地板终止，原因是机器上别的进程填满了共享的 978 MB `/tmp`——这也是现在把约 100 KB 的工作目录放在仓库文件系统上的原因；以及 **13.6 小时**（796 个采样，2026-10-20 06:09 → 19:46），被重启终止，但这次曲线没有丢，因为工作目录已经搬走：RSS 在启动后两次下台阶，逐小时均值前 3 小时为 5068-5087 kB，随后 5 小时为 4381-4443 kB，最后 6 小时为 4202-4252 kB，最后一个采样 4296 kB，描述符 14-28，线程 1，僵尸 0。这些运行带来了四处改动：描述符检查改为比较每一半的*最低*值而不是峰值（运行足够久之后峰值就是掷硬币——8.92 小时那一段峰值读到 25 → 24，而最低值是 14 → 14）；rinit 对自己的控制台限流，而控制台正是磁盘被写满那次的出口；harness 打印的重启次数是限流后的下界——它统计的那行被限制为每个调用点每 5 秒 40 条，所以 `churn: N restarts` 读出来约 8/s，而真实 churn 用宿主 `/proc/stat` 的 fork 速率独立测得约 545/s；以及采样器改为睡到下一个绝对槽位——原来每次采样后再睡满一个 `interval`，使一次 60 秒运行只采到 60 个样本中的 56 个，失败于一个它本来已经满足的覆盖检查 |
-| 二进制 ≤2 MB 动态 / ≤4 MB 静态 | [测量](#测量计划-01-校准点)：aarch64 静态 1.57 MiB、armv7 静态 1.26 MiB，由 `make size-check` 检查 |
+| 二进制 ≤2 MB 动态 / ≤4 MB 静态 | [测量](#测量计划-01-校准点)：aarch64 动态 0.88 MiB、armv7 动态 0.94 MiB，由 `make size-check` 检查 |
 | 单元测试覆盖率总体 ≥80%、核心 ≥90% | **92.32%** 和 **97.76%**（`make coverage-check`，见[上文](#测试)） |
 | 文档：架构、单元格式、`rctl`、移植 | 本 README（架构、状态、测量）、[`docs/units.md`](docs/units.md)（每条指令、取值语法和默认值）、[`docs/porting.md`](docs/porting.md)（内核、用户空间、构建、与 systemd 的差异），以及 `rinit-开发计划.md` |
 
 还有一个清单没要求、但计划 §0.1 的设计目标要求的数字：rinit 的 RSS，在*客户机里*从
-`/proc/1/status` 测得，而不是在宿主机上——空闲 **1 632 kB**，跑 20 个服务时
-**1 872 kB**，对应 §0.1 的 2 MB 和 6 MB。有意思的是增量：多二十个单元只多花不到
+`/proc/1/status` 测得，而不是在宿主机上——空闲 **2 516 kB**，跑 20 个服务时
+**2 944 kB**，断言阈值为 3 MB 和 6 MB。有意思的是增量：多二十个单元只多花不到
 200 kB，因为一个单元是一份配置、一个状态和几个定时器，而不是一个线程。
 
 ## 运行：`make run`（arm64 默认，arm32 也支持）
@@ -467,12 +467,12 @@ make ARCH=arm32 run      # ARMv7 hard-float, qemu virt / Cortex-A15
 
 它按顺序做这些事（见 [Makefile](Makefile)）：
 
-1. 按 ARCH 构建静态 rinit/rctl（arm64 为 `aarch64-unknown-linux-gnu`，arm32 为 `armv7-unknown-linux-gnueabihf`）。
+1. 按 ARCH 构建动态 rinit/rctl/processes（arm64 为 `aarch64-unknown-linux-gnu`，arm32 为 `armv7-unknown-linux-gnueabihf`）。
 2. 从 `mirrors.tuna.tsinghua.edu.cn/kernel/v6.x/` 取 `linux-6.6.158.tar.xz`，
    构建 `arch/arm64/boot/Image`（arm64）或 `arch/arm/boot/zImage`（arm32）。
 3. 取 `busybox-1.36.1.tar.bz2`，用 initramfs 需要的 applet 构建一个**静态** busybox。
 4. 组装 `build/out/initramfs-<target>.cpio.gz`（arm32 在 `build/arm32/out/`；
-   busybox + rinit + rctl + `units/`，再加上登录 shell 需要的 `/etc` 与
+   busybox + rinit + rctl + processes + `units/`，再加上登录 shell 需要的 `/etc` 与
    `/var` 骨架）。验收镜像 `...-demo.cpio.gz` 是同一套根，再加 `units/demo/`，
    也是 `make test-system` 启动的那个。
 5. 用 `qemu-system-aarch64 -machine virt -cpu cortex-a57 -m 128M`（arm64）或
@@ -725,6 +725,20 @@ rinit 对**自己的**控制台输出限流，按调用点：每 5 秒 40 行，
 不存在的单元——会得到一条说明"运行中的配置未改变"的错误，而且确实没变：在新的调度
 整体成型之前，什么都不碰（见 `crates/rinit/src/reload.rs`）。
 
+### processes
+
+`processes` 直接读取 `/proc`，不依赖控制 socket。默认表格显示 PID、PPID、用户、状态、
+VSZ、RSS、生命周期 `%CPU`、`TIME+` 和完整命令行；`--tree` 用父子连接线展示同一组
+字段。`--long` 增加 PSS、USS 和 swap，`--json` 输出机器可读记录，另支持 `--sort`、
+`--limit`、`--pid`、`--user`、`--ascii` 和 `--proc-root`。PSS/USS 需要读
+`smaps_rollup`，所以只在显式请求时采集。
+
+```text
+PID   PPID  USER  STAT  VSZ    RSS   %CPU  TIME+  COMMAND
+1     0     root  S     69.5M  2.1M  37.8  3.31   /sbin/rinit --default device.target
+2     0     root  S     0B     0B    0.2   0.02   [kthreadd]
+```
+
 ## 设计决策与对计划的有意偏离
 
 有二十处与书面计划不同，或把计划留白的地方钉死。都记录在这里，以免被误认为漂移：
@@ -741,9 +755,9 @@ rinit 对**自己的**控制台输出限流，按调用点：每 5 秒 40 行，
    时无法测试；放到 trait 后面，`first_wave_mounts_with` 就能在宿主机上对着会记录的
    假实现运行。这与计划 §4.2 要求的形态一致。
 4. **不用 `initgroups(3)`。** 计划 §7.4 提到了它，但它会走 glibc 的 NSS，在运行时
-   加载模块——这正是 §7.4 在别处对 `getpwnam`/`getgrnam` 路径明令禁止的，在静态
-   二进制里尤其糟。附加组改为在 `rinit_core::users` 里从 `/etc/group` 计算，再用
-   `setgroups(2)` 应用。结果相同，没有动态加载器，而且可测。
+   加载模块——这正是 §7.4 在别处对 `getpwnam`/`getgrnam` 路径明令禁止的，而镜像里
+   也没有 NSS 模块。附加组改为在 `rinit_core::users` 里从 `/etc/group` 计算，再用
+   `setgroups(2)` 应用。结果相同，不依赖 NSS，而且可测。
 5. **capability 步骤围绕 `setuid` 拆开。** 计划 §7.4 列出的是一次 `capset()`，
    在 `setgid` 之前同时设置 bounding 和 ambient 集合。照字面用不了：
    `security/commoncap.c` 里的 `cap_emulate_setxuid` 会在每次 root→非 root 的
@@ -851,13 +865,13 @@ rinit 对**自己的**控制台输出限流，按调用点：每 5 秒 40 行，
 
 | 目标                                 | 二进制              | 大小                    | 在镜像里 |
 | ------------------------------------ | ------------------- | ----------------------- | ----------- |
-| `aarch64-unknown-linux-gnu`（静态）  | `rinit`             | 1.57 MiB (1 649 744 B)  | 是         |
-| `armv7-unknown-linux-gnueabihf`（静态） | `rinit`          | 1.26 MiB (1 317 252 B)  | 是         |
+| `aarch64-unknown-linux-gnu`（动态）  | `rinit`             | 0.88 MiB (922 680 B)  | 是         |
+| `armv7-unknown-linux-gnueabihf`（动态） | `rinit`          | 0.94 MiB (986 468 B)  | 是         |
 | `x86_64-unknown-linux-musl`（静态）  | `rinit`             | 1.05 MiB (1 098 688 B)  | 是         |
 
-`rctl` 在 aarch64 上是 994 152 B，在 armv7 上是 727 256 B，在 musl 上是
-406 200 B；都在 initramfs 里。`make size-check` 是门禁，它按计划 §0.1 的 4 MiB
-静态预算检查所选 ARCH 的两个二进制。
+`rctl` 在 aarch64/armv7 上分别是 332 584/330 904 B，`processes` 分别是
+463 672/461 984 B；三者都是动态链接并随 initramfs 发布，loader、libc 和 libgcc
+一起打包。`make size-check` 用 4 MiB 上限检查所选 ARCH 的三个二进制。
 musl 的数字来自手工构建（`cargo build --release --target
 x86_64-unknown-linux-musl`），这也解释了那个目标为什么坏了一段时间却没人发现：
 `ioctl` 的请求参数在 glibc 里是 `unsigned long`、在 musl 里是 `int`，所以四个调用点
@@ -869,9 +883,9 @@ M0 的 bring-up 辅助程序 `rinit-testservice` 已经删除：没有东西再�
 那个步骤现在的替代是 `--test-service`，它通过与单元相同的 spawn 路径运行命令。
 
 打包后的镜像（`build/out/initramfs-aarch64-unknown-linux-gnu.cpio.gz` 和
-`…-demo.cpio.gz`：静态 busybox + rinit + rctl + 单元目录 + `/etc`/`/var` 骨架）
-gzip 后分别是 2.31 MiB（2 419 117 B）和 2.31 MiB（2 423 284 B）；arm32 的两个镜像
-分别是 2.04 MiB（2 136 598 B）和 2.04 MiB（2 143 555 B）。`run-disk` 的镜像是
+`…-demo.cpio.gz`：静态 busybox + 动态 rinit/rctl/processes + 单元目录 + `/etc`/`/var` 骨架）
+gzip 后分别是 2.31 MiB（2 419 117 B）和 2.83 MiB（2 966 232 B）；arm32 的两个镜像
+分别是 2.04 MiB（2 136 598 B）和 2.62 MiB（2 742 947 B）。`run-disk` 的镜像是
 至少 64 MiB 的 ext4（首次启动前实际使用约 38-40 MiB，其中默认 swap 文件占
 32 MiB），不放进 initramfs。差值就是 `units/demo/`
 里的十四个文件，只有第二个镜像带它们。打包是可复现的——`scripts/mkinitramfs.sh` 把归档
@@ -879,11 +893,11 @@ gzip 后分别是 2.31 MiB（2 419 117 B）和 2.31 MiB（2 423 284 B）；arm32
 这个数字可核对，而不只是"重新测了一遍"。例外是*强制*重建 busybox（`make -B`）：
 busybox 自己的构建不是字节级可复现的，镜像会随之变动几个字节。
 
-两个二进制都在计划 §0.1 的预算内：目标是每个可执行文件 ≤2 MB，静态构建最多允许
-4 MB。
+三个 Rust 二进制都在计划 §0.1 的预算内：每个都低于 4 MiB 门禁，动态 loader 和
+运行库由镜像单独携带。
 
 计划 §0.1 的内存列由 `make test-system` 在客户机里从 `/proc/1/status` 测量：
-128M 机器上启动时 **1 632 kB**、跑 20 个服务时 **1 872 kB**，断言阈值为 ≤2 MB 和
+128M 机器上启动时 **2 516 kB**、跑 20 个服务时 **2 944 kB**，断言阈值为 ≤3 MB 和
 ≤6 MB。soak 监视的宿主进程读数更高——约 5 MB——因为它是同一份代码未优化的 `--dev`
 构建。
 

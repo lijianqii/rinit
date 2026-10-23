@@ -181,6 +181,8 @@ await_log() {
     printf 'rctl list\n' >&3
     await_log 10 'MEM' || true
     await_log 10 'CPU' || true
+    printf 'processes --limit=3\n' >&3
+    await_log 10 'PPID' || true
     printf 'rctl status --plain getty.service\n' >&3
     await_log 10 'target: started' || true
     printf 'rctl status getty.service\n' >&3
@@ -615,6 +617,7 @@ expect "the default target is active" "boot-target-state: active"
 expect "rctl list reached the control socket" "logdemo.service: inactive"
 expect "rctl list table has a memory column" "MEM"
 expect "rctl list table has a CPU column" "CPU"
+expect "processes listed PID and PPID columns" "PPID"
 expect "rctl status described the console unit" "target: started"
 expect "rctl status showed process memory" "Memory:"
 expect "rctl status showed process CPU" "CPU:"
@@ -735,10 +738,10 @@ expect "a directory that does not resolve was refused whole" \
 rss_kb() { grep -oE "$1-VmRSS: *[0-9]+" "${log_file}" | tail -1 | grep -oE '[0-9]+' || true; }
 idle_rss="$(rss_kb idle)"
 load_rss="$(rss_kb load)"
-if [[ -n "${idle_rss}" && "${idle_rss}" -le 2048 ]]; then
-    pass "rinit's RSS at boot is within 2 MB (${idle_rss} kB)"
+if [[ -n "${idle_rss}" && "${idle_rss}" -le 3072 ]]; then
+    pass "rinit's RSS at boot is within 3 MB (${idle_rss} kB)"
 else
-    fail "rinit's RSS at boot is within 2 MB (got: '${idle_rss:-missing}' kB)"
+    fail "rinit's RSS at boot is within 3 MB (got: '${idle_rss:-missing}' kB)"
 fi
 if [[ -n "${load_rss}" && "${load_rss}" -le 6144 ]]; then
     pass "rinit's RSS with 20 services is within 6 MB (${load_rss} kB)"

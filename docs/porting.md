@@ -37,10 +37,13 @@ still boots with every unit unlimited.
 
 ## 2. Userspace the image has to contain
 
-- `/sbin/rinit` - the binary (static, `panic="abort"`, LTO; see the README's
-  Measurements for the size).
+- `/sbin/rinit` - the binary (dynamic, `panic="abort"`, LTO; see the README's
+  Measurements for the size). The image also carries `/lib/ld-linux-*.so.1`,
+  `libc.so.6` and `libgcc_s.so.1` for it.
 - `/bin/rctl` - the control client. Useless without the socket rinit binds at
   `/run/rinit/control.sock`, which is why the two ship together.
+- `/usr/bin/processes` - the `/proc` viewer. It reads `/proc` directly and does
+  not need the control socket.
 - `/etc/rinit/units/*.service|*.target` - the units. At minimum something that
   gives you a console (`getty.service`) or a shell, or a port to an appliance
   has nothing to talk to.
@@ -99,8 +102,8 @@ make ARCH=arm32 run
 cortex-a15`. `highmem=off` keeps the PCI ECAM below 4G; without it the 32-bit
 kernel's `pci-host-generic` probe fails with `EOVERFLOW` and `i6300esb` never
 appears. The Debian armhf toolchain has no `rcrt1.o`, so `.cargo/config.toml`
-links ARMv7 as a plain static (non-PIE) binary rather than static-PIE; both forms
-have no `ld.so`/`libc.so` dependency.
+links ARMv7 as PIE. The armv7 image carries `/lib/ld-linux-armhf.so.3`, libc and
+libgcc just like aarch64.
 
 Nothing in the Rust source is architecture-specific. A new architecture needs
 three things changed, and they are all in the scripts:
