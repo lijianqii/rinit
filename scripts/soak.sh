@@ -201,9 +201,11 @@ Restart=no
 # The soak restarts this unit every sample, which at `--interval 1` is far
 # faster than the default start-limit window. The control path is what is under
 # test here, not the breaker; disable it so a short run does not turn the driven
-# unit into `failed (start-limit)`.
+# unit into `failed (start-limit)`. A zero restart delay also keeps the final
+# active check from racing the 2 s default at the last sample.
 StartLimitBurst=1000000
 StartLimitIntervalSec=0
+RestartSec=0
 TimeoutStopSec=5
 EOF
 
@@ -496,7 +498,9 @@ fail=0
 # no steady or rctl-driven unit at all.
 check_active() {
     local unit="$1" out=""
-    for _ in $(seq 1 20); do
+    # A restart issued by the last sample can still be in its stop/reap window
+    # when the loop ends; give it ten seconds before calling it a failure.
+    for _ in $(seq 1 100); do
         if ! out="$("${control_runner[@]}" status --plain "$unit" 2>>"$control_errors")"; then
             echo "FAIL: rctl status ${unit} failed at the end of the soak" >&2
             fail=1
