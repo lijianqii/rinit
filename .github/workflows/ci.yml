@@ -54,6 +54,15 @@ jobs:
       - name: Docs build
         run: cargo doc --offline --locked --workspace --no-deps
 
+      - name: Coverage gate
+        run: |
+          rustup component add llvm-tools-preview
+          cargo install cargo-llvm-cov --locked
+          make coverage-check
+
+      - name: Soak (60 s)
+        run: make soak
+
   aarch64:
     name: cross-compile (aarch64, dynamic)
     runs-on: ubuntu-latest
@@ -98,6 +107,9 @@ jobs:
             fi
             echo "$bin: $(du -h "$path" | cut -f1) (dynamic)"
           done
+
+      - name: Size gate
+        run: make size-check
 
   arm32:
     name: cross-compile (armv7, dynamic)

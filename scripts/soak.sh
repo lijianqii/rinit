@@ -3,9 +3,9 @@
 # and children for growth (plan §3 M4 "长稳 soak + 内存泄漏检测", §4.4).
 #
 # Usage:
-#   scripts/soak.sh [--seconds N] [--interval SECONDS] [--rinit PATH]
+#   scripts/soak.sh [--seconds N] [--interval SECONDS] [--rinit PATH] [--rctl PATH]
 #                   [--warmup N] [--max-rss-kb N] [--min-free-kb N]
-#                   [--max-samples N] [--keep]
+#                   [--max-samples N] [--zombie-streak N] [--keep]
 #
 # What it does:
 #   1. builds a scratch unit directory whose services churn: one crash-restarts
@@ -16,14 +16,22 @@
 #      scratch directory (`--dev` skips mounts, so this needs no privileges);
 #   3. every `--interval` samples the rinit process: RSS, open descriptors,
 #      thread count and zombie children;
-#   4. drives the control socket in a loop (`rctl status/log/restart`), because
-#      the socket, the job queue and the log ring are all per-request state;
+#   4. drives the control socket in a loop (`rctl log/restart`), because the
+#      socket, the job queue and the log ring are all per-request state; the
+#      count is taken from rctl's exit status, not from rinit's rate-limited
+#      console;
 #   5. after the first `--warmup` samples (boot + first-touch allocations), the
 #      steady-state curve must stay flat: RSS may not grow by more than
-#      `--max-rss-kb`, descriptors must come back to the baseline, and no child
-#      may be left as a zombie;
+#      `--max-rss-kb`, descriptors must come back to the baseline, and a zombie
+#      must not persist for `--zombie-streak` samples or survive a quiescent
+#      sweep after the churn stops;
 #   6. stops rinit with SIGTERM and checks it exits 0 (a soak that cannot shut
 #      down cleanly has found something too).
+#
+# The rinit and rctl binaries are copied into the work directory before the run,
+# so a concurrent `cargo build` cannot replace one half of the pair while the
+# other half is still the old protocol. The work directory also records the git
+# commit, protocol version and binary hashes.
 #
 # The default 60 seconds is a commit-time regression check, not the acceptance
 # run. §3 M4 asks for 72 hours with no leak: that is the same script with
@@ -44,8 +52,10 @@ set -euo pipefail
 seconds=60
 interval=1
 rinit=""
+rctl=""
 warmup=5
 max_rss_kb=1024
+zombie_streak_limit=3
 keep=0
 # The work directory itself needs almost nothing (the console is streamed, not
 # kept), but the machine is shared: another process filling the filesystem would
@@ -62,15 +72,22 @@ while [[ $# -gt 0 ]]; do
         --seconds) seconds="${2:?}"; shift 2 ;;
         --interval) interval="${2:?}"; shift 2 ;;
         --rinit) rinit="${2:?}"; shift 2 ;;
+        --rctl) rctl="${2:?}"; shift 2 ;;
         --warmup) warmup="${2:?}"; shift 2 ;;
         --max-rss-kb) max_rss_kb="${2:?}"; shift 2 ;;
         --min-free-kb) min_free_kb="${2:?}"; shift 2 ;;
         --max-samples) max_samples="${2:?}"; shift 2 ;;
+        --zombie-streak) zombie_streak_limit="${2:?}"; shift 2 ;;
         --keep) keep=1; shift ;;
         -h | --help) usage; exit 0 ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
 done
+
+if [[ ! "$zombie_streak_limit" =~ ^[1-9][0-9]*$ ]]; then
+    echo "--zombie-streak must be a positive integer" >&2
+    exit 2
+fi
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
@@ -80,7 +97,15 @@ if [[ -z "$rinit" ]]; then
     cargo build --offline --quiet
     rinit="$repo_root/target/debug/rinit"
 fi
-rctl="$repo_root/target/debug/rctl"
+# A custom rinit usually lives in the same target directory as its rctl; prefer
+# that over silently pairing a release rinit with a debug rctl.
+if [[ -z "$rctl" ]]; then
+    if [[ -x "$(dirname "$rinit")/rctl" ]]; then
+        rctl="$(dirname "$rinit")/rctl"
+    else
+        rctl="$repo_root/target/debug/rctl"
+    fi
+fi
 for bin in "$rinit" "$rctl"; do
     [[ -x "$bin" ]] || {
         echo "missing binary: $bin" >&2
@@ -90,7 +115,42 @@ done
 
 work="$(mktemp -d "${TMPDIR:-/tmp}/rinit-soak-XXXXXX")"
 units="$work/units"
-mkdir -p "$units" "$work/control" "$work/notify"
+mkdir -p "$units" "$work/control" "$work/notify" "$work/bin"
+
+# Copy both binaries into the run's own directory. The old harness pointed at
+# the shared target/debug path; a concurrent `cargo build` could replace rctl
+# with a different protocol version while the already-running rinit stayed on
+# the old one, and every control command then failed with VersionMismatch. The
+# copy makes the pair immutable for the duration of the run.
+install -m 0755 "$rinit" "$work/bin/rinit"
+install -m 0755 "$rctl" "$work/bin/rctl"
+rinit="$work/bin/rinit"
+rctl="$work/bin/rctl"
+
+hash_of() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{ print $1 }'
+    else
+        echo unknown
+    fi
+}
+commit="$(git -C "$repo_root" rev-parse HEAD 2>/dev/null || echo unknown)"
+dirty="$(git -C "$repo_root" status --porcelain 2>/dev/null | head -5 | tr '\n' ';' || true)"
+protocol="$(sed -n 's/.*PROTOCOL_VERSION: u16 = \([0-9][0-9]*\);.*/\1/p' \
+    "$repo_root/crates/rinit-core/src/control.rs" 2>/dev/null | head -1)"
+[[ -n "$protocol" ]] || protocol=unknown
+run_info="$work/run.txt"
+{
+    printf 'started  %s\n' "$(date -Is)"
+    printf 'commit   %s\n' "$commit"
+    printf 'dirty    %s\n' "${dirty:-clean}"
+    printf 'protocol %s\n' "$protocol"
+    printf 'rinit    %s\n' "$(hash_of "$rinit")"
+    printf 'rctl     %s\n' "$(hash_of "$rctl")"
+    printf 'uname    %s\n' "$(uname -a)"
+} >"$run_info"
+echo "soak: commit ${commit} protocol ${protocol}"
+echo "soak: binaries copied to $work/bin"
 
 # The churn unit: it exits successfully, so `Restart=always` brings it straight
 # back up - each cycle is a spawn, a log pipe, an exit and a reap, with no
@@ -115,13 +175,16 @@ StartLimitIntervalSec=0
 EOF
 
 # A steady unit keeps the "normal" side of the manager exercised alongside the
-# churn: one long-lived process that is never restarted.
+# churn: one long-lived process that is never restarted. Thirty days is longer
+# than any supported soak; `sleep 86400` (one day) used to exit after the first
+# 24 hours, which quietly removed the steady baseline from the rest of a 72-hour
+# run.
 cat >"$units/steady.service" <<'EOF'
 [Unit]
 Description=stays up
 [Service]
 Type=simple
-ExecStart=/bin/sleep 86400
+ExecStart=/bin/sleep 2592000
 Restart=no
 TimeoutStopSec=5
 EOF
@@ -133,8 +196,14 @@ cat >"$units/driven.service" <<'EOF'
 Description=driven by rctl
 [Service]
 Type=simple
-ExecStart=/bin/sleep 86400
+ExecStart=/bin/sleep 2592000
 Restart=no
+# The soak restarts this unit every sample, which at `--interval 1` is far
+# faster than the default start-limit window. The control path is what is under
+# test here, not the breaker; disable it so a short run does not turn the driven
+# unit into `failed (start-limit)`.
+StartLimitBurst=1000000
+StartLimitIntervalSec=0
 TimeoutStopSec=5
 EOF
 
@@ -158,20 +227,20 @@ counts="$work/counts"
 #
 # So the console goes into a fifo and a reader instead of into a file. The reader
 # is the only thing that has to keep up, and it keeps almost nothing: a running
-# count of the two lines the assertions below need - written out as it goes, so
-# they are readable *before* the shutdown - and a rolling tail of the last
-# `log_lines` lines for a post-mortem. The run is unchanged in every way but how
-# much disk it uses.
+# count of the churn lines the assertions below need - written out as it goes,
+# so it is readable *before* the shutdown - and a rolling tail of the last
+# `log_lines` lines for a post-mortem. Control successes are counted from rctl's
+# exit status instead, because rinit's own console is rate limited.
 log_lines=2000
 mkfifo "$work/console"
+control_errors="$work/control-errors.log"
+: >"$control_errors"
 # (`snapshot`, not `log`: gawk has a `log` builtin and refuses the name.)
 awk -v counts="$counts" -v snapshot="$log" -v keep="$log_lines" '
     /churn\.service will restart in/ { r++; if (r % 200 == 0) { print "R " r >> counts; close(counts) } }
-    /control: .* ok/                 { c++; if (c % 50 == 0)  { print "C " c >> counts; close(counts) } }
     { ring[NR % keep] = $0 }
     END {
         print "R " r >> counts
-        print "C " c >> counts
         close(counts)
         for (i = NR - keep + 1; i <= NR; i++) if ((i % keep) in ring) print ring[i % keep] > snapshot
         close(snapshot)
@@ -209,8 +278,7 @@ flush_log() {
 }
 
 # One of the reader's running counts, or 0 when it has not written that one yet
-# (it writes every 200 restarts and every 50 control commands, so early in a run
-# the file may hold only the other).
+# (it writes every 200 restarts, and once at EOF).
 counted() {
     awk -v want="$1" '$1 == want { n = $2 } END { print n + 0 }' "$counts" 2>/dev/null || echo 0
 }
@@ -247,6 +315,50 @@ zombies_of() {
     ' /proc/[0-9]*/status 2>/dev/null || echo 0
 }
 
+# Detailed zombie rows for a post-mortem. Only run when a zombie has already
+# been seen, so the per-file awk cost does not touch the sampling interval.
+zombie_details() {
+    local status
+    for status in /proc/[0-9]*/status; do
+        [[ -r "$status" ]] || continue
+        awk -v parent="$1" '
+            $1 == "Name:"  { name = $2 }
+            $1 == "State:" { state = $2 }
+            $1 == "PPid:"  {
+                if (state == "Z" && $2 == parent) {
+                    split(FILENAME, parts, "/")
+                    printf "pid=%s ppid=%s comm=%s\n", parts[3], $2, name
+                }
+            }
+        ' "$status"
+    done
+}
+
+# Count control success by exit status. The old harness scraped rinit's console
+# for `control: ... ok`, but that console is rate limited and can also be stale
+# if the rctl binary is replaced mid-run. An exit status is the contract rctl
+# actually promises, and it survives both.
+control_ok=0
+control_fail=0
+control_attempts=0
+control_runner=("$rctl")
+if command -v timeout >/dev/null 2>&1; then
+    control_runner=(timeout 75 "$rctl")
+fi
+run_control() {
+    local label="$1"
+    shift
+    control_attempts=$((control_attempts + 1))
+    if "${control_runner[@]}" "$@" >/dev/null 2>>"$control_errors"; then
+        control_ok=$((control_ok + 1))
+    else
+        local rc=$?
+        control_fail=$((control_fail + 1))
+        printf '%s: %s failed rc=%d\n' "$(date '+%F %T')" "$label" "$rc" \
+            >>"$control_errors"
+    fi
+}
+
 # Wait for the control socket so the churn loop does not race the boot.
 for _ in $(seq 1 50); do
     [[ -S "$RINIT_CONTROL_DIR/control.sock" ]] && break
@@ -263,6 +375,9 @@ echo "soaking for ${seconds}s (interval ${interval}s, warmup ${warmup} samples).
 echo "sample  when             rss_kb  fds  threads  zombies"
 curve="$work/curve.txt"
 : >"$curve"
+zombie_streak=0
+max_zombie_streak=0
+zombie_fail=0
 
 sample=0
 started=$SECONDS
@@ -293,6 +408,19 @@ while ((SECONDS < end)); do
     fds="$(fds_of "$rinit_pid")"
     threads="$(threads_of "$rinit_pid")"
     zombies="$(zombies_of "$rinit_pid")"
+    if ((zombies > 0)); then
+        zombie_streak=$((zombie_streak + 1))
+        if ((zombie_streak > max_zombie_streak)); then
+            max_zombie_streak=$zombie_streak
+        fi
+        if ((zombie_streak == zombie_streak_limit)); then
+            echo "FAIL: zombie(s) present for ${zombie_streak} consecutive samples" >&2
+            zombie_details "$rinit_pid" >&2 || true
+            zombie_fail=1
+        fi
+    else
+        zombie_streak=0
+    fi
     # A timestamp per sample, so a run that stops at hour 60 says *when* it
     # stopped: the curve itself is numbers only, and a wall-clock time is the one
     # thing a post-mortem needs that the numbers cannot carry.
@@ -305,7 +433,7 @@ while ((SECONDS < end)); do
     # a reason that has nothing to do with rinit; a full filesystem would abort
     # the appends (`set -e`) and look like a crash.
     kill -0 "$console_pid" 2>/dev/null || {
-        echo "the console reader (pid ${console_pid}) is gone: the restart and control counts would stop, so this run cannot assert anything" >&2
+        echo "the console reader (pid ${console_pid}) is gone: the restart count and log tail would stop, so this run cannot assert anything" >&2
         exit 3
     }
     free="$(free_kb)"
@@ -314,10 +442,12 @@ while ((SECONDS < end)); do
         exit 3
     fi
 
-    # Drive the control socket: a start/stop cycle plus a log read, every
-    # sample. Each one is a fresh connection, a fresh request and a reply.
-    "$rctl" restart driven.service >/dev/null 2>&1 || true
-    "$rctl" log --tail=5 >/dev/null 2>&1 || true
+    # Drive the control socket: a restart plus a log read, every sample. Each
+    # one is a fresh connection, a fresh request and a reply. The count comes
+    # from rctl's exit status; the console `control: ... ok` line is rate
+    # limited and was the source of the false 72-hour failure.
+    run_control "restart driven.service" restart driven.service
+    run_control "log --tail=5" log --tail=5
 
     kill -0 "$rinit_pid" 2>/dev/null || {
         echo "rinit died mid-soak:" >&2
@@ -360,6 +490,54 @@ fds_peak="$(peak "$steady" 2)"
 max_zombies="$(peak "$steady" 4)"
 
 fail=0
+
+# A steady-state workload has to still be there at the end. The old 86400-second
+# sleeps quietly expired at hour 24, so the last two thirds of a 72-hour run had
+# no steady or rctl-driven unit at all.
+check_active() {
+    local unit="$1" out=""
+    for _ in $(seq 1 20); do
+        if ! out="$("${control_runner[@]}" status --plain "$unit" 2>>"$control_errors")"; then
+            echo "FAIL: rctl status ${unit} failed at the end of the soak" >&2
+            fail=1
+            return
+        fi
+        if grep -q '^state: active' <<<"$out"; then
+            return
+        fi
+        sleep 0.1
+    done
+    echo "FAIL: ${unit} was not active at the end of the soak" >&2
+    printf '%s\n' "$out" >&2
+    fail=1
+}
+check_active steady.service
+check_active driven.service
+
+# Stop the churn and wait for the exit pipeline to settle before scanning for
+# zombies. A zombie seen while thousands of processes are exiting is a sampling
+# race; a zombie that survives a quiescent second is a reaper bug.
+if ! "${control_runner[@]}" stop churn.service >/dev/null 2>>"$control_errors"; then
+    echo "FAIL: rctl stop churn.service failed" >&2
+    fail=1
+fi
+quiescent_zombies=0
+for _ in $(seq 1 10); do
+    quiescent_zombies="$(zombies_of "$rinit_pid")"
+    if ((quiescent_zombies == 0)); then
+        break
+    fi
+    sleep 0.2
+done
+if ((quiescent_zombies > 0)); then
+    echo "FAIL: ${quiescent_zombies} zombie(s) survived a quiescent sweep after churn stopped" >&2
+    zombie_details "$rinit_pid" >&2 || true
+    fail=1
+fi
+if ((zombie_fail)); then
+    fail=1
+fi
+
 rss_delta=$((last_rss - first_rss))
 if ((rss_delta > max_rss_kb)); then
     echo "FAIL: RSS kept climbing: ${first_rss}kB peak in the first half, ${last_rss}kB in the second (allowed +${max_rss_kb}kB)" >&2
@@ -369,9 +547,8 @@ if ((last_fds > first_fds + 2)); then
     echo "FAIL: descriptors kept climbing: their lowest was ${first_fds} in the first half and ${last_fds} in the second (peak ${fds_peak}): something is not closing" >&2
     fail=1
 fi
-if ((max_zombies > 0)); then
-    echo "FAIL: ${max_zombies} zombie(s) parented to rinit: the reaper is missing exits" >&2
-    fail=1
+if ((max_zombie_streak > 0)); then
+    echo "note: a transient zombie was visible at ${max_zombie_streak} consecutive sample(s); the quiescent sweep is the authoritative check" >&2
 fi
 
 # A clock step, a signal or any other early exit must not be able to turn a
@@ -413,15 +590,23 @@ fi
 
 # The control socket has to have answered, or the request/reply path - the
 # thing that owns a connection, a job and a log query per call - went untested.
-control_ok="$(counted C)"
-if ((control_ok < sample)); then
-    echo "FAIL: only ${control_ok} control command(s) succeeded for ${sample} samples" >&2
+# Exactly two commands run per sample; a single lost reply is a failure now,
+# rather than the old `control_ok >= sample` check that tolerated half of them.
+if ((control_attempts != sample * 2)); then
+    echo "FAIL: ${control_attempts} control attempt(s) for ${sample} samples (expected $((sample * 2)))" >&2
+    fail=1
+fi
+if ((control_fail > 0)); then
+    echo "FAIL: ${control_fail} of ${control_attempts} control command(s) failed" >&2
+    if [[ -s "$control_errors" ]]; then
+        tail -20 "$control_errors" >&2
+    fi
     fail=1
 fi
 
 echo
-echo "steady state: rss ${first_rss}kB -> ${last_rss}kB peak per half (delta ${rss_delta}kB), fds ${first_fds} -> ${last_fds} at their lowest (peak ${fds_peak}), max zombies ${max_zombies}"
-echo "churn: ${restarts} restarts, ${control_ok} control command(s) answered"
+echo "steady state: rss ${first_rss}kB -> ${last_rss}kB peak per half (delta ${rss_delta}kB), fds ${first_fds} -> ${last_fds} at their lowest (peak ${fds_peak}), max zombies ${max_zombies} (streak ${max_zombie_streak}, quiescent ${quiescent_zombies})"
+echo "churn: ${restarts} restarts, ${control_ok}/${control_attempts} control command(s) answered"
 
 if ((fail)); then
     echo "SOAK FAILED" >&2

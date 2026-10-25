@@ -10,11 +10,14 @@ README tracks implementation status. A Chinese translation of this file lives at
 
 Every milestone's scope and every item of the plan's extension list (§7.1–§7.11)
 is implemented and proven: the [Acceptance](#acceptance-plan-6s-checklist) section
-answers plan §6's checklist line by line, with one exception - the 72 h soak, which
-is a deployment-time run of `make soak` rather than a feature.
+answers plan §6's checklist line by line, with one exception - the 72 h soak. The
+eighth segment completed 72 hours and kept RSS/descriptors flat, but it is not a
+valid acceptance result: it ran an old binary, used the host `--dev` mode, and
+its `rctl` was replaced mid-run by a different protocol version. A rerun on
+current HEAD with the hardened harness is still pending.
 
 What is in place, and what it is proven by. Every claim below is either a host
-test (`make check`) or a guest assertion (`make test-system`, 100 of them in
+test (`make check`) or a guest assertion (`make test-system`, 105 of them in
 `scripts/system-test.sh`); "proven on the host" always means the fake-runtime or
 `--dev` form of the same code path, and the guest means the real one.
 
@@ -338,15 +341,24 @@ redundant:
 - **the soak harness** (`scripts/soak.sh`, plan §3 M4/§4.4): runs rinit under
   churn, samples RSS/descriptors/threads/zombies, drives the control socket in a
   loop, and fails if the steady state is not flat or if `SIGTERM` does not exit 0.
-  The default 60 s is a commit-time check; `make soak SOAK_ARGS='--seconds
-  259200'` is the 72-hour acceptance run the plan asks for. rinit's console is the
-  one unbounded thing in a run - the churn unit is deliberately unthrottled, so
-  rinit logs every restart - and it goes through a reader that keeps only the
-  counts the assertions need and a 2000-line tail, which is why a 72-hour run
-  leaves ~100 KB behind instead of filling the disk. rinit bounds that console
-  itself as well, per call site rather than per message text - a restart loop
-  prints the same handful of messages with a different pid in each one, so a
-  text-keyed limiter would fold nothing (`rinit_core::ratelimit`);
+  The harness copies `rinit` and `rctl` into its work directory and records the
+  commit, protocol version and binary hashes, so a concurrent `cargo build`
+  cannot pair a new client with an old server. Control success is counted from
+  `rctl`'s exit status rather than from rinit's rate-limited console. The steady
+  and driven units sleep for 30 days; the old 24-hour sleep silently removed the
+  steady baseline from the last two thirds of a 72-hour run. A zombie must
+  persist for `--zombie-streak` samples (default 3) or survive a quiescent sweep
+  after the churn stops; a single sample that catches an exit-to-reap race no
+  longer fails the run. The default 60 s is a commit-time check;
+  `make soak SOAK_ARGS='--seconds 259200'` is the 72-hour acceptance run the
+  plan asks for. rinit's console is the one unbounded thing in a run - the churn
+  unit is deliberately unthrottled, so rinit logs every restart - and it goes
+  through a reader that keeps only the restart count and a 2000-line tail, which
+  is why a 72-hour run leaves ~100 KB behind instead of filling the disk. rinit
+  bounds that console itself as well, per call site rather than per message text
+  - a restart loop prints the same handful of messages with a different pid in
+  each one, so a text-keyed limiter would fold nothing
+  (`rinit_core::ratelimit`);
 - **the acceptance gates** (`make gates`): plan §0.1's size budget and plan §6's
   coverage thresholds, measured rather than quoted, which is where the numbers in
   [Acceptance](#acceptance-plan-6s-checklist) and
@@ -520,7 +532,7 @@ repository or a measurement in this README:
 | crash-restart, breaker, health checks | `make test-system` ("a crashed service is scheduled for restart", "the breaker tripped on the failing unit") and `crates/rinit/tests/m2_lifecycle.rs` |
 | `rctl` can start, stop, query and read logs | `make test-system`'s M3 block and `crates/rctl/tests/control.rs` |
 | graceful shutdown, no zombies, no fd leak | `make soak` samples descriptors, threads and zombie children through restart churn, and asserts each comes back to its baseline |
-| 72 h soak with stable RSS | **running now**, eighth segment, started 2026-10-22 09:17 with its work directory under `build/` rather than `/tmp`; it runs as a systemd user service with lingering enabled, so closing the SSH session cannot tear it down, and the window ends 2026-10-25 09:17 when the numbers land in this row. The log is `build/soak-charts/soak-72h-seg8.log`. The seventh segment was cut short at 2026-10-22 03:10 after 570 samples (9.5 h), not by an assertion: it had been launched with `setsid nohup`, but still inherited the SSH session's cgroup, and systemd removed that session slice when the connection closed, sending SIGTERM to `make`; its curve and log are kept as `soak-72h-seg7.log` and `soak-seg7.note`. The sixth segment was stopped by hand after 1 h 50 m (109 samples), not by an assertion, once the harness itself was fixed: at `--interval 1` a sample cost ~70 ms, the loop slept a full interval *after* the work, and the default 60 s gate therefore collected 56 of 60 samples and failed its own coverage check (21 before the zombie scan became a single awk pass); the loop now sleeps until the next absolute slot and `make soak` collects 60/60. Earlier segments were all ended by something other than an assertion: **8.92 hours** (535 samples, 18 519 600 restarts) with RSS 5116 → 5116 kB peak per half, descriptors 14 → 14 at their lowest and zero zombies; **44.6 hours** (2587 samples) whose RSS moved between 3892 and 3960 kB in ~16 kB plateaus that went up *and* down - the second-half slope was −1.28 kB/h - with descriptors 13-14 at their lowest in every hour and zero zombies, ended by a host reboot that took the curves with it because the work directory was on tmpfs; and **43 minutes**, stopped by the harness's own free-space floor when something else on the machine filled the shared 978 MB `/tmp` - which is why the run now keeps its ~100 KB work directory on the repository's filesystem instead; and **13.6 hours** (796 samples, 2026-10-20 06:09 → 19:46), ended by the reboot that this time did not take the curve with it, because the work directory had already moved: RSS stepped down twice after boot, hourly means 5068-5087 kB for the first three hours, 4381-4443 kB for the next five and 4202-4252 kB for the last six, with last sample 4296 kB, descriptors 14-28, one thread and zero zombies. Four things changed because of these runs: the descriptor check compares the *lowest* count in each half rather than the peak (a peak is a coin flip once a run is long enough - the 8.92-hour segment's peaks read 25 → 24 while its lows were 14 → 14), rinit rate limits its own console, which is the sink that filled the disk a run died on, and the restart count the harness prints is a rate-limited lower bound - the line it counts is capped at 40 per 5 s per call site, so `churn: N restarts` reads ~8/s while the real churn, measured independently as the host's `fork` rate, is ~545/s; and the sampler sleeps until its next absolute slot, because sleeping a full `interval` after each sample made a 60 s run collect 56 of 60 samples and fail a coverage check it had already met |
+| 72 h soak with stable RSS | **Not yet passed.** Segment 8 completed 4320 samples with flat RSS/descriptors, but it is **not a valid acceptance result**: it ran an old binary, used host `--dev` mode, and its `rctl` was replaced mid-run by a different protocol version (control stopped at 3648 commands). The only zombie signal was two isolated samples. The hardened harness now copies both binaries, counts `rctl` exit status, keeps 30-day steady units and uses a quiescent zombie sweep; a rerun on current HEAD is required. |
 | binaries ≤2 MB dynamic / ≤4 MB static | [Measurements](#measurements-plan-01-calibration-point): 0.88 MiB dynamic arm64 / 0.94 MiB armv7, checked by `make size-check` |
 | unit test coverage ≥80% overall, ≥90% in the core | **88.48%** and **97.82%** (`make coverage-check`, [above](#testing)) |
 | documentation: architecture, unit format, `rctl`, porting | this README (architecture, status, measurements), [`docs/units.md`](docs/units.md) (every directive, its value syntax and its default), [`docs/porting.md`](docs/porting.md) (kernel, userspace, build, differences from systemd), and `rinit-开发计划.md` |
@@ -530,6 +542,14 @@ RSS, measured *in the guest* out of `/proc/1/status` rather than on the host -
 **2 516 kB idle** and **2 944 kB with 20 services running**, with a 3 MB boot
 limit and 6 MB load limit. The growth is the interesting part: twenty more units cost under 200 kB,
 because a unit is a config, a state and a few timers rather than a thread.
+
+Plan §0.1's original goals are stricter than those gates: **≤2 MB idle** and
+**<1 s from kernel to the first service**, with a **≤100 ms** cold start for
+rinit. The recorded guest run reads **2 516 kB**, **5 190 ms** and **505 ms**
+(an earlier run read 2 590 ms / 239 ms); `scripts/system-test.sh` only fails
+below 3 MB and 30 s, and its comment incorrectly says the plan names no budget.
+Those are deliberate calibration points, not accidental passes: either optimise
+them or add them to the deviation list with the reason.
 
 ## Running: `make run` (arm64 default, arm32 supported)
 
@@ -1090,6 +1110,11 @@ was the plan's original boundary - both are in the extension list (§7.9, §7.7)
 and both are implemented. The table records where the project started, not where
 it ended; this README records the latter.
 
-What is left is not a feature: the 72 h soak (a deployment-time run of
-`make soak`), and the coverage and size numbers re-measured as the tree changes
-rather than once - which `make gates` now does.
+What is left is not a feature: rerun the 72 h soak on a fixed commit with the
+hardened harness, add a 24 h target-guest run, then wire the remaining
+device-image boot into CI (the coverage/size gates and the 60 s soak are already
+there). The plan's §0.1
+boot and idle-memory targets are also still above the recorded measurements
+(`5 190 ms` to first service, `505 ms` of it rinit; `2 516 kB` idle), so either
+optimise them or record the relaxed thresholds as deliberate deviations instead
+of leaving the tests at 30 s / 3 MB without an explanation.

@@ -101,9 +101,9 @@ make ARCH=arm32 run
 `arch/arm/boot/zImage` and `qemu-system-arm -machine virt,highmem=off -cpu
 cortex-a15`. `highmem=off` keeps the PCI ECAM below 4G; without it the 32-bit
 kernel's `pci-host-generic` probe fails with `EOVERFLOW` and `i6300esb` never
-appears. The Debian armhf toolchain has no `rcrt1.o`, so `.cargo/config.toml`
-links ARMv7 as PIE. The armv7 image carries `/lib/ld-linux-armhf.so.3`, libc and
-libgcc just like aarch64.
+appears. The ARMv7 binaries are PIE, like the aarch64 ones; the loader and
+runtime libraries are packaged by the image builder. The armv7 image carries
+`/lib/ld-linux-armhf.so.3`, libc and libgcc just like aarch64.
 
 Nothing in the Rust source is architecture-specific. A new architecture needs
 three things changed, and they are all in the scripts:

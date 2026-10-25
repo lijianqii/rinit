@@ -19,9 +19,9 @@
 # (the password field in /etc/passwd is empty, so there is nothing to type).
 # Swap the two lines below to get a shell with no login step at all.
 #
-# Neither alternative is expressed as a `Conflicts=`, because M1 parses
-# conflicts but does not stop units - that needs a live unit being stopped,
-# which is M2's job.
+# Neither alternative is expressed as a `Conflicts=`: the boot target picks one
+# explicitly, and `Conflicts=` would only matter if someone started the other
+# later.
 #
 # This file and the two targets beside it are the whole of what `make run` packs:
 # `units/` is the boot set, and the §7.x acceptance units live in `units/demo/`,

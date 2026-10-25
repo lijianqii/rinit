@@ -38,6 +38,14 @@ use crate::watchdog::Watchdog;
 /// deadlines. Small enough that a quick exit is noticed promptly.
 const SHUTDOWN_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
+/// How often an otherwise idle supervisor loop wakes to drain children.
+///
+/// `SIGCHLD` covers a service's direct child, but PID 1 also adopts orphans
+/// reparented to it, and an already-dead orphan does not necessarily generate a
+/// fresh signal. Draining once a second independently of the signal closes that
+/// gap without turning the loop into a busy poll.
+const HOUSEKEEPING_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// How often a `NeedsSocket=` wait looks for the path (plan §7.8).
 ///
 /// A directory lookup, not a syscall on the socket: frequent enough that a
@@ -228,6 +236,13 @@ async fn supervise(
     // much smaller budget (plan §7.1).
     let mut fast = false;
     loop {
+        // Drain every exited child before doing anything else. The signal path
+        // below covers the normal case, but a zombie that was reparented to PID 1
+        // after its parent died may arrive without a fresh SIGCHLD; the periodic
+        // arm in `select!` guarantees this also runs on an otherwise idle loop.
+        for outcome in reap_into_manager(manager) {
+            log_outcome(&outcome);
+        }
         // Plan §7.5's health checkpoint: the feed happens here, in the loop that
         // starts services, reaps children and answers `rctl` - so a loop that
         // stops iterating stops feeding, and the hardware resets the machine. A
@@ -323,6 +338,11 @@ async fn supervise(
                 let _ = reply.send((status, text));
             }
             _ = tokio::time::sleep(wait) => {}
+            // The idle half of the orphan reaping rule: even with no signal and
+            // no deadline due, wake often enough to drain a child that was
+            // reparented to PID 1 without a fresh SIGCHLD. The actual drain is
+            // at the top of the loop, so this arm has no body.
+            _ = tokio::time::sleep(HOUSEKEEPING_POLL) => {}
             Some(unit) = activation.recv() => {
                 woke_socket = Some(unit);
             }
