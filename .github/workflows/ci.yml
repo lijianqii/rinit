@@ -153,6 +153,9 @@ jobs:
             echo "$bin: $(du -h "$path" | cut -f1) (dynamic, armv7)"
           done
 
+      - name: Size gate
+        run: make ARCH=arm32 size-check
+
   guest:
     name: qemu system test (aarch64)
     runs-on: ubuntu-latest
