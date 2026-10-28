@@ -10,11 +10,12 @@ README tracks implementation status. A Chinese translation of this file lives at
 
 Every milestone's scope and every item of the plan's extension list (§7.1–§7.11)
 is implemented and proven: the [Acceptance](#acceptance-plan-6s-checklist) section
-answers plan §6's checklist line by line, with one exception - the 72 h soak. The
-eighth segment completed 72 hours and kept RSS/descriptors flat, but it is not a
-valid acceptance result: it ran an old binary, used the host `--dev` mode, and
-its `rctl` was replaced mid-run by a different protocol version. A rerun on
-current HEAD with the hardened harness is still pending.
+answers plan §6's checklist line by line, including the 72 h host soak. The ninth
+segment, run on `8b373d8` with the hardened harness, completed 4,320 samples and
+passed: 8,640/8,640 control commands were answered, the RSS peak fell from
+5,168 kB in the first half to 4,300 kB in the second, descriptors returned to
+their baseline of 11, and the quiescent zombie sweep was clean. It remains a host
+`--dev` result; the target-guest 24 h run is still pending.
 
 What is in place, and what it is proven by. Every claim below is either a host
 test (`make check`) or a guest assertion (`make test-system`, 105 of them in
@@ -532,7 +533,7 @@ repository or a measurement in this README:
 | crash-restart, breaker, health checks | `make test-system` ("a crashed service is scheduled for restart", "the breaker tripped on the failing unit") and `crates/rinit/tests/m2_lifecycle.rs` |
 | `rctl` can start, stop, query and read logs | `make test-system`'s M3 block and `crates/rctl/tests/control.rs` |
 | graceful shutdown, no zombies, no fd leak | `make soak` samples descriptors, threads and zombie children through restart churn, and asserts each comes back to its baseline |
-| 72 h soak with stable RSS | **Not yet passed.** Segment 8 completed 4320 samples with flat RSS/descriptors, but it is **not a valid acceptance result**: it ran an old binary, used host `--dev` mode, and its `rctl` was replaced mid-run by a different protocol version (control stopped at 3648 commands). The only zombie signal was two isolated samples. The hardened harness now copies both binaries, counts `rctl` exit status, keeps 30-day steady units and uses a quiescent zombie sweep; a rerun on current HEAD is required. |
+| 72 h soak with stable RSS | **Passed on the host.** Segment 9 on `8b373d8` completed **4,320/4,320 samples** and **8,640/8,640 control commands**. RSS peak per half fell from 5,168 kB to 4,300 kB, descriptor minima were 11 and 11 (peak 22), the maximum zombie streak was 1 transient sample, and the final quiescent sweep found 0 zombies. This is a host `--dev` result; the target-guest 24 h run is still pending. |
 | binaries ≤2 MB dynamic / ≤4 MB static | [Measurements](#measurements-plan-01-calibration-point): 0.88 MiB dynamic arm64 / 0.94 MiB armv7, checked by `make size-check` |
 | unit test coverage ≥80% overall, ≥90% in the core | **88.48%** and **97.82%** (`make coverage-check`, [above](#testing)) |
 | documentation: architecture, unit format, `rctl`, porting | this README (architecture, status, measurements), [`docs/units.md`](docs/units.md) (every directive, its value syntax and its default), [`docs/porting.md`](docs/porting.md) (kernel, userspace, build, differences from systemd), and `rinit-开发计划.md` |
@@ -1110,10 +1111,9 @@ was the plan's original boundary - both are in the extension list (§7.9, §7.7)
 and both are implemented. The table records where the project started, not where
 it ended; this README records the latter.
 
-What is left is not a feature: rerun the 72 h soak on a fixed commit with the
-hardened harness, add a 24 h target-guest run, then wire the remaining
-device-image boot into CI (the coverage/size gates and the 60 s soak are already
-there). The plan's §0.1
+What is left is not a feature: the 72 h host soak is now closed, but a 24 h
+target-guest run is still needed, then the remaining device-image boot should be
+wired into CI (the coverage/size gates and the 60 s soak are already there). The plan's §0.1
 boot and idle-memory targets are also still above the recorded measurements
 (`5 190 ms` to first service, `505 ms` of it rinit; `2 516 kB` idle), so either
 optimise them or record the relaxed thresholds as deliberate deviations instead
