@@ -265,7 +265,7 @@ qemu run: $(KERNEL_IMAGE) $(INITRAMFS)
 # The persistent variant: an ext4 root filesystem instead of an initramfs. The
 # image is built only when missing, so changes made in the guest survive the
 # next `make run-disk`; `make disk-image` is the explicit destructive rebuild.
-disk-image: rinit $(DROPBEAR_BIN_DIR)/dropbear $(BOOT_UNIT_FILES) \
+disk-image: rinit $(BUSYBOX_BIN) $(DROPBEAR_BIN_DIR)/dropbear $(BOOT_UNIT_FILES) \
             $(DEVICE_UNIT_FILES) $(FSTAB) $(MDEV_CONF) $(INITRAMFS_SCRIPTS) \
             $(SCRIPTS)/mkdisk.sh $(SCRIPTS)/mkswapfile.sh
 	$(SCRIPTS)/build-initramfs.sh $(TARGET) --busybox-src $(BUSYBOX_SRC) \
