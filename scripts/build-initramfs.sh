@@ -6,6 +6,7 @@
 #   scripts/build-initramfs.sh <target-triple> [--busybox-src DIR] [--out FILE]
 #                                                    [--demo-units] [--device-units]
 #                                                    [--dropbear-bin DIR]
+#                                                    [--ssh-key FILE]
 #                                                    [--rootfs DIR]
 #
 # Options:
@@ -18,6 +19,8 @@
 #                      `make run` wants; `make test-system` passes it.
 #   --device-units     also pack units/device/, the deployable-device services.
 #   --dropbear-bin DIR install dropbear/dropbearkey from DIR.
+#   --ssh-key FILE     install this public key as root's authorized_keys.
+#                      Requires --dropbear-bin; without it the file stays empty.
 #   --rootfs DIR       populate DIR as a root filesystem and stop (no cpio).
 #                      Used by `make run-disk` before mke2fs.
 #
@@ -39,6 +42,7 @@ output=""
 demo_units=""
 device_units=""
 dropbear_bin=""
+ssh_key=""
 rootfs_out=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -47,14 +51,19 @@ while [[ $# -gt 0 ]]; do
         --demo-units) demo_units=1; shift ;;
         --device-units) device_units=1; shift ;;
         --dropbear-bin) dropbear_bin="${2:?}"; shift 2 ;;
+        --ssh-key) ssh_key="${2:?}"; shift 2 ;;
         --rootfs) rootfs_out="${2:?}"; shift 2 ;;
-        -h | --help) sed -n '2,29p' "$0"; exit 0 ;;
+        -h | --help) sed -n '2,/^set -euo pipefail$/p' "$0" | sed '$d'; exit 0 ;;
         -*) echo "unknown option: $1" >&2; exit 2 ;;
         *) triple="$1"; shift ;;
     esac
 done
 
-: "${triple:?usage: build-initramfs.sh <target-triple> [--busybox-src DIR] [--out FILE] [--demo-units] [--device-units] [--dropbear-bin DIR] [--rootfs DIR]}"
+: "${triple:?usage: build-initramfs.sh <target-triple> [--busybox-src DIR] [--out FILE] [--demo-units] [--device-units] [--dropbear-bin DIR] [--ssh-key FILE] [--rootfs DIR]}"
+if [[ -n "${ssh_key}" ]]; then
+    [[ -n "${dropbear_bin}" ]] || { echo "error: --ssh-key requires --dropbear-bin" >&2; exit 2; }
+    [[ -r "${ssh_key}" ]] || { echo "error: cannot read SSH key ${ssh_key}" >&2; exit 2; }
+fi
 [[ -n "${output}" ]] || output="${repo_root}/build/out/initramfs-${triple}.cpio.gz"
 
 bin_dir="${repo_root}/target/${triple}/release"
@@ -323,8 +332,12 @@ if [[ -n "${dropbear_bin}" ]]; then
     install -d -m 0700 "${work}/etc/dropbear" "${work}/root/.ssh"
     install -m 0755 "${dropbear_bin}/dropbear" "${work}/usr/sbin/dropbear"
     install -m 0755 "${dropbear_bin}/dropbearkey" "${work}/usr/bin/dropbearkey"
-    : >"${work}/root/.ssh/authorized_keys"
-    chmod 0600 "${work}/root/.ssh/authorized_keys"
+    if [[ -n "${ssh_key}" ]]; then
+        install -m 0600 "${ssh_key}" "${work}/root/.ssh/authorized_keys"
+    else
+        : >"${work}/root/.ssh/authorized_keys"
+        chmod 0600 "${work}/root/.ssh/authorized_keys"
+    fi
 fi
 
 if [[ -n "${rootfs_out}" ]]; then

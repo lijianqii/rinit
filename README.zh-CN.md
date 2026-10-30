@@ -265,7 +265,7 @@ units/                # 启动集：两个 target、getty.service（`make run` �
 units/demo/           # §7.x 的验收单元；只打进 `make test-system` 启动的镜像，
                       # 并从控制台手动启动
 units/device/         # 可部署设备服务；只打进 `run-disk` 的 ext4 镜像
-scripts/              # fetch/kernel/busybox/dropbear/initramfs/disk/qemu/tests/soak/reboot
+scripts/              # fetch/kernel/busybox/dropbear/initramfs/disk/qemu/tests/soak/reboot/device
 ```
 
 ## 构建
@@ -610,7 +610,9 @@ ssh -p 2222 root@localhost
 ```
 
 `/root/.ssh/authorized_keys` 初始为空；请通过串口或首次启动前自行加入公钥，镜像
-不提供默认凭据。主机密钥在第一次连接时生成到 `/etc/dropbear`，并随 ext4 镜像持久化。
+不提供默认凭据。`make disk-image AUTHORIZED_KEY=<file.pub>` 可以在构建时装入公钥，
+CI 正是用这种方式免控制台登录。主机密钥在第一次连接时生成到 `/etc/dropbear`，并随
+ext4 镜像持久化。
 dropbear 源码缓存在 `build/dl/dropbear-2026.94.tar.bz2`；离线环境把这个 tarball
 放进去再跑 `make disk-image` 即可。`scripts/build-dropbear.sh` 会应用
 `scripts/dropbear-pty.patch`，保证重新解压源码后仍保留 PTY 修复。
@@ -635,6 +637,15 @@ scripts/reboot-test.sh \
 
 `--arch arm` 选择 ARMv7 默认路径，`--keep-image` 保留工作副本；失败时脚本会自动
 保留副本以便诊断。
+
+`scripts/device-smoke.sh` 是更短的 CI 门禁。它启动镜像，检查 ext4 根文件系统、
+devpts、swap、`device.target`、sshd、mdev、syslog、klogd、`network-online`、
+`/dev/vda`、`/dev/ptmx` 和 `rctl`，遇到 panic 或 ext4 错误就失败。CI 用每次运行
+生成的临时公钥构建镜像，并在 initramfs 系统测试之后运行它：
+
+```bash
+scripts/device-smoke.sh --key ~/.ssh/id_ed25519
+```
 
 镜像构建需要 `e2fsprogs`（`mke2fs -d`）和 `util-linux`（`mkswap`）；内核需要 `CONFIG_EXT4_FS`、
 `CONFIG_VIRTIO_BLK`，并且 `CONFIG_DEVTMPFS_MOUNT` 必须关闭（由 rinit 自己挂载

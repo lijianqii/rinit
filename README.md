@@ -294,7 +294,7 @@ units/                # the boot set: the two targets, getty.service (the consol
 units/demo/           # the §7.x acceptance units; packed only into the image
                       # `make test-system` boots, and started from the console
 units/device/         # deployable-device services; packed into `run-disk`
-scripts/              # fetch/kernel/busybox/dropbear/initramfs/disk/qemu/tests/soak/reboot
+scripts/              # fetch/kernel/busybox/dropbear/initramfs/disk/qemu/tests/soak/reboot/device
 ```
 
 ## Building
@@ -716,8 +716,10 @@ ssh -p 2222 root@localhost
 ```
 
 `/root/.ssh/authorized_keys` starts empty; add a key through the serial console
-(or before the first boot), because no default credential is shipped. Host keys
-are generated on the first connection in `/etc/dropbear` and persist in the ext4
+(or before the first boot), because no default credential is shipped.
+`make disk-image AUTHORIZED_KEY=<file.pub>` installs that key during the build
+instead, which is how CI gets in without a console login. Host keys are
+generated on the first connection in `/etc/dropbear` and persist in the ext4
 image. The dropbear source is cached at
 `build/dl/dropbear-2026.94.tar.bz2`; if the build host is offline, put that
 tarball there and rerun `make disk-image`. `scripts/build-dropbear.sh` applies
@@ -747,6 +749,16 @@ scripts/reboot-test.sh \
 
 `--arch arm` selects the ARMv7 defaults, `--keep-image` keeps the working copy,
 and a failed run keeps it automatically for diagnosis.
+
+`scripts/device-smoke.sh` is the shorter CI gate. It boots the image and checks
+ext4 root, devpts, swap, `device.target`, sshd, mdev, syslog, klogd,
+`network-online`, `/dev/vda`, `/dev/ptmx` and `rctl`, then fails on a panic or
+an ext4 error. CI builds the image with a per-run key and runs this after the
+initramfs system test:
+
+```bash
+scripts/device-smoke.sh --key ~/.ssh/id_ed25519
+```
 
 The image needs `e2fsprogs` (`mke2fs -d`) and `util-linux` (`mkswap`); the kernel needs `CONFIG_EXT4_FS`,
 `CONFIG_VIRTIO_BLK` and `CONFIG_DEVTMPFS_MOUNT` **off** (rinit mounts `/dev`

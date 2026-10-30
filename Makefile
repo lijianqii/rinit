@@ -75,6 +75,8 @@ SWAP_SIZE_MB     ?= 32
 DROPBEAR_VERSION ?= 2026.94
 # Host-side SSH access to `run-disk`: ssh -p 2222 root@localhost.
 DISK_HOSTFWD     ?= tcp::2222-:22
+# Public key installed for root by `disk-image`; empty keeps the image keyless.
+AUTHORIZED_KEY   ?=
 
 # Everything the guest's acceptance tests need the kernel to provide.
 KERNEL_REQUIRED_OPTS := CGROUP_SCHED FAIR_GROUP_SCHED CFS_BANDWIDTH MEMCG \
@@ -265,11 +267,14 @@ qemu run: $(KERNEL_IMAGE) $(INITRAMFS)
 # The persistent variant: an ext4 root filesystem instead of an initramfs. The
 # image is built only when missing, so changes made in the guest survive the
 # next `make run-disk`; `make disk-image` is the explicit destructive rebuild.
+# AUTHORIZED_KEY=<file.pub> installs a client key for root; CI uses it to boot
+# the image without a console login.
 disk-image: rinit $(BUSYBOX_BIN) $(DROPBEAR_BIN_DIR)/dropbear $(BOOT_UNIT_FILES) \
             $(DEVICE_UNIT_FILES) $(FSTAB) $(MDEV_CONF) $(INITRAMFS_SCRIPTS) \
             $(SCRIPTS)/mkdisk.sh $(SCRIPTS)/mkswapfile.sh
 	$(SCRIPTS)/build-initramfs.sh $(TARGET) --busybox-src $(BUSYBOX_SRC) \
-	    --device-units --dropbear-bin $(DROPBEAR_BIN_DIR) --rootfs $(ROOTFS_DIR)
+	    --device-units --dropbear-bin $(DROPBEAR_BIN_DIR) --rootfs $(ROOTFS_DIR) \
+	    $(if $(AUTHORIZED_KEY),--ssh-key "$(AUTHORIZED_KEY)")
 	$(SCRIPTS)/mkswapfile.sh $(ROOTFS_DIR)/swapfile $(SWAP_SIZE_MB)
 	$(SCRIPTS)/mkdisk.sh $(ROOTFS_DIR) $(DISK_IMAGE)
 
