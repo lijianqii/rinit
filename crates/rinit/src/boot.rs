@@ -882,6 +882,46 @@ async fn control_start(
             return (Status::NoSuchUnit, format!("no such unit: {unit} ({why})"));
         }
     }
+    let order = match manager.start_order(unit) {
+        Ok(order) => order,
+        Err(e) => {
+            return (
+                Status::Error,
+                format!("cannot resolve dependencies for {unit}: {e}"),
+            );
+        }
+    };
+    let required = manager.required_closure(unit);
+    for dependency in order {
+        match manager.request_start(&dependency, RequestSource::Dependency) {
+            Some(Effect::None) => {}
+            Some(effect) => {
+                if let Err(e) = apply_effect(manager, notify, logs, &dependency, Some(effect)).await
+                {
+                    return (
+                        Status::Error,
+                        format!("cannot start dependency {dependency}: {e}"),
+                    );
+                }
+                run_start_post(manager, &dependency).await;
+            }
+            None => {
+                // A dependency that is still stopping is not ready for this
+                // start; the target must not pretend it came up.
+                return (
+                    Status::Error,
+                    format!("dependency {dependency} is still stopping"),
+                );
+            }
+        }
+        if required.contains(&dependency) && manager.is_failed(&dependency) {
+            return (
+                Status::Error,
+                format!("required dependency {dependency} failed to start"),
+            );
+        }
+    }
+
     let effect = manager.request_start(unit, RequestSource::UserStart);
     match effect {
         Some(Effect::None) => (Status::Ok, format!("{unit} is already active")),

@@ -213,8 +213,8 @@ sc_wants_soft() {
 
 sc_requires_hard() {
     fail=0
-    start_unit fs-requires.target && fail=1
-    [ "$(unit_state fs-requires.target)" != active ] || fail=1
+    start_unit fs-requires.target || true
+    wait_state fs-requires.target failed 5 || fail=1
     [ "$(unit_state fs-requires-fail.service)" = failed ] || fail=1
     cleanup_names fs-requires.target fs-requires-fail.service
     return "$fail"

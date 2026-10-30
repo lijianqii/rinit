@@ -13,7 +13,7 @@
 
 use rinit_core::unit::cgroup::CgroupLimits;
 use rinit_core::unit::config::{RestartPolicy, ServiceKind};
-use rinit_core::unit::dependency::spawns_process;
+use rinit_core::unit::dependency::{DependencyGraph, spawns_process};
 use rinit_core::unit::restart::BackoffState;
 use rinit_core::{Effect, Event, ExitOutcome, FailedReason, NotifyMessage, UnitState, transition};
 use rinit_core::{Job, JobQueue, JobTarget, RequestSource, UnitConfig, UnitName};
@@ -560,6 +560,50 @@ impl UnitManager {
     /// Read a unit.
     pub fn get(&self, unit: &UnitName) -> Option<&UnitRuntime> {
         self.units.get(unit)
+    }
+
+    /// Dependencies a control-driven start must bring up first, in boot order.
+    ///
+    /// The boot path already resolves the graph; a `rctl start` of a target or
+    /// of a unit with `Requires=`/`Wants=` has to do the same, otherwise the
+    /// target looks active while the units it aggregates are still inactive.
+    /// Ordering-only edges are not pulled in; the closure is.
+    pub fn start_order(&self, unit: &UnitName) -> Result<Vec<UnitName>, String> {
+        let configs: Vec<&UnitConfig> = self.units.values().map(|rt| &rt.config).collect();
+        let graph = DependencyGraph::build(configs).map_err(|e| e.to_string())?;
+        let closure = graph.closure_of(unit);
+        let levels = graph.levels().map_err(|e| e.to_string())?;
+        let mut order = Vec::new();
+        for level in levels {
+            for candidate in level {
+                if candidate != *unit && closure.contains(&candidate) {
+                    order.push(candidate);
+                }
+            }
+        }
+        Ok(order)
+    }
+
+    /// The transitive `Requires=` closure of `unit`.
+    ///
+    /// `Wants=` failures are tolerated; a required unit that fails takes the
+    /// dependent start with it, exactly like the boot path.
+    pub fn required_closure(&self, unit: &UnitName) -> Vec<UnitName> {
+        let mut out: Vec<UnitName> = Vec::new();
+        let mut stack = vec![unit.clone()];
+        while let Some(current) = stack.pop() {
+            let Some(rt) = self.units.get(&current) else {
+                continue;
+            };
+            for required in &rt.config.deps.requires {
+                if out.contains(required) {
+                    continue;
+                }
+                out.push(required.clone());
+                stack.push(required.clone());
+            }
+        }
+        out
     }
 
     /// Take a pending reload definition at the start of a start (plan §7.6).

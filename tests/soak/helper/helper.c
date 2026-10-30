@@ -87,7 +87,10 @@ static void socket_connect(const char *path)
 
 static void oom_eat(void)
 {
-    const size_t total = 32U * 1024U * 1024U;
+    /* The guest has a 32 MiB swap file, so 32 MiB of anonymous memory fits in
+     * RAM+swap and never reaches the 16 MiB cgroup OOM. Touch past the combined
+     * limit; 64 MiB is enough and still allocatable on the 32-bit guest. */
+    const size_t total = 64U * 1024U * 1024U;
     volatile unsigned char *memory = malloc(total);
     size_t offset;
 
