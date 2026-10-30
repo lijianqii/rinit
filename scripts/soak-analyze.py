@@ -163,12 +163,15 @@ def main():
     rss_second = median(rss[len(rss) // 2:])
     rss_drift = rss_second - rss_first
     rss_slope = slope_kb_per_hour(stable)
-    if rss_drift > 128:
-        reasons.append(f"RSS median drift {rss_drift:.0f} kB exceeds 128 kB")
-    # A slope over a 100-second smoke run is noise, not a leak; apply it only
-    # where there is enough time for the number to mean something.
-    if duration >= 6 * 3600 and rss_slope > 1.0:
-        reasons.append(f"RSS slope {rss_slope:.2f} kB/h exceeds 1 kB/h")
+    # One-hour preflights are for wiring and functional probes, not leak
+    # acceptance: a feature probe can move RSS once and a half-vs-half median
+    # then reads as growth. Apply the leak thresholds only to runs long enough
+    # for a leak to dominate allocator/cache noise.
+    if duration >= 6 * 3600:
+        if rss_drift > 128:
+            reasons.append(f"RSS median drift {rss_drift:.0f} kB exceeds 128 kB")
+        if rss_slope > 1.0:
+            reasons.append(f"RSS slope {rss_slope:.2f} kB/h exceeds 1 kB/h")
 
     feature_rows = read_feature_rows(feature_path)
     feature_failures = []

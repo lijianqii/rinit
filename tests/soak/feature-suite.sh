@@ -90,7 +90,6 @@ run_scenario() {
     local fn=$4
     local started result detail duration
     started=$(date +%s)
-    feature_start
     if "$fn"; then
         result=pass
         detail=ok
@@ -98,11 +97,22 @@ run_scenario() {
         result=fail
         detail="probe returned failure"
     fi
-    feature_end
     duration=$(( ($(date +%s) - started) * 1000 ))
     scenarios=$((scenarios + 1))
     [ "$result" = pass ] || failures=$((failures + 1))
     record "$name" "$level" "$result" "$expected" "$detail"
+}
+
+feature_window_start() {
+    touch /run/rinit-feature-active
+}
+
+feature_window_end() {
+    # Keep the sampler's exclusion window open long enough that at least one
+    # 60-second sample covers each tier, even when the probes themselves are
+    # shorter than the sample interval.
+    sleep 120
+    rm -f /run/rinit-feature-active
 }
 
 unit_state() {
@@ -553,6 +563,7 @@ sc_control_recovery() {
 # tier runners
 
 run_light() {
+    feature_window_start
     rand_between 1 13
     case "$NEXT" in
         1) run_scenario light-rctl-formats light 0 sc_rctl_formats ;;
@@ -569,9 +580,11 @@ run_light() {
         12) run_scenario light-log-ring light 0 sc_log_ring ;;
         13) run_scenario light-device light 0 sc_device_services ;;
     esac
+    feature_window_end
 }
 
 run_light_all() {
+    feature_window_start
     run_scenario light-rctl-formats light 0 sc_rctl_formats
     run_scenario light-rctl-log light 0 sc_rctl_log
     run_scenario light-processes light 0 sc_processes
@@ -585,9 +598,11 @@ run_light_all() {
     run_scenario light-restart light 0 sc_restart_policies
     run_scenario light-log-ring light 0 sc_log_ring
     run_scenario light-device light 0 sc_device_services
+    feature_window_end
 }
 
 run_medium() {
+    feature_window_start
     run_scenario medium-cgroup-limits medium 0 sc_cgroup_limits
     run_scenario medium-cgroup-cleanup medium 0 sc_cgroup_cleanup
     run_scenario medium-sandbox medium 0 sc_sandbox
@@ -605,13 +620,16 @@ run_medium() {
     run_scenario medium-notify-timeout medium 1 sc_notify_timeout
     run_scenario medium-tty medium 0 sc_tty_success
     run_scenario medium-tty-bad medium 1 sc_tty_bad
+    feature_window_end
 }
 
 run_heavy() {
+    feature_window_start
     run_scenario heavy-oom heavy 1 sc_oom
     run_scenario heavy-breaker heavy 1 sc_breaker
     run_scenario heavy-disk heavy 0 sc_disk_audit
     run_scenario heavy-control heavy 0 sc_control_recovery
+    feature_window_end
 }
 
 finish() {
@@ -629,7 +647,9 @@ finish() {
 }
 
 if [ -n "$only" ]; then
+    feature_window_start
     run_scenario "manual-$only" manual 0 "sc_$only"
+    feature_window_end
     finish
 fi
 
