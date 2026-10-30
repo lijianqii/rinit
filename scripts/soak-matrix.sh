@@ -91,15 +91,17 @@ start_arch() {
         args+=(--helper "$helper" --feature-suite "$feature_suite")
     fi
     "$repo_root/scripts/soak-qemu.sh" "${args[@]}" >"$log" 2>&1 &
-    echo $!
+    started_pid=$!
 }
 
-child_aarch64=$(start_arch aarch64 "$tag_aarch64" "$port_aarch64" \
+start_arch aarch64 "$tag_aarch64" "$port_aarch64" \
     "$aarch64_image" "$aarch64_kernel" "$log_aarch64" \
-    "$helper_dir/soak-helper-aarch64")
-child_arm=$(start_arch arm "$tag_arm" "$port_arm" \
+    "$helper_dir/soak-helper-aarch64"
+child_aarch64=$started_pid
+start_arch arm "$tag_arm" "$port_arm" \
     "$arm_image" "$arm_kernel" "$log_arm" \
-    "$helper_dir/soak-helper-arm")
+    "$helper_dir/soak-helper-arm"
+child_arm=$started_pid
 
 echo "soak-matrix: aarch64=$tag_aarch64 pid=$child_aarch64 port=$port_aarch64"
 echo "soak-matrix: arm32=$tag_arm pid=$child_arm port=$port_arm"
