@@ -4,11 +4,16 @@
 # The guest sampler is started once over SSH, then runs independently of the
 # host connection. This avoids making the whole 24 h run depend on 1,440 SSH
 # sessions; the serial console still carries a compact heartbeat if SSH fails.
+#
+# Usage: scripts/soak-qemu.sh --key PATH [--arch aarch64|arm] [--seconds N]
+#                             [--interval N] [--tag NAME] [--kernel FILE]
+#                             [--disk FILE]
 set -u
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-kernel="$repo_root/build/src/linux-6.6.158/arch/arm64/boot/Image"
-disk="$repo_root/build/out/rinit-aarch64-unknown-linux-gnu.ext4"
+arch=aarch64
+kernel=""
+disk=""
 key=""
 seconds=3600
 interval=60
@@ -17,6 +22,7 @@ log_dir="$repo_root/build/soak-charts"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --arch) arch="${2:?}"; shift 2 ;;
         --kernel) kernel="${2:?}"; shift 2 ;;
         --disk) disk="${2:?}"; shift 2 ;;
         --key) key="${2:?}"; shift 2 ;;
@@ -28,6 +34,20 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+case "$arch" in
+    aarch64)
+        : "${kernel:=$repo_root/build/src/linux-6.6.158/arch/arm64/boot/Image}"
+        : "${disk:=$repo_root/build/out/rinit-aarch64-unknown-linux-gnu.ext4}"
+        qemu_bin=qemu-system-aarch64
+        ;;
+    arm)
+        : "${kernel:=$repo_root/build/arm32/src/linux-6.6.158/arch/arm/boot/zImage}"
+        : "${disk:=$repo_root/build/arm32/out/rinit-armv7-unknown-linux-gnueabihf.ext4}"
+        qemu_bin=qemu-system-arm
+        ;;
+    *) echo "error: --arch must be aarch64 or arm" >&2; exit 2 ;;
+esac
+
 [[ -n "$key" ]] || { echo "error: --key is required" >&2; exit 2; }
 for f in "$kernel" "$disk" "$key"; do
     [[ -e "$f" ]] || { echo "error: missing $f" >&2; exit 2; }
@@ -38,7 +58,7 @@ guest_csv="$log_dir/soak-qemu-${tag}-guest.csv"
 run_info="$log_dir/soak-qemu-${tag}-run.txt"
 rm -f "$serial" "$guest_csv" "$run_info"
 
-work=$(mktemp -d /tmp/opencode/soak-qemu.XXXXXX)
+work=$(mktemp -d "${TMPDIR:-/tmp}/soak-qemu.XXXXXX")
 qemu_pid=""
 cleanup() {
     if [[ -n "$qemu_pid" ]] && kill -0 "$qemu_pid" 2>/dev/null; then
@@ -92,13 +112,14 @@ ssh_guest() {
 {
     printf 'started  %s\n' "$(date '+%F %T %Z')"
     printf 'commit   %s\n' "$(git -C "$repo_root" rev-parse HEAD)"
+    printf 'arch     %s\n' "$arch"
     printf 'image    %s\n' "$(sha256sum "$disk" | cut -d' ' -f1)"
     printf 'kernel   %s\n' "$(sha256sum "$kernel" | cut -d' ' -f1)"
-    printf 'qemu     %s\n' "$(qemu-system-aarch64 --version | head -1)"
+    printf 'qemu     %s\n' "$("$qemu_bin" --version | head -1)"
     printf 'duration %ss interval %ss\n' "$seconds" "$interval"
 } >"$run_info"
 
-timeout -k 5 $((seconds + 1800)) "$repo_root/scripts/run-qemu.sh" --arch aarch64 \
+timeout -k 5 $((seconds + 1800)) "$repo_root/scripts/run-qemu.sh" --arch "$arch" \
     --kernel "$kernel" --disk "$disk" --root /dev/vda \
     --hostfwd tcp::2222-:22 --kernel-args "-- --default device.target" \
     </dev/null >"$serial" 2>&1 &
