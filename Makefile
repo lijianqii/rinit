@@ -77,6 +77,8 @@ DROPBEAR_VERSION ?= 2026.94
 DISK_HOSTFWD     ?= tcp::2222-:22
 # Public key installed for root by `disk-image`; empty keeps the image keyless.
 AUTHORIZED_KEY   ?=
+# Extra MiB added to the disk image: long runs use 64 to get ~128 MB.
+DISK_EXTRA_MB    ?= 0
 
 # Everything the guest's acceptance tests need the kernel to provide.
 KERNEL_REQUIRED_OPTS := CGROUP_SCHED FAIR_GROUP_SCHED CFS_BANDWIDTH MEMCG \
@@ -276,7 +278,7 @@ disk-image: rinit $(BUSYBOX_BIN) $(DROPBEAR_BIN_DIR)/dropbear $(BOOT_UNIT_FILES)
 	    --device-units --dropbear-bin $(DROPBEAR_BIN_DIR) --rootfs $(ROOTFS_DIR) \
 	    $(if $(AUTHORIZED_KEY),--ssh-key "$(AUTHORIZED_KEY)")
 	$(SCRIPTS)/mkswapfile.sh $(ROOTFS_DIR)/swapfile $(SWAP_SIZE_MB)
-	$(SCRIPTS)/mkdisk.sh $(ROOTFS_DIR) $(DISK_IMAGE)
+	DISK_EXTRA_MB=$(DISK_EXTRA_MB) $(SCRIPTS)/mkdisk.sh $(ROOTFS_DIR) $(DISK_IMAGE)
 
 $(DISK_IMAGE):
 	$(MAKE) disk-image

@@ -7,7 +7,7 @@
 #
 # Usage: scripts/soak-qemu.sh --key PATH [--arch aarch64|arm] [--seconds N]
 #                             [--interval N] [--tag NAME] [--kernel FILE]
-#                             [--disk FILE]
+#                             [--disk FILE] [--port N] [--checkpoint-interval N]
 set -u
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -17,6 +17,8 @@ disk=""
 key=""
 seconds=3600
 interval=60
+port=2222
+checkpoint_interval=3600
 tag="qemu-soak"
 log_dir="$repo_root/build/soak-charts"
 
@@ -28,11 +30,18 @@ while [[ $# -gt 0 ]]; do
         --key) key="${2:?}"; shift 2 ;;
         --seconds) seconds="${2:?}"; shift 2 ;;
         --interval) interval="${2:?}"; shift 2 ;;
+        --port) port="${2:?}"; shift 2 ;;
+        --checkpoint-interval) checkpoint_interval="${2:?}"; shift 2 ;;
         --tag) tag="${2:?}"; shift 2 ;;
         -h | --help) sed -n '2,/^set -u$/p' "$0" | sed '$d'; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
+
+[[ "$port" =~ ^[0-9]+$ ]] && ((10#$port >= 1 && 10#$port <= 65535)) ||
+    { echo "error: --port must be 1..65535" >&2; exit 2; }
+[[ "$checkpoint_interval" =~ ^[0-9]+$ ]] ||
+    { echo "error: --checkpoint-interval must be a non-negative integer" >&2; exit 2; }
 
 case "$arch" in
     aarch64)
@@ -56,7 +65,11 @@ mkdir -p "$log_dir"
 serial="$log_dir/soak-qemu-${tag}.log"
 guest_csv="$log_dir/soak-qemu-${tag}-guest.csv"
 run_info="$log_dir/soak-qemu-${tag}-run.txt"
+checkpoint_dir="$log_dir/soak-qemu-${tag}-checkpoints"
 rm -f "$serial" "$guest_csv" "$run_info"
+rm -rf "$checkpoint_dir"
+mkdir -p "$checkpoint_dir"
+printf 'checkpoint log for %s\n' "$tag" >"$checkpoint_dir/log"
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/soak-qemu.XXXXXX")
 qemu_pid=""
@@ -103,8 +116,9 @@ StartLimitIntervalSec=0
 EOF
 
 ssh_guest() {
-    ssh -p 2222 -i "$key" -o BatchMode=yes -o StrictHostKeyChecking=no \
-        -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 \
+    timeout 30 ssh -p "$port" -i "$key" -o BatchMode=yes \
+        -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        -o LogLevel=ERROR -o ConnectTimeout=5 \
         -o ServerAliveInterval=10 -o ServerAliveCountMax=3 \
         root@127.0.0.1 "$@"
 }
@@ -116,12 +130,14 @@ ssh_guest() {
     printf 'image    %s\n' "$(sha256sum "$disk" | cut -d' ' -f1)"
     printf 'kernel   %s\n' "$(sha256sum "$kernel" | cut -d' ' -f1)"
     printf 'qemu     %s\n' "$("$qemu_bin" --version | head -1)"
-    printf 'duration %ss interval %ss\n' "$seconds" "$interval"
+    printf 'port     %s\n' "$port"
+    printf 'duration %ss interval %ss checkpoint %ss\n' \
+        "$seconds" "$interval" "$checkpoint_interval"
 } >"$run_info"
 
 timeout -k 5 $((seconds + 1800)) "$repo_root/scripts/run-qemu.sh" --arch "$arch" \
     --kernel "$kernel" --disk "$disk" --root /dev/vda \
-    --hostfwd tcp::2222-:22 --kernel-args "-- --default device.target" \
+    --hostfwd "tcp::$port-:22" --kernel-args "-- --default device.target" \
     </dev/null >"$serial" 2>&1 &
 qemu_pid=$!
 
@@ -156,9 +172,22 @@ ssh_guest "nohup sh /root/soak-guest.sh --seconds $seconds --interval $interval 
 }
 
 deadline=$((SECONDS + seconds + 1800))
+last_checkpoint=$SECONDS
 while ((SECONDS < deadline)); do
     if grep -q 'SOAK_DONE' "$serial"; then break; fi
     if ! kill -0 "$qemu_pid" 2>/dev/null; then break; fi
+    if ((checkpoint_interval > 0 && SECONDS - last_checkpoint >= checkpoint_interval)); then
+        stamp="$(date +%Y%m%d%H%M%S)"
+        tmp="$checkpoint_dir/.guest-$stamp.csv"
+        if ssh_guest 'cat /var/log/rinit/soak-guest.csv' >"$tmp" 2>/dev/null && [[ -s "$tmp" ]]; then
+            mv "$tmp" "$checkpoint_dir/guest-$stamp.csv"
+            printf 'ok   %s guest-%s.csv\n' "$(date '+%F %T %Z')" "$stamp" >>"$checkpoint_dir/log"
+        else
+            rm -f "$tmp"
+            printf 'FAIL %s ssh/checkpoint unavailable\n' "$(date '+%F %T %Z')" >>"$checkpoint_dir/log"
+        fi
+        last_checkpoint=$SECONDS
+    fi
     sleep 20
 done
 

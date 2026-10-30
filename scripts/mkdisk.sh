@@ -10,6 +10,11 @@ set -euo pipefail
 
 root="${1:?usage: mkdisk.sh <root-dir> <output.img>}"
 out="${2:?usage: mkdisk.sh <root-dir> <output.img>}"
+extra_mb="${DISK_EXTRA_MB:-0}"
+[[ "${extra_mb}" =~ ^[0-9]+$ ]] || {
+    echo "mkdisk: DISK_EXTRA_MB must be a non-negative integer" >&2
+    exit 2
+}
 mke2fs="${MKE2FS:-}"
 if [[ -z "${mke2fs}" ]]; then
     for candidate in /sbin/mke2fs /usr/sbin/mke2fs; do
@@ -24,7 +29,7 @@ fi
 }
 
 used_kb="$(du -sk "${root}" | cut -f1)"
-size_kb=$((used_kb + used_kb / 4 + 16384))
+size_kb=$((used_kb + used_kb / 4 + 16384 + extra_mb * 1024))
 (( size_kb < 65536 )) && size_kb=65536
 blocks=$(( (size_kb + 3) / 4 ))
 

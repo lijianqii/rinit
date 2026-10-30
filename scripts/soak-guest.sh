@@ -24,7 +24,7 @@ done
 
 mkdir -p /var/log/rinit
 : >"$out"
-printf 'elapsed,rss_kb,fds,threads,zombies,control_ok,control_fail,ip,route,udhcpc,dropbear,network,sshd\n' >"$out"
+printf 'elapsed,rss_kb,fds,threads,zombies,control_ok,control_fail,ip,route,udhcpc,dropbear,network,sshd,device_target,disk_free_kb,mem_available_kb,swap_used_kb,load1,feature_active\n' >"$out"
 
 start=$(date +%s)
 count=$((seconds / interval))
@@ -63,19 +63,33 @@ while [ "$i" -le "$count" ]; do
     dropbear=$(ps 2>/dev/null | grep -c '[d]ropbear')
     network=$(rctl status --plain network.service 2>/dev/null | awk '/^state:/{print $2; exit}')
     sshd=$(rctl status --plain sshd.service 2>/dev/null | awk '/^state:/{print $2; exit}')
+    device_target=$(rctl status --plain device.target 2>/dev/null | awk '/^state:/{print $2; exit}')
+    disk_free_kb=$(df -k / 2>/dev/null | awk 'NR == 2 { print $4; exit }')
+    mem_available_kb=$(awk '/^MemAvailable:/{print $2; exit}' /proc/meminfo 2>/dev/null)
+    swap_total=$(awk '/^SwapTotal:/{print $2; exit}' /proc/meminfo 2>/dev/null)
+    swap_free=$(awk '/^SwapFree:/{print $2; exit}' /proc/meminfo 2>/dev/null)
+    swap_used_kb=$(( ${swap_total:-0} - ${swap_free:-0} ))
+    load1=$(awk '{print $1; exit}' /proc/loadavg 2>/dev/null)
+    if [ -f /run/rinit-feature-active ]; then feature_active=1; else feature_active=0; fi
+
     [ "$network" = "active" ] || health_fail=$((health_fail + 1))
     [ "$sshd" = "active" ] || health_fail=$((health_fail + 1))
+    [ "$device_target" = "active" ] || health_fail=$((health_fail + 1))
     [ -n "$ip4" ] || health_fail=$((health_fail + 1))
     [ -n "$route" ] || health_fail=$((health_fail + 1))
     [ "$udhcpc" -gt 0 ] || health_fail=$((health_fail + 1))
     [ "$dropbear" -gt 0 ] || health_fail=$((health_fail + 1))
+    [ -n "$disk_free_kb" ] && [ "$disk_free_kb" -ge 8192 ] || health_fail=$((health_fail + 1))
 
     elapsed=$(( $(date +%s) - start ))
-    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
         "$elapsed" "$rss" "$fds" "$threads" "$zombies" "$ctl_ok" "$ctl_fail" \
-        "$ip4" "$route" "$udhcpc" "$dropbear" "$network" "$sshd" >>"$out"
-    printf 'SOAK elapsed=%s rss=%s fds=%s threads=%s zombies=%s control=%s/%s network=%s sshd=%s\n' \
-        "$elapsed" "$rss" "$fds" "$threads" "$zombies" "$ctl_ok" "$((ctl_ok + ctl_fail))" "$network" "$sshd" >"$console"
+        "$ip4" "$route" "$udhcpc" "$dropbear" "$network" "$sshd" \
+        "$device_target" "${disk_free_kb:-}" "${mem_available_kb:-}" \
+        "$swap_used_kb" "${load1:-}" "$feature_active" >>"$out"
+    printf 'SOAK elapsed=%s rss=%s fds=%s threads=%s zombies=%s control=%s/%s network=%s sshd=%s disk_free=%s feature=%s\n' \
+        "$elapsed" "$rss" "$fds" "$threads" "$zombies" "$ctl_ok" "$((ctl_ok + ctl_fail))" \
+        "$network" "$sshd" "${disk_free_kb:-}" "$feature_active" >"$console"
 
     i=$((i + 1))
     if [ "$i" -le "$count" ]; then
