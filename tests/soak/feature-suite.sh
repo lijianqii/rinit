@@ -516,7 +516,7 @@ sc_tty_bad() {
 # heavy probes
 
 sc_oom() {
-    start_unit oom.service || return 1
+    start_unit fs-oom.service || return 1
     i=0
     while [ "$i" -lt 15 ]; do
         dmesg 2>/dev/null | grep -qi 'Memory cgroup out of memory' && break
@@ -525,8 +525,8 @@ sc_oom() {
     done
     fail=0
     dmesg 2>/dev/null | grep -qi 'Memory cgroup out of memory' || fail=1
-    [ "$(unit_restarts oom.service)" -gt 0 ] 2>/dev/null || fail=1
-    stop_unit oom.service
+    [ "$(unit_restarts fs-oom.service)" -gt 0 ] 2>/dev/null || fail=1
+    stop_unit fs-oom.service
     return "$fail"
 }
 

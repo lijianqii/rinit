@@ -85,6 +85,21 @@ static void socket_connect(const char *path)
     close(fd);
 }
 
+static void oom_eat(void)
+{
+    const size_t total = 32U * 1024U * 1024U;
+    volatile unsigned char *memory = malloc(total);
+    size_t offset;
+
+    if (memory == NULL) {
+        fail("malloc");
+    }
+    for (offset = 0; offset < total; offset += 4096U) {
+        memory[offset] = (unsigned char)(offset >> 12);
+    }
+    sleep(30);
+}
+
 static void pty_hold(const char *path)
 {
     int master = posix_openpt(O_RDWR | O_NOCTTY);
@@ -113,7 +128,7 @@ int main(int argc, char **argv)
 {
     if (argc < 2) {
         fprintf(stderr,
-                "usage: %s notify-ready [--hold] | notify-hold | "
+                "usage: %s notify-ready [--hold] | notify-hold | oom-eat | "
                 "socket-connect PATH | pty-hold PATH\n",
                 argv[0]);
         return 2;
@@ -127,6 +142,10 @@ int main(int argc, char **argv)
     }
     if (strcmp(argv[1], "notify-hold") == 0) {
         sleep(30);
+        return 0;
+    }
+    if (strcmp(argv[1], "oom-eat") == 0) {
+        oom_eat();
         return 0;
     }
     if (strcmp(argv[1], "socket-connect") == 0) {

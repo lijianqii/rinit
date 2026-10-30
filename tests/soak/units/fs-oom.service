@@ -1,0 +1,10 @@
+[Unit]
+Description=cgroup OOM probe
+[Service]
+Type=simple
+CgroupMemoryMax=16M
+ExecStart=/usr/local/bin/rinit-soak-helper oom-eat
+Restart=on-failure
+RestartSec=0
+StartLimitBurst=2
+StartLimitIntervalSec=300
