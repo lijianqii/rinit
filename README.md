@@ -294,7 +294,7 @@ units/                # the boot set: the two targets, getty.service (the consol
 units/demo/           # the §7.x acceptance units; packed only into the image
                       # `make test-system` boots, and started from the console
 units/device/         # deployable-device services; packed into `run-disk`
-scripts/              # fetch/kernel/busybox/dropbear/initramfs/disk/qemu/tests/soak
+scripts/              # fetch/kernel/busybox/dropbear/initramfs/disk/qemu/tests/soak/reboot
 ```
 
 ## Building
@@ -731,6 +731,22 @@ command line disables the whole second wave, so do not use it on a device image
 that needs interactive SSH. The ext4 image is reused by `run-disk`, so an image
 built before this fstab entry existed must be rebuilt with `make disk-image`
 before testing interactive SSH again.
+
+The reboot/power-loss regression is `scripts/reboot-test.sh`. It copies the
+image, seeds a marker, `/etc/hostname` and a unit wanted by `device.target`,
+reboots through rinit's SIGTERM path, then kills qemu with SIGKILL and checks
+the marker and ext4 journal recovery after the next boot. The image must already
+contain the public half of `--key` in `/root/.ssh/authorized_keys`:
+
+```bash
+scripts/reboot-test.sh \
+    --image build/out/rinit-aarch64-unknown-linux-gnu.ext4 \
+    --kernel build/src/linux-6.6.158/arch/arm64/boot/Image \
+    --key ~/.ssh/id_ed25519
+```
+
+`--arch arm` selects the ARMv7 defaults, `--keep-image` keeps the working copy,
+and a failed run keeps it automatically for diagnosis.
 
 The image needs `e2fsprogs` (`mke2fs -d`) and `util-linux` (`mkswap`); the kernel needs `CONFIG_EXT4_FS`,
 `CONFIG_VIRTIO_BLK` and `CONFIG_DEVTMPFS_MOUNT` **off** (rinit mounts `/dev`

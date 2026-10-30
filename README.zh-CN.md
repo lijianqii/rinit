@@ -265,7 +265,7 @@ units/                # 启动集：两个 target、getty.service（`make run` �
 units/demo/           # §7.x 的验收单元；只打进 `make test-system` 启动的镜像，
                       # 并从控制台手动启动
 units/device/         # 可部署设备服务；只打进 `run-disk` 的 ext4 镜像
-scripts/              # fetch/kernel/busybox/dropbear/initramfs/disk/qemu/tests/soak
+scripts/              # fetch/kernel/busybox/dropbear/initramfs/disk/qemu/tests/soak/reboot
 ```
 
 ## 构建
@@ -620,6 +620,21 @@ dropbear 源码缓存在 `build/dl/dropbear-2026.94.tar.bz2`；离线环境把�
 会话。内核命令行上的 `nofstab` 会禁用整个第二波挂载，所以需要交互式 SSH 的设备
 镜像不要使用它。`run-disk` 会复用已有 ext4 镜像，因此在这条 fstab 配置加入之前
 构建的镜像，必须先执行 `make disk-image` 重建，再测试交互式 SSH。
+
+重启/断电回归测试是 `scripts/reboot-test.sh`。它复制镜像，写入 marker、
+`/etc/hostname` 和一个被 `device.target` 拉起的单元，先通过 rinit 的 SIGTERM 路径
+正常重启，再用 SIGKILL 杀掉 qemu，验证下次启动后 marker 和 ext4 journal 恢复。
+镜像必须已经在 `/root/.ssh/authorized_keys` 中包含 `--key` 对应的公钥：
+
+```bash
+scripts/reboot-test.sh \
+    --image build/out/rinit-aarch64-unknown-linux-gnu.ext4 \
+    --kernel build/src/linux-6.6.158/arch/arm64/boot/Image \
+    --key ~/.ssh/id_ed25519
+```
+
+`--arch arm` 选择 ARMv7 默认路径，`--keep-image` 保留工作副本；失败时脚本会自动
+保留副本以便诊断。
 
 镜像构建需要 `e2fsprogs`（`mke2fs -d`）和 `util-linux`（`mkswap`）；内核需要 `CONFIG_EXT4_FS`、
 `CONFIG_VIRTIO_BLK`，并且 `CONFIG_DEVTMPFS_MOUNT` 必须关闭（由 rinit 自己挂载
