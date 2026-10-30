@@ -108,6 +108,7 @@ rctl status --plain device.target >/dev/null 2>&1 || health_fail=$((health_fail 
 rctl status --plain sshd.service >/dev/null 2>&1 || health_fail=$((health_fail + 1))
 rctl status --plain mdev.service >/dev/null 2>&1 || health_fail=$((health_fail + 1))
 
+sync
 if [ "$control_fail" -eq 0 ] && [ "$quiescent" -eq 0 ] && [ "$health_fail" -eq 0 ]; then
     result=OK
 else

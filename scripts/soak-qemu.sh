@@ -193,8 +193,27 @@ done
 
 ssh_final=0
 if ssh_guest 'true' >/dev/null 2>&1; then ssh_final=1; fi
+csv_ok=0
 if ((ssh_final)); then
-    ssh_guest 'cat /var/log/rinit/soak-guest.csv' >"$guest_csv" 2>/dev/null || true
+    expected=$((seconds / interval))
+    tmp="$guest_csv.partial"
+    rm -f "$tmp"
+    for attempt in 1 2 3; do
+        if ssh_guest 'cat /var/log/rinit/soak-guest.csv' >"$tmp" 2>/dev/null; then
+            rows=$(( $(wc -l <"$tmp") - 1 ))
+            header="$(head -1 "$tmp")"
+            if [[ "$header" == elapsed,* ]] && ((rows >= expected)); then
+                mv "$tmp" "$guest_csv"
+                csv_ok=1
+                break
+            fi
+        fi
+        sleep 2
+    done
+    if ((csv_ok == 0)); then
+        [[ -e "$tmp" ]] && mv "$tmp" "$guest_csv.partial"
+        echo "warning: final guest CSV is incomplete; kept as $guest_csv.partial" >&2
+    fi
     ssh_guest 'cat /var/log/rinit/soak-guest.status' 2>/dev/null || true
 fi
 
@@ -205,9 +224,14 @@ if ((ssh_final)); then
 else
     echo 'SSH final: unreachable'
 fi
+if ((csv_ok)); then
+    echo "CSV final: $rows rows"
+else
+    echo 'CSV final: incomplete or unavailable'
+fi
 
 result=FAIL
-if [[ "$serial_status" == *'status=OK'* ]] && ((ssh_final)); then
+if [[ "$serial_status" == *'status=OK'* ]] && ((ssh_final)) && ((csv_ok)); then
     result=OK
 fi
 echo "SOAK ${result} tag=${tag} samples=${guest_csv} serial=${serial}"
