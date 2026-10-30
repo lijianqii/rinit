@@ -1,0 +1,13 @@
+[Unit]
+Description=health check probe
+[Service]
+Type=simple
+ExecStart=/bin/sleep 60
+HealthCheck=/bin/sh -c "test -f /run/fs-health-ok"
+HealthIntervalSec=1
+HealthTimeoutSec=1
+HealthRestartOnFailure=true
+Restart=on-failure
+RestartSec=0
+StartLimitBurst=1000000
+StartLimitIntervalSec=0

@@ -1,0 +1,6 @@
+[Unit]
+Description=stop timeout probe
+[Service]
+Type=simple
+ExecStart=/bin/sh -c "trap '' TERM; while :; do sleep 1; done"
+TimeoutStopSec=2

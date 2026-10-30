@@ -8,6 +8,8 @@
 # Usage: scripts/soak-qemu.sh --key PATH [--arch aarch64|arm] [--seconds N]
 #                             [--interval N] [--tag NAME] [--kernel FILE]
 #                             [--disk FILE] [--port N] [--checkpoint-interval N]
+#                             [--helper FILE --feature-suite FILE]
+#                             [--feature-args STRING] [--seed N]
 set -u
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -21,6 +23,10 @@ port=2222
 checkpoint_interval=3600
 tag="qemu-soak"
 log_dir="$repo_root/build/soak-charts"
+helper=""
+feature_suite=""
+feature_args=""
+seed=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -32,6 +38,10 @@ while [[ $# -gt 0 ]]; do
         --interval) interval="${2:?}"; shift 2 ;;
         --port) port="${2:?}"; shift 2 ;;
         --checkpoint-interval) checkpoint_interval="${2:?}"; shift 2 ;;
+        --helper) helper="${2:?}"; shift 2 ;;
+        --feature-suite) feature_suite="${2:?}"; shift 2 ;;
+        --feature-args) feature_args="${2:?}"; shift 2 ;;
+        --seed) seed="${2:?}"; shift 2 ;;
         --tag) tag="${2:?}"; shift 2 ;;
         -h | --help) sed -n '2,/^set -u$/p' "$0" | sed '$d'; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
@@ -61,6 +71,12 @@ esac
 for f in "$kernel" "$disk" "$key"; do
     [[ -e "$f" ]] || { echo "error: missing $f" >&2; exit 2; }
 done
+if [[ -n "$feature_suite" ]]; then
+    [[ -n "$helper" ]] || { echo "error: --feature-suite requires --helper" >&2; exit 2; }
+    [[ -e "$helper" ]] || { echo "error: missing $helper" >&2; exit 2; }
+    [[ -e "$feature_suite" ]] || { echo "error: missing $feature_suite" >&2; exit 2; }
+fi
+seed="${seed:-$(date +%s)}"
 mkdir -p "$log_dir"
 serial="$log_dir/soak-qemu-${tag}.log"
 guest_csv="$log_dir/soak-qemu-${tag}-guest.csv"
@@ -131,6 +147,8 @@ ssh_guest() {
     printf 'kernel   %s\n' "$(sha256sum "$kernel" | cut -d' ' -f1)"
     printf 'qemu     %s\n' "$("$qemu_bin" --version | head -1)"
     printf 'port     %s\n' "$port"
+    printf 'seed     %s\n' "$seed"
+    printf 'feature  %s\n' "${feature_suite:-none}"
     printf 'duration %ss interval %ss checkpoint %ss\n' \
         "$seconds" "$interval" "$checkpoint_interval"
 } >"$run_info"
@@ -162,7 +180,51 @@ ssh_guest 'cat > /root/soak-guest.sh' <"$repo_root/scripts/soak-guest.sh" || {
     echo "FAIL: could not install guest sampler" >&2
     exit 3
 }
-ssh_guest "chmod 700 /root/soak-guest.sh; rctl reload; rctl start steady.service; rctl start driven.service; rctl start churn.service" >/dev/null || {
+ssh_guest 'chmod 700 /root/soak-guest.sh' >/dev/null || exit 3
+
+if [[ -n "$feature_suite" ]]; then
+    tar -C "$repo_root/units/demo" -cf - . |
+        ssh_guest 'tar -C /etc/rinit/units -xf -' || {
+        echo "FAIL: could not install demo units" >&2
+        exit 3
+    }
+    tar -C "$repo_root/tests/soak/units" -cf - . |
+        ssh_guest 'tar -C /etc/rinit/units -xf -' || {
+        echo "FAIL: could not install soak units" >&2
+        exit 3
+    }
+    ssh_guest 'cat > /usr/local/bin/rinit-soak-helper' <"$helper" || {
+        echo "FAIL: could not install helper" >&2
+        exit 3
+    }
+    ssh_guest 'cat > /root/feature-suite.sh' <"$feature_suite" || {
+        echo "FAIL: could not install feature suite" >&2
+        exit 3
+    }
+    ssh_guest "chmod 700 /root/feature-suite.sh; chmod 755 /usr/local/bin/rinit-soak-helper; rctl reload" >/dev/null || {
+        echo "FAIL: could not reload feature units" >&2
+        exit 3
+    }
+    # SocketActivate sockets are bound during boot, not by a reload. Reboot
+    # once before starting the soak so the feature units are part of that boot.
+    ssh_guest 'reboot' >/dev/null 2>&1 || true
+    boot_deadline=$((SECONDS + 180))
+    while ((SECONDS < boot_deadline)); do
+        [[ "$(grep -cF 'rinit 0.1.0 starting (pid 1)' "$serial")" -ge 2 ]] && break
+        sleep 1
+    done
+    for _ in $(seq 1 180); do
+        ssh_guest 'true' >/dev/null 2>&1 && break
+        sleep 1
+    done
+    ssh_guest 'true' >/dev/null 2>&1 || {
+        echo "FAIL: SSH did not return after the feature-unit reboot" >&2
+        tail -30 "$serial" >&2
+        exit 3
+    }
+fi
+
+ssh_guest "rctl start steady.service; rctl start driven.service; rctl start churn.service" >/dev/null || {
     echo "FAIL: could not start soak units" >&2
     exit 3
 }
@@ -170,6 +232,12 @@ ssh_guest "nohup sh /root/soak-guest.sh --seconds $seconds --interval $interval 
     echo "FAIL: could not start guest sampler" >&2
     exit 3
 }
+if [[ -n "$feature_suite" ]]; then
+    ssh_guest "nohup sh /root/feature-suite.sh --seconds $seconds --seed $seed $feature_args >/var/log/rinit/feature-suite.log 2>&1 &" || {
+        echo "FAIL: could not start feature suite" >&2
+        exit 3
+    }
+fi
 
 deadline=$((SECONDS + seconds + 1800))
 last_checkpoint=$SECONDS
@@ -190,6 +258,15 @@ while ((SECONDS < deadline)); do
     fi
     sleep 20
 done
+
+if [[ -n "$feature_suite" ]]; then
+    feature_deadline=$((SECONDS + 900))
+    while ((SECONDS < feature_deadline)); do
+        grep -q 'FEATURE_DONE' "$serial" && break
+        kill -0 "$qemu_pid" 2>/dev/null || break
+        sleep 10
+    done
+fi
 
 ssh_final=0
 if ssh_guest 'true' >/dev/null 2>&1; then ssh_final=1; fi
@@ -217,6 +294,16 @@ if ((ssh_final)); then
     ssh_guest 'cat /var/log/rinit/soak-guest.status' 2>/dev/null || true
 fi
 
+feature_ok=1
+if [[ -n "$feature_suite" ]]; then
+    feature_csv="$log_dir/soak-qemu-${tag}-features.csv"
+    ssh_guest 'cat /var/log/rinit/feature-results.csv' >"$feature_csv" 2>/dev/null || true
+    ssh_guest 'cat /var/log/rinit/feature-suite.status' 2>/dev/null || true
+    feature_status=$(grep 'FEATURE_DONE' "$serial" | tail -1 || true)
+    printf '%s\n' "$feature_status"
+    [[ "$feature_status" == *'status=OK'* ]] || feature_ok=0
+fi
+
 serial_status=$(grep 'SOAK_DONE' "$serial" | tail -1 || true)
 printf '%s\n' "$serial_status"
 if ((ssh_final)); then
@@ -231,7 +318,7 @@ else
 fi
 
 result=FAIL
-if [[ "$serial_status" == *'status=OK'* ]] && ((ssh_final)) && ((csv_ok)); then
+if [[ "$serial_status" == *'status=OK'* ]] && ((ssh_final)) && ((csv_ok)) && ((feature_ok)); then
     result=OK
 fi
 echo "SOAK ${result} tag=${tag} samples=${guest_csv} serial=${serial}"

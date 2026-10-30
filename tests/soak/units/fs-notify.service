@@ -1,0 +1,6 @@
+[Unit]
+Description=notify readiness probe
+[Service]
+Type=notify
+ExecStart=/usr/local/bin/rinit-soak-helper notify-ready --hold
+TimeoutStartSec=5

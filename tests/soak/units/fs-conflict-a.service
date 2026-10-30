@@ -1,0 +1,5 @@
+[Unit]
+Description=conflict A
+[Service]
+Type=simple
+ExecStart=/bin/sleep 60

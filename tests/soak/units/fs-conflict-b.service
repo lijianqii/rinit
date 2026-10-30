@@ -1,0 +1,6 @@
+[Unit]
+Description=conflict B
+Conflicts=fs-conflict-a.service
+[Service]
+Type=simple
+ExecStart=/bin/sleep 60

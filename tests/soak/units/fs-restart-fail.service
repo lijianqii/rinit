@@ -1,0 +1,9 @@
+[Unit]
+Description=restart-on-failure probe
+[Service]
+Type=simple
+ExecStart=/bin/false
+Restart=on-failure
+RestartSec=0
+StartLimitBurst=1000000
+StartLimitIntervalSec=0

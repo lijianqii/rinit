@@ -1,0 +1,4 @@
+[Unit]
+Description=hard dependency target
+Type=target
+Requires=fs-requires-fail.service

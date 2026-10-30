@@ -1,0 +1,7 @@
+[Unit]
+Description=TTY success probe
+[Service]
+Type=oneshot
+TTYPath=/run/fs-tty
+TTYReset=false
+ExecStart=/bin/sh -c "test -t 0 && echo tty-ok > /tmp/fs-tty-result || echo tty-no > /tmp/fs-tty-result"

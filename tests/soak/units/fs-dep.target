@@ -1,0 +1,5 @@
+[Unit]
+Description=soak dependency target
+Type=target
+Requires=fs-dep-a.service fs-dep-b.service
+After=fs-dep-b.service

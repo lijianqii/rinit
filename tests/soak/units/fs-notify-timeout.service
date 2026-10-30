@@ -1,0 +1,6 @@
+[Unit]
+Description=notify timeout probe
+[Service]
+Type=notify
+ExecStart=/usr/local/bin/rinit-soak-helper notify-hold
+TimeoutStartSec=2

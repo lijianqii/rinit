@@ -1,0 +1,6 @@
+[Unit]
+Description=start timeout probe
+[Service]
+Type=oneshot
+ExecStart=/bin/sleep 5
+TimeoutStartSec=1

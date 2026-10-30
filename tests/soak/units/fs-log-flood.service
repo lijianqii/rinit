@@ -1,0 +1,5 @@
+[Unit]
+Description=log flood probe
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c "i=0; while [ $i -lt 200 ]; do echo flood-$i; i=$((i+1)); done"

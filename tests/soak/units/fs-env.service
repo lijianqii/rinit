@@ -1,0 +1,8 @@
+[Unit]
+Description=environment and working directory probe
+[Service]
+Type=oneshot
+Environment=FS_ONE=one
+EnvironmentFile=/etc/fs-env.conf
+WorkingDirectory=/tmp
+ExecStart=/bin/sh -c "echo env=$FS_ONE file=$FS_TWO pwd=$PWD"

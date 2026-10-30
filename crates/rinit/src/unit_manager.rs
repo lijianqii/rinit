@@ -1150,8 +1150,12 @@ impl UnitManager {
                 rt.backoff.on_active(now);
                 schedule_health(rt);
             }
-            // `oneshot` completes on exit; boot waits for it directly.
-            ServiceKind::Oneshot => {}
+            // `oneshot` completes on exit; boot waits for it directly. A
+            // control-driven start still owns the same start deadline, so a
+            // command that never returns is stopped like any other start.
+            ServiceKind::Oneshot => {
+                rt.start_deadline = deadline(rt.config.timeout_start_sec);
+            }
             // `notify` waits for `READY=1`, bounded by `TimeoutStartSec`
             // (plan §1.3(12)). A zero timeout means wait forever.
             ServiceKind::Notify => {

@@ -1,0 +1,7 @@
+[Unit]
+Description=oneshot lifecycle probe
+[Service]
+Type=oneshot
+ExecStartPre=/bin/sh -c "echo pre > /tmp/fs-pre"
+ExecStart=/bin/sh -c "echo main >> /tmp/fs-pre"
+ExecStartPost=/bin/sh -c "echo post >> /tmp/fs-pre"

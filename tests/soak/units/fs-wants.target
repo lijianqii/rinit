@@ -1,0 +1,4 @@
+[Unit]
+Description=soft dependency target
+Type=target
+Wants=fs-wants-fail.service

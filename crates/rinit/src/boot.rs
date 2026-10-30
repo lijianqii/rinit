@@ -899,6 +899,7 @@ async fn control_start(
                 if manager.is_failed(unit) {
                     (Status::Error, format!("{unit} failed to start"))
                 } else {
+                    run_start_post(manager, unit).await;
                     (Status::Ok, format!("started {unit}"))
                 }
             }

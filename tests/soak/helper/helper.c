@@ -89,7 +89,6 @@ static void pty_hold(const char *path)
 {
     int master = posix_openpt(O_RDWR | O_NOCTTY);
     char *slave;
-    FILE *file;
 
     if (master < 0) {
         fail("posix_openpt");
@@ -101,13 +100,9 @@ static void pty_hold(const char *path)
     if (slave == NULL) {
         fail("ptsname");
     }
-    file = fopen(path, "w");
-    if (file == NULL) {
-        fail("fopen");
-    }
-    fprintf(file, "%s\n", slave);
-    if (fclose(file) != 0) {
-        fail("fclose");
+    unlink(path);
+    if (symlink(slave, path) < 0) {
+        fail("symlink");
     }
     for (;;) {
         pause();

@@ -1,0 +1,6 @@
+[Unit]
+Description=TTY negative probe
+[Service]
+Type=oneshot
+TTYPath=/dev/null
+ExecStart=/bin/sh -c "echo should-not-run"

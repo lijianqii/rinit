@@ -1,0 +1,5 @@
+[Unit]
+Description=soak dependency B
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c "echo b >> /tmp/fs-order"

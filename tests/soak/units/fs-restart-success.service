@@ -1,0 +1,9 @@
+[Unit]
+Description=restart-on-success probe
+[Service]
+Type=simple
+ExecStart=/bin/sh -c "exit 0"
+Restart=on-success
+RestartSec=0
+StartLimitBurst=1000000
+StartLimitIntervalSec=0

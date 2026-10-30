@@ -1,0 +1,5 @@
+[Unit]
+Description=hard dependency that fails
+[Service]
+Type=oneshot
+ExecStart=/bin/false

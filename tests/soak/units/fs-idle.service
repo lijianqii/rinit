@@ -1,0 +1,7 @@
+[Unit]
+Description=socket idle timeout probe
+[Service]
+Type=simple
+SocketActivate=/run/fs-idle.sock
+IdleTimeoutSec=2
+ExecStart=/bin/sleep 30

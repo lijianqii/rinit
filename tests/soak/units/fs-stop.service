@@ -1,0 +1,6 @@
+[Unit]
+Description=ExecStop probe
+[Service]
+Type=simple
+ExecStart=/bin/sleep 60
+ExecStop=/bin/sh -c "echo stop > /tmp/fs-stop"
