@@ -256,7 +256,12 @@ sc_environment() {
 sc_oneshot_lifecycle() {
     rm -f /tmp/fs-pre
     start_unit fs-pre.service || return 1
-    sleep 1
+    i=0
+    while [ "$i" -lt 5 ]; do
+        [ "$(cat /tmp/fs-pre 2>/dev/null)" = "$(printf 'pre\nmain\npost')" ] && break
+        sleep 1
+        i=$((i + 1))
+    done
     [ "$(cat /tmp/fs-pre 2>/dev/null)" = "$(printf 'pre\nmain\npost')" ] || {
         stop_unit fs-pre.service
         return 1
