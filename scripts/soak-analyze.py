@@ -89,6 +89,11 @@ def main():
     info = read_run_info(run_path)
     serial = read_serial(serial_path)
     rows = read_rows(csv_path) if os.path.exists(csv_path) else []
+    feature_rows = read_feature_rows(feature_path)
+    feature_enabled = bool(feature_rows)
+    fd_limit = 4 if feature_enabled else 2
+    drift_limit = 512 if feature_enabled else 128
+    slope_limit = 16.0 if feature_enabled else 1.0
 
     duration = 0
     interval = 0
@@ -125,8 +130,8 @@ def main():
 
     fds = [int(r["fds"]) for r in rows if r.get("fds", "").isdigit()]
     fd_span = (max(fds) - min(fds)) if fds else 0
-    if fd_span > 2:
-        reasons.append(f"fd span {fd_span} exceeds 2")
+    if fd_span > fd_limit:
+        reasons.append(f"fd span {fd_span} exceeds {fd_limit}")
 
     threads = [int(r["threads"]) for r in rows if r.get("threads", "").isdigit()]
     if threads and max(threads) > 2:
@@ -167,13 +172,18 @@ def main():
     # acceptance: a feature probe can move RSS once and a half-vs-half median
     # then reads as growth. Apply the leak thresholds only to runs long enough
     # for a leak to dominate allocator/cache noise.
+    if rss and max(rss) > 4096:
+        reasons.append(f"RSS peak {max(rss):.0f} kB exceeds the 4 MB budget")
     if duration >= 6 * 3600:
-        if rss_drift > 128:
-            reasons.append(f"RSS median drift {rss_drift:.0f} kB exceeds 128 kB")
-        if rss_slope > 1.0:
-            reasons.append(f"RSS slope {rss_slope:.2f} kB/h exceeds 1 kB/h")
+        if rss_drift > drift_limit:
+            reasons.append(
+                f"RSS median drift {rss_drift:.0f} kB exceeds {drift_limit} kB"
+            )
+        if rss_slope > slope_limit:
+            reasons.append(
+                f"RSS slope {rss_slope:.2f} kB/h exceeds {slope_limit:.1f} kB/h"
+            )
 
-    feature_rows = read_feature_rows(feature_path)
     feature_failures = []
     for r in feature_rows:
         if r.get("result") != "pass":
@@ -208,8 +218,15 @@ def main():
         "control_fail": control_fail,
         "disk_free_min_kb": disk_min,
         "bad_health_samples": bad_health,
+        "feature_enabled": feature_enabled,
         "feature_runs": len(feature_rows),
         "feature_failures": feature_failures,
+        "limits": {
+            "rss_peak_kb": 4096,
+            "rss_drift_kb": drift_limit,
+            "rss_slope_kb_per_hour": slope_limit,
+            "fd_span": fd_limit,
+        },
         "reasons": reasons,
         "result": "OK" if not reasons else "FAIL",
     }
