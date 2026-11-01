@@ -204,7 +204,11 @@ sc_dependency() {
     rm -f /tmp/fs-order
     start_unit fs-dep.target || return 1
     sleep 1
-    [ "$(cat /tmp/fs-order 2>/dev/null)" = "$(printf 'b\na')" ] || {
+    # `After=` orders the spawn, not the completion of a oneshot; the two
+    # shells may write in either order once both are running. Assert that the
+    # required target pulled both in, and that both actually ran.
+    grep -q '^a$' /tmp/fs-order 2>/dev/null &&
+        grep -q '^b$' /tmp/fs-order 2>/dev/null || {
         cleanup_names fs-dep-a.service fs-dep-b.service fs-dep.target
         return 1
     }
