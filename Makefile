@@ -121,8 +121,9 @@ MAKE_BUSYBOX     := $(MAKE) -C $(BUSYBOX_SRC) ARCH=$(BUSYBOX_ARCH) CROSS_COMPILE
 
 .DEFAULT_GOAL    := run
 .PHONY: run run-disk kernel kernel-config-check busybox dropbear rinit processes \
-        initramfs initramfs-demo disk-image qemu help clean distclean check \
-        test test-system soak parallel gates size-check coverage-check
+        tools install-tools initramfs initramfs-demo disk-image qemu help clean \
+        distclean check test test-system soak parallel gates size-check \
+        coverage-check
 
 help:
 	@sed -n '2,/^# ====/p' $(MAKEFILE_LIST) | sed '$$d' | sed 's/^# \{0,1\}//'
@@ -135,6 +136,24 @@ RINIT_SRCS       := $(shell find crates -name '*.rs' 2>/dev/null) Cargo.toml Car
 
 rinit: $(RINIT_BIN) $(RCTL_BIN) $(PROCESSES_BIN)
 processes: $(PROCESSES_BIN)
+
+# Independent tools (rinit-tools). `tools` builds every bin target for the
+# selected architecture; `install-tools` installs them into an already
+# populated rootfs and enforces the glibc/size gates.
+TOOLS_ARCH       := $(if $(filter arm64,$(ARCH)),aarch64,armv7)
+TOOLS_PROFILE    ?= replace-system
+TOOLS_BIN_DIR    := target/$(TARGET)/release
+
+tools:
+	cargo build --release --target $(TARGET) --bins
+
+install-tools: tools
+	$(SCRIPTS)/install-tools.sh \
+	    --rootfs $(ROOTFS_DIR) \
+	    --bin-dir $(TOOLS_BIN_DIR) \
+	    --manifest tools.list \
+	    --profile $(TOOLS_PROFILE) \
+	    --arch $(TOOLS_ARCH)
 
 # Grouped target: one cargo invocation builds all three binaries. Nothing
 # happens when they already exist and are newer than the sources.
@@ -271,12 +290,19 @@ qemu run: $(KERNEL_IMAGE) $(INITRAMFS)
 # next `make run-disk`; `make disk-image` is the explicit destructive rebuild.
 # AUTHORIZED_KEY=<file.pub> installs a client key for root; CI uses it to boot
 # the image without a console login.
-disk-image: rinit $(BUSYBOX_BIN) $(DROPBEAR_BIN_DIR)/dropbear $(BOOT_UNIT_FILES) \
-            $(DEVICE_UNIT_FILES) $(FSTAB) $(MDEV_CONF) $(INITRAMFS_SCRIPTS) \
-            $(SCRIPTS)/mkdisk.sh $(SCRIPTS)/mkswapfile.sh
+disk-image: rinit tools $(BUSYBOX_BIN) $(DROPBEAR_BIN_DIR)/dropbear \
+            $(BOOT_UNIT_FILES) $(DEVICE_UNIT_FILES) $(FSTAB) $(MDEV_CONF) \
+            $(INITRAMFS_SCRIPTS) $(SCRIPTS)/mkdisk.sh \
+            $(SCRIPTS)/mkswapfile.sh $(SCRIPTS)/install-tools.sh tools.list
 	$(SCRIPTS)/build-initramfs.sh $(TARGET) --busybox-src $(BUSYBOX_SRC) \
 	    --device-units --dropbear-bin $(DROPBEAR_BIN_DIR) --rootfs $(ROOTFS_DIR) \
 	    $(if $(AUTHORIZED_KEY),--ssh-key "$(AUTHORIZED_KEY)")
+	$(SCRIPTS)/install-tools.sh \
+	    --rootfs $(ROOTFS_DIR) \
+	    --bin-dir $(TOOLS_BIN_DIR) \
+	    --manifest tools.list \
+	    --profile $(TOOLS_PROFILE) \
+	    --arch $(TOOLS_ARCH)
 	$(SCRIPTS)/mkswapfile.sh $(ROOTFS_DIR)/swapfile $(SWAP_SIZE_MB)
 	DISK_EXTRA_MB=$(DISK_EXTRA_MB) $(SCRIPTS)/mkdisk.sh $(ROOTFS_DIR) $(DISK_IMAGE)
 

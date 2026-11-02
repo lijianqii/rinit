@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/rinit-core",
     "crates/rinit-runtime",
+    "crates/rinit-tools",
     "crates/rinit",
     "crates/rctl",
     "crates/processes",
@@ -10,6 +11,7 @@ members = [
 default-members = [
     "crates/rinit-core",
     "crates/rinit-runtime",
+    "crates/rinit-tools",
     "crates/rinit",
     "crates/rctl",
     "crates/processes",

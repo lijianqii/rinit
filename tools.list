@@ -1,0 +1,29 @@
+# rinit-tools install manifest.
+#
+# Columns are whitespace-separated:
+#   applet  cargo-bin  install-path  busybox-link  max-kib  source
+#
+# `-` means "no BusyBox link" / "no per-tool size budget yet".
+# The default profile is replace-system: the install path is a real ELF and the
+# BusyBox link at the same path is removed. The `coexist` profile is for A/B and
+# rollback and is not represented by this file.
+#
+# Existing binaries.
+rinit      rinit      /sbin/rinit      -               1229  crates/rinit
+rctl       rctl       /bin/rctl        -                600  crates/rctl
+processes  processes  /bin/processes   -                600  crates/processes
+
+# First replace-system set. These binaries are added in
+# crates/rinit-tools/src/bin/ as the implementation lands.
+mount      mount      /bin/mount       /bin/mount      1024  crates/rinit-tools/src/bin/mount.rs
+umount     umount     /bin/umount      /bin/umount     1024  crates/rinit-tools/src/bin/umount.rs
+hostname   hostname   /bin/hostname    /bin/hostname    600  crates/rinit-tools/src/bin/hostname.rs
+reboot     reboot     /sbin/reboot     /sbin/reboot     600  crates/rinit-tools/src/bin/reboot.rs
+poweroff   poweroff   /sbin/poweroff   /sbin/poweroff   600  crates/rinit-tools/src/bin/poweroff.rs
+sysctl     sysctl     /sbin/sysctl     /sbin/sysctl     600  crates/rinit-tools/src/bin/sysctl.rs
+ps         ps         /bin/ps          /bin/ps          800  crates/rinit-tools/src/bin/ps.rs
+free       free       /usr/bin/free    /usr/bin/free    600  crates/rinit-tools/src/bin/free.rs
+uptime     uptime     /usr/bin/uptime  /usr/bin/uptime  600  crates/rinit-tools/src/bin/uptime.rs
+dmesg      dmesg      /bin/dmesg       /bin/dmesg       800  crates/rinit-tools/src/bin/dmesg.rs
+df         df         /bin/df          /bin/df          800  crates/rinit-tools/src/bin/df.rs
+top        top        /usr/bin/top     /usr/bin/top     800  crates/rinit-tools/src/bin/top.rs
