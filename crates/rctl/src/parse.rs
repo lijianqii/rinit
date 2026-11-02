@@ -53,6 +53,14 @@ pub fn command_line(args: &[String]) -> Result<Parsed, String> {
             ensure_no_arguments(rest)?;
             Ok(Parsed::Request(Request::Reload))
         }
+        "reboot" => {
+            ensure_no_arguments(rest)?;
+            Ok(Parsed::Request(Request::Reboot))
+        }
+        "poweroff" => {
+            ensure_no_arguments(rest)?;
+            Ok(Parsed::Request(Request::Poweroff))
+        }
         other => Err(format!("unknown command '{other}'")),
     }
 }
@@ -260,6 +268,14 @@ mod tests {
         assert_eq!(parse(&["reload"]), Ok(Parsed::Request(Request::Reload)));
         assert!(parse(&["reload", "app.service"]).is_err());
         assert!(parse(&["reload", "--tail", "5"]).is_err());
+    }
+
+    #[test]
+    fn reboot_and_poweroff_take_nothing() {
+        assert_eq!(parse(&["reboot"]), Ok(Parsed::Request(Request::Reboot)));
+        assert_eq!(parse(&["poweroff"]), Ok(Parsed::Request(Request::Poweroff)));
+        assert!(parse(&["reboot", "app.service"]).is_err());
+        assert!(parse(&["poweroff", "--tail", "5"]).is_err());
     }
 
     /// A bare unit name defaults to `.service`, exactly as in a unit file.

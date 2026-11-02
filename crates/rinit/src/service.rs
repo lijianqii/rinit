@@ -264,13 +264,9 @@ pub async fn shutdown(services: &mut ServiceSet) -> Result<(), RuntimeError> {
     tokio::time::sleep(STOP_GRACE).await;
     reap_and_log(services);
 
-    if crate::boot::is_pid1() {
-        rlog!("rebooting");
-        crate::boot::reboot_now();
-    } else {
-        rlog!("not PID 1: stopping without reboot");
-    }
-
+    // The caller decides whether this shutdown ends in a reboot, a poweroff or
+    // simply returning (the `--test-service` path). Keeping the final action
+    // here made it impossible to offer a real poweroff command.
     Ok(())
 }
 

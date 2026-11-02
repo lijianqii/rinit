@@ -156,7 +156,7 @@ pub async fn run(cfg: Config) -> Result<(), RuntimeError> {
             control: &mut control,
             logs: &logs,
         };
-        supervise(
+        let shutdown = supervise(
             &cfg,
             &mut signals,
             &mut manager,
@@ -178,7 +178,10 @@ pub async fn run(cfg: Config) -> Result<(), RuntimeError> {
         // lets the test process exit instead of spinning in `reboot_now`,
         // where `reboot(2)` would fail without `CAP_SYS_BOOT`.
         if !cfg.skip_mounts {
-            reboot_now();
+            match shutdown {
+                ShutdownAction::Reboot => reboot_now(),
+                ShutdownAction::PowerOff => poweroff_now(),
+            }
         }
         return Ok(());
     }
@@ -208,13 +211,15 @@ pub async fn run(cfg: Config) -> Result<(), RuntimeError> {
     }
 }
 
-/// The supervised main loop (plan §3 M2).
-///
-/// Four things can wake it: a child exited, a `notify` service signalled
-/// readiness, a timer elapsed (restart backoff, start timeout, post-timeout
-/// kill), or a signal arrived. The timers are what make this a loop rather than
-/// a plain `recv()` - without them a service scheduled to restart in two
-/// seconds would sit there until some unrelated signal arrived.
+/// What the supervisor must do after all services have stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShutdownAction {
+    /// Restart the machine.
+    Reboot,
+    /// Power the machine off.
+    PowerOff,
+}
+
 struct Supervised<'a> {
     /// Where a started service's readiness arrives.
     notify: &'a mut NotifyHub,
@@ -224,6 +229,13 @@ struct Supervised<'a> {
     logs: &'a ServiceLogs,
 }
 
+/// The supervised main loop (plan §3 M2).
+///
+/// Four things can wake it: a child exited, a `notify` service signalled
+/// readiness, a timer elapsed (restart backoff, start timeout, post-timeout
+/// kill), or a signal arrived. The timers are what make this a loop rather than
+/// a plain `recv()` - without them a service scheduled to restart in two
+/// seconds would sit there until some unrelated signal arrived.
 async fn supervise(
     cfg: &Config,
     signals: &mut SignalSet,
@@ -231,10 +243,11 @@ async fn supervise(
     supervised: &mut Supervised<'_>,
     watchdog: &mut Watchdog,
     activation: &mut Activated,
-) {
+) -> ShutdownAction {
     // Set when the shutdown was triggered by power failure, which runs under a
     // much smaller budget (plan §7.1).
     let mut fast = false;
+    let mut action = ShutdownAction::Reboot;
     loop {
         // Drain every exited child before doing anything else. The signal path
         // below covers the normal case, but a zombie that was reparented to PID 1
@@ -328,6 +341,14 @@ async fn supervise(
                 }
             }
             Some((request, reply)) = supervised.control.recv() => {
+                let requested = match &request {
+                    Request::Reboot => Some(ShutdownAction::Reboot),
+                    Request::Poweroff => Some(ShutdownAction::PowerOff),
+                    _ => None,
+                };
+                if let Some(requested) = requested {
+                    action = requested;
+                }
                 let (status, text) = handle_control(cfg, manager, supervised.notify, supervised.logs, &request).await;
                 if status == Status::Ok {
                     rlog!("control: {} ok", request.describe());
@@ -336,6 +357,9 @@ async fn supervise(
                 }
                 // The client may have hung up; that is not rinit's problem.
                 let _ = reply.send((status, text));
+                if requested.is_some() {
+                    break;
+                }
             }
             _ = tokio::time::sleep(wait) => {}
             // The idle half of the orphan reaping rule: even with no signal and
@@ -384,6 +408,7 @@ async fn supervise(
     supervised.notify.disarm_all();
     let budget = fast.then_some(FAST_SHUTDOWN_BUDGET);
     stop_and_reap(manager, budget).await;
+    action
 }
 
 /// Bring every unit the queue still wants running down, then wait for them.
@@ -830,6 +855,10 @@ async fn handle_control(
         // Plan §7.6. The reply is the report: what was added, changed, removed
         // and deferred, so a reload is never a silent act.
         Request::Reload => control_reload(cfg, manager, notify, logs).await,
+        // The supervisor handles the side effect (it owns the shutdown path);
+        // this reply only tells the client the request was understood.
+        Request::Reboot => (Status::Ok, "reboot requested".to_string()),
+        Request::Poweroff => (Status::Ok, "poweroff requested".to_string()),
     }
 }
 
@@ -1874,6 +1903,32 @@ pub fn reboot_now() -> ! {
         rlog!("reboot failed: {e}; trying sysrq");
         if let Err(e) = reboot::sysrq_reboot() {
             rlog!("sysrq reset failed: {e}; halting");
+        }
+    }
+    loop {
+        signal::pause();
+    }
+}
+
+/// Power the machine off after the service tree has stopped.
+///
+/// Mirrors [`reboot_now`]: unmount what can be unmounted, sync, then
+/// `reboot(RB_POWER_OFF)`. The SysRq `o` trigger is the last resort so PID 1
+/// never remains alive after a requested poweroff.
+pub fn poweroff_now() -> ! {
+    rlog!("powering off");
+    let report = rinit_runtime::unmount_filesystems();
+    for point in &report.unmounted {
+        rlog!("unmounted {point}");
+    }
+    for warning in &report.warnings {
+        rlog!("warning: {warning}");
+    }
+    reboot::sync();
+    if let Err(e) = reboot::reboot(reboot::RB_POWER_OFF) {
+        rlog!("poweroff failed: {e}; trying sysrq");
+        if let Err(e) = reboot::sysrq_poweroff() {
+            rlog!("sysrq poweroff failed: {e}; halting");
         }
     }
     loop {

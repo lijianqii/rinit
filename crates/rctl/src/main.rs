@@ -47,6 +47,8 @@ Commands:
   reset-failed <UNIT>     Clear a unit's failed/start-limit state
   log [UNIT] [--tail N]   Show buffered log
   reload                  Re-read the unit directory and apply the difference
+  reboot                  Stop services and reboot
+  poweroff                Stop services and power off
 
 Options:
   -h, --help              Show this help and exit

@@ -6,6 +6,8 @@ use crate::error::SyscallError;
 
 /// `reboot(2)` command: restart the system.
 pub const RB_AUTOBOOT: libc::c_int = 0x0123_4567;
+/// `reboot(2)` command: power the system off.
+pub const RB_POWER_OFF: libc::c_int = 0x4321_fedc;
 /// Invoke `reboot(2)`. Requires `CAP_SYS_BOOT` (rinit runs as root).
 pub fn reboot(cmd: libc::c_int) -> Result<(), SyscallError> {
     // SAFETY: `reboot` takes only scalar arguments.
@@ -34,12 +36,24 @@ pub fn sync() {
 /// [`SyscallError`] with `ENOENT`/`EACCES` when the trigger is unavailable
 /// (no `/proc`, `kernel.sysrq` disabled, or not root).
 pub fn sysrq_reboot() -> Result<(), SyscallError> {
+    sysrq(b'b')
+}
+
+/// Last-resort poweroff through the kernel's SysRq trigger.
+///
+/// `o` is the kernel's "power off" action. It is only used after
+/// `reboot(RB_POWER_OFF)` failed; the graceful path already ran.
+pub fn sysrq_poweroff() -> Result<(), SyscallError> {
+    sysrq(b'o')
+}
+
+fn sysrq(command: u8) -> Result<(), SyscallError> {
     let mut trigger = std::fs::OpenOptions::new()
         .write(true)
         .open("/proc/sysrq-trigger")
         .map_err(|e| SyscallError::from_io("open(/proc/sysrq-trigger)", &e))?;
     trigger
-        .write_all(b"b")
+        .write_all(&[command])
         .map_err(|e| SyscallError::from_io("write(/proc/sysrq-trigger)", &e))?;
     trigger
         .flush()

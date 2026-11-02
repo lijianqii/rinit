@@ -89,6 +89,10 @@ pub enum Request {
     },
     /// Re-read the unit directory and apply the difference (plan §7.6).
     Reload,
+    /// Stop services and reboot the machine.
+    Reboot,
+    /// Stop services and power the machine off.
+    Poweroff,
 }
 
 impl Request {
@@ -105,6 +109,8 @@ impl Request {
             Request::ResetFailed(_) => Command::ResetFailed,
             Request::Log { .. } => Command::Log,
             Request::Reload => Command::Reload,
+            Request::Reboot => Command::Reboot,
+            Request::Poweroff => Command::Poweroff,
         }
     }
 
@@ -125,6 +131,8 @@ impl Request {
                 None => "log".to_string(),
             },
             Request::Reload => "reload".to_string(),
+            Request::Reboot => "reboot".to_string(),
+            Request::Poweroff => "poweroff".to_string(),
         }
     }
 }
@@ -245,6 +253,10 @@ pub enum Command {
     StatusFormatted = 9,
     /// `rctl list --format=...`.
     ListFormatted = 10,
+    /// `rctl reboot`.
+    Reboot = 11,
+    /// `rctl poweroff`.
+    Poweroff = 12,
 }
 
 impl Command {
@@ -266,6 +278,8 @@ impl Command {
             8 => Some(Command::Reload),
             9 => Some(Command::StatusFormatted),
             10 => Some(Command::ListFormatted),
+            11 => Some(Command::Reboot),
+            12 => Some(Command::Poweroff),
             _ => None,
         }
     }
@@ -425,7 +439,7 @@ pub fn encode_request(request: &Request) -> Vec<u8> {
             put_opt_unit(&mut out, unit.as_ref());
             out.extend_from_slice(&tail.to_le_bytes());
         }
-        Request::Reload => {}
+        Request::Reload | Request::Reboot | Request::Poweroff => {}
     }
     out
 }
@@ -479,6 +493,8 @@ pub fn decode_request(body: &[u8]) -> Result<Request, ProtocolError> {
             Request::Log { unit, tail }
         }
         Command::Reload => Request::Reload,
+        Command::Reboot => Request::Reboot,
+        Command::Poweroff => Request::Poweroff,
     };
 
     if !decoder.is_empty() {
@@ -668,6 +684,8 @@ mod tests {
             tail: u32::MAX,
         });
         round_trip(Request::Reload);
+        round_trip(Request::Reboot);
+        round_trip(Request::Poweroff);
     }
 
     /// The reload command is a new code on an existing wire, so the byte it
@@ -678,6 +696,12 @@ mod tests {
         assert_eq!(Request::Reload.command().byte(), 8);
         assert_eq!(Command::from_byte(8), Some(Command::Reload));
         assert_eq!(Request::Reload.describe(), "reload");
+        assert_eq!(Request::Reboot.command().byte(), 11);
+        assert_eq!(Request::Poweroff.command().byte(), 12);
+        assert_eq!(Command::from_byte(11), Some(Command::Reboot));
+        assert_eq!(Command::from_byte(12), Some(Command::Poweroff));
+        assert_eq!(Request::Reboot.describe(), "reboot");
+        assert_eq!(Request::Poweroff.describe(), "poweroff");
         let body = encode_request(&Request::Reload);
         assert_eq!(body.len(), 3, "version (2) + command (1), and nothing else");
         assert!(decode_request(&body).is_ok());
