@@ -27,3 +27,13 @@ uptime     uptime     /usr/bin/uptime  /usr/bin/uptime  600  crates/rinit-tools/
 dmesg      dmesg      /bin/dmesg       /bin/dmesg       800  crates/rinit-tools/src/bin/dmesg.rs
 df         df         /bin/df          /bin/df          800  crates/rinit-tools/src/bin/df.rs
 top        top        /usr/bin/top     /usr/bin/top     800  crates/rinit-tools/src/bin/top.rs
+
+# Second replace-system set: file operations that BusyBox used to provide.
+ls         ls         /bin/ls          /bin/ls          800  crates/rinit-tools/src/bin/ls.rs
+cat        cat        /bin/cat         /bin/cat         600  crates/rinit-tools/src/bin/cat.rs
+cp         cp         /bin/cp          /bin/cp          800  crates/rinit-tools/src/bin/cp.rs
+mv         mv         /bin/mv          /bin/mv          600  crates/rinit-tools/src/bin/mv.rs
+rm         rm         /bin/rm          /bin/rm          600  crates/rinit-tools/src/bin/rm.rs
+mkdir      mkdir      /bin/mkdir       /bin/mkdir       600  crates/rinit-tools/src/bin/mkdir.rs
+ln         ln         /bin/ln          /bin/ln          600  crates/rinit-tools/src/bin/ln.rs
+touch      touch      /bin/touch       /bin/touch       600  crates/rinit-tools/src/bin/touch.rs

@@ -95,10 +95,23 @@ The first `replace-system` set is:
 | `df` | `/bin/df` | `df.rs` | low |
 | `top` | `/usr/bin/top` | `top.rs` | medium |
 
-Not in the first version:
+The second wave replaces the file-oriented BusyBox applets:
+
+| BusyBox applet | install path | source binary | risk |
+| --- | --- | --- | --- |
+| `ls` | `/bin/ls` | `ls.rs` | medium: formatting and symlink display |
+| `cat` | `/bin/cat` | `cat.rs` | low |
+| `cp` | `/bin/cp` | `cp.rs` | high: recursive copies and symlinks |
+| `mv` | `/bin/mv` | `mv.rs` | medium: cross-device fallback |
+| `rm` | `/bin/rm` | `rm.rs` | high: destructive operation |
+| `mkdir` | `/bin/mkdir` | `mkdir.rs` | low |
+| `ln` | `/bin/ln` | `ln.rs` | medium |
+| `touch` | `/bin/touch` | `touch.rs` | low |
+
+Still out of scope:
 
 - `sh`, `ash`;
-- `ls`, `cp`, `mv`, `rm`, `grep`, `sed`, `awk`;
+- `grep`, `sed`, `awk`;
 - `ip`, `ifconfig`, `udhcpc`, `ntpd`, `wget`;
 - filesystem creation/repair tools.
 
@@ -188,6 +201,28 @@ required, the NSS module becomes an explicit image dependency and gate.
 
 Supports reading a key, writing a key, and listing the supported subset.
 Writes use `/proc/sys`; permission failures are reported with a non-zero exit.
+
+### File operations (second wave)
+
+The supported subset is deliberately smaller than GNU coreutils; unsupported
+options fail instead of being ignored.
+
+```text
+ls [-aAldh] [FILE...]
+cat [-bnsu] [FILE...]
+cp [-rRafpn] SOURCE... DEST
+mv [-fn] SOURCE... DEST
+rm [-rRfd] FILE...
+mkdir [-p] [-m MODE] DIRECTORY...
+ln [-sfn] TARGET... LINK
+touch [-amc] [-t STAMP] FILE...
+```
+
+`cp` and `mv` resolve a destination directory to `DEST/basename(SOURCE)`;
+multiple sources require an existing destination directory. `cp` preserves
+symlinks instead of following them. `rm` refuses `/`, `.` and `..`. `touch -t`
+accepts `MMDDhhmm`, `YYMMDDhhmm`, `CCYYMMDDhhmm`, each with an optional `.ss`.
+Ownership is not preserved by `cp -p`; mode and timestamps are.
 
 ## 7. Architecture
 
@@ -279,9 +314,9 @@ After installation:
 /bin/mount       regular ELF, not a symlink
 /bin/hostname    regular ELF, not a symlink
 /sbin/reboot     regular ELF, not a symlink
+/bin/ls          regular ELF, not a symlink
 /bin/busybox     BusyBox ELF
 /bin/sh          symlink to busybox
-/bin/ls          symlink to busybox
 ```
 
 ## 9. glibc dynamic-link gate
@@ -319,12 +354,12 @@ Provisional first-version budgets, to be replaced by measured values:
 | profile | tools | total budget |
 | --- | --- | --- |
 | minimal | `rinit` only | 1.2 MB |
-| `replace-system` | 15 including existing | 12 MB |
-| full toolbox (later) | 19+ | 16 MB |
+| `replace-system` (first + second wave) | 23 including existing | 16 MB |
+| full toolbox (later) | 30+ | 20 MB |
 
 Each tool also has its own budget in `tools.list`. CI fails on either a per-tool
-or a total overrun. If the first version exceeds 12 MB, evaluate a shared
-`librinit-tools.so` for non-init tools; do not add it pre-emptively.
+or a total overrun. If the installed set exceeds its total budget, evaluate a
+shared `librinit-tools.so` for non-init tools; do not add it pre-emptively.
 
 ## 11. Testing
 
@@ -334,6 +369,8 @@ or a total overrun. If the first version exceeds 12 MB, evaluate a shared
 - stable output fields compared with BusyBox for the supported subset;
 - mount/umount against real tmpfs/devpts entries, not only `--help`;
 - hostname `-F`;
+- file operations: recursive copy, no-clobber, symlink preservation, directory
+  removal guards, hard/symbolic links and `touch -t`;
 - reboot/poweroff through a fake control socket and then a real guest.
 
 ### Multi-binary/install

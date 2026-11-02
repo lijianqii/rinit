@@ -110,15 +110,16 @@ qemu_pid=$!
 
 wait_ssh || { echo "FAIL: SSH did not come up" >&2; tail -30 "$serial" >&2; exit 3; }
 
-for path in mount umount hostname ps free uptime dmesg df sysctl top reboot poweroff; do
+for path in mount umount hostname ps free uptime dmesg df sysctl top reboot poweroff \
+    ls cat cp mv rm mkdir ln touch; do
     case "$path" in
-        mount | umount | hostname | ps | dmesg | df) full="/bin/$path" ;;
+        mount | umount | hostname | ps | dmesg | df | ls | cat | cp | mv | rm | mkdir | ln | touch) full="/bin/$path" ;;
         free | uptime | top) full="/usr/bin/$path" ;;
         sysctl | reboot | poweroff) full="/sbin/$path" ;;
     esac
     check "$full is a real executable" "ssh_guest 'test -x $full && ! test -L $full'"
 done
-check 'BusyBox remains' "ssh_guest 'test -x /bin/busybox && test -L /bin/sh && test -L /bin/ls'"
+check 'BusyBox remains' "ssh_guest 'test -x /bin/busybox && test -L /bin/sh && busybox ls / >/dev/null'"
 
 check 'hostname reads' "ssh_guest 'hostname' | grep -q ."
 check 'hostname -F sets the name' "ssh_guest 'printf \"tools-test\\n\" >/tmp/h; hostname -F /tmp/h; test \"\$(hostname)\" = tools-test'"
@@ -138,6 +139,18 @@ check 'mount -o ro is applied' "ssh_guest 'mkdir -p /tmp/toolmnt-ro; mount -t tm
 check 'mount fails on a missing target' "! ssh_guest 'mount -t tmpfs tmpfs /no/such/tool-target' >/dev/null 2>&1"
 check 'umount fails on an unknown target' "! ssh_guest 'umount /no/such/tool-target' >/dev/null 2>&1"
 check 'BusyBox mount fallback' "ssh_guest 'busybox mount' | grep -q ' / '"
+
+check 'ls lists a file' "ssh_guest 'ls /etc/hostname' | grep -q hostname"
+check 'cat reads a file' "ssh_guest 'cat /etc/hostname' | grep -q rinit"
+check 'cp copies a file' "ssh_guest 'cp /etc/hostname /tmp/tool-cp && cmp -s /etc/hostname /tmp/tool-cp'"
+check 'mv moves a file' "ssh_guest 'mv /tmp/tool-cp /tmp/tool-mv && test -f /tmp/tool-mv && ! test -e /tmp/tool-cp'"
+check 'rm removes a file' "ssh_guest 'rm /tmp/tool-mv && ! test -e /tmp/tool-mv'"
+check 'mkdir creates parents' "ssh_guest 'mkdir -p /tmp/tool-dir/a/b && test -d /tmp/tool-dir/a/b'"
+check 'ln creates a symlink' "ssh_guest 'ln -s /etc/hostname /tmp/tool-link && test -L /tmp/tool-link'"
+check 'touch creates a file' "ssh_guest 'touch /tmp/tool-touch && test -f /tmp/tool-touch'"
+check 'cp refuses a directory without -r' "! ssh_guest 'cp /etc /tmp/tool-cp-dir' >/dev/null 2>&1"
+check 'rm refuses a directory without -r' "! ssh_guest 'rm /etc' >/dev/null 2>&1"
+ssh_guest 'rm -rf /tmp/tool-dir /tmp/tool-link /tmp/tool-touch /tmp/tool-cp-dir' >/dev/null 2>&1 || true
 
 if ((power_cycle)); then
     boot_count=$(grep -cF 'starting (pid 1)' "$serial" || true)

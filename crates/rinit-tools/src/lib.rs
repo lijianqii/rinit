@@ -22,6 +22,7 @@ use std::io;
 use std::path::Path;
 
 pub mod control;
+pub mod fsutil;
 
 /// Exit code for a successful invocation.
 pub const EXIT_OK: u8 = 0;
