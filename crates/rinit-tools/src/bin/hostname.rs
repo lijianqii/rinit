@@ -12,15 +12,19 @@ fn read_hostname() -> io::Result<String> {
     read_trimmed(Path::new(PATH))
 }
 
-fn write_hostname(name: &str) -> io::Result<()> {
-    if name.is_empty()
-        || name
+fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && !name
             .bytes()
             .any(|byte| byte == 0 || byte.is_ascii_whitespace())
-    {
+}
+
+fn write_hostname(name: &str) -> io::Result<()> {
+    if !valid_name(name) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "hostname must be non-empty and contain no whitespace",
+            "hostname must be 1-64 bytes and contain no whitespace",
         ));
     }
     std::fs::write(PATH, format!("{name}\n"))
@@ -124,5 +128,14 @@ mod tests {
     fn short_name_drops_the_domain() {
         assert_eq!(short_name("host.example.com"), "host");
         assert_eq!(short_name("host"), "host");
+    }
+
+    #[test]
+    fn hostname_validation_rejects_empty_whitespace_and_oversize() {
+        assert!(valid_name("host"));
+        assert!(!valid_name(""));
+        assert!(!valid_name("two words"));
+        assert!(!valid_name("a\0b"));
+        assert!(!valid_name(&"a".repeat(65)));
     }
 }

@@ -6,8 +6,7 @@ use std::process::ExitCode;
 
 use rinit_tools::{EXIT_OK, program_name, read_trimmed, usage_error};
 
-fn meminfo() -> io::Result<BTreeMap<String, u64>> {
-    let text = read_trimmed(std::path::Path::new("/proc/meminfo"))?;
+fn parse_meminfo(text: &str) -> BTreeMap<String, u64> {
     let mut values = BTreeMap::new();
     for line in text.lines() {
         let Some((key, rest)) = line.split_once(':') else {
@@ -20,7 +19,12 @@ fn meminfo() -> io::Result<BTreeMap<String, u64>> {
             values.insert(key.trim().to_string(), value);
         }
     }
-    Ok(values)
+    values
+}
+
+fn meminfo() -> io::Result<BTreeMap<String, u64>> {
+    let text = read_trimmed(std::path::Path::new("/proc/meminfo"))?;
+    Ok(parse_meminfo(&text))
 }
 
 fn field(values: &BTreeMap<String, u64>, key: &str) -> u64 {
@@ -117,5 +121,16 @@ mod tests {
         assert_eq!(scaled(1024, "b"), "1048576");
         assert_eq!(human(1024), "1.0Mi");
         assert_eq!(human(1024 * 1024), "1.0Gi");
+    }
+
+    #[test]
+    fn meminfo_parser_reads_numeric_fields_only() {
+        let values = parse_meminfo(
+            "MemTotal:       2048 kB\nMemFree:  512 kB\nBad: nope\nSwapTotal: 1024 kB\n",
+        );
+        assert_eq!(values.get("MemTotal"), Some(&2048));
+        assert_eq!(values.get("MemFree"), Some(&512));
+        assert_eq!(values.get("SwapTotal"), Some(&1024));
+        assert!(!values.contains_key("Bad"));
     }
 }

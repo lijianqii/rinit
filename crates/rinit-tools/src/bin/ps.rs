@@ -5,11 +5,8 @@ use std::process::ExitCode;
 
 use rinit_tools::{EXIT_OK, program_name, usage_error};
 
-fn passwd() -> BTreeMap<u32, String> {
+fn parse_passwd(text: &str) -> BTreeMap<u32, String> {
     let mut users = BTreeMap::new();
-    let Ok(text) = std::fs::read_to_string("/etc/passwd") else {
-        return users;
-    };
     for line in text.lines() {
         let fields: Vec<&str> = line.split(':').collect();
         if fields.len() < 3 {
@@ -22,8 +19,13 @@ fn passwd() -> BTreeMap<u32, String> {
     users
 }
 
-fn stat(pid: &str) -> Option<(String, u64, u64, u64)> {
-    let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+fn passwd() -> BTreeMap<u32, String> {
+    std::fs::read_to_string("/etc/passwd")
+        .map(|text| parse_passwd(&text))
+        .unwrap_or_default()
+}
+
+fn parse_stat(text: &str) -> Option<(String, u64, u64)> {
     let open = text.find('(')?;
     let close = text.rfind(')')?;
     let comm = text.get(open + 1..close)?.to_string();
@@ -34,7 +36,13 @@ fn stat(pid: &str) -> Option<(String, u64, u64, u64)> {
     let utime = rest.get(11)?.parse::<u64>().ok()?;
     let stime = rest.get(12)?.parse::<u64>().ok()?;
     let ppid = rest.get(1)?.parse::<u64>().ok()?;
-    Some((comm, utime + stime, ppid, uid(pid)))
+    Some((comm, utime + stime, ppid))
+}
+
+fn stat(pid: &str) -> Option<(String, u64, u64, u64)> {
+    let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (comm, ticks, ppid) = parse_stat(&text)?;
+    Some((comm, ticks, ppid, uid(pid)))
 }
 
 fn uid(pid: &str) -> u64 {
@@ -160,5 +168,18 @@ mod tests {
     #[test]
     fn zero_ticks_render_as_zero_time() {
         assert_eq!(ticks_time(0), "0:00");
+    }
+
+    #[test]
+    fn passwd_parser_maps_uids() {
+        let users = parse_passwd("root:x:0:0::/root:/bin/sh\nnobody:x:65534:65534::/:/bin/false\n");
+        assert_eq!(users.get(&0).map(String::as_str), Some("root"));
+        assert_eq!(users.get(&65534).map(String::as_str), Some("nobody"));
+    }
+
+    #[test]
+    fn stat_parser_handles_parentheses_in_comm() {
+        let text = "42 (my proc) S 1 2 3 4 5 6 7 8 9 10 100 200 0 0\n";
+        assert_eq!(parse_stat(text), Some(("my proc".to_string(), 300, 1)));
     }
 }

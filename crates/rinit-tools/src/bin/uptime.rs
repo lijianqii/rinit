@@ -6,24 +6,25 @@ use std::process::ExitCode;
 
 use rinit_tools::{EXIT_OK, program_name, read_trimmed, usage_error};
 
+fn parse_uptime(text: &str) -> Option<f64> {
+    text.split_whitespace().next()?.parse::<f64>().ok()
+}
+
+fn parse_loadavg(text: &str) -> Option<String> {
+    let fields: Vec<&str> = text.split_whitespace().take(3).collect();
+    (fields.len() == 3).then(|| fields.join(" "))
+}
+
 fn read_uptime() -> io::Result<f64> {
     let text = read_trimmed(Path::new("/proc/uptime"))?;
-    text.split_whitespace()
-        .next()
-        .and_then(|value| value.parse::<f64>().ok())
+    parse_uptime(&text)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad /proc/uptime"))
 }
 
 fn loadavg() -> io::Result<String> {
     let text = read_trimmed(Path::new("/proc/loadavg"))?;
-    let fields: Vec<&str> = text.split_whitespace().take(3).collect();
-    if fields.len() != 3 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "bad /proc/loadavg",
-        ));
-    }
-    Ok(fields.join(" "))
+    parse_loadavg(&text)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad /proc/loadavg"))
 }
 
 fn wall_clock() -> String {
@@ -108,5 +109,16 @@ mod tests {
         assert_eq!(clock(3661), "01:01");
         assert_eq!(clock(86400), "1 day, 00:00");
         assert_eq!(clock(90061), "1 day, 01:01");
+    }
+
+    #[test]
+    fn proc_parsers_reject_truncated_data() {
+        assert_eq!(parse_uptime("123.5 456.0\n"), Some(123.5));
+        assert_eq!(parse_uptime("not-a-number"), None);
+        assert_eq!(
+            parse_loadavg("0.10 0.20 0.30 1/100 123\n").as_deref(),
+            Some("0.10 0.20 0.30")
+        );
+        assert_eq!(parse_loadavg("0.10 0.20"), None);
     }
 }
