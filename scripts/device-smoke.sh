@@ -185,6 +185,15 @@ check 'network-online is active' "ssh_guest 'rctl status --plain network-online.
 check '/dev/vda exists' "ssh_guest 'test -e /dev/vda'"
 check '/dev/ptmx exists' "ssh_guest 'test -e /dev/ptmx'"
 check 'rctl list includes the target' "ssh_guest 'rctl list' | grep -q 'device.target'"
+check 'mount is a real ELF path' "ssh_guest 'test -x /bin/mount && ! test -L /bin/mount'"
+check 'hostname is a real ELF path' "ssh_guest 'test -x /bin/hostname && ! test -L /bin/hostname'"
+check 'reboot is a real ELF path' "ssh_guest 'test -x /sbin/reboot && ! test -L /sbin/reboot'"
+check 'ps runs' "ssh_guest 'ps >/dev/null'"
+check 'free runs' "ssh_guest 'free >/dev/null'"
+check 'uptime runs' "ssh_guest 'uptime >/dev/null'"
+check 'df runs' "ssh_guest 'df >/dev/null'"
+check 'top batch snapshot runs' "ssh_guest 'top -b -n 1 >/dev/null'"
+check 'BusyBox remains available' "ssh_guest 'test -x /bin/busybox && test -L /bin/sh'"
 
 kill_qemu
 
