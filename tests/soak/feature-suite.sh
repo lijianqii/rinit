@@ -152,6 +152,19 @@ log_has() {
     rctl log "$1" 2>/dev/null | grep -q -- "$2"
 }
 
+wait_log() {
+    local name=$1
+    local pattern=$2
+    local limit=$3
+    local i=0
+    while [ "$i" -lt "$limit" ]; do
+        log_has "$name" "$pattern" && return 0
+        sleep 1
+        i=$((i + 1))
+    done
+    return 1
+}
+
 start_unit() {
     rctl start "$1" >/dev/null 2>&1
 }
@@ -324,11 +337,10 @@ sc_device_services() {
 
 sc_cgroup_limits() {
     start_unit cglimit.service || return 1
-    sleep 1
     fail=0
-    log_has cglimit.service 'cpu=50000 100000' || fail=1
-    log_has cglimit.service 'mem=33554432 high=25165824' || fail=1
-    log_has cglimit.service 'pids=64' || fail=1
+    wait_log cglimit.service 'cpu=50000 100000' 10 || fail=1
+    wait_log cglimit.service 'mem=33554432 high=25165824' 10 || fail=1
+    wait_log cglimit.service 'pids=64' 10 || fail=1
     stop_unit cglimit.service
     return "$fail"
 }
