@@ -7,6 +7,7 @@
 #   make ARCH=... run-disk  build an ext4 rootfs (dropbear + device units) and
 #                         boot it as a persistent virtio disk
 #   make disk-image    force a destructive rebuild of that ext4 image
+#   make pack        rebuild the rootfs and write rinit-<target>-rootfs.tar.gz
 #   make kernel      build the Linux kernel Image/zImage only
 #   make busybox     build busybox only
 #   make processes   build the /proc process viewer only
@@ -114,6 +115,7 @@ DEVICE_UNIT_FILES := $(wildcard units/device/*.service) $(wildcard units/device/
 DROPBEAR_BIN_DIR  := $(SRC_DIR)/dropbear-bin
 ROOTFS_DIR        := $(OUT_DIR)/rootfs
 DISK_IMAGE        := $(OUT_DIR)/rinit-$(TARGET).ext4
+PACK_ARCHIVE      := $(OUT_DIR)/rinit-$(TARGET)-rootfs.tar.gz
 
 SCRIPTS          := scripts
 MAKE_KERNEL      := $(MAKE) -C $(KERNEL_SRC) ARCH=$(KERNEL_ARCH) CROSS_COMPILE=$(CROSS_COMPILE)
@@ -121,7 +123,7 @@ MAKE_BUSYBOX     := $(MAKE) -C $(BUSYBOX_SRC) ARCH=$(BUSYBOX_ARCH) CROSS_COMPILE
 
 .DEFAULT_GOAL    := run
 .PHONY: run run-disk kernel kernel-config-check busybox dropbear rinit processes \
-        tools install-tools initramfs initramfs-demo disk-image qemu help clean \
+        tools install-tools initramfs initramfs-demo disk-image pack qemu help clean \
         distclean check test test-system soak parallel gates size-check \
         coverage-check
 
@@ -319,6 +321,14 @@ disk-image: rinit tools $(BUSYBOX_BIN) $(DROPBEAR_BIN_DIR)/dropbear \
 
 $(DISK_IMAGE):
 	$(MAKE) disk-image
+
+# Package the populated rootfs as a deployable tarball. `disk-image` already
+# rebuilds that tree and validates the installed tools, so pack follows the same
+# path instead of risking a tarball that disagrees with the ext4 image.
+pack: disk-image
+	mkdir -p $(OUT_DIR)
+	tar --owner=0:0 --group=0:0 -C $(ROOTFS_DIR) -czf $(PACK_ARCHIVE) .
+	@printf 'pack: wrote %s (%s)\n' "$(PACK_ARCHIVE)" "$$(du -h '$(PACK_ARCHIVE)' | cut -f1)"
 
 run-disk: $(KERNEL_IMAGE) $(DISK_IMAGE)
 	$(SCRIPTS)/run-qemu.sh --arch $(QEMU_ARCH) --kernel $(KERNEL_IMAGE) \

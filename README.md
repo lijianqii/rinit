@@ -603,6 +603,7 @@ make ARCH=arm64 run # build if needed, boot → interactive root shell
 make ARCH=arm32 run # the same for ARMv7 (qemu virt, Cortex-A15)
 make ARCH=arm64 run-disk  # persistent ext4 root filesystem + device services
 make disk-image     # force a destructive rebuild of that ext4 image
+make pack           # rebuild the rootfs and write rinit-<target>-rootfs.tar.gz
 make kernel         # kernel only (Image or zImage for the selected ARCH)
 make busybox        # busybox only
 make initramfs      # rinit + initramfs only
@@ -681,7 +682,8 @@ the same rootfs tree plus `units/device/`, dropbear and the swap file, then boot
 with `root=/dev/vda rw rootfstype=ext4 init=/sbin/rinit -- --default
 device.target`. There is no initramfs. The image is **reused if it exists**, so
 changes made in the guest survive the next boot; `make disk-image` is the
-explicit destructive rebuild.
+explicit destructive rebuild. `make pack` performs the same rebuild and writes
+the populated rootfs to `build/.../out/rinit-<target>-rootfs.tar.gz`.
 
 `device.target` starts:
 
