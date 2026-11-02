@@ -102,3 +102,22 @@ fn main() -> ExitCode {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn key_path_rejects_traversal_and_empty_parts() {
+        assert!(key_path("kernel.hostname").is_ok());
+        for bad in [
+            "",
+            "..",
+            "kernel..hostname",
+            "/etc/passwd",
+            "kernel/../hostname",
+        ] {
+            assert!(key_path(bad).is_err(), "{bad} must be rejected");
+        }
+    }
+}

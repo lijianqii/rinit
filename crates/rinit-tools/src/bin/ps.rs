@@ -152,3 +152,13 @@ fn main() -> ExitCode {
     }
     ExitCode::from(EXIT_OK)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_ticks_render_as_zero_time() {
+        assert_eq!(ticks_time(0), "0:00");
+    }
+}

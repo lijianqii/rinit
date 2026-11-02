@@ -104,3 +104,18 @@ fn main() -> ExitCode {
     }
     ExitCode::from(EXIT_OK)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn units_scale_and_humanize() {
+        assert_eq!(scaled(1024, "k"), "1024");
+        assert_eq!(scaled(1024, "m"), "1");
+        assert_eq!(scaled(1024, "g"), "0");
+        assert_eq!(scaled(1024, "b"), "1048576");
+        assert_eq!(human(1024), "1.0Mi");
+        assert_eq!(human(1024 * 1024), "1.0Gi");
+    }
+}

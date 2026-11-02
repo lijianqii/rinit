@@ -96,3 +96,17 @@ fn main() -> ExitCode {
     );
     ExitCode::from(EXIT_OK)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uptime_clock_handles_days_and_hours() {
+        assert_eq!(clock(0), "00:00");
+        assert_eq!(clock(61), "00:01");
+        assert_eq!(clock(3661), "01:01");
+        assert_eq!(clock(86400), "1 day, 00:00");
+        assert_eq!(clock(90061), "1 day, 01:01");
+    }
+}

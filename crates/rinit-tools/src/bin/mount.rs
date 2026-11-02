@@ -218,3 +218,28 @@ fn main() -> ExitCode {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn options_split_flags_from_data() {
+        let parsed = parse_options("ro,noexec,mode=755,size=64k");
+        assert_ne!(parsed.flags & libc::MS_RDONLY, 0);
+        assert_ne!(parsed.flags & libc::MS_NOEXEC, 0);
+        assert_eq!(parsed.data, ["mode=755", "size=64k"]);
+    }
+
+    #[test]
+    fn rw_clears_the_read_only_flag() {
+        let parsed = parse_options("ro,rw");
+        assert_eq!(parsed.flags & libc::MS_RDONLY, 0);
+    }
+
+    #[test]
+    fn nul_paths_are_rejected() {
+        assert!(cstring("a\0b", "path").is_err());
+        assert!(cstring("ok", "path").is_ok());
+    }
+}

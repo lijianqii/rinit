@@ -16,9 +16,7 @@ fn umount_one(target: &str, flags: libc::c_int) -> Result<(), String> {
     }
 }
 
-fn all_targets() -> Result<Vec<String>, String> {
-    let text = read_trimmed(std::path::Path::new("/proc/mounts"))
-        .map_err(|e| format!("/proc/mounts: {e}"))?;
+fn targets_from_mounts(text: &str) -> Vec<String> {
     let mut targets: Vec<String> = text
         .lines()
         .filter_map(|line| line.split_whitespace().nth(1))
@@ -26,7 +24,13 @@ fn all_targets() -> Result<Vec<String>, String> {
         .map(str::to_string)
         .collect();
     targets.reverse();
-    Ok(targets)
+    targets
+}
+
+fn all_targets() -> Result<Vec<String>, String> {
+    let text = read_trimmed(std::path::Path::new("/proc/mounts"))
+        .map_err(|e| format!("/proc/mounts: {e}"))?;
+    Ok(targets_from_mounts(&text))
 }
 
 fn main() -> ExitCode {
@@ -70,4 +74,15 @@ fn main() -> ExitCode {
         }
     }
     ExitCode::from(if fail == 0 { EXIT_OK } else { 1 })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn all_targets_skips_root_and_reverses_mount_order() {
+        let text = "/dev/vda / ext4 rw 0 0\ntmpfs /run tmpfs rw 0 0\nproc /proc proc rw 0 0\n";
+        assert_eq!(targets_from_mounts(text), ["/proc", "/run"]);
+    }
 }

@@ -124,3 +124,23 @@ fn main() -> ExitCode {
     }
     ExitCode::from(EXIT_OK)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mount_escapes_are_decoded() {
+        assert_eq!(unescape(r"/tmp/a\040b"), "/tmp/a b");
+        assert_eq!(unescape(r"/tmp/a\011b"), "/tmp/a\tb");
+    }
+
+    #[test]
+    fn mount_lines_need_device_and_target() {
+        assert_eq!(
+            mount_line("/dev/vda / ext4 rw 0 0"),
+            Some(("/dev/vda".to_string(), "/".to_string()))
+        );
+        assert_eq!(mount_line("too-few"), None);
+    }
+}

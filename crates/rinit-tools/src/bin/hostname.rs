@@ -115,3 +115,14 @@ fn main() -> ExitCode {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_name_drops_the_domain() {
+        assert_eq!(short_name("host.example.com"), "host");
+        assert_eq!(short_name("host"), "host");
+    }
+}

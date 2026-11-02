@@ -204,6 +204,18 @@ jobs:
           --key "$RUNNER_TEMP/device-key"
           --tag ci-device
 
+      - name: Test the install gate
+        run: scripts/install-tools-test.sh
+
+      - name: Exercise the replaced tools
+        run: >-
+          scripts/tools-test.sh
+          --arch aarch64
+          --image build/out/rinit-aarch64-unknown-linux-gnu.ext4
+          --kernel build/src/linux-6.6.158/arch/arm64/boot/Image
+          --key "$RUNNER_TEMP/device-key"
+          --tag ci-tools
+
       - name: Upload the serial log
         if: always()
         uses: actions/upload-artifact@v4

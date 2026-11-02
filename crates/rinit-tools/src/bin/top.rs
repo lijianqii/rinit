@@ -207,3 +207,16 @@ fn main() -> ExitCode {
     }
     ExitCode::from(EXIT_OK)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn human_and_uptime_formatting() {
+        assert_eq!(human(512), "512K");
+        assert_eq!(human(2048), "2.0M");
+        assert_eq!(uptime_text(61), "00:01");
+        assert_eq!(uptime_text(90061), "1 days, 01:01");
+    }
+}
