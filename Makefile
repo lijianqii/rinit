@@ -143,9 +143,17 @@ processes: $(PROCESSES_BIN)
 TOOLS_ARCH       := $(if $(filter arm64,$(ARCH)),aarch64,armv7)
 TOOLS_PROFILE    ?= replace-system
 TOOLS_BIN_DIR    := target/$(TARGET)/release
+TOOLS_SRCS       := $(RINIT_SRCS) tools.list scripts/install-tools.sh
+TOOLS_STAMP      := $(TOOLS_BIN_DIR)/.rinit-tools-stamp
 
 tools:
 	cargo build --release --target $(TARGET) --bins
+
+# A stamp keeps `make run` incremental: the phony `tools` target is only run
+# when a tool source, the manifest or the installer changed, not on every boot.
+$(TOOLS_STAMP): $(TOOLS_SRCS)
+	$(MAKE) tools
+	@touch $@
 
 install-tools: tools
 	$(SCRIPTS)/install-tools.sh \
@@ -266,13 +274,16 @@ INITRAMFS_SCRIPTS := $(SCRIPTS)/build-initramfs.sh $(SCRIPTS)/mkinitramfs.sh
 # loop - boot, get a console, look at a service - and fourteen units that exist
 # to be started one at a time from the console are not part of that.
 $(INITRAMFS): $(RINIT_BIN) $(RCTL_BIN) $(PROCESSES_BIN) $(BUSYBOX_BIN) \
-              $(BOOT_UNIT_FILES) $(FSTAB) $(MDEV_CONF) $(INITRAMFS_SCRIPTS)
-	$(SCRIPTS)/build-initramfs.sh $(TARGET) --busybox-src $(BUSYBOX_SRC) --out $@
+              $(BOOT_UNIT_FILES) $(FSTAB) $(MDEV_CONF) $(INITRAMFS_SCRIPTS) \
+              $(TOOLS_STAMP)
+	$(SCRIPTS)/build-initramfs.sh $(TARGET) --busybox-src $(BUSYBOX_SRC) \
+	    --rinit-tools --tools-profile $(TOOLS_PROFILE) --out $@
 
 $(INITRAMFS_DEMO): $(RINIT_BIN) $(RCTL_BIN) $(PROCESSES_BIN) $(BUSYBOX_BIN) \
                    $(BOOT_UNIT_FILES) $(DEMO_UNIT_FILES) $(FSTAB) $(MDEV_CONF) \
-                   $(INITRAMFS_SCRIPTS)
-	$(SCRIPTS)/build-initramfs.sh $(TARGET) --busybox-src $(BUSYBOX_SRC) --demo-units --out $@
+                   $(INITRAMFS_SCRIPTS) $(TOOLS_STAMP)
+	$(SCRIPTS)/build-initramfs.sh $(TARGET) --busybox-src $(BUSYBOX_SRC) \
+	    --rinit-tools --tools-profile $(TOOLS_PROFILE) --demo-units --out $@
 
 # The guest boots units/, so nothing is put on the kernel cmdline: any token
 # there would override the unit directory and the console shell would never

@@ -8,6 +8,8 @@
 #                                                    [--dropbear-bin DIR]
 #                                                    [--ssh-key FILE]
 #                                                    [--rootfs DIR]
+#                                                    [--rinit-tools]
+#                                                    [--tools-profile NAME]
 #
 # Options:
 #   --busybox-src DIR  install the given *built* busybox source tree
@@ -23,6 +25,10 @@
 #                      Requires --dropbear-bin; without it the file stays empty.
 #   --rootfs DIR       populate DIR as a root filesystem and stop (no cpio).
 #                      Used by `make run-disk` before mke2fs.
+#   --rinit-tools      install the rinit-tools manifest into the image, after
+#                      busybox so the replacement paths can be verified.
+#   --tools-profile    replace-system (default) or coexist; implies
+#                      --rinit-tools when passed.
 #
 # Examples:
 #   scripts/build-initramfs.sh aarch64-unknown-linux-gnu --busybox-src build/src/busybox-1.36.1
@@ -44,6 +50,8 @@ device_units=""
 dropbear_bin=""
 ssh_key=""
 rootfs_out=""
+rinit_tools=0
+tools_profile=replace-system
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --busybox-src) busybox_src="${2:?}"; shift 2 ;;
@@ -53,13 +61,19 @@ while [[ $# -gt 0 ]]; do
         --dropbear-bin) dropbear_bin="${2:?}"; shift 2 ;;
         --ssh-key) ssh_key="${2:?}"; shift 2 ;;
         --rootfs) rootfs_out="${2:?}"; shift 2 ;;
+        --rinit-tools) rinit_tools=1; shift ;;
+        --tools-profile) tools_profile="${2:?}"; rinit_tools=1; shift 2 ;;
         -h | --help) sed -n '2,/^set -euo pipefail$/p' "$0" | sed '$d'; exit 0 ;;
         -*) echo "unknown option: $1" >&2; exit 2 ;;
         *) triple="$1"; shift ;;
     esac
 done
 
-: "${triple:?usage: build-initramfs.sh <target-triple> [--busybox-src DIR] [--out FILE] [--demo-units] [--device-units] [--dropbear-bin DIR] [--ssh-key FILE] [--rootfs DIR]}"
+: "${triple:?usage: build-initramfs.sh <target-triple> [--busybox-src DIR] [--out FILE] [--demo-units] [--device-units] [--dropbear-bin DIR] [--ssh-key FILE] [--rootfs DIR] [--rinit-tools] [--tools-profile NAME]}"
+case "${tools_profile}" in
+    replace-system | coexist) ;;
+    *) echo "error: --tools-profile must be replace-system or coexist" >&2; exit 2 ;;
+esac
 if [[ -n "${ssh_key}" ]]; then
     [[ -n "${dropbear_bin}" ]] || { echo "error: --ssh-key requires --dropbear-bin" >&2; exit 2; }
     [[ -r "${ssh_key}" ]] || { echo "error: cannot read SSH key ${ssh_key}" >&2; exit 2; }
@@ -320,6 +334,22 @@ if [[ -n "${busybox_src}" ]]; then
     printf 'root:$6$rinit$h.sfVK5a75HqcCQ8mjFVlpyRSK5rin/8GpC7okbfq82BH16wN0lJDJUvCd.0bpt2/q/MtfkobUfMxtG72uIuj.:0:0:99999:7:::\nnobody:!:65534:0:99999:7:::\n' >"${work}/etc/shadow"
     chmod 0600 "${work}/etc/shadow"
     printf 'root:x:0:\nnogroup:x:65534:\n' >"${work}/etc/group"
+fi
+
+# Optional rinit-tools: install after busybox so every replacement path can be
+# checked as the expected BusyBox symlink before it is removed.
+if ((rinit_tools)); then
+    case "${triple}" in
+        aarch64-*) tools_arch=aarch64 ;;
+        armv7-*)   tools_arch=armv7 ;;
+        *) echo "error: --rinit-tools is not supported for ${triple}" >&2; exit 2 ;;
+    esac
+    "${here}/install-tools.sh" \
+        --rootfs "${work}" \
+        --bin-dir "${bin_dir}" \
+        --manifest "${repo_root}/tools.list" \
+        --profile "${tools_profile}" \
+        --arch "${tools_arch}"
 fi
 
 # Dropbear is only installed for the disk/device image. It generates its host

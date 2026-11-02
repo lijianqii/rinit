@@ -295,7 +295,10 @@ make ARCH=arm32 tools
 ```
 
 The default profile is `replace-system`. `tools` builds every binary in the
-manifest for the selected target.
+manifest for the selected target. Both image paths install the manifest:
+`make run` does it while assembling the initramfs, and `make run-disk` does it
+through `disk-image`. `run-disk` reuses an existing ext4 image, so
+`make disk-image` is the explicit rebuild when the tool set changes.
 
 ### Install
 
