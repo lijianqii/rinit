@@ -15,25 +15,23 @@ fn parse_loadavg(text: &str) -> Option<String> {
     (fields.len() == 3).then(|| fields.join(" "))
 }
 
-fn read_uptime() -> io::Result<f64> {
-    let text = read_trimmed(Path::new("/proc/uptime"))?;
+fn read_uptime(root: &Path) -> io::Result<f64> {
+    let text = read_trimmed(&root.join("proc/uptime"))?;
     parse_uptime(&text)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad /proc/uptime"))
 }
 
-fn loadavg() -> io::Result<String> {
-    let text = read_trimmed(Path::new("/proc/loadavg"))?;
+fn loadavg(root: &Path) -> io::Result<String> {
+    let text = read_trimmed(&root.join("proc/loadavg"))?;
     parse_loadavg(&text)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad /proc/loadavg"))
 }
 
 fn wall_clock() -> String {
-    // SAFETY: `time` and `localtime_r` are given valid, local storage; the
-    // returned pointer is only read while `tm` is alive.
+    // SAFETY: `time` and `localtime_r` use valid local storage for the call.
     let now = unsafe { libc::time(std::ptr::null_mut()) };
     let mut tm = unsafe { std::mem::zeroed::<libc::tm>() };
-    let ok = unsafe { libc::localtime_r(&now, &mut tm) };
-    if ok.is_null() {
+    if unsafe { libc::localtime_r(&now, &mut tm) }.is_null() {
         return "??:??:??".to_string();
     }
     format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
@@ -55,11 +53,9 @@ fn clock(seconds: u64) -> String {
     }
 }
 
-fn main() -> ExitCode {
-    rinit_tools::restore_sigpipe();
-    let program = program_name(std::env::args().next().as_deref(), "uptime");
+fn run(args: &[String], root: &Path, program: &str) -> ExitCode {
     let mut pretty = false;
-    for arg in std::env::args().skip(1) {
+    for arg in args {
         match arg.as_str() {
             "-h" | "--help" => {
                 println!("Usage: uptime [-p]");
@@ -67,11 +63,11 @@ fn main() -> ExitCode {
             }
             "-p" | "--pretty" => pretty = true,
             other => {
-                return ExitCode::from(usage_error(&program, &format!("unknown option '{other}'")));
+                return ExitCode::from(usage_error(program, &format!("unknown option '{other}'")));
             }
         }
     }
-    let seconds = match read_uptime() {
+    let seconds = match read_uptime(root) {
         Ok(value) => value as u64,
         Err(e) => {
             eprintln!("{program}: cannot read uptime: {e}");
@@ -82,7 +78,7 @@ fn main() -> ExitCode {
         println!("up {}", clock(seconds));
         return ExitCode::from(EXIT_OK);
     }
-    let loads = match loadavg() {
+    let loads = match loadavg(root) {
         Ok(value) => value,
         Err(e) => {
             eprintln!("{program}: cannot read load average: {e}");
@@ -98,9 +94,23 @@ fn main() -> ExitCode {
     ExitCode::from(EXIT_OK)
 }
 
+fn main() -> ExitCode {
+    rinit_tools::restore_sigpipe();
+    let program = program_name(std::env::args().next().as_deref(), "uptime");
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    run(&args, Path::new("/"), &program)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_root(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("rinit-uptime-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("proc")).expect("root");
+        root
+    }
 
     #[test]
     fn uptime_clock_handles_days_and_hours() {
@@ -120,5 +130,30 @@ mod tests {
             Some("0.10 0.20 0.30")
         );
         assert_eq!(parse_loadavg("0.10 0.20"), None);
+    }
+
+    #[test]
+    fn run_reads_a_fake_proc() {
+        let root = test_root("run");
+        std::fs::write(root.join("proc/uptime"), "3661.5 0.0\n").expect("uptime");
+        std::fs::write(root.join("proc/loadavg"), "0.1 0.2 0.3 1/10 42\n").expect("loadavg");
+        assert_eq!(run(&[], &root, "uptime"), ExitCode::from(0));
+        assert_eq!(run(&["-p".to_string()], &root, "uptime"), ExitCode::from(0));
+        assert_eq!(
+            run(&["--help".to_string()], &root, "uptime"),
+            ExitCode::from(0)
+        );
+        assert_eq!(
+            run(&["--bad".to_string()], &root, "uptime"),
+            ExitCode::from(2)
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn missing_proc_is_a_failure() {
+        let root = test_root("missing");
+        assert_eq!(run(&[], &root, "uptime"), ExitCode::from(1));
+        let _ = std::fs::remove_dir_all(root);
     }
 }

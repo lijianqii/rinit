@@ -66,12 +66,10 @@ fn statvfs(path: &str) -> io::Result<(u64, u64, u64)> {
     ))
 }
 
-fn main() -> ExitCode {
-    rinit_tools::restore_sigpipe();
-    let program = program_name(std::env::args().next().as_deref(), "df");
+fn run(args: &[String], root: &std::path::Path, program: &str) -> ExitCode {
     let mut human_flag = false;
     let mut paths = Vec::new();
-    for arg in std::env::args().skip(1) {
+    for arg in args {
         match arg.as_str() {
             "-h" => human_flag = true,
             "-k" => human_flag = false,
@@ -81,14 +79,14 @@ fn main() -> ExitCode {
                 return ExitCode::from(EXIT_OK);
             }
             value if value.starts_with('-') => {
-                return ExitCode::from(usage_error(&program, &format!("unknown option '{value}'")));
+                return ExitCode::from(usage_error(program, &format!("unknown option '{value}'")));
             }
             value => paths.push(value.to_string()),
         }
     }
 
     let mut mounts = Vec::new();
-    match read_trimmed(std::path::Path::new("/proc/mounts")) {
+    match read_trimmed(&root.join("proc/mounts")) {
         Ok(text) => {
             for line in text.lines() {
                 if let Some((device, mount)) = mount_line(line) {
@@ -125,6 +123,13 @@ fn main() -> ExitCode {
     ExitCode::from(EXIT_OK)
 }
 
+fn main() -> ExitCode {
+    rinit_tools::restore_sigpipe();
+    let program = program_name(std::env::args().next().as_deref(), "df");
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    run(&args, std::path::Path::new("/"), &program)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,5 +147,51 @@ mod tests {
             Some(("/dev/vda".to_string(), "/".to_string()))
         );
         assert_eq!(mount_line("too-few"), None);
+    }
+}
+
+#[cfg(test)]
+mod root_tests {
+    use super::*;
+
+    fn test_root(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("rinit-df-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("proc")).expect("proc");
+        std::fs::create_dir_all(root.join("mnt")).expect("mnt");
+        root
+    }
+
+    #[test]
+    fn run_lists_a_fake_mount_and_filters_paths() {
+        let root = test_root("run");
+        let mount = root.join("mnt");
+        let line = format!("tmpfs {} tmpfs rw 0 0\n", mount.display());
+        std::fs::write(root.join("proc/mounts"), line).expect("mounts");
+        assert_eq!(run(&[], &root, "df"), ExitCode::from(0));
+        assert_eq!(run(&["-h".to_string()], &root, "df"), ExitCode::from(0));
+        assert_eq!(
+            run(&["-k".to_string(), "-P".to_string()], &root, "df"),
+            ExitCode::from(0)
+        );
+        assert_eq!(
+            run(&[mount.display().to_string()], &root, "df"),
+            ExitCode::from(0)
+        );
+        assert_eq!(
+            run(&["/not-mounted".to_string()], &root, "df"),
+            ExitCode::from(0)
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_rejects_bad_options_and_missing_proc() {
+        let root = test_root("missing");
+        std::fs::remove_file(root.join("proc/mounts")).ok();
+        assert_eq!(run(&[], &root, "df"), ExitCode::from(1));
+        assert_eq!(run(&["--help".to_string()], &root, "df"), ExitCode::from(0));
+        assert_eq!(run(&["--bad".to_string()], &root, "df"), ExitCode::from(2));
+        let _ = std::fs::remove_dir_all(root);
     }
 }

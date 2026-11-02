@@ -27,19 +27,16 @@ fn targets_from_mounts(text: &str) -> Vec<String> {
     targets
 }
 
-fn all_targets() -> Result<Vec<String>, String> {
-    let text = read_trimmed(std::path::Path::new("/proc/mounts"))
-        .map_err(|e| format!("/proc/mounts: {e}"))?;
+fn all_targets(root: &std::path::Path) -> Result<Vec<String>, String> {
+    let text = read_trimmed(&root.join("proc/mounts")).map_err(|e| format!("/proc/mounts: {e}"))?;
     Ok(targets_from_mounts(&text))
 }
 
-fn main() -> ExitCode {
-    rinit_tools::restore_sigpipe();
-    let program = program_name(std::env::args().next().as_deref(), "umount");
+fn run(args: &[String], root: &std::path::Path, program: &str) -> ExitCode {
     let mut flags = 0;
     let mut all = false;
     let mut targets = Vec::new();
-    for arg in std::env::args().skip(1) {
+    for arg in args {
         match arg.as_str() {
             "-h" | "--help" => {
                 println!("Usage: umount [-a] [-l] [-f] TARGET...");
@@ -49,13 +46,13 @@ fn main() -> ExitCode {
             "-l" | "--lazy" => flags |= libc::MNT_DETACH,
             "-f" | "--force" => flags |= libc::MNT_FORCE,
             value if value.starts_with('-') => {
-                return ExitCode::from(usage_error(&program, &format!("unknown option '{value}'")));
+                return ExitCode::from(usage_error(program, &format!("unknown option '{value}'")));
             }
             value => targets.push(value.to_string()),
         }
     }
     if all {
-        match all_targets() {
+        match all_targets(root) {
             Ok(list) => targets.extend(list),
             Err(e) => {
                 eprintln!("{program}: {e}");
@@ -64,7 +61,7 @@ fn main() -> ExitCode {
         }
     }
     if targets.is_empty() {
-        return ExitCode::from(usage_error(&program, "a target is required"));
+        return ExitCode::from(usage_error(program, "a target is required"));
     }
     let mut fail = 0;
     for target in targets {
@@ -76,6 +73,13 @@ fn main() -> ExitCode {
     ExitCode::from(if fail == 0 { EXIT_OK } else { 1 })
 }
 
+fn main() -> ExitCode {
+    rinit_tools::restore_sigpipe();
+    let program = program_name(std::env::args().next().as_deref(), "umount");
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    run(&args, std::path::Path::new("/"), &program)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -84,5 +88,56 @@ mod tests {
     fn all_targets_skips_root_and_reverses_mount_order() {
         let text = "/dev/vda / ext4 rw 0 0\ntmpfs /run tmpfs rw 0 0\nproc /proc proc rw 0 0\n";
         assert_eq!(targets_from_mounts(text), ["/proc", "/run"]);
+    }
+}
+
+#[cfg(test)]
+mod root_tests {
+    use super::*;
+
+    fn test_root(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("rinit-umount-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("proc")).expect("proc");
+        root
+    }
+
+    #[test]
+    fn run_handles_options_and_missing_mounts() {
+        let root = test_root("run");
+        assert_eq!(
+            run(&["--help".to_string()], &root, "umount"),
+            ExitCode::from(0)
+        );
+        assert_eq!(
+            run(&["--bad".to_string()], &root, "umount"),
+            ExitCode::from(2)
+        );
+        assert_eq!(run(&[], &root, "umount"), ExitCode::from(2));
+        assert_eq!(
+            run(&["/no/such/target".to_string()], &root, "umount"),
+            ExitCode::from(1)
+        );
+        assert_eq!(
+            run(
+                &["-l".to_string(), "/no/such/target".to_string()],
+                &root,
+                "umount"
+            ),
+            ExitCode::from(1)
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_all_reads_fake_mounts_and_reports_failures() {
+        let root = test_root("all");
+        std::fs::write(
+            root.join("proc/mounts"),
+            "/dev/vda / ext4 rw 0 0\ntmpfs /run tmpfs rw 0 0\n",
+        )
+        .expect("mounts");
+        assert_eq!(run(&["-a".to_string()], &root, "umount"), ExitCode::from(1));
+        let _ = std::fs::remove_dir_all(root);
     }
 }

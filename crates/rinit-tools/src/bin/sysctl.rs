@@ -6,9 +6,7 @@ use std::process::ExitCode;
 
 use rinit_tools::{EXIT_OK, program_name, read_trimmed, usage_error};
 
-const ROOT: &str = "/proc/sys";
-
-fn key_path(key: &str) -> Result<PathBuf, String> {
+fn key_path(root: &Path, key: &str) -> Result<PathBuf, String> {
     if key.is_empty()
         || key.starts_with('/')
         || key
@@ -17,16 +15,19 @@ fn key_path(key: &str) -> Result<PathBuf, String> {
     {
         return Err(format!("invalid sysctl key '{key}'"));
     }
-    Ok(Path::new(ROOT).join(key.replace('.', "/")))
+    Ok(root.join("proc/sys").join(key.replace('.', "/")))
 }
 
-fn read_key(key: &str) -> Result<String, String> {
-    let path = key_path(key)?;
+fn read_key(root: &Path, key: &str) -> Result<String, String> {
+    let path = key_path(root, key)?;
     read_trimmed(&path).map_err(|e| format!("{key}: {e}"))
 }
 
-fn write_key(key: &str, value: &str) -> Result<(), String> {
-    let path = key_path(key)?;
+fn write_key(root: &Path, key: &str, value: &str) -> Result<(), String> {
+    let path = key_path(root, key)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("{key}: {e}"))?;
+    }
     std::fs::write(&path, format!("{value}\n")).map_err(|e| format!("{key}: {e}"))
 }
 
@@ -50,12 +51,9 @@ fn walk(dir: &Path, prefix: &str, out: &mut Vec<String>) -> io::Result<()> {
     Ok(())
 }
 
-fn main() -> ExitCode {
-    rinit_tools::restore_sigpipe();
-    let program = program_name(std::env::args().next().as_deref(), "sysctl");
-    let args: Vec<String> = std::env::args().skip(1).collect();
+fn run(args: &[String], root: &Path, program: &str) -> ExitCode {
     let Some(command) = args.first() else {
-        return ExitCode::from(usage_error(&program, "a key or -a/-w is required"));
+        return ExitCode::from(usage_error(program, "a key or -a/-w is required"));
     };
     match command.as_str() {
         "-h" | "--help" => {
@@ -64,7 +62,7 @@ fn main() -> ExitCode {
         }
         "-a" | "--all" => {
             let mut lines = Vec::new();
-            if let Err(e) = walk(Path::new(ROOT), "", &mut lines) {
+            if let Err(e) = walk(&root.join("proc/sys"), "", &mut lines) {
                 eprintln!("{program}: {e}");
                 return ExitCode::from(1);
             }
@@ -75,12 +73,12 @@ fn main() -> ExitCode {
         }
         "-w" | "--write" => {
             let Some(assignment) = args.get(1) else {
-                return ExitCode::from(usage_error(&program, "-w needs KEY=VALUE"));
+                return ExitCode::from(usage_error(program, "-w needs KEY=VALUE"));
             };
             let Some((key, value)) = assignment.split_once('=') else {
-                return ExitCode::from(usage_error(&program, "-w needs KEY=VALUE"));
+                return ExitCode::from(usage_error(program, "-w needs KEY=VALUE"));
             };
-            if let Err(e) = write_key(key, value) {
+            if let Err(e) = write_key(root, key, value) {
                 eprintln!("{program}: {e}");
                 return ExitCode::from(1);
             }
@@ -90,7 +88,7 @@ fn main() -> ExitCode {
         key => {
             let mut fail = false;
             for key in std::iter::once(key).chain(args.iter().skip(1).map(String::as_str)) {
-                match read_key(key) {
+                match read_key(root, key) {
                     Ok(value) => println!("{key} = {value}"),
                     Err(e) => {
                         eprintln!("{program}: {e}");
@@ -103,13 +101,28 @@ fn main() -> ExitCode {
     }
 }
 
+fn main() -> ExitCode {
+    rinit_tools::restore_sigpipe();
+    let program = program_name(std::env::args().next().as_deref(), "sysctl");
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    run(&args, Path::new("/"), &program)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn test_root(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("rinit-sysctl-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("proc/sys/kernel")).expect("root");
+        root
+    }
+
     #[test]
     fn key_path_rejects_traversal_and_empty_parts() {
-        assert!(key_path("kernel.hostname").is_ok());
+        let root = Path::new("/");
+        assert!(key_path(root, "kernel.hostname").is_ok());
         for bad in [
             "",
             "..",
@@ -117,7 +130,48 @@ mod tests {
             "/etc/passwd",
             "kernel/../hostname",
         ] {
-            assert!(key_path(bad).is_err(), "{bad} must be rejected");
+            assert!(key_path(root, bad).is_err(), "{bad} must be rejected");
         }
+    }
+
+    #[test]
+    fn run_reads_writes_and_lists_a_fake_tree() {
+        let root = test_root("rw");
+        std::fs::write(root.join("proc/sys/kernel/hostname"), "demo\n").expect("write");
+        assert_eq!(
+            run(&["kernel.hostname".to_string()], &root, "sysctl"),
+            ExitCode::from(0)
+        );
+        assert_eq!(
+            run(
+                &["-w".to_string(), "kernel.hostname=new".to_string()],
+                &root,
+                "sysctl"
+            ),
+            ExitCode::from(0)
+        );
+        assert_eq!(read_key(&root, "kernel.hostname").as_deref(), Ok("new"));
+        assert_eq!(run(&["-a".to_string()], &root, "sysctl"), ExitCode::from(0));
+        assert_eq!(
+            run(&["--help".to_string()], &root, "sysctl"),
+            ExitCode::from(0)
+        );
+        assert_eq!(run(&["-w".to_string()], &root, "sysctl"), ExitCode::from(2));
+        assert_eq!(
+            run(&["-w".to_string(), "bad".to_string()], &root, "sysctl"),
+            ExitCode::from(2)
+        );
+        assert_eq!(run(&[], &root, "sysctl"), ExitCode::from(2));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn missing_key_is_a_failure() {
+        let root = test_root("missing");
+        assert_eq!(
+            run(&["kernel.nope".to_string()], &root, "sysctl"),
+            ExitCode::from(1)
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -19,8 +19,8 @@ fn parse_passwd(text: &str) -> BTreeMap<u32, String> {
     users
 }
 
-fn passwd() -> BTreeMap<u32, String> {
-    std::fs::read_to_string("/etc/passwd")
+fn passwd(root: &std::path::Path) -> BTreeMap<u32, String> {
+    std::fs::read_to_string(root.join("etc/passwd"))
         .map(|text| parse_passwd(&text))
         .unwrap_or_default()
 }
@@ -39,14 +39,14 @@ fn parse_stat(text: &str) -> Option<(String, u64, u64)> {
     Some((comm, utime + stime, ppid))
 }
 
-fn stat(pid: &str) -> Option<(String, u64, u64, u64)> {
-    let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+fn stat(pid: &str, root: &std::path::Path) -> Option<(String, u64, u64, u64)> {
+    let text = std::fs::read_to_string(root.join(format!("proc/{pid}/stat"))).ok()?;
     let (comm, ticks, ppid) = parse_stat(&text)?;
-    Some((comm, ticks, ppid, uid(pid)))
+    Some((comm, ticks, ppid, uid(pid, root)))
 }
 
-fn uid(pid: &str) -> u64 {
-    let Ok(text) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+fn uid(pid: &str, root: &std::path::Path) -> u64 {
+    let Ok(text) = std::fs::read_to_string(root.join(format!("proc/{pid}/status"))) else {
         return 0;
     };
     for line in text.lines() {
@@ -59,8 +59,8 @@ fn uid(pid: &str) -> u64 {
     0
 }
 
-fn cmdline(pid: &str, comm: &str) -> String {
-    let Ok(bytes) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+fn cmdline(pid: &str, comm: &str, root: &std::path::Path) -> String {
+    let Ok(bytes) = std::fs::read(root.join(format!("proc/{pid}/cmdline"))) else {
         return format!("[{comm}]");
     };
     if bytes.is_empty() {
@@ -95,11 +95,9 @@ fn ticks_time(ticks: u64) -> String {
     }
 }
 
-fn main() -> ExitCode {
-    rinit_tools::restore_sigpipe();
-    let program = program_name(std::env::args().next().as_deref(), "ps");
+fn run(args: &[String], root: &std::path::Path, program: &str) -> ExitCode {
     let mut full = false;
-    for arg in std::env::args().skip(1) {
+    for arg in args {
         match arg.as_str() {
             "-e" | "-A" => {}
             "-f" => full = true,
@@ -108,14 +106,14 @@ fn main() -> ExitCode {
                 return ExitCode::from(EXIT_OK);
             }
             other => {
-                return ExitCode::from(usage_error(&program, &format!("unknown option '{other}'")));
+                return ExitCode::from(usage_error(program, &format!("unknown option '{other}'")));
             }
         }
     }
 
-    let users = passwd();
+    let users = passwd(root);
     let mut entries = Vec::new();
-    let Ok(dir) = std::fs::read_dir("/proc") else {
+    let Ok(dir) = std::fs::read_dir(root.join("proc")) else {
         eprintln!("{program}: cannot read /proc");
         return ExitCode::from(1);
     };
@@ -127,7 +125,7 @@ fn main() -> ExitCode {
         else {
             continue;
         };
-        let Some((comm, ticks, ppid, uid)) = stat(pid) else {
+        let Some((comm, ticks, ppid, uid)) = stat(pid, root) else {
             continue;
         };
         let user = users
@@ -139,7 +137,7 @@ fn main() -> ExitCode {
             user,
             ticks,
             ppid,
-            cmdline(pid, &comm),
+            cmdline(pid, &comm, root),
         ));
     }
     entries.sort_by_key(|entry| entry.0);
@@ -159,6 +157,13 @@ fn main() -> ExitCode {
         }
     }
     ExitCode::from(EXIT_OK)
+}
+
+fn main() -> ExitCode {
+    rinit_tools::restore_sigpipe();
+    let program = program_name(std::env::args().next().as_deref(), "ps");
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    run(&args, std::path::Path::new("/"), &program)
 }
 
 #[cfg(test)]
@@ -181,5 +186,46 @@ mod tests {
     fn stat_parser_handles_parentheses_in_comm() {
         let text = "42 (my proc) S 1 2 3 4 5 6 7 8 9 10 100 200 0 0\n";
         assert_eq!(parse_stat(text), Some(("my proc".to_string(), 300, 1)));
+    }
+}
+
+#[cfg(test)]
+mod root_tests {
+    use super::*;
+
+    fn test_root(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("rinit-ps-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("proc/1")).expect("proc");
+        std::fs::create_dir_all(root.join("etc")).expect("etc");
+        std::fs::write(root.join("etc/passwd"), "root:x:0:0::/root:/bin/sh\n").expect("passwd");
+        std::fs::write(
+            root.join("proc/1/stat"),
+            "1 (init) S 0 1 1 0 -1 4194560 1 0 0 0 10 20 0 0\n",
+        )
+        .expect("stat");
+        std::fs::write(root.join("proc/1/status"), "Uid:\t0\t0\t0\t0\n").expect("status");
+        std::fs::write(root.join("proc/1/cmdline"), "/sbin/rinit\0--default\0").expect("cmdline");
+        root
+    }
+
+    #[test]
+    fn run_prints_default_and_full_tables() {
+        let root = test_root("run");
+        assert_eq!(run(&[], &root, "ps"), ExitCode::from(0));
+        assert_eq!(run(&["-e".to_string()], &root, "ps"), ExitCode::from(0));
+        assert_eq!(run(&["-f".to_string()], &root, "ps"), ExitCode::from(0));
+        assert_eq!(run(&["--help".to_string()], &root, "ps"), ExitCode::from(0));
+        assert_eq!(run(&["--bad".to_string()], &root, "ps"), ExitCode::from(2));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn missing_proc_is_a_failure() {
+        let root = std::env::temp_dir().join(format!("rinit-ps-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("root");
+        assert_eq!(run(&[], &root, "ps"), ExitCode::from(1));
+        let _ = std::fs::remove_dir_all(root);
     }
 }

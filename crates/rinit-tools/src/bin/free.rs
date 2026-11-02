@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::io;
+use std::path::Path;
 use std::process::ExitCode;
 
 use rinit_tools::{EXIT_OK, program_name, read_trimmed, usage_error};
@@ -22,8 +23,8 @@ fn parse_meminfo(text: &str) -> BTreeMap<String, u64> {
     values
 }
 
-fn meminfo() -> io::Result<BTreeMap<String, u64>> {
-    let text = read_trimmed(std::path::Path::new("/proc/meminfo"))?;
+fn meminfo(root: &Path) -> io::Result<BTreeMap<String, u64>> {
+    let text = read_trimmed(&root.join("proc/meminfo"))?;
     Ok(parse_meminfo(&text))
 }
 
@@ -51,11 +52,9 @@ fn human(kib: u64) -> String {
     }
 }
 
-fn main() -> ExitCode {
-    rinit_tools::restore_sigpipe();
-    let program = program_name(std::env::args().next().as_deref(), "free");
+fn run(args: &[String], root: &Path, program: &str) -> ExitCode {
     let mut unit = "k".to_string();
-    for arg in std::env::args().skip(1) {
+    for arg in args {
         match arg.as_str() {
             "--help" => {
                 println!("Usage: free [-b|-k|-m|-g|-h]");
@@ -65,12 +64,12 @@ fn main() -> ExitCode {
                 unit = arg.trim_start_matches('-').to_string();
             }
             other => {
-                return ExitCode::from(usage_error(&program, &format!("unknown option '{other}'")));
+                return ExitCode::from(usage_error(program, &format!("unknown option '{other}'")));
             }
         }
     }
 
-    let values = match meminfo() {
+    let values = match meminfo(root) {
         Ok(values) => values,
         Err(e) => {
             eprintln!("{program}: cannot read /proc/meminfo: {e}");
@@ -109,9 +108,23 @@ fn main() -> ExitCode {
     ExitCode::from(EXIT_OK)
 }
 
+fn main() -> ExitCode {
+    rinit_tools::restore_sigpipe();
+    let program = program_name(std::env::args().next().as_deref(), "free");
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    run(&args, Path::new("/"), &program)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_root(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("rinit-free-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("proc")).expect("root");
+        root
+    }
 
     #[test]
     fn units_scale_and_humanize() {
@@ -132,5 +145,33 @@ mod tests {
         assert_eq!(values.get("MemFree"), Some(&512));
         assert_eq!(values.get("SwapTotal"), Some(&1024));
         assert!(!values.contains_key("Bad"));
+    }
+
+    #[test]
+    fn run_renders_a_fake_meminfo() {
+        let root = test_root("run");
+        std::fs::write(
+            root.join("proc/meminfo"),
+            "MemTotal: 2048 kB\nMemFree: 512 kB\nBuffers: 128 kB\nCached: 256 kB\nShmem: 32 kB\nMemAvailable: 1024 kB\nSwapTotal: 1024 kB\nSwapFree: 512 kB\n",
+        )
+        .expect("meminfo");
+        assert_eq!(run(&[], &root, "free"), ExitCode::from(0));
+        assert_eq!(run(&["-m".to_string()], &root, "free"), ExitCode::from(0));
+        assert_eq!(
+            run(&["--help".to_string()], &root, "free"),
+            ExitCode::from(0)
+        );
+        assert_eq!(
+            run(&["--bad".to_string()], &root, "free"),
+            ExitCode::from(2)
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn missing_meminfo_is_a_failure() {
+        let root = test_root("missing");
+        assert_eq!(run(&[], &root, "free"), ExitCode::from(1));
+        let _ = std::fs::remove_dir_all(root);
     }
 }

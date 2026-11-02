@@ -88,9 +88,8 @@ fn mount_one(
     }
 }
 
-fn list_mounts() -> Result<(), String> {
-    let text = read_trimmed(std::path::Path::new("/proc/mounts"))
-        .map_err(|e| format!("/proc/mounts: {e}"))?;
+fn list_mounts(root: &std::path::Path) -> Result<(), String> {
+    let text = read_trimmed(&root.join("proc/mounts")).map_err(|e| format!("/proc/mounts: {e}"))?;
     for line in text.lines() {
         let fields: Vec<&str> = line.split_whitespace().collect();
         if fields.len() < 4 {
@@ -104,8 +103,9 @@ fn list_mounts() -> Result<(), String> {
     Ok(())
 }
 
-fn mount_fstab() -> Result<(), String> {
-    let text = std::fs::read_to_string("/etc/fstab").map_err(|e| format!("/etc/fstab: {e}"))?;
+fn mount_fstab(root: &std::path::Path) -> Result<(), String> {
+    let text =
+        std::fs::read_to_string(root.join("etc/fstab")).map_err(|e| format!("/etc/fstab: {e}"))?;
     let mut fail = 0;
     for line in text.lines() {
         let line = line.split('#').next().unwrap_or("").trim();
@@ -134,12 +134,9 @@ fn mount_fstab() -> Result<(), String> {
     }
 }
 
-fn main() -> ExitCode {
-    rinit_tools::restore_sigpipe();
-    let program = program_name(std::env::args().next().as_deref(), "mount");
-    let args: Vec<String> = std::env::args().skip(1).collect();
+fn run(args: &[String], root: &std::path::Path, program: &str) -> ExitCode {
     if args.is_empty() {
-        return match list_mounts() {
+        return match list_mounts(root) {
             Ok(()) => ExitCode::from(EXIT_OK),
             Err(e) => {
                 eprintln!("{program}: {e}");
@@ -166,21 +163,21 @@ fn main() -> ExitCode {
             "-t" => {
                 index += 1;
                 let Some(value) = args.get(index) else {
-                    return ExitCode::from(usage_error(&program, "-t needs a type"));
+                    return ExitCode::from(usage_error(program, "-t needs a type"));
                 };
                 fstype = Some(value.clone());
             }
             "-o" => {
                 index += 1;
                 let Some(value) = args.get(index) else {
-                    return ExitCode::from(usage_error(&program, "-o needs options"));
+                    return ExitCode::from(usage_error(program, "-o needs options"));
                 };
                 let extra = parse_options(value);
                 options.flags |= extra.flags;
                 options.data.extend(extra.data);
             }
             value if value.starts_with('-') => {
-                return ExitCode::from(usage_error(&program, &format!("unknown option '{value}'")));
+                return ExitCode::from(usage_error(program, &format!("unknown option '{value}'")));
             }
             value => positional.push(value.to_string()),
         }
@@ -188,7 +185,7 @@ fn main() -> ExitCode {
     }
 
     if all {
-        return match mount_fstab() {
+        return match mount_fstab(root) {
             Ok(()) => ExitCode::from(EXIT_OK),
             Err(e) => {
                 eprintln!("{program}: {e}");
@@ -198,7 +195,7 @@ fn main() -> ExitCode {
     }
     let (source, target) = match positional.as_slice() {
         [] => {
-            return match list_mounts() {
+            return match list_mounts(root) {
                 Ok(()) => ExitCode::from(EXIT_OK),
                 Err(e) => {
                     eprintln!("{program}: {e}");
@@ -208,7 +205,7 @@ fn main() -> ExitCode {
         }
         [source, target] => (source.as_str(), target.as_str()),
         [target] => ("", target.as_str()),
-        _ => return ExitCode::from(usage_error(&program, "too many arguments")),
+        _ => return ExitCode::from(usage_error(program, "too many arguments")),
     };
     match mount_one(source, target, fstype.as_deref(), &options) {
         Ok(()) => ExitCode::from(EXIT_OK),
@@ -217,6 +214,13 @@ fn main() -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+fn main() -> ExitCode {
+    rinit_tools::restore_sigpipe();
+    let program = program_name(std::env::args().next().as_deref(), "mount");
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    run(&args, std::path::Path::new("/"), &program)
 }
 
 #[cfg(test)]
@@ -241,5 +245,79 @@ mod tests {
     fn nul_paths_are_rejected() {
         assert!(cstring("a\0b", "path").is_err());
         assert!(cstring("ok", "path").is_ok());
+    }
+}
+
+#[cfg(test)]
+mod root_tests {
+    use super::*;
+
+    fn test_root(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("rinit-mount-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("proc")).expect("proc");
+        std::fs::create_dir_all(root.join("etc")).expect("etc");
+        root
+    }
+
+    #[test]
+    fn run_lists_fake_mounts_and_handles_bad_options() {
+        let root = test_root("list");
+        std::fs::write(
+            root.join("proc/mounts"),
+            "/dev/vda / ext4 rw 0 0\ntmpfs /run tmpfs rw 0 0\n",
+        )
+        .expect("mounts");
+        assert_eq!(run(&[], &root, "mount"), ExitCode::from(0));
+        assert_eq!(
+            run(&["--help".to_string()], &root, "mount"),
+            ExitCode::from(0)
+        );
+        assert_eq!(
+            run(&["--bad".to_string()], &root, "mount"),
+            ExitCode::from(2)
+        );
+        assert_eq!(run(&["-t".to_string()], &root, "mount"), ExitCode::from(2));
+        assert_eq!(run(&["-o".to_string()], &root, "mount"), ExitCode::from(2));
+        assert_eq!(
+            run(
+                &["a".to_string(), "b".to_string(), "c".to_string()],
+                &root,
+                "mount"
+            ),
+            ExitCode::from(2)
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_mounts_a_noauto_fstab_without_syscalls() {
+        let root = test_root("fstab");
+        std::fs::write(
+            root.join("etc/fstab"),
+            "tmpfs /tmp tmpfs rw,noauto 0 0\n# comment\n",
+        )
+        .expect("fstab");
+        assert_eq!(run(&["-a".to_string()], &root, "mount"), ExitCode::from(0));
+        std::fs::write(root.join("etc/fstab"), "broken line\n").expect("fstab");
+        assert_eq!(run(&["-a".to_string()], &root, "mount"), ExitCode::from(1));
+        std::fs::remove_file(root.join("etc/fstab")).ok();
+        assert_eq!(run(&["-a".to_string()], &root, "mount"), ExitCode::from(1));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn missing_mounts_and_missing_target_are_errors() {
+        let root = test_root("missing");
+        assert_eq!(run(&[], &root, "mount"), ExitCode::from(1));
+        assert_eq!(
+            run(
+                &["tmpfs".to_string(), "/no/such/target".to_string()],
+                &root,
+                "mount"
+            ),
+            ExitCode::from(1)
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 }
