@@ -567,7 +567,7 @@ make ARCH=arm32 run      # ARMv7 hard-float, qemu virt / Cortex-A15
 
 > Requires network access (for the source tarballs) and the matching cross
 > toolchain: `gcc-aarch64-linux-gnu` for arm64, `gcc-arm-linux-gnueabihf` for
-> arm32, plus `qemu-system-arm bc flex bison libssl-dev`. Downloads are cached
+> arm32, plus `qemu-system-arm bc flex bison libssl-dev binutils`. Downloads are cached
 > under `build/dl/`; arm32 builds under `build/arm32/` so the two trees never
 > share a kernel or busybox config.
 
@@ -580,7 +580,8 @@ What it does, in order (see [Makefile](Makefile)):
 3. Fetch `busybox-1.36.1.tar.bz2` and build a **static** busybox with the
    applets the initramfs needs.
 4. Assemble `build/out/initramfs-<target>.cpio.gz` (busybox + rinit + rctl + processes +
-   `units/`, plus the `/etc` and `/var` skeleton the login shell expects). The
+   the `rinit-tools` manifest + `units/`, plus the `/etc` and `/var` skeleton the
+   login shell expects). The
    arm32 tree lives under `build/arm32/out/`. The acceptance image
    `...-demo.cpio.gz` is the same root plus `units/demo/`, and is what
    `make test-system` boots.
@@ -660,8 +661,9 @@ it just boots. In particular:
 - `busybox-1.36.1/busybox` present → busybox is not rebuilt;
 - `target/.../release/rinit` newer than the sources → `cargo build` is not
   re-run;
-- the initramfs is repacked when rinit, busybox, a file in `units/` (or, for the
-  acceptance image, `units/demo/`), or one of the packing scripts changes.
+- the initramfs is repacked when rinit, busybox, a tool source, `tools.list`,
+  `scripts/install-tools.sh`, a file in `units/` (or, for the acceptance image,
+  `units/demo/`), or one of the packing scripts changes.
 
 Because that already holds, there is no `SKIP_BUILD` knob to forget to pass.
 

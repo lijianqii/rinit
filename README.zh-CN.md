@@ -479,7 +479,7 @@ make ARCH=arm32 run      # ARMv7 hard-float, qemu virt / Cortex-A15
 
 > 需要联网（下载源码包）和对应交叉工具链：arm64 用 `gcc-aarch64-linux-gnu`，
 > arm32 用 `gcc-arm-linux-gnueabihf`，另需 `qemu-system-arm bc flex bison
-> libssl-dev`。下载缓存在 `build/dl/`；arm32 构建树在 `build/arm32/`，
+> libssl-dev binutils`。下载缓存在 `build/dl/`；arm32 构建树在 `build/arm32/`，
 > 不会和 arm64 共用内核或 busybox 配置。
 
 它按顺序做这些事（见 [Makefile](Makefile)）：
@@ -489,9 +489,9 @@ make ARCH=arm32 run      # ARMv7 hard-float, qemu virt / Cortex-A15
    构建 `arch/arm64/boot/Image`（arm64）或 `arch/arm/boot/zImage`（arm32）。
 3. 取 `busybox-1.36.1.tar.bz2`，用 initramfs 需要的 applet 构建一个**静态** busybox。
 4. 组装 `build/out/initramfs-<target>.cpio.gz`（arm32 在 `build/arm32/out/`；
-   busybox + rinit + rctl + processes + `units/`，再加上登录 shell 需要的 `/etc` 与
-   `/var` 骨架）。验收镜像 `...-demo.cpio.gz` 是同一套根，再加 `units/demo/`，
-   也是 `make test-system` 启动的那个。
+   busybox + rinit + rctl + processes + `rinit-tools` 清单 + `units/`，再加上登录
+   shell 需要的 `/etc` 与 `/var` 骨架）。验收镜像 `...-demo.cpio.gz` 是同一套根，
+   再加 `units/demo/`，也是 `make test-system` 启动的那个。
 5. 用 `qemu-system-aarch64 -machine virt -cpu cortex-a57 -m 128M`（arm64）或
    `qemu-system-arm -machine virt,highmem=off -cpu cortex-a15 -m 128M`（arm32）
    启动，并加 `-device i6300esb`——rinit 武装的看门狗（计划 §7.5）——以及 qemu 的
@@ -556,8 +556,9 @@ make KERNEL_VERSION=6.6.158 BUSYBOX_VERSION=1.36.1 ...   # pin versions
 - `linux-6.6.158/arch/arm64/boot/Image` 存在 → 不重建内核；
 - `busybox-1.36.1/busybox` 存在 → 不重建 busybox；
 - `target/.../release/rinit` 比源码新 → 不重跑 `cargo build`；
-- rinit、busybox、`units/` 里的某个文件（验收镜像还包括 `units/demo/`）、或某个
-  打包脚本变化时，重新打包 initramfs。
+- rinit、busybox、某个工具源码、`tools.list`、`scripts/install-tools.sh`、
+  `units/` 里的某个文件（验收镜像还包括 `units/demo/`）、或某个打包脚本变化时，
+  重新打包 initramfs。
 
 既然这些已经成立，就不需要一个会被忘记传的 `SKIP_BUILD` 开关。
 
