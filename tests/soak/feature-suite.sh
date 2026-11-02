@@ -511,7 +511,12 @@ sc_tty_success() {
     helper_pid=$!
     wait_file /run/fs-tty 5 || { kill "$helper_pid" 2>/dev/null; return 1; }
     start_unit fs-tty.service || { kill "$helper_pid" 2>/dev/null; return 1; }
-    sleep 1
+    i=0
+    while [ "$i" -lt 5 ]; do
+        [ "$(cat /tmp/fs-tty-result 2>/dev/null)" = 'tty-ok' ] && break
+        sleep 1
+        i=$((i + 1))
+    done
     [ "$(cat /tmp/fs-tty-result 2>/dev/null)" = 'tty-ok' ] || {
         stop_unit fs-tty.service
         kill "$helper_pid" 2>/dev/null
