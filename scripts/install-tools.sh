@@ -142,5 +142,7 @@ while read -r applet cargo_bin install_path busybox_link budget_kib _source; do
     installed=$((installed + 1))
 done <"$manifest"
 
-((installed > 0)) || die "manifest installed nothing"
+if ((installed == 0)) && ((allow_missing == 0)); then
+    die "manifest installed nothing"
+fi
 echo "install-tools: profile=$profile arch=$arch installed=$installed"
