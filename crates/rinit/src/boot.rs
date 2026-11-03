@@ -123,8 +123,8 @@ pub async fn run(cfg: Config) -> Result<(), RuntimeError> {
     if cfg.service_argv.is_empty() {
         let mut notify = NotifyHub::new();
         // One shared log ring for the whole boot (plan §1.3(7)), mirrored to a
-        // file if the boot asked for one. Before `start_units`, so the first
-        // service's output is captured like every other line.
+        // file if the boot asked for one. Installed before the first unit, so
+        // the first service's output is captured like every other line.
         let logs = ServiceLogs::new();
         if let Some(path) = &cfg.log_file {
             logs.persist_to(path);
@@ -132,16 +132,19 @@ pub async fn run(cfg: Config) -> Result<(), RuntimeError> {
         // Plan §7.9: the sockets rinit holds for units that asked to be started
         // by a connection rather than at boot.
         let mut activation = Activated::disabled();
-        let mut manager =
-            start_units(&cfg, &mut notify, &logs, cgroup, &mut activation, started).await?;
+        // Resolve the schedule and bind its sockets before the loop starts, so
+        // the first level is ready to queue and a bind failure is already a
+        // failed unit rather than a surprise during the boot.
+        let plan = manager::announce_plan(&cfg.unit_dir, &cfg.default_target)?;
+        let mut manager = prepare_units(&plan, cgroup, &mut activation);
+        let boot = Boot::new(plan, started);
         // The control socket is bound after the mounts, so `/run` exists
-        // (plan §1.3(10)); a failure to bind it is only a warning.
+        // (plan §1.3(10)); a failure to bind it is only a warning. It is
+        // available during boot for reads and power requests.
         let mut control = ControlServer::bind(cfg.skip_mounts);
-        // Plan §7.5: armed once the boot is up and the loop below owns the
-        // system, and fed from that loop's health checkpoint (see `supervise`).
-        // Arming it earlier would mean feeding it from the boot sequence too, and
-        // a slow level - a service with a long `TimeoutStartSec=` - would then be
-        // able to reset a machine that is booting perfectly well.
+        // Plan §7.5: armed before the first level, and fed by the same loop that
+        // advances boot. A wedged loop therefore still stops feeding; a slow but
+        // healthy level does not.
         let mut watchdog = Watchdog::prepare(
             cfg.skip_mounts,
             cfg.watchdog_device.clone(),
@@ -159,6 +162,7 @@ pub async fn run(cfg: Config) -> Result<(), RuntimeError> {
             &mut supervised,
             &mut watchdog,
             &mut activation,
+            boot,
         )
         .await;
         // The service pipes are closed by now; write whatever they queued before
@@ -228,6 +232,315 @@ struct Supervised<'a> {
     logs: &'a ServiceLogs,
 }
 
+/// Build the manager from a resolved boot plan and bind its sockets.
+///
+/// No service is started here, so it can run before the event loop without
+/// waiting for anything.
+fn prepare_units(
+    plan: &manager::BootPlan,
+    cgroup: crate::cgroup::Cgroup,
+    activation: &mut Activated,
+) -> UnitManager {
+    let mut units = UnitManager::new();
+    units.begin_boot();
+    units.set_cgroup(cgroup);
+    for config in &plan.configs {
+        units.add(config.clone());
+    }
+    // Plan §7.7: the templates, so `rctl start worker@1.service` can make one.
+    units.set_templates(plan.templates.clone());
+
+    // Plan §7.9: bind sockets before the first level. A socket rinit cannot
+    // bind is a failed unit, not a failed boot.
+    for config in &plan.configs {
+        let Some(path) = &config.socket_activate else {
+            continue;
+        };
+        match activation.bind(&config.name, std::path::Path::new(path)) {
+            Ok(()) => {
+                if let Some(fd) = activation.listener_fd(&config.name) {
+                    units.set_listener(&config.name, fd);
+                }
+            }
+            Err(e) => {
+                rlog!("error: {}: cannot bind {path}: {e}", config.name);
+                fail_unit(&mut units, &config.name);
+            }
+        }
+    }
+
+    // Shutdown walks the startup order backwards (plan §1.3(8)).
+    units.set_shutdown_order(plan.levels.iter().flatten().cloned().collect());
+    units
+}
+
+/// Re-arm socket watchers that are allowed to report another connection.
+///
+/// A running service accepts for itself; a failed unit must not be retried by
+/// the socket (only an explicit start/reset does that); a flow already owns the
+/// wake-up. What remains is an idle socket, and it gets one permit at a time.
+fn sync_socket_activation(
+    manager: &UnitManager,
+    starts: &StartCoordinator,
+    activation: &mut Activated,
+    activations: &BTreeMap<UnitName, Instant>,
+) {
+    for unit in activation.units() {
+        if starts.flows.contains_key(&unit) {
+            continue;
+        }
+        let Some(rt) = manager.get(&unit) else {
+            continue;
+        };
+        if rt.pid.is_some()
+            || matches!(
+                rt.state,
+                UnitState::Starting | UnitState::RestartWait | UnitState::Deactivating
+            )
+            || manager.is_failed(&unit)
+        {
+            continue;
+        }
+        if activations
+            .get(&unit)
+            .is_some_and(|at| at.elapsed() < SOCKET_ACTIVATION_COOLDOWN)
+        {
+            continue;
+        }
+        activation.rearm(&unit);
+    }
+}
+
+/// The boot schedule, advanced by the same loop that later supervises services.
+///
+/// Boot used to be a separate synchronous walk: it could not answer signals,
+/// could not feed the watchdog, and its waits duplicated the start path. Here it
+/// is a job source: each call queues the service flows for the current level and
+/// returns as soon as the level is still pending. The supervisor's reaper,
+/// watchdog feed and signal handling all keep running while that happens.
+struct Boot {
+    plan: manager::BootPlan,
+    /// Index of the level currently being started, or the next one when
+    /// `active` is false.
+    level: usize,
+    active: bool,
+    /// Services of the current level that have not reached their readiness
+    /// point yet.
+    pending: BTreeSet<UnitName>,
+    /// Targets of the current level, settled once every service in it is ready.
+    targets: Vec<UnitName>,
+    /// Every unit in the boot schedule, for the "N started" count.
+    planned: BTreeSet<UnitName>,
+    counted: BTreeSet<UnitName>,
+    started_units: usize,
+    first_service_uptime_ms: Option<u64>,
+    started_at: Instant,
+    complete: bool,
+}
+
+impl Boot {
+    fn new(plan: manager::BootPlan, started_at: Instant) -> Self {
+        let planned = plan.levels.iter().flatten().cloned().collect();
+        Boot {
+            plan,
+            level: 0,
+            active: false,
+            pending: BTreeSet::new(),
+            targets: Vec::new(),
+            planned,
+            counted: BTreeSet::new(),
+            started_units: 0,
+            first_service_uptime_ms: None,
+            started_at,
+            complete: false,
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        self.complete
+    }
+
+    /// Record flows that spawned a main process since the last pass.
+    fn record_spawned(&mut self, spawned: &[UnitName]) {
+        for unit in spawned {
+            if !self.planned.contains(unit) || !self.counted.insert(unit.clone()) {
+                continue;
+            }
+            self.started_units += 1;
+            if self.first_service_uptime_ms.is_none() {
+                self.first_service_uptime_ms = rinit_runtime::time::uptime_ms();
+            }
+        }
+    }
+
+    /// Queue the next level, or settle the current one.
+    fn advance(
+        &mut self,
+        manager: &mut UnitManager,
+        starts: &mut StartCoordinator,
+        spawned: &[UnitName],
+    ) {
+        self.record_spawned(spawned);
+        if self.complete {
+            return;
+        }
+        loop {
+            if !self.active {
+                let Some(level) = self.plan.levels.get(self.level).cloned() else {
+                    self.finish(manager);
+                    return;
+                };
+                self.begin_level(manager, starts, level);
+            }
+
+            if !self.settle_pending(manager, starts) {
+                return;
+            }
+            self.settle_targets(manager);
+            self.level += 1;
+            self.active = false;
+        }
+    }
+
+    fn begin_level(
+        &mut self,
+        manager: &mut UnitManager,
+        starts: &mut StartCoordinator,
+        level: Vec<UnitName>,
+    ) {
+        let entries: Vec<(UnitName, ServiceKind)> = manager::commands_in_level(&self.plan, &level)
+            .into_iter()
+            .map(|entry| (entry.name.clone(), entry.kind))
+            .collect();
+        rlog!(
+            "starting level {}: {} service(s)",
+            self.level,
+            entries.len()
+        );
+
+        let mut pending = BTreeSet::new();
+        for (name, _kind) in entries {
+            if manager.is_failed(&name) {
+                rlog!("skipping {name}: a required unit failed");
+                continue;
+            }
+            if manager.listener_fd(&name).is_some() {
+                rlog!("{name}: waiting for a connection");
+                continue;
+            }
+            match manager.request_start(&name, RequestSource::Dependency) {
+                Some(effect) => match starts.begin_effect(manager, &name, effect) {
+                    Ok(()) => {
+                        pending.insert(name);
+                    }
+                    Err(e) => rlog!("error: cannot start {name}: {e}"),
+                },
+                None => {
+                    rlog!("{name}: start queued behind a stop");
+                    pending.insert(name);
+                }
+            }
+        }
+
+        self.targets = level
+            .iter()
+            .filter(|name| manager::config_of(&self.plan, name).is_some_and(|c| c.is_target()))
+            .cloned()
+            .collect();
+        self.pending = pending;
+        self.active = true;
+    }
+
+    /// Whether every service in the current level has reached its readiness
+    /// point. Returns `false` while one is still `Starting`.
+    fn settle_pending(&mut self, manager: &mut UnitManager, starts: &StartCoordinator) -> bool {
+        let pending: Vec<UnitName> = self.pending.iter().cloned().collect();
+        for unit in pending {
+            if starts.flows.contains_key(&unit) {
+                continue;
+            }
+            let kind = manager::config_of(&self.plan, &unit)
+                .map_or(ServiceKind::Simple, |config| config.service_kind);
+            let state = manager.get(&unit).map(|rt| rt.state);
+            match readiness::readiness_of(kind) {
+                // The process being exec'd is the whole promise of `simple`;
+                // an immediate exit is a runtime failure, not a start failure.
+                readiness::Readiness::Immediate => {
+                    if manager.is_failed(&unit) {
+                        fail_unit(manager, &unit);
+                    }
+                    self.pending.remove(&unit);
+                }
+                readiness::Readiness::OnExitSuccess | readiness::Readiness::OnReady => {
+                    if matches!(state, Some(UnitState::Active | UnitState::ActiveExited)) {
+                        self.pending.remove(&unit);
+                    } else if matches!(state, Some(UnitState::Starting)) {
+                        // Still starting; the manager's deadline or the notify
+                        // socket will make the next step observable.
+                    } else {
+                        // The flow is gone and the unit never reached the
+                        // readiness point: this is a failed start, and its
+                        // `Requires=` dependents must fail with it.
+                        fail_unit(manager, &unit);
+                        self.pending.remove(&unit);
+                    }
+                }
+            }
+        }
+        self.pending.is_empty()
+    }
+
+    fn settle_targets(&mut self, manager: &mut UnitManager) {
+        if self.targets.is_empty() {
+            return;
+        }
+        let mut active = Vec::new();
+        let mut failed = Vec::new();
+        for name in &self.targets {
+            match manager.reach_target(name) {
+                UnitState::Active => active.push(name.canonical()),
+                UnitState::Failed(_) => failed.push(name.canonical()),
+                _ => {}
+            }
+        }
+        if !active.is_empty() {
+            rlog!("level {} reached: {} active", self.level, active.join(", "));
+        }
+        if !failed.is_empty() {
+            rlog!("level {} failed: {} failed", self.level, failed.join(", "));
+        }
+    }
+
+    fn finish(&mut self, manager: &UnitManager) {
+        rlog!(
+            "boot complete: {} unit(s) started from '{}' ({} still running)",
+            self.started_units,
+            self.plan.default_target,
+            manager.running_count()
+        );
+        let rinit_ms = self.started_at.elapsed().as_millis() as u64;
+        match self.first_service_uptime_ms {
+            Some(first) => rlog!(
+                "boot timing: first service at {first}ms of kernel uptime (rinit's own boot: {rinit_ms}ms)"
+            ),
+            None => {
+                rlog!("boot timing: rinit's own boot took {rinit_ms}ms (kernel uptime unreadable)")
+            }
+        }
+        self.complete = true;
+    }
+
+    fn log_interrupted(&self) {
+        if !self.complete {
+            rlog!(
+                "warning: boot interrupted at level {} ({} unit(s) started)",
+                self.level,
+                self.started_units
+            );
+        }
+    }
+}
+
 /// The supervised main loop (plan §3 M2).
 ///
 /// Four things can wake it: a child exited, a `notify` service signalled
@@ -242,12 +555,14 @@ async fn supervise(
     supervised: &mut Supervised<'_>,
     watchdog: &mut Watchdog,
     activation: &mut Activated,
+    boot: Boot,
 ) -> ShutdownAction {
     // Set when the shutdown was triggered by power failure, which runs under a
     // much smaller budget (plan §7.1).
     let mut fast = false;
     let mut action = ShutdownAction::Reboot;
     let mut starts = StartCoordinator::default();
+    let mut boot = Some(boot);
     // Last activation per socket, so a listener that stays readable does not
     // spawn the service on every watcher tick.
     let mut socket_activations: BTreeMap<UnitName, Instant> = BTreeMap::new();
@@ -260,7 +575,15 @@ async fn supervise(
         }
         // Advance each start one step. Nothing here waits: a slow socket, a
         // conflicting unit or a long `ExecStartPre=` returns to this loop.
-        starts.advance(manager, supervised.notify, supervised.logs);
+        let spawned = starts.advance(manager, supervised.notify, supervised.logs);
+        if let Some(schedule) = boot.as_mut() {
+            schedule.advance(manager, &mut starts, &spawned);
+            if schedule.is_complete() {
+                manager.finish_boot();
+                boot = None;
+            }
+        }
+        sync_socket_activation(manager, &starts, activation, &socket_activations);
         // Plan §7.5's health checkpoint: the feed happens here, in the loop that
         // starts services, reaps children and answers `rctl` - so a loop that
         // stops iterating stops feeding, and the hardware resets the machine. A
@@ -274,13 +597,13 @@ async fn supervise(
         // Service anything already due before blocking, so a zero-length timer
         // does not wait for the next unrelated wake-up.
         for unit in manager.due_restarts() {
-            if let Err(e) = starts.begin(manager, &unit, StartCompletion::AtReady) {
+            if let Err(e) = starts.begin(manager, &unit) {
                 rlog!("error: restart of {unit} failed: {e}");
             }
         }
         // A start that arrived while its unit was stopping (plan §1.3(13)).
         for unit in manager.due_queued_starts() {
-            if let Err(e) = starts.begin(manager, &unit, StartCompletion::AtReady) {
+            if let Err(e) = starts.begin(manager, &unit) {
                 rlog!("error: queued start of {unit} failed: {e}");
             }
         }
@@ -303,9 +626,7 @@ async fn supervise(
             rlog!("stopping {unit}: idle");
             starts.cancel(&unit);
             let effect = manager.request_stop(&unit, RequestSource::UserStop);
-            if let Err(e) =
-                apply_effect(manager, supervised.notify, supervised.logs, &unit, effect).await
-            {
+            if let Err(e) = apply_effect(manager, &unit, effect).await {
                 rlog!("error: cannot stop idle {unit}: {e}");
             }
         }
@@ -358,40 +679,53 @@ async fn supervise(
                 if let Some(requested) = requested {
                     action = requested;
                 }
-                if let Request::Stop(unit) = &request {
-                    starts.cancel(unit);
-                }
-                let reloaded = matches!(&request, Request::Reload);
-                match handle_control(
-                    cfg,
-                    manager,
-                    supervised.notify,
-                    supervised.logs,
-                    activation,
-                    &mut starts,
-                    &request,
-                )
-                .await
-                {
-                    ControlAction::Reply(status, text) => {
-                        if reloaded {
-                            starts.after_reload(manager);
-                        }
-                        if status == Status::Ok {
-                            rlog!("control: {} ok", request.describe());
-                        } else {
-                            rlog!("control: {} -> {status:?}", request.describe());
-                        }
-                        // The client may have hung up; that is not rinit's problem.
-                        let _ = reply.send((status, text));
+                // Before the final level settles, a mutation could race the
+                // boot schedule (or make its level wait forever). Reads and
+                // power requests stay available; `rctl start/stop/reload` gets
+                // a clear "boot in progress" answer instead of a half-applied
+                // change.
+                if boot.is_some() && request_mutates_boot(&request) {
+                    let (status, text) = (
+                        Status::Conflict,
+                        "boot is still in progress; retry after boot completes".to_string(),
+                    );
+                    rlog!("control: {} -> {status:?}", request.describe());
+                    let _ = reply.send((status, text));
+                } else {
+                    if let Request::Stop(unit) = &request {
+                        starts.cancel(unit);
                     }
-                    ControlAction::Start(mut job) => {
-                        // The reply waits until the unit is actually up: a
-                        // oneshot has exited, a forking daemon has been located,
-                        // and a notify service has said READY=1.
-                        job.reply = Some(reply);
-                        rlog!("control: {} accepted", request.describe());
-                        starts.controls.push(job);
+                    let reloaded = matches!(&request, Request::Reload);
+                    match handle_control(
+                        cfg,
+                        manager,
+                        supervised.logs,
+                        activation,
+                        &mut starts,
+                        &request,
+                    )
+                    .await
+                    {
+                        ControlAction::Reply(status, text) => {
+                            if reloaded {
+                                starts.after_reload(manager);
+                            }
+                            if status == Status::Ok {
+                                rlog!("control: {} ok", request.describe());
+                            } else {
+                                rlog!("control: {} -> {status:?}", request.describe());
+                            }
+                            // The client may have hung up; that is not rinit's problem.
+                            let _ = reply.send((status, text));
+                        }
+                        ControlAction::Start(mut job) => {
+                            // The reply waits until the unit is actually up: a
+                            // oneshot has exited, a forking daemon has been located,
+                            // and a notify service has said READY=1.
+                            job.reply = Some(reply);
+                            rlog!("control: {} accepted", request.describe());
+                            starts.controls.push(job);
+                        }
                     }
                 }
                 if requested.is_some() {
@@ -440,6 +774,9 @@ async fn supervise(
         }
     }
 
+    if let Some(schedule) = &boot {
+        schedule.log_interrupted();
+    }
     // A start that has not reached `ExecStart=` yet has no unit process for the
     // stop path to signal: kill its `ExecStartPre=`/`Post=` command here, and
     // release any control client still waiting for the reply.
@@ -457,9 +794,7 @@ async fn supervise(
     // system is going down.
     for unit in manager.shutdown_order() {
         let effect = manager.request_stop(&unit, RequestSource::ShutdownStop);
-        if let Err(e) =
-            apply_effect(manager, supervised.notify, supervised.logs, &unit, effect).await
-        {
+        if let Err(e) = apply_effect(manager, &unit, effect).await {
             rlog!("warning: stopping {unit} failed: {e}");
         }
     }
@@ -601,17 +936,6 @@ const START_POLL: Duration = Duration::from_millis(20);
 /// this covers the successful-but-already-exited case.
 const SOCKET_ACTIVATION_COOLDOWN: Duration = Duration::from_secs(1);
 
-/// When a flow finishes after the main process is spawned.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StartCompletion {
-    /// Return as soon as `ExecStart=` is running. Boot uses this so a whole
-    /// level is still spawned before its `oneshot` units are waited for.
-    AtSpawn,
-    /// Run `ExecStartPost=` and, for `oneshot`/`forking`, wait until the unit
-    /// has actually finished starting. The supervisor uses this.
-    AtReady,
-}
-
 /// One in-flight start, advanced one non-blocking step at a time.
 ///
 /// The supervisor must stay responsive while a service starts: a slow
@@ -622,7 +946,6 @@ enum StartCompletion {
 /// most the work that is ready and returns.
 struct StartFlow {
     unit: UnitName,
-    completion: StartCompletion,
     stage: StartStage,
     spawned: bool,
 }
@@ -674,11 +997,7 @@ impl StartFlow {
     /// `adopt_pending_config` runs here, before any stage reads the definition,
     /// so a reload that deferred a change to this start cannot make
     /// `ExecStartPre=` see one definition and `ExecStart=` another.
-    fn new(
-        manager: &mut UnitManager,
-        unit: &UnitName,
-        completion: StartCompletion,
-    ) -> Result<Self, String> {
+    fn new(manager: &mut UnitManager, unit: &UnitName) -> Result<Self, String> {
         manager.adopt_pending_config(unit);
         let Some(rt) = manager.get(unit) else {
             return Err(format!("{unit} is not registered"));
@@ -694,7 +1013,6 @@ impl StartFlow {
         };
         Ok(StartFlow {
             unit: unit.clone(),
-            completion,
             stage,
             spawned: false,
         })
@@ -716,22 +1034,6 @@ impl StartFlow {
     /// Whether `pid` is one this flow is still waiting for.
     fn wants_pid(&self, pid: libc::pid_t) -> bool {
         self.running_aux_pid() == Some(pid)
-    }
-
-    /// Conflicting units this flow is still waiting to exit.
-    ///
-    /// The supervisor's global reaper clears these; the boot driver has no
-    /// reaper of its own, so it polls exactly these pids and reports their
-    /// exits to the manager.
-    fn waiting_conflict_pids(&self, manager: &UnitManager) -> Vec<libc::pid_t> {
-        match &self.stage {
-            StartStage::Conflicts { waits: Some(waits) } => waits
-                .iter()
-                .filter(|wait| !wait.done)
-                .filter_map(|wait| manager.get(&wait.unit).and_then(|rt| rt.pid))
-                .collect(),
-            _ => Vec::new(),
-        }
     }
 
     /// Advance to the next thing that is ready now.
@@ -925,10 +1227,6 @@ impl StartFlow {
                 StartStage::Spawn => match spawn_unit(manager, notify, logs, &self.unit) {
                     Ok(spawned) => {
                         self.spawned = spawned;
-                        if self.completion == StartCompletion::AtSpawn {
-                            self.stage = StartStage::Done;
-                            return Some(Ok(spawned));
-                        }
                         let kind = manager
                             .get(&self.unit)
                             .map_or(ServiceKind::Simple, |rt| rt.config.service_kind);
@@ -1076,17 +1374,6 @@ fn start_deadline(secs: u64) -> Instant {
     }
 }
 
-/// Turn one `waitpid` result into the manager's exit vocabulary.
-fn child_outcome(exit: rinit_runtime::syscall::wait::ChildExit) -> ExitOutcome {
-    match exit {
-        rinit_runtime::syscall::wait::ChildExit::Exited { code: 0, .. } => ExitOutcome::Success,
-        rinit_runtime::syscall::wait::ChildExit::Exited { code, .. } => ExitOutcome::Failure(code),
-        rinit_runtime::syscall::wait::ChildExit::Signaled { signal, .. } => {
-            ExitOutcome::Signalled(signal)
-        }
-    }
-}
-
 /// Describe an auxiliary command's exit for its log line.
 fn describe_exit(outcome: ExitOutcome) -> String {
     match outcome {
@@ -1149,88 +1436,6 @@ fn spawn_aux_command(unit: &UnitName, plan: &AuxCommandPlan) -> Result<libc::pid
     .map_err(|e| format!("{unit}: cannot start '{}': {e}", plan.argv.join(" ")))
 }
 
-/// Run one auxiliary command to completion for the boot path.
-///
-/// Boot ordering is synchronous by design, so the boot half of the start path
-/// keeps a direct wait while the supervisor uses [`StartFlow`].
-async fn run_aux_command(
-    manager: &UnitManager,
-    unit: &UnitName,
-    cmd: &rinit_core::ExecCommand,
-) -> Option<i32> {
-    let plan = match plan_aux_command(manager, unit, cmd) {
-        Ok(plan) => plan,
-        Err(reason) => {
-            rlog!("error: {reason}");
-            return None;
-        }
-    };
-    let pid = match spawn_aux_command(unit, &plan) {
-        Ok(pid) => pid,
-        Err(reason) => {
-            rlog!("error: {reason}");
-            return None;
-        }
-    };
-    let timeout = if plan.timeout_sec == 0 {
-        crate::deadline::MAX_TIMEOUT
-    } else {
-        Duration::from_secs(plan.timeout_sec)
-    };
-    match readiness::wait_for_exit(pid, timeout).await {
-        Ok(code) => code,
-        Err(()) => {
-            // Timed out: make sure it is gone before carrying on.
-            let _ = process::kill_process_group(pid, libc::SIGKILL);
-            let _ = readiness::wait_for_exit(pid, Duration::from_secs(5)).await;
-            rlog!("error: {unit}: '{}' timed out", plan.argv.join(" "));
-            None
-        }
-    }
-}
-
-/// Drive a [`StartFlow`] to completion for the boot path.
-///
-/// Boot has no supervisor loop yet, so it waits directly. The flow still owns
-/// the rules; only the wait is synchronous here.
-async fn start_unit(
-    manager: &mut UnitManager,
-    notify: &mut NotifyHub,
-    logs: &ServiceLogs,
-    unit: &UnitName,
-) -> Result<bool, RuntimeError> {
-    let mut flow = match StartFlow::new(manager, unit, StartCompletion::AtSpawn) {
-        Ok(flow) => flow,
-        Err(reason) => {
-            rlog!("error: {reason}");
-            return Ok(false);
-        }
-    };
-    let mut aux = BTreeMap::new();
-    loop {
-        if let Some(pid) = flow.running_aux_pid()
-            && let Ok(Some(exit)) = rinit_runtime::syscall::wait::poll_child(pid)
-        {
-            aux.insert(pid, child_outcome(exit));
-        }
-        // Boot has no global reaper, so the conflicting units this flow stopped
-        // are polled here. Their exits still go through the manager, which owns
-        // the state transition and the cgroup cleanup.
-        for pid in flow.waiting_conflict_pids(manager) {
-            if let Ok(Some(exit)) = rinit_runtime::syscall::wait::poll_child(pid)
-                && let Some(outcome) = manager.on_child_exit(pid, child_outcome(exit))
-            {
-                log_outcome(&outcome);
-            }
-        }
-        match flow.advance(manager, notify, logs, &mut aux) {
-            Some(Ok(spawned)) => return Ok(spawned),
-            Some(Err(_)) => return Ok(false),
-            None => tokio::time::sleep(START_POLL).await,
-        }
-    }
-}
-
 /// Every start the supervisor is driving, one step per loop iteration.
 ///
 /// The map is keyed by unit so a restart due, a queued start and a connection
@@ -1245,16 +1450,11 @@ pub(crate) struct StartCoordinator {
 
 impl StartCoordinator {
     /// Add `unit` to the flows if it is not already being started.
-    fn begin(
-        &mut self,
-        manager: &mut UnitManager,
-        unit: &UnitName,
-        completion: StartCompletion,
-    ) -> Result<(), String> {
+    fn begin(&mut self, manager: &mut UnitManager, unit: &UnitName) -> Result<(), String> {
         if self.flows.contains_key(unit) {
             return Ok(());
         }
-        let flow = StartFlow::new(manager, unit, completion)?;
+        let flow = StartFlow::new(manager, unit)?;
         self.flows.insert(unit.clone(), flow);
         Ok(())
     }
@@ -1282,13 +1482,29 @@ impl StartCoordinator {
     }
 
     /// Advance every start and control job once.
-    fn advance(&mut self, manager: &mut UnitManager, notify: &mut NotifyHub, logs: &ServiceLogs) {
+    ///
+    /// Returns the units whose flow spawned its main process on this call. Boot
+    /// uses it for the "N unit(s) started" line; supervision ignores it.
+    fn advance(
+        &mut self,
+        manager: &mut UnitManager,
+        notify: &mut NotifyHub,
+        logs: &ServiceLogs,
+    ) -> Vec<UnitName> {
+        let mut spawned = Vec::new();
         let units: Vec<UnitName> = self.flows.keys().cloned().collect();
         for unit in units {
-            let done = match self.flows.get_mut(&unit) {
-                Some(flow) => flow.advance(manager, notify, logs, &mut self.aux_exits),
-                None => None,
+            let (done, newly_spawned) = match self.flows.get_mut(&unit) {
+                Some(flow) => {
+                    let was_spawned = flow.spawned;
+                    let done = flow.advance(manager, notify, logs, &mut self.aux_exits);
+                    (done, flow.spawned && !was_spawned)
+                }
+                None => (None, false),
             };
+            if newly_spawned {
+                spawned.push(unit.clone());
+            }
             if done.is_some() {
                 self.flows.remove(&unit);
             }
@@ -1327,6 +1543,7 @@ impl StartCoordinator {
                 index += 1;
             }
         }
+        spawned
     }
 
     /// Abandon an in-flight start because the unit was asked to stop.
@@ -1564,7 +1781,7 @@ fn apply_start_effect(
     match effect {
         Effect::SpawnProcess | Effect::CancelBackoffAndStart => {
             if !flows.contains_key(unit) {
-                let flow = StartFlow::new(manager, unit, StartCompletion::AtReady)?;
+                let flow = StartFlow::new(manager, unit)?;
                 flows.insert(unit.clone(), flow);
             }
             Ok(())
@@ -1572,7 +1789,7 @@ fn apply_start_effect(
         Effect::ClearStartLimitAndStart => {
             manager.clear_start_limit(unit);
             if !flows.contains_key(unit) {
-                let flow = StartFlow::new(manager, unit, StartCompletion::AtReady)?;
+                let flow = StartFlow::new(manager, unit)?;
                 flows.insert(unit.clone(), flow);
             }
             Ok(())
@@ -1583,22 +1800,6 @@ fn apply_start_effect(
             Err(format!("{unit} was asked to stop while starting"))
         }
         Effect::ScheduleBackoff { .. } => Err(format!("unexpected start effect for {unit}")),
-    }
-}
-
-/// Run `unit`'s `ExecStartPost=` commands, logging (never propagating) failures.
-async fn run_start_post(manager: &UnitManager, unit: &UnitName) {
-    let post = manager
-        .get(unit)
-        .map(|rt| rt.config.exec_start_post.clone())
-        .unwrap_or_default();
-    for cmd in &post {
-        if run_aux_command(manager, unit, cmd).await != Some(0) {
-            rlog!(
-                "warning: {unit}: ExecStartPost '{}' failed",
-                cmd.argv().join(" ")
-            );
-        }
     }
 }
 
@@ -1627,22 +1828,22 @@ fn exec_start_of(manager: &UnitManager, unit: &UnitName) -> String {
 /// Returns whether a process was spawned, which is what the boot log counts.
 pub(crate) async fn apply_effect(
     manager: &mut UnitManager,
-    notify: &mut NotifyHub,
-    logs: &ServiceLogs,
     unit: &UnitName,
     effect: Option<Effect>,
 ) -> Result<bool, RuntimeError> {
     match effect {
         None | Some(Effect::None) => Ok(false),
-        // `CancelBackoffAndStart` needs no extra step: taking the unit back to
-        // `Starting` clears `restart_at` on its way through.
-        Some(Effect::SpawnProcess | Effect::CancelBackoffAndStart) => {
-            start_unit(manager, notify, logs, unit).await
-        }
-        Some(Effect::ClearStartLimitAndStart) => {
-            manager.clear_start_limit(unit);
-            start_unit(manager, notify, logs, unit).await
-        }
+        // A start is a flow, not an effect applied here. Reaching this from a
+        // stop/control path means the caller used the wrong queue operation.
+        Some(
+            Effect::SpawnProcess | Effect::CancelBackoffAndStart | Effect::ClearStartLimitAndStart,
+        ) => Err(RuntimeError::Io {
+            op: "start effect",
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{unit} was asked to start outside the start coordinator"),
+            ),
+        }),
         // `stop_unit` cancels a pending restart too, so a stop is a stop.
         Some(Effect::SendStopSignal | Effect::CancelBackoffAndStop) => {
             manager.stop_unit(unit);
@@ -1662,6 +1863,19 @@ pub(crate) async fn apply_effect(
 /// This is where a request stops being bytes and starts being a change to the
 /// running system, so it lives with the manager and the notify hub rather than
 /// with the socket that delivered it.
+/// Whether a control request would change the boot schedule while it is still
+/// running. Reads, logs and power requests are deliberately not in this set.
+fn request_mutates_boot(request: &Request) -> bool {
+    matches!(
+        request,
+        Request::Start(_)
+            | Request::Stop(_)
+            | Request::Restart(_)
+            | Request::ResetFailed(_)
+            | Request::Reload
+    )
+}
+
 enum ControlAction {
     /// The request is answered now.
     Reply(Status, String),
@@ -1673,7 +1887,6 @@ enum ControlAction {
 async fn handle_control(
     cfg: &Config,
     manager: &mut UnitManager,
-    notify: &mut NotifyHub,
     logs: &ServiceLogs,
     activation: &mut Activated,
     starts: &mut StartCoordinator,
@@ -1749,7 +1962,7 @@ async fn handle_control(
         }
         Request::Start(unit) => control_start(manager, unit),
         Request::Stop(unit) => {
-            let (status, text) = control_stop(manager, notify, logs, unit).await;
+            let (status, text) = control_stop(manager, unit).await;
             ControlAction::Reply(status, text)
         }
         Request::Restart(unit) => control_restart(manager, unit),
@@ -1766,8 +1979,7 @@ async fn handle_control(
         // Plan §7.6. The reply is the report: what was added, changed, removed
         // and deferred, so a reload is never a silent act.
         Request::Reload => {
-            let (status, text) =
-                control_reload(cfg, manager, notify, logs, activation, starts).await;
+            let (status, text) = control_reload(cfg, manager, activation, starts).await;
             ControlAction::Reply(status, text)
         }
         // The supervisor handles the side effect (it owns the shutdown path);
@@ -1785,12 +1997,10 @@ async fn handle_control(
 async fn control_reload(
     cfg: &Config,
     manager: &mut UnitManager,
-    notify: &mut NotifyHub,
-    logs: &ServiceLogs,
     activation: &mut Activated,
     starts: &mut StartCoordinator,
 ) -> (Status, String) {
-    match crate::reload::reload(cfg, manager, notify, logs, activation, starts).await {
+    match crate::reload::reload(cfg, manager, activation, starts).await {
         Ok(report) => {
             let mut lines = report.lines();
             let summary = report.summary();
@@ -1836,12 +2046,7 @@ fn control_start(manager: &mut UnitManager, unit: &UnitName) -> ControlAction {
 }
 
 /// `rctl stop`.
-async fn control_stop(
-    manager: &mut UnitManager,
-    notify: &mut NotifyHub,
-    logs: &ServiceLogs,
-    unit: &UnitName,
-) -> (Status, String) {
+async fn control_stop(manager: &mut UnitManager, unit: &UnitName) -> (Status, String) {
     if !manager.exists(unit) {
         return (Status::NoSuchUnit, format!("no such unit: {unit}"));
     }
@@ -1857,7 +2062,7 @@ async fn control_stop(
         Some(Effect::None) if !was_up => (Status::Ok, format!("{unit} is already stopped")),
         Some(Effect::None) => (Status::Ok, format!("stopped {unit}")),
         None => (Status::Ok, format!("{unit} is already stopping")),
-        Some(effect) => match apply_effect(manager, notify, logs, unit, Some(effect)).await {
+        Some(effect) => match apply_effect(manager, unit, Some(effect)).await {
             Ok(_) => (Status::Ok, format!("stopped {unit}")),
             Err(e) => (Status::Error, format!("cannot stop {unit}: {e}")),
         },
@@ -2396,323 +2601,6 @@ fn next_deadline(manager: &UnitManager) -> std::time::Duration {
     })
 }
 
-/// How a boot-time wait for `Type=notify` readiness ended.
-enum NotifyWait {
-    Ready,
-    /// The process exited, or the unit otherwise left `Starting`, without
-    /// reporting readiness.
-    Failed,
-    TimedOut,
-}
-
-/// Wait for `unit` to send `READY=1` (plan §1.3(12)).
-///
-/// Boot cannot use the supervisor's notify arm yet, so it pumps the same hub
-/// here. Messages for other units are still delivered to the manager: a notify
-/// service that becomes ready while this one is being awaited must not have its
-/// readiness dropped.
-async fn wait_for_notify(
-    manager: &mut UnitManager,
-    notify: &mut NotifyHub,
-    unit: &UnitName,
-    pid: libc::pid_t,
-    timeout: Duration,
-) -> NotifyWait {
-    let deadline = crate::deadline::after(timeout);
-    loop {
-        match manager.get(unit).map(|rt| rt.state) {
-            Some(UnitState::Active | UnitState::ActiveExited) => return NotifyWait::Ready,
-            Some(UnitState::Starting) => {}
-            _ => return NotifyWait::Failed,
-        }
-
-        // A notify service that dies before `READY=1` is a failed start, not a
-        // zombie boot is waiting on. Reap it through the manager so its policy
-        // and cgroup cleanup still apply.
-        match rinit_runtime::syscall::wait::poll_child(pid) {
-            Ok(Some(exit)) => {
-                if let Some(outcome) = manager.on_child_exit(pid, child_outcome(exit)) {
-                    log_outcome(&outcome);
-                }
-                continue;
-            }
-            Ok(None) => {}
-            Err(e) if e.errno() == libc::EINTR => continue,
-            Err(_) => return NotifyWait::Failed,
-        }
-
-        if Instant::now() >= deadline {
-            let _ = process::kill_process_group(pid, libc::SIGKILL);
-            manager.signal_cgroup_members(unit, libc::SIGKILL);
-            // Reap the killed process, but leave the state change to the
-            // caller's `fail_unit`: going through `on_child_exit` first would
-            // let `Restart=` arm a retry that the failed start must not get.
-            let _ = readiness::wait_for_exit(pid, Duration::from_secs(5)).await;
-            return NotifyWait::TimedOut;
-        }
-
-        tokio::select! {
-            Some((source, message)) = notify.recv() => {
-                if let Some(status) = &message.status {
-                    rlog!("{source}: {status}");
-                }
-                if manager.on_notify(&source, &message) {
-                    rlog!("{source} is ready");
-                }
-            }
-            _ = tokio::time::sleep(START_POLL) => {}
-        }
-    }
-}
-
-/// Resolve the unit directory and start every level of the schedule.
-///
-/// Levels run strictly in order, but the units *within* a level are all spawned
-/// before the next level begins. That is the parallelism: a unit's
-/// dependencies all sit in earlier levels, so nothing in a level waits on
-/// anything else in the same level.
-///
-/// `oneshot` units must finish before the next level starts (plan §1.3(3):
-/// `Active(Exited)` is what satisfies dependents). They are waited for with a
-/// blocking reap rather than the main loop, because boot ordering cannot depend
-/// on an event loop that has not finished starting yet.
-///
-/// A unit that fails to start does **not** abort the boot (plan §1.3(13)): it is
-/// recorded as failed and everything that hard-`Requires=` it is failed with it
-/// and skipped. Only a fatal setup problem is returned as an error.
-///
-/// # Errors
-/// Returns a [`RuntimeError`] for a parse/dependency failure or an
-/// infrastructure error (a notify socket that cannot be created).
-async fn start_units(
-    cfg: &Config,
-    notify: &mut NotifyHub,
-    logs: &ServiceLogs,
-    cgroup: crate::cgroup::Cgroup,
-    activation: &mut Activated,
-    started: std::time::Instant,
-) -> Result<UnitManager, RuntimeError> {
-    let plan = manager::announce_plan(&cfg.unit_dir, &cfg.default_target)?;
-    let mut units = UnitManager::new();
-    // Before any unit starts: limits must be in place from the first fork.
-    units.set_cgroup(cgroup);
-    for cfg in &plan.configs {
-        units.add(cfg.clone());
-    }
-    // Plan §7.7: the templates, so `rctl start worker@1.service` can make one.
-    units.set_templates(plan.templates.clone());
-
-    // Plan §7.9: bind the sockets of every unit that asked to be started by a
-    // connection, *before* any level runs - the socket outliving the service is
-    // the whole mechanism, and a client that connects to a socket bound a moment
-    // later has already been told the service does not exist.
-    let activated: Vec<(UnitName, String)> = plan
-        .configs
-        .iter()
-        .filter_map(|config| {
-            config
-                .socket_activate
-                .as_ref()
-                .map(|path| (config.name.clone(), path.clone()))
-        })
-        .collect();
-    for (unit, path) in activated {
-        match activation.bind(&unit, std::path::Path::new(&path)) {
-            Ok(()) => {
-                if let Some(fd) = activation.listener_fd(&unit) {
-                    units.set_listener(&unit, fd);
-                }
-            }
-            // A socket rinit cannot bind is a failed unit, not a failed boot: the
-            // rest of the system has no reason to stop because one service cannot
-            // be reached.
-            Err(e) => {
-                rlog!("error: {unit}: cannot bind {path}: {e}");
-                fail_unit(&mut units, &unit);
-            }
-        }
-    }
-    // Shutdown walks the startup order backwards (plan §1.3(8)), so record it
-    // while the schedule is still at hand.
-    units.set_shutdown_order(plan.levels.iter().flatten().cloned().collect());
-
-    let mut started_units = 0usize;
-    // Plan §4.3: when the first service was pulled up, which is the number the
-    // acceptance list asks for.
-    let mut first_service_uptime_ms: Option<u64> = None;
-    for (index, level) in plan.levels.iter().enumerate() {
-        let batch = manager::commands_in_level(&plan, level);
-        rlog!("starting level {index}: {} service(s)", batch.len());
-
-        // Units whose *start* is not over when their process is exec'd: a
-        // `oneshot` finishes by exiting, a `forking` unit by its main process
-        // exiting and its daemon being located (plan §7.10). Both are waited for
-        // here, with the kind carried along because only the follow-up differs.
-        let mut pending: Vec<(UnitName, libc::pid_t, u64, ServiceKind)> = Vec::new();
-        for entry in batch {
-            let name = entry.name;
-            // A unit whose hard dependency already failed must not start
-            // (plan §1.3(13)).
-            if units.is_failed(name) {
-                rlog!("skipping {name}: a required unit failed");
-                continue;
-            }
-            // Plan §7.9: a socket-activated unit is bound, not started. Its
-            // service comes up when a connection does.
-            if units.listener_fd(name).is_some() {
-                rlog!("{name}: waiting for a connection");
-                continue;
-            }
-
-            // The boot schedule is a set of `Dependency` start requests, so a
-            // unit pulled in twice is started once (plan §1.3(11)).
-            let effect = units.request_start(name, RequestSource::Dependency);
-            let spawned = apply_effect(&mut units, notify, logs, name, effect).await?;
-            if spawned {
-                started_units += 1;
-                if first_service_uptime_ms.is_none() {
-                    first_service_uptime_ms = rinit_runtime::time::uptime_ms();
-                }
-            }
-            // A start that already failed has no readiness to wait for, and
-            // running `ExecStartPost=` for it would be a command after a start
-            // that never happened.
-            if units.is_failed(name) {
-                continue;
-            }
-
-            // `oneshot`/`forking` are ready once the command exits 0; `notify`
-            // once it sends `READY=1`; `simple` at exec.
-            if readiness::readiness_of(entry.kind) != readiness::Readiness::Immediate
-                && let Some(pid) = units.get(name).and_then(|rt| rt.pid)
-            {
-                pending.push((name.clone(), pid, entry.timeout_start_sec, entry.kind));
-            } else {
-                // `ExecStartPost` runs once the main command is under way. For a
-                // `oneshot` that is after it has exited, so it is run below.
-                run_start_post(&units, name).await;
-            }
-        }
-
-        // Wait for the initializers to finish before starting anything that
-        // depends on them. The wait is a direct `waitpid` per pid rather than
-        // the main loop, because boot ordering must not depend on an event loop
-        // that has not finished starting.
-        for (name, pid, timeout_sec, kind) in &pending {
-            let timeout = if *timeout_sec == 0 {
-                // As above: `0` is "wait forever", spelled as the longest
-                // deadline rinit will compute.
-                crate::deadline::MAX_TIMEOUT
-            } else {
-                std::time::Duration::from_secs(*timeout_sec)
-            };
-            match readiness::readiness_of(*kind) {
-                readiness::Readiness::OnReady => {
-                    match wait_for_notify(&mut units, notify, name, *pid, timeout).await {
-                        NotifyWait::Ready => run_start_post(&units, name).await,
-                        NotifyWait::Failed => {
-                            rlog!("error: {name} failed before reporting readiness");
-                            fail_unit(&mut units, name);
-                        }
-                        NotifyWait::TimedOut => {
-                            rlog!("error: {name} did not report readiness within {timeout_sec}s");
-                            units.signal_cgroup_members(name, libc::SIGKILL);
-                            fail_unit(&mut units, name);
-                        }
-                    }
-                }
-                _ => match readiness::wait_for_exit(*pid, timeout).await {
-                    Ok(Some(0)) => match kind {
-                        // Plan §7.10: the exit is the middle of a `forking`
-                        // unit's start, so the daemon it left behind is what
-                        // makes it `Active` - and not being able to find it
-                        // fails the start rather than leaving a unit that
-                        // claims to be running.
-                        ServiceKind::Forking => match units.finish_forking_start(name) {
-                            Ok(daemon) => {
-                                rlog!("{name}: main process exited; daemon is pid {daemon}");
-                                run_start_post(&units, name).await;
-                            }
-                            Err(why) => {
-                                rlog!("error: {name}: cannot locate the daemon: {why}");
-                                fail_unit(&mut units, name);
-                            }
-                        },
-                        _ => {
-                            rlog!("{name} completed (Active(Exited))");
-                            units.mark_oneshot_done(name);
-                            run_start_post(&units, name).await;
-                        }
-                    },
-                    Ok(Some(code)) => {
-                        rlog!("error: {name} exited {code}");
-                        fail_unit(&mut units, name);
-                    }
-                    Ok(None) => {
-                        rlog!("error: {name} was killed by a signal");
-                        fail_unit(&mut units, name);
-                    }
-                    Err(()) => {
-                        rlog!("error: {name} did not finish within {timeout_sec}s");
-                        let _ = process::kill_process_group(*pid, libc::SIGKILL);
-                        // And whatever the process group cannot reach: a
-                        // `forking` unit that never detached has already started
-                        // the daemon it never named, and abandoning the start
-                        // must not leave it running (plan §7.10).
-                        units.signal_cgroup_members(name, libc::SIGKILL);
-                        fail_unit(&mut units, name);
-                    }
-                },
-            }
-        }
-
-        // Targets spawn no process (plan §7.2); reaching one means its
-        // dependencies are up, which is what releases the next level.
-        let targets: Vec<&UnitName> = level
-            .iter()
-            .filter(|name| manager::config_of(&plan, name).is_some_and(|c| c.is_target()))
-            .collect();
-        if !targets.is_empty() {
-            let mut active = Vec::new();
-            let mut failed = Vec::new();
-            // Targets spawn nothing, so the level loop has to settle their
-            // state explicitly (plan §7.2). `reach_target` refuses to overwrite
-            // a Failed that `fail_start` already propagated from a dependency.
-            for name in targets {
-                match units.reach_target(name) {
-                    UnitState::Active => active.push(name.canonical()),
-                    UnitState::Failed(_) => failed.push(name.canonical()),
-                    _ => {}
-                }
-            }
-            if !active.is_empty() {
-                rlog!("level {index} reached: {} active", active.join(", "));
-            }
-            if !failed.is_empty() {
-                rlog!("level {index} failed: {} failed", failed.join(", "));
-            }
-        }
-    }
-
-    rlog!(
-        "boot complete: {started_units} unit(s) started from '{}' ({} still running)",
-        plan.default_target,
-        units.running_count()
-    );
-    // Plan §4.3's number, and rinit's share of it. `first_service_uptime_ms` is
-    // the kernel's clock, so it covers the kernel's own boot too; the elapsed time
-    // is the same clock read from a different corner, and the difference is what
-    // rinit spent.
-    let rinit_ms = started.elapsed().as_millis() as u64;
-    match first_service_uptime_ms {
-        Some(first) => rlog!(
-            "boot timing: first service at {first}ms of kernel uptime (rinit's own boot: {rinit_ms}ms)"
-        ),
-        None => rlog!("boot timing: rinit's own boot took {rinit_ms}ms (kernel uptime unreadable)"),
-    }
-    Ok(units)
-}
-
 /// Run the first-wave mounts off the async thread and log the outcome.
 ///
 /// Mounts block, so they go through `spawn_blocking` (plan §2.1⑤). This is the
@@ -2942,7 +2830,6 @@ mod tests {
         let action = handle_control(
             &test_config(),
             manager,
-            notify,
             logs,
             &mut activation,
             &mut starts,
@@ -3196,7 +3083,7 @@ mod tests {
         let logs = ServiceLogs::new();
         let mut aux = BTreeMap::new();
 
-        let mut flow = StartFlow::new(&mut manager, &app, StartCompletion::AtReady).expect("flow");
+        let mut flow = StartFlow::new(&mut manager, &app).expect("flow");
         assert!(
             flow.advance(&mut manager, &mut notify, &logs, &mut aux)
                 .is_none(),

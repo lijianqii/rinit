@@ -25,6 +25,7 @@ use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::time::Duration;
 
 use rinit_core::UnitName;
@@ -39,15 +40,6 @@ use crate::log::rlog;
 /// One descriptor, on fd 3: the plan asks for one listening socket per unit, so
 /// there is no range and no per-socket name to carry.
 pub const LISTEN_FDS_ENV: &str = "LISTEN_FDS=1";
-
-/// How long the watcher waits before deciding again, once a connection is queued.
-///
-/// The event is "there is something to accept", and only the service can clear it
-/// by accepting - so without a floor, a client that is kept waiting would wake the
-/// main loop as fast as the reactor can run it. Ten milliseconds is short enough to
-/// be invisible in the handover and gives at most a hundred wake-ups a second while
-/// something is queued.
-const WATCH_FLOOR: Duration = Duration::from_millis(10);
 
 /// The sockets rinit holds for units that asked for one.
 pub struct Activated {
@@ -66,6 +58,9 @@ struct Bound {
     /// can come and go without the socket doing the same.
     listener: std::os::unix::net::UnixListener,
     path: PathBuf,
+    /// One permit, one wake-up. The watcher consumes it when it reports a
+    /// connection and does not ask again until the main loop rearms it.
+    permit: mpsc::Sender<()>,
     _watch: tokio::task::JoinHandle<()>,
 }
 
@@ -110,7 +105,12 @@ impl Activated {
         let watched = OwnedFd::from(listener.try_clone()?);
         let sender = self.sender.clone();
         let watched_unit = unit.clone();
-        let watch = tokio::spawn(async move { watch(watched, sender, watched_unit).await });
+        let (permit, permit_rx) = mpsc::channel(1);
+        // The first connection is allowed through without the main loop having
+        // to ask: a socket that is bound but never reported would be dead.
+        let _ = permit.try_send(());
+        let watch =
+            tokio::spawn(async move { watch(watched, sender, permit_rx, watched_unit).await });
 
         rlog!("{unit}: listening on {}", path.display());
         self.sockets.insert(
@@ -118,6 +118,7 @@ impl Activated {
             Bound {
                 listener,
                 path: path.to_path_buf(),
+                permit,
                 _watch: watch,
             },
         );
@@ -145,6 +146,21 @@ impl Activated {
         }
     }
 
+    /// The units whose sockets rinit currently holds.
+    pub fn units(&self) -> Vec<UnitName> {
+        self.sockets.keys().cloned().collect()
+    }
+
+    /// Allow the watcher for `unit` to report one more connection.
+    ///
+    /// At most one permit is queued, so calling this while the unit is idle is
+    /// idempotent and does not wake the loop by itself.
+    pub fn rearm(&mut self, unit: &UnitName) {
+        if let Some(bound) = self.sockets.get(unit) {
+            let _ = bound.permit.try_send(());
+        }
+    }
+
     /// A unit whose socket has a connection waiting, if any.
     pub async fn recv(&mut self) -> Option<UnitName> {
         self.ready.recv().await
@@ -163,7 +179,12 @@ impl Activated {
 /// Readability, not `accept`: the connection is the service's, and taking it here
 /// would mean rinit had to pass the accepted stream instead of the socket the
 /// service is written to expect.
-async fn watch(listener: OwnedFd, sender: mpsc::UnboundedSender<UnitName>, unit: UnitName) {
+async fn watch(
+    listener: OwnedFd,
+    sender: mpsc::UnboundedSender<UnitName>,
+    mut permit: mpsc::Receiver<()>,
+    unit: UnitName,
+) {
     // SAFETY: `listener` is an `OwnedFd`, so this call owns a valid descriptor and
     // never closes or replaces it while the `AsyncFd` lives - the obligation
     // `register` documents. `AsyncFd::new` is deprecated as unsound for exactly
@@ -176,6 +197,12 @@ async fn watch(listener: OwnedFd, sender: mpsc::UnboundedSender<UnitName>, unit:
         }
     };
     loop {
+        // One permit, one report. A level-triggered listener stays readable
+        // until the service accepts, so without this wait the watcher would
+        // report the same queued connection as fast as the reactor can run it.
+        if permit.recv().await.is_none() {
+            return;
+        }
         let mut guard = match afd.readable().await {
             Ok(guard) => guard,
             Err(e) => {
@@ -189,7 +216,6 @@ async fn watch(listener: OwnedFd, sender: mpsc::UnboundedSender<UnitName>, unit:
             return;
         }
         guard.clear_ready();
-        tokio::time::sleep(WATCH_FLOOR).await;
     }
 }
 
@@ -278,6 +304,22 @@ mod tests {
             .expect("rinit still holds the sender");
         assert_eq!(woken, unit);
 
+        // The watcher does not keep reporting the same queued connection.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), activated.recv())
+                .await
+                .is_err(),
+            "a second report must wait for an explicit rearm"
+        );
+        activated.rearm(&unit);
+        let second = UnixStream::connect(&path).expect("second connect");
+        let woken = tokio::time::timeout(Duration::from_secs(2), activated.recv())
+            .await
+            .expect("rearm must let the watcher report a new connection")
+            .expect("rinit still holds the sender");
+        assert_eq!(woken, unit);
+
+        drop(second);
         drop(client);
         activated.disarm();
         drop(activated);

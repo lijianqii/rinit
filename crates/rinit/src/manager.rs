@@ -164,8 +164,6 @@ pub struct LevelEntry<'a> {
     pub name: &'a UnitName,
     /// How startup completion is judged (plan §1.3(3)).
     pub kind: ServiceKind,
-    /// `TimeoutStartSec`; `0` means wait forever (plan §1.1).
-    pub timeout_start_sec: u64,
 }
 
 /// The services of a level, in schedule order.
@@ -179,7 +177,6 @@ pub fn commands_in_level<'a>(plan: &'a BootPlan, level: &'a [UnitName]) -> Vec<L
             spawns_process(cfg).then_some(LevelEntry {
                 name,
                 kind: cfg.service_kind,
-                timeout_start_sec: cfg.timeout_start_sec,
             })
         })
         .collect()

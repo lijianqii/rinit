@@ -286,6 +286,97 @@ fn a_unit_without_restart_is_left_down() {
     );
 }
 
+/// A termination signal during boot must stop the level that is in progress,
+/// shut down what has already started, and not wait for that level's timeout.
+#[test]
+fn a_signal_during_boot_stops_starting_and_shuts_down() {
+    let dir = TempDir::new("boot-signal");
+    let marker = dir.0.join("pre-started");
+    dir.write("all.target", "[Unit]\nType=target\nRequires=slow.service\n");
+    dir.write(
+        "slow.service",
+        &format!(
+            "[Service]\nType=oneshot\nTimeoutStartSec=60\n\
+             ExecStartPre=/bin/sh -c \"echo pre > {}; sleep 30\"\n\
+             ExecStart=/bin/true\n",
+            marker.display()
+        ),
+    );
+
+    let bin = env!("CARGO_BIN_EXE_rinit");
+    let control_dir = dir.0.join("control");
+    let mut child = Command::new(bin)
+        .arg("--dev")
+        .arg("--units")
+        .arg(&dir.0)
+        .arg("--default")
+        .arg("all.target")
+        .env("RINIT_CONTROL_DIR", &control_dir)
+        .env("RINIT_NOTIFY_DIR", dir.0.join("notify"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn rinit");
+
+    let console = std::sync::Arc::new(Console::new());
+    let readers = [
+        drain_console(
+            child.stdout.take().expect("piped stdout"),
+            std::sync::Arc::clone(&console),
+        ),
+        drain_console(
+            child.stderr.take().expect("piped stderr"),
+            std::sync::Arc::clone(&console),
+        ),
+    ];
+
+    // Wait until `ExecStartPre=` is actually running; the signal is meant to
+    // interrupt a live start, not merely the queuing of one.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !marker.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "ExecStartPre did not start:\n{}",
+            console.text()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // The control socket is available during boot, but a mutation must not race
+    // the schedule.
+    let control_socket = control_dir.join("control.sock");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !control_socket.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the control socket must be bound during boot"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let (status, text) = control(&control_socket, rinit_core::Request::Reload);
+    assert_eq!(status, rinit_core::Status::Conflict, "{text}");
+    assert!(text.contains("boot is still in progress"), "{text}");
+
+    let started = std::time::Instant::now();
+    // SAFETY: signalling our own child.
+    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+    let status = child.wait().expect("wait for rinit");
+    for reader in readers {
+        let _ = reader.join();
+    }
+    let log = console.text();
+
+    assert!(status.success(), "rinit must exit cleanly:\n{log}");
+    assert!(log.contains("received SIGTERM"), "{log}");
+    assert!(log.contains("boot interrupted"), "{log}");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "shutdown must not wait for the 30 s ExecStartPre:\n{log}"
+    );
+    let _ = std::fs::remove_dir_all(&dir.0);
+}
+
 /// Plan §7.2: a target spawns no process, but a completed boot has to leave it
 /// `Active` - the boot log already says so, and `rctl` must agree.
 #[test]
@@ -878,7 +969,7 @@ fn a_notify_unit_that_never_reports_readiness_fails_its_target() {
     let log = boot_units(&dir, "all.target");
 
     assert!(
-        log.contains("app.service did not report readiness within"),
+        log.contains("app.service did not signal readiness in time"),
         "the timeout must name the unit:\n{log}"
     );
     assert!(
@@ -2563,6 +2654,27 @@ fn boot_with_control(units: &TempDir, tag: &str) -> (std::process::Child, PathBu
         assert!(
             std::time::Instant::now() < deadline,
             "rinit must bind the control socket"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // The socket exists during boot now. Wait until the target has settled so a
+    // test does not race the "boot in progress" guard.
+    let target = rinit_core::UnitName::parse("all.target").expect("target name");
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let (_, text) = control(
+            &socket,
+            rinit_core::Request::Status {
+                unit: Some(target.clone()),
+                tail: 0,
+            },
+        );
+        if text.contains("state: active") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the boot target did not become active:\n{text}"
         );
         std::thread::sleep(Duration::from_millis(20));
     }

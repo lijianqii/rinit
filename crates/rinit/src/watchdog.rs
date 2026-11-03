@@ -17,18 +17,17 @@
 //!   watchdog hardware is normal, so the default path stays silent. A device the
 //!   operator named is worth one warning line when it cannot be opened, because
 //!   they asked for it and would otherwise have to guess.
-//! - **The feed comes from the supervisor loop and nowhere else.** That is the
-//!   plan's "喂狗必须发生在主循环的健康检查点": a timer thread would keep the
-//!   hardware happy while the loop that starts services, reaps children and
-//!   answers `rctl` is wedged, which is the opposite of self-healing. The loop
-//!   asks [`Watchdog::next_feed_in`] so that a pending feed cannot be slept
-//!   through, and calls [`Watchdog::feed_if_due`] once per iteration.
+//! - **The feed comes from the main loop and nowhere else.** That is the plan's
+//!   "喂狗必须发生在主循环的健康检查点": a timer thread would keep the hardware
+//!   happy while the loop that starts services, reaps children and answers
+//!   `rctl` is wedged, which is the opposite of self-healing. The loop asks
+//!   [`Watchdog::next_feed_in`] so that a pending feed cannot be slept through,
+//!   and calls [`Watchdog::feed_if_due`] once per iteration.
 //!
-//! What is deliberately *not* covered: the boot itself. The watchdog is armed
-//! when the supervisor loop begins, so mounts, unit loading and the first start
-//! of every level run outside it. Arming earlier would mean feeding from the boot
-//! sequence too, and a level that takes longer than the timeout - a slow service
-//! with a long `TimeoutStartSec=` - would reset the machine mid-boot.
+//! Boot and supervision share that loop. The watchdog is armed after the first
+//! mount wave and before the first unit, so a slow `ExecStartPre=` or a level
+//! waiting for `READY=1` is fed like any other loop work. A machine that stops
+//! iterating - not one that is merely taking a long time - is what resets.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};

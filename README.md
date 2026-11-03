@@ -123,7 +123,7 @@ attaches qemu's `i6300esb` and the kernel is built with its driver - so the
 timeout below is that driver's answer to rinit's `WDIOC_SETTIMEOUT`, not a
 stand-in file's. The uptime is the part that matters: the device was armed with a
 10 s timeout within seconds of boot, so a machine still running long after that
-is a machine whose supervisor loop is feeding it.
+is a machine whose main loop is feeding it.
 
 ```
 ~ # d=/sys/class/watchdog/watchdog0; echo wd-ident=$(cat $d/identity) wd-state=$(cat $d/state) wd-timeout=$(cat $d/timeout)
@@ -1028,15 +1028,12 @@ open. All are noted here so they are not mistaken for drift:
     (`WatchdogDevice=`, `WatchdogTimeoutSec=`) through the mechanism that
     already exists. A config file would add a parser, a second boot-time failure
     mode, and a second place to look for one setting.
-17. **The watchdog is armed when the supervisor loop starts, not at the top of
-    the boot.** §7.5 says "启动时打开" and then requires the feed to happen at the
-    main loop's health checkpoint. Arming it earlier would mean feeding from the
-    boot sequence as well, and a level that legitimately takes longer than the
-    timeout - a service with a long `TimeoutStartSec=`, a slow filesystem -
-    would reset a machine that is booting correctly. The window that is left
-    uncovered (mounts, unit loading, the first start) is bounded by the start
-    timeouts; the loop that follows is where an init silently wedges. A
-    `--test-service` boot, which is a bring-up path rather than a system boot,
+17. **The watchdog is armed after the first mount wave, before the first unit.**
+    Boot and supervision now share one loop, so the same health checkpoint feeds
+    the device while a level waits for a slow `ExecStartPre=` or `READY=1`. A
+    machine that stops iterating still resets; a machine that is merely taking a
+    long time does not. Mounts and unit loading remain outside the armed window;
+    a `--test-service` boot, which is a bring-up path rather than a system boot,
     arms nothing.
 18. **The guest is *given* a watchdog, because the target qemu machine has
     none.** `-device i6300esb` in `scripts/run-qemu.sh` plus

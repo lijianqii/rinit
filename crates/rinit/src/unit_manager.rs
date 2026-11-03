@@ -401,6 +401,12 @@ pub struct UnitManager {
     /// after a reload replaced the directory, and so the expansion uses the text
     /// the plan was built from.
     templates: BTreeMap<String, String>,
+    /// Whether the boot schedule is still being walked.
+    ///
+    /// A start that fails before its readiness point is terminal during boot:
+    /// `Restart=` belongs to a running service, and a retry armed here would
+    /// outlive the level that already failed it.
+    boot_in_progress: bool,
 }
 
 impl UnitManager {
@@ -415,7 +421,18 @@ impl UnitManager {
             cgroup: Cgroup::disabled(),
             listen_fds: BTreeMap::new(),
             templates: BTreeMap::new(),
+            boot_in_progress: false,
         }
+    }
+
+    /// Mark the boot schedule as running.
+    pub fn begin_boot(&mut self) {
+        self.boot_in_progress = true;
+    }
+
+    /// Mark the boot schedule complete, restoring normal restart semantics.
+    pub fn finish_boot(&mut self) {
+        self.boot_in_progress = false;
     }
 
     /// Record the listening socket a unit's service should be handed
@@ -1045,9 +1062,9 @@ impl UnitManager {
 
     /// Mark a `oneshot` as having completed successfully.
     ///
-    /// The boot sequence waits for these with a direct `waitpid` (it cannot use
-    /// the main loop, which has not started yet), so the manager needs to be
-    /// told the outcome instead of deriving it.
+    /// Test seam for a completed command; production derives this from the
+    /// reaped exit in [`on_child_exit`](Self::on_child_exit).
+    #[cfg(test)]
     pub fn mark_oneshot_done(&mut self, unit: &UnitName) {
         let now = self.now_millis();
         if let Some(rt) = self.units.get_mut(unit) {
@@ -1283,31 +1300,11 @@ impl UnitManager {
 
     /// Send `signal` to everything still in `unit`'s cgroup.
     ///
-    /// §7.3's second stage, exposed for the one path that abandons a start
-    /// without going through `stop_unit`: boot's wait for a `forking` unit's main
-    /// process, which times out into `fail_unit` and would otherwise leave the
-    /// daemon that unit had already started behind. A unit with no cgroup of its
-    /// own has nothing to sweep.
+    /// Test seam for the cgroup sweep; production reaches the same code through
+    /// `stop_unit` and the start/stop deadline paths.
+    #[cfg(test)]
     pub fn signal_cgroup_members(&self, unit: &UnitName, signal: libc::c_int) {
         self.cgroup.signal_members(unit, signal);
-    }
-
-    /// Take over from a `forking` unit's main process (plan §7.10).
-    ///
-    /// The boot loop waits for that process itself - boot ordering cannot depend
-    /// on the reaper's loop - so this is the same step `on_child_exit` takes,
-    /// callable from there. On failure the unit has not been changed: the caller
-    /// fails the start, because "locate the daemon" has no partial success.
-    ///
-    /// # Errors
-    /// The reason the daemon could not be located, for the unit's failure line.
-    pub fn finish_forking_start(&mut self, unit: &UnitName) -> Result<libc::pid_t, String> {
-        let Some(rt) = self.units.get(unit) else {
-            return Err(format!("{unit} is not registered"));
-        };
-        let daemon = find_daemon(&rt.config, &self.cgroup, unit)?;
-        self.mark_daemon_started(unit, daemon);
-        Ok(daemon)
     }
 
     /// Record a notify message for `unit` and act on readiness.
@@ -1904,6 +1901,21 @@ impl UnitManager {
                 unit,
                 state: UnitState::ActiveExited,
             });
+        }
+
+        // A start that never reached its readiness point during boot is
+        // terminal. The boot schedule is not supervision yet: retrying it would
+        // let a broken level start the next one, and a `Restart=` armed here
+        // would survive the `fail_unit` that settles the level.
+        if starting && self.boot_in_progress {
+            let state = rt.state;
+            self.cgroup.cleanup(&unit);
+            if matches!(state, UnitState::Failed(_)) {
+                for dependent in self.fail_start(&unit) {
+                    rlog!("error: {dependent} requires {unit}, which failed");
+                }
+            }
+            return Some(Outcome::Exited { unit, state });
         }
 
         if !rt.policy().wants_restart(outcome) {

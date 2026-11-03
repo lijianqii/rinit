@@ -19,12 +19,14 @@
 //! global `SIGCHLD` queue, so a concurrent reaper cannot steal the exit status
 //! this code depends on.
 
+use rinit_core::ServiceKind;
+#[cfg(test)]
+use rinit_runtime::syscall::wait;
+#[cfg(test)]
 use std::time::Duration;
 
-use rinit_core::ServiceKind;
-use rinit_runtime::syscall::wait;
-
 /// How often to poll while waiting for a child to exit.
+#[cfg(test)]
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// What a unit needed before the next startup level could begin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,16 +57,14 @@ pub const fn readiness_of(kind: ServiceKind) -> Readiness {
 /// Wait for `pid` to exit, returning its exit code.
 ///
 /// Only safe when `pid` was spawned by this process and is not being reaped
-/// concurrently.
-///
-/// This is `async` on purpose: boot waits for `oneshot` units, and blocking the
-/// single `current_thread` runtime with `std::thread::sleep` would stall the
-/// reactor that delivers signals (plan §2.1①/⑤).
+/// concurrently. Production now observes readiness through the manager; this
+/// remains as the focused test of the poll/deadline accounting.
 ///
 /// # Errors
 /// Returns `Err(())` when `timeout` elapses first. A child that exits on a
 /// signal is reported as `Ok(None)`: it did not succeed, but it did terminate,
 /// so the caller can distinguish "hung" from "died".
+#[cfg(test)]
 pub async fn wait_for_exit(pid: libc::pid_t, timeout: Duration) -> Result<Option<i32>, ()> {
     let deadline = crate::deadline::after(timeout);
     loop {

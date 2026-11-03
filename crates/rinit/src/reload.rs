@@ -35,9 +35,7 @@ use crate::activation::Activated;
 use crate::args::Config;
 use crate::boot::{StartCoordinator, apply_effect};
 use crate::log::rlog;
-use crate::logs::ServiceLogs;
 use crate::manager;
-use crate::notify::NotifyHub;
 use crate::unit_manager::{ConfigChange, UnitManager};
 
 /// What one reload did.
@@ -126,8 +124,6 @@ impl Report {
 pub async fn reload(
     cfg: &Config,
     manager: &mut UnitManager,
-    notify: &mut NotifyHub,
-    logs: &ServiceLogs,
     activation: &mut Activated,
     starts: &mut StartCoordinator,
 ) -> Result<Report, RuntimeError> {
@@ -154,7 +150,7 @@ pub async fn reload(
         }
         if manager.is_up(&name) {
             let effect = manager.request_stop(&name, RequestSource::UserStop);
-            apply_effect(manager, notify, logs, &name, effect).await?;
+            apply_effect(manager, &name, effect).await?;
             report.stopped.push(name.clone());
         }
         // A removed unit must not keep a live socket: a connection would still
