@@ -69,7 +69,10 @@ BUSYBOX_URLS     ?= $(MIRROR)/busybox/busybox-$(BUSYBOX_VERSION).tar.bz2 \
                     https://busybox.net/downloads/busybox-$(BUSYBOX_VERSION).tar.gz
 
 JOBS             ?= $(shell nproc 2>/dev/null || echo 2)
-QEMU_MEM         ?= 128M
+# The initramfs now carries the full rinit-tools set; 128M is too small for the
+# kernel to unpack it on aarch64, so the development/test images use 256M. The
+# long soak uses a disk image and passes 128M explicitly to keep its baseline.
+QEMU_MEM         ?= 256M
 # The persistent device image gets a swap file of this size. It is created only
 # by `make disk-image`; an existing image keeps its original file.
 SWAP_SIZE_MB     ?= 32
@@ -354,7 +357,8 @@ test: check
 # It boots the acceptance image: the §7.x units it drives from the console are
 # in `units/demo/`, which `make run`'s image does not carry.
 test-system: $(KERNEL_IMAGE) $(INITRAMFS_DEMO)
-	$(SCRIPTS)/system-test.sh --arch $(QEMU_ARCH) --kernel $(KERNEL_IMAGE) --initrd $(INITRAMFS_DEMO)
+	QEMU_MEM=$(QEMU_MEM) $(SCRIPTS)/system-test.sh --arch $(QEMU_ARCH) \
+	    --kernel $(KERNEL_IMAGE) --initrd $(INITRAMFS_DEMO)
 
 # `soak` is the M4 long-run leak check: sustained restart churn plus a loop
 # driving the control socket, watching RSS, descriptors and zombies. The default

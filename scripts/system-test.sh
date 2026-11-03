@@ -38,6 +38,7 @@ arch="aarch64"
 kernel=""
 initrd=""
 timeout_s=90
+mem="${QEMU_MEM:-256M}"
 log_file=""
 keep_log=0
 # No --service by default: from M1 the guest boots the unit directory, and
@@ -486,7 +487,7 @@ feeder_pid=$!
 set +e
 timeout -k 5 "${timeout_s}" \
     "${repo_root}/scripts/run-qemu.sh" \
-    --arch "${arch}" --kernel "${kernel}" --initrd "${initrd}" \
+    --arch "${arch}" --kernel "${kernel}" --initrd "${initrd}" --mem "${mem}" \
     ${service:+--service "${service}"} \
     --kernel-args "${kernel_args}" <"${fifo}" >"${log_file}" 2>&1
 qemu_rc=$?

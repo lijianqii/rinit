@@ -4,7 +4,7 @@
 # Usage:
 #   scripts/run-qemu.sh --arch <aarch64|arm|x86_64> --kernel <Image|zImage|vmlinuz>
 #                       (--initrd <cpio.gz> | --disk <img> --root <dev>)
-#                       [--mem 128M] [--hostfwd tcp::2222-:22]
+#                       [--mem 256M] [--hostfwd tcp::2222-:22]
 #                       [--service "<cmd> [args...]"]
 #                       [--kernel-args "<tokens>"]
 #
@@ -44,7 +44,7 @@ initrd=""
 disk=""
 root=""
 hostfwd=""
-mem="128M"
+mem="256M"
 service=""
 kernel_args=""
 extra=()

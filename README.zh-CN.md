@@ -445,7 +445,7 @@ cargo llvm-cov --offline --workspace --html                  # target/llvm-cov/h
 
 | 计划 §6 | 现状 |
 | ------- | --------------- |
-| 在 qemu（128M）里作为 PID 1 启动，内核无 panic | `make test-system`：aarch64 与 armv7 各 105 条断言，包括 "no rinit panic" 和四条内核日志检查 |
+| 在 qemu（256M）里作为 PID 1 启动，内核无 panic | `make test-system`：aarch64 与 armv7 各 105 条断言，包括 "no rinit panic" 和四条内核日志检查 |
 | 20 个服务并行，明显快于串行 | **19.2x**：`make parallel`——20 个各睡 1 s 的 `oneshot` 服务，并行总耗时 1065 ms，串行 20 424 ms |
 | 崩溃重启、熔断、健康检查 | `make test-system`（"a crashed service is scheduled for restart"、"the breaker tripped on the failing unit"）和 `crates/rinit/tests/m2_lifecycle.rs` |
 | `rctl` 能启动、停止、查询、读日志 | `make test-system` 的 M3 段和 `crates/rctl/tests/control.rs` |
@@ -492,8 +492,8 @@ make ARCH=arm32 run      # ARMv7 hard-float, qemu virt / Cortex-A15
    busybox + rinit + rctl + processes + `rinit-tools` 清单 + `units/`，再加上登录
    shell 需要的 `/etc` 与 `/var` 骨架）。验收镜像 `...-demo.cpio.gz` 是同一套根，
    再加 `units/demo/`，也是 `make test-system` 启动的那个。
-5. 用 `qemu-system-aarch64 -machine virt -cpu cortex-a57 -m 128M`（arm64）或
-   `qemu-system-arm -machine virt,highmem=off -cpu cortex-a15 -m 128M`（arm32）
+5. 用 `qemu-system-aarch64 -machine virt -cpu cortex-a57 -m 256M`（arm64）或
+   `qemu-system-arm -machine virt,highmem=off -cpu cortex-a15 -m 256M`（arm32）
    启动，并加 `-device i6300esb`——rinit 武装的看门狗（计划 §7.5）——以及 qemu 的
    用户态网络（`-netdev user` 加 `virtio-net-device`），DHCP 客户端就跑在它上面。
 

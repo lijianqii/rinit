@@ -530,7 +530,7 @@ repository or a measurement in this README:
 
 | plan §6 | where it stands |
 | ------- | --------------- |
-| boots as PID 1 in qemu (128M) with no kernel panic | `make test-system`: 105 assertions on aarch64 and armv7, including "no rinit panic" and four kernel-log checks |
+| boots as PID 1 in qemu (256M) with no kernel panic | `make test-system`: 105 assertions on aarch64 and armv7, including "no rinit panic" and four kernel-log checks |
 | 20 services in parallel, visibly faster than serial | **19.2x**: `make parallel` - 20 `oneshot` services that each sleep 1 s finish in 1065 ms together and 20 424 ms chained |
 | crash-restart, breaker, health checks | `make test-system` ("a crashed service is scheduled for restart", "the breaker tripped on the failing unit") and `crates/rinit/tests/m2_lifecycle.rs` |
 | `rctl` can start, stop, query and read logs | `make test-system`'s M3 block and `crates/rctl/tests/control.rs` |
@@ -585,8 +585,8 @@ What it does, in order (see [Makefile](Makefile)):
    arm32 tree lives under `build/arm32/out/`. The acceptance image
    `...-demo.cpio.gz` is the same root plus `units/demo/`, and is what
    `make test-system` boots.
-5. Boot it in `qemu-system-aarch64 -machine virt -cpu cortex-a57 -m 128M`
-   (arm64) or `qemu-system-arm -machine virt -cpu cortex-a15 -m 128M` (arm32),
+5. Boot it in `qemu-system-aarch64 -machine virt -cpu cortex-a57 -m 256M`
+   (arm64) or `qemu-system-arm -machine virt -cpu cortex-a15 -m 256M` (arm32),
    with `-device i6300esb`, the watchdog rinit arms (plan §7.5), and qemu's
    user-mode network (`-netdev user` plus `virtio-net-device`), which is what
    the DHCP client runs on.

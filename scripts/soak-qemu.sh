@@ -154,7 +154,7 @@ ssh_guest() {
 } >"$run_info"
 
 timeout -k 5 $((seconds + 1800)) "$repo_root/scripts/run-qemu.sh" --arch "$arch" \
-    --kernel "$kernel" --disk "$disk" --root /dev/vda \
+    --kernel "$kernel" --disk "$disk" --root /dev/vda --mem 128M \
     --hostfwd "tcp::$port-:22" --kernel-args "-- --default device.target" \
     </dev/null >"$serial" 2>&1 &
 qemu_pid=$!
