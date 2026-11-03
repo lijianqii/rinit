@@ -108,6 +108,30 @@ The second wave replaces the file-oriented BusyBox applets:
 | `ln` | `/bin/ln` | `ln.rs` | medium |
 | `touch` | `/bin/touch` | `touch.rs` | low |
 
+The third wave adds shell and script basics:
+
+```text
+echo [-neE] [STRING...]
+sleep NUMBER[smhd]...
+uname [-asnrvmpoi]
+id [-ugGnr]
+whoami
+env [-i] [-u NAME] [NAME=VALUE...] [COMMAND [ARG...]]
+which [-a] COMMAND...
+dirname PATH...
+basename NAME [SUFFIX]
+realpath [-e|-m] [-q] [-z] PATH...
+readlink [-fenmq] PATH...
+mktemp [-dqu] [-p DIR] [TEMPLATE]
+sync
+stat [-L] [-c FORMAT] [-t] FILE...
+```
+
+`stat` supports the format directives `%n %s %a %f %u %U %g %G %h %i
+%d %D %F %X %Y %Z %y %%`; `realpath` defaults to strict resolution and
+`-m` allows missing components. `which` searches `PATH`, not the shell's
+command table.
+
 Still out of scope:
 
 - `sh`, `ash`;
@@ -357,8 +381,8 @@ Provisional first-version budgets, to be replaced by measured values:
 | profile | tools | total budget |
 | --- | --- | --- |
 | minimal | `rinit` only | 1.2 MB |
-| `replace-system` (first + second wave) | 23 including existing | 16 MB |
-| full toolbox (later) | 30+ | 20 MB |
+| `replace-system` (first three waves) | 37 including existing | 20 MB |
+| full toolbox (later) | 50+ | 24 MB |
 
 Each tool also has its own budget in `tools.list`. CI fails on either a per-tool
 or a total overrun. If the installed set exceeds its total budget, evaluate a
@@ -374,6 +398,8 @@ shared `librinit-tools.so` for non-init tools; do not add it pre-emptively.
 - hostname `-F`;
 - file operations: recursive copy, no-clobber, symlink preservation, directory
   removal guards, hard/symbolic links and `touch -t`;
+- script basics: PATH search, environment handling, user/group lookup, path
+  resolution, temporary names and `stat` formatting;
 - reboot/poweroff through a fake control socket and then a real guest.
 
 ### Multi-binary/install

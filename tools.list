@@ -37,3 +37,19 @@ rm         rm         /bin/rm          /bin/rm          600  crates/rinit-tools/
 mkdir      mkdir      /bin/mkdir       /bin/mkdir       600  crates/rinit-tools/src/bin/mkdir.rs
 ln         ln         /bin/ln          /bin/ln          600  crates/rinit-tools/src/bin/ln.rs
 touch      touch      /bin/touch       /bin/touch       600  crates/rinit-tools/src/bin/touch.rs
+
+# Third replace-system set: shell and script basics.
+echo       echo       /bin/echo        /bin/echo        600  crates/rinit-tools/src/bin/echo.rs
+sleep      sleep      /bin/sleep       /bin/sleep       600  crates/rinit-tools/src/bin/sleep.rs
+uname      uname      /bin/uname       /bin/uname       600  crates/rinit-tools/src/bin/uname.rs
+id         id         /usr/bin/id      /usr/bin/id      600  crates/rinit-tools/src/bin/id.rs
+whoami     whoami     /usr/bin/whoami  /usr/bin/whoami  600  crates/rinit-tools/src/bin/whoami.rs
+env        env        /usr/bin/env     /usr/bin/env     600  crates/rinit-tools/src/bin/env.rs
+which      which      /usr/bin/which   /usr/bin/which   600  crates/rinit-tools/src/bin/which.rs
+dirname    dirname    /usr/bin/dirname /usr/bin/dirname 600  crates/rinit-tools/src/bin/dirname.rs
+basename   basename   /usr/bin/basename /usr/bin/basename 600 crates/rinit-tools/src/bin/basename.rs
+realpath   realpath   /usr/bin/realpath /usr/bin/realpath 600 crates/rinit-tools/src/bin/realpath.rs
+readlink   readlink   /usr/bin/readlink /usr/bin/readlink 600 crates/rinit-tools/src/bin/readlink.rs
+mktemp     mktemp     /bin/mktemp      /bin/mktemp      600  crates/rinit-tools/src/bin/mktemp.rs
+sync       sync       /bin/sync        /bin/sync        600  crates/rinit-tools/src/bin/sync.rs
+stat       stat       /bin/stat        /bin/stat        800  crates/rinit-tools/src/bin/stat.rs

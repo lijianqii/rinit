@@ -111,10 +111,11 @@ qemu_pid=$!
 wait_ssh || { echo "FAIL: SSH did not come up" >&2; tail -30 "$serial" >&2; exit 3; }
 
 for path in mount umount hostname ps free uptime dmesg df sysctl top reboot poweroff \
-    ls cat cp mv rm mkdir ln touch; do
+    ls cat cp mv rm mkdir ln touch echo sleep uname mktemp sync stat \
+    id whoami env which dirname basename realpath readlink; do
     case "$path" in
-        mount | umount | hostname | ps | dmesg | df | ls | cat | cp | mv | rm | mkdir | ln | touch) full="/bin/$path" ;;
-        free | uptime | top) full="/usr/bin/$path" ;;
+        mount | umount | hostname | ps | dmesg | df | ls | cat | cp | mv | rm | mkdir | ln | touch | echo | sleep | uname | mktemp | sync | stat) full="/bin/$path" ;;
+        free | uptime | top | id | whoami | env | which | dirname | basename | realpath | readlink) full="/usr/bin/$path" ;;
         sysctl | reboot | poweroff) full="/sbin/$path" ;;
     esac
     check "$full is a real executable" "ssh_guest 'test -x $full && ! test -L $full'"
@@ -150,7 +151,22 @@ check 'ln creates a symlink' "ssh_guest 'ln -s /etc/hostname /tmp/tool-link && t
 check 'touch creates a file' "ssh_guest 'touch /tmp/tool-touch && test -f /tmp/tool-touch'"
 check 'cp refuses a directory without -r' "! ssh_guest 'cp /etc /tmp/tool-cp-dir' >/dev/null 2>&1"
 check 'rm refuses a directory without -r' "! ssh_guest 'rm /etc' >/dev/null 2>&1"
-ssh_guest 'rm -rf /tmp/tool-dir /tmp/tool-link /tmp/tool-touch /tmp/tool-cp-dir' >/dev/null 2>&1 || true
+
+check '/bin/echo prints its arguments' "ssh_guest '/bin/echo hello' | grep -q hello"
+check 'sleep accepts zero' "ssh_guest 'sleep 0'"
+check 'uname reports Linux' "ssh_guest 'uname -s' | grep -q '^Linux$'"
+check 'id prints a numeric uid' "ssh_guest 'id -u' | grep -qE '^[0-9]+\$'"
+check 'whoami prints a name' "ssh_guest 'whoami' | grep -q ."
+check 'env prints PATH' "ssh_guest 'env' | grep -q '^PATH='"
+check 'which finds sh' "ssh_guest 'which sh' | grep -q sh"
+check 'dirname strips the last component' "ssh_guest 'test \"\$(dirname /a/b)\" = /a'"
+check 'basename strips directory and suffix' "ssh_guest 'test \"\$(basename /a/b.txt .txt)\" = b'"
+check 'realpath resolves an existing path' "ssh_guest 'realpath /etc/hostname' | grep -q '^/etc/hostname$'"
+check 'readlink prints a symlink target' "ssh_guest 'ln -s /etc/hostname /tmp/tool-readlink && test \"\$(readlink /tmp/tool-readlink)\" = /etc/hostname'"
+check 'mktemp creates a file' "ssh_guest 'p=\$(mktemp /tmp/tool-tmp.XXXXXX) && test -f \"\$p\" && rm -f \"\$p\"'"
+check 'sync succeeds' "ssh_guest 'sync'"
+check 'stat prints a file name and size' "ssh_guest 'stat -c \"%n %s\" /etc/hostname' | grep -q hostname"
+ssh_guest 'rm -rf /tmp/tool-dir /tmp/tool-link /tmp/tool-touch /tmp/tool-cp-dir /tmp/tool-readlink' >/dev/null 2>&1 || true
 
 if ((power_cycle)); then
     boot_count=$(grep -cF 'starting (pid 1)' "$serial" || true)
