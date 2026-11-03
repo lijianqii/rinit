@@ -2,7 +2,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -77,17 +77,14 @@ fn make_name(template: &str, options: &Options) -> Result<String, String> {
             return Ok(path);
         }
         let result = if options.directory {
-            fs::create_dir(&path)
-                .and_then(|()| fs::set_permissions(&path, fs::Permissions::from_mode(0o700)))
+            fs::DirBuilder::new().mode(0o700).create(&path)
         } else {
             OpenOptions::new()
                 .write(true)
                 .create_new(true)
+                .mode(0o600)
                 .open(&path)
-                .and_then(|file| {
-                    drop(file);
-                    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
-                })
+                .map(drop)
         };
         match result {
             Ok(()) => return Ok(path),
@@ -172,6 +169,7 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
     fn temp_root(tag: &str) -> PathBuf {

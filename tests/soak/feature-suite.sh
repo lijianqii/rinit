@@ -51,11 +51,11 @@ mkdir -p /var/log/rinit
 printf 'ts,seed,scenario,tier,result,expected_fail,duration_ms,detail\n' >"$out"
 printf 'feature suite seed=%s\n' "$seed" >"$status"
 
-trap 'rm -rf /run/rinit-feature.lock; rm -f /run/rinit-feature-active' EXIT
 if ! mkdir /run/rinit-feature.lock 2>/dev/null; then
     echo "feature-suite: already running" >&2
     exit 0
 fi
+trap 'rm -rf /run/rinit-feature.lock; rm -f /run/rinit-feature-active' EXIT
 
 rand_between() {
     state=$(( (state * 48271) % 2147483647 ))

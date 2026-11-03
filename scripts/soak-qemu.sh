@@ -224,6 +224,10 @@ if [[ -n "$feature_suite" ]]; then
     }
 fi
 
+ssh_guest 'rctl reload' >/dev/null || {
+    echo "FAIL: could not reload soak units" >&2
+    exit 3
+}
 ssh_guest "rctl start steady.service; rctl start driven.service; rctl start churn.service" >/dev/null || {
     echo "FAIL: could not start soak units" >&2
     exit 3

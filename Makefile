@@ -137,7 +137,8 @@ help:
 RINIT_BIN        := target/$(TARGET)/release/rinit
 RCTL_BIN         := target/$(TARGET)/release/rctl
 PROCESSES_BIN    := target/$(TARGET)/release/processes
-RINIT_SRCS       := $(shell find crates -name '*.rs' 2>/dev/null) Cargo.toml Cargo.lock
+RINIT_SRCS       := $(shell find crates \( -name '*.rs' -o -name 'Cargo.toml' \) 2>/dev/null) \
+                    Cargo.toml Cargo.lock rust-toolchain.toml
 
 rinit: $(RINIT_BIN) $(RCTL_BIN) $(PROCESSES_BIN)
 processes: $(PROCESSES_BIN)
@@ -256,8 +257,15 @@ $(BUSYBOX_BIN): $(BUSYBOX_SRC)/.config
 # --- dropbear -------------------------------------------------------------
 dropbear: $(DROPBEAR_BIN_DIR)/dropbear
 
+DROPBEAR_VERSION_STAMP := $(DROPBEAR_BIN_DIR)/.version-$(DROPBEAR_VERSION)
+
+$(DROPBEAR_VERSION_STAMP):
+	mkdir -p $(DROPBEAR_BIN_DIR)
+	touch $@
+
 $(DROPBEAR_BIN_DIR)/dropbear: $(SCRIPTS)/build-dropbear.sh \
-                              $(SCRIPTS)/dropbear-pty.patch
+                              $(SCRIPTS)/dropbear-pty.patch \
+                              $(DROPBEAR_VERSION_STAMP)
 	DROPBEAR_VERSION=$(DROPBEAR_VERSION) \
 	    $(SCRIPTS)/build-dropbear.sh $(TARGET) $(DROPBEAR_BIN_DIR)
 

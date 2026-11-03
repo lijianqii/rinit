@@ -1,7 +1,7 @@
 //! `rm` - remove files and directory trees.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Component, Path};
 use std::process::ExitCode;
 
 use rinit_tools::fsutil;
@@ -16,7 +16,23 @@ struct Options {
 
 fn protected(path: &str) -> bool {
     let trimmed = path.trim_end_matches('/');
-    trimmed.is_empty() || trimmed == "." || trimmed == ".."
+    if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
+        return true;
+    }
+    if let Some(last) = trimmed.rsplit('/').next()
+        && (last == "." || last == "..")
+    {
+        return true;
+    }
+    let path = Path::new(trimmed);
+    if let Some(Component::CurDir | Component::ParentDir | Component::RootDir) =
+        path.components().next_back()
+    {
+        return true;
+    }
+    fs::canonicalize(path)
+        .map(|resolved| resolved == Path::new("/"))
+        .unwrap_or(false)
 }
 
 fn remove_path(path: &Path, options: Options) -> Result<(), String> {
@@ -160,9 +176,22 @@ mod tests {
     }
 
     #[test]
+    fn protects_parent_and_current_directory_components() {
+        for path in [
+            "/", "/.", "//.", "/usr/..", "/tmp/..", "foo/..", "foo/.", "..", ".", "",
+        ] {
+            assert!(protected(path), "{path} must be protected");
+        }
+        assert!(!protected("./build"));
+        assert!(!protected("/tmp/build"));
+    }
+
+    #[test]
     fn run_refuses_protected_paths_and_bad_options() {
         assert_eq!(run(&["/".to_string()], "rm"), ExitCode::from(1));
         assert_eq!(run(&["..".to_string()], "rm"), ExitCode::from(1));
+        assert_eq!(run(&["/usr/..".to_string()], "rm"), ExitCode::from(1));
+        assert_eq!(run(&["/.".to_string()], "rm"), ExitCode::from(1));
         assert_eq!(run(&["--help".to_string()], "rm"), ExitCode::from(EXIT_OK));
         assert_eq!(
             run(&["--bad".to_string()], "rm"),

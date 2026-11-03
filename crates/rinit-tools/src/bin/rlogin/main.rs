@@ -93,6 +93,24 @@ fn verify_hash(password: &str, hash: &str) -> bool {
     crypt::verify(password, hash)
 }
 
+fn ignore_job_control_signals() {
+    // SAFETY: fixed process-wide signal dispositions.
+    unsafe {
+        for signal in [libc::SIGINT, libc::SIGQUIT, libc::SIGTSTP, libc::SIGTTOU] {
+            libc::signal(signal, libc::SIG_IGN);
+        }
+    }
+}
+
+fn default_job_control_signals() {
+    // SAFETY: restore dispositions inherited across exec.
+    unsafe {
+        for signal in [libc::SIGINT, libc::SIGQUIT, libc::SIGTSTP, libc::SIGTTOU] {
+            libc::signal(signal, libc::SIG_DFL);
+        }
+    }
+}
+
 fn read_raw_line() -> io::Result<String> {
     let mut line = String::new();
     io::stdin().read_line(&mut line)?;
@@ -139,7 +157,7 @@ fn authenticate(user: &User, force: bool) -> io::Result<bool> {
     if hash.is_empty() {
         return Ok(true);
     }
-    if hash.starts_with('!') || hash.starts_with('*') || !hash.starts_with("$6$") {
+    if hash.starts_with('!') || hash.starts_with('*') {
         return Ok(false);
     }
     let password = read_password("Password: ")?;
@@ -213,6 +231,14 @@ fn nologin(user: &User) -> bool {
 fn change_identity(user: &User) -> Result<(), String> {
     let name =
         CString::new(user.name.as_str()).map_err(|_| "user name contains NUL".to_string())?;
+    // The tty must be handed to the user while we still have CAP_CHOWN/FOWNER.
+    // SAFETY: fd 0 is the console handed over by getty.
+    if unsafe { libc::fchown(0, user.uid as libc::uid_t, user.gid as libc::gid_t) } != 0 {
+        return Err(format!("fchown tty: {}", io::Error::last_os_error()));
+    }
+    if unsafe { libc::fchmod(0, 0o600) } != 0 {
+        return Err(format!("fchmod tty: {}", io::Error::last_os_error()));
+    }
     // SAFETY: `name` is a valid C string; the IDs come from /etc/passwd.
     let groups = unsafe { libc::initgroups(name.as_ptr(), user.gid as libc::gid_t) };
     if groups != 0 && user.uid != 0 {
@@ -225,10 +251,21 @@ fn change_identity(user: &User) -> Result<(), String> {
     if unsafe { libc::setuid(user.uid as libc::uid_t) } != 0 {
         return Err(io::Error::last_os_error().to_string());
     }
-    // SAFETY: fd 0 is the console handed over by getty.
+    // SAFETY: these queries have no preconditions.
+    let (uid, euid, gid, egid) = unsafe {
+        (
+            libc::getuid(),
+            libc::geteuid(),
+            libc::getgid(),
+            libc::getegid(),
+        )
+    };
+    if uid != user.uid || euid != user.uid || gid != user.gid || egid != user.gid {
+        return Err("identity did not drop to the requested user".to_string());
+    }
+    // SAFETY: `umask` is process-local and has no failure mode.
     unsafe {
-        libc::fchown(0, user.uid as libc::uid_t, user.gid as libc::gid_t);
-        libc::fchmod(0, 0o600);
+        libc::umask(0o022);
     }
     Ok(())
 }
@@ -380,6 +417,7 @@ fn run(args: &[String], program: &str) -> ExitCode {
         Ok(parsed) => parsed,
         Err(error) => return ExitCode::from(usage_error(program, &error)),
     };
+    ignore_job_control_signals();
     let passwd = match fs::read_to_string("/etc/passwd") {
         Ok(text) => text,
         Err(error) => {
@@ -450,6 +488,7 @@ fn run(args: &[String], program: &str) -> ExitCode {
         eprintln!("{program}: {error}");
         return ExitCode::from(1);
     }
+    default_job_control_signals();
     if let Err(error) = start_shell(&user, parsed.preserve, parsed.host.as_deref()) {
         eprintln!("{program}: {error}");
         return ExitCode::from(1);
@@ -599,6 +638,19 @@ mod tests {
         assert_eq!(parsed.username, "root");
         assert!(parse_args(&["-h".to_string()]).is_err());
         assert!(parse_args(&["a".to_string(), "b".to_string()]).is_err());
+    }
+
+    #[test]
+    fn job_control_signals_are_ignored_and_restored() {
+        let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
+        ignore_job_control_signals();
+        // SAFETY: a null handler queries the current disposition.
+        unsafe { libc::sigaction(libc::SIGINT, std::ptr::null(), &mut action) };
+        assert_eq!(action.sa_sigaction, libc::SIG_IGN);
+        default_job_control_signals();
+        // SAFETY: a null handler queries the current disposition.
+        unsafe { libc::sigaction(libc::SIGINT, std::ptr::null(), &mut action) };
+        assert_eq!(action.sa_sigaction, libc::SIG_DFL);
     }
 
     #[test]

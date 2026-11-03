@@ -131,14 +131,45 @@ fn configure_termios(term: &mut libc::termios, local: bool, baud: u32) {
     } else {
         term.c_cflag &= !libc::CLOCAL;
     }
-    term.c_lflag |= libc::ICANON | libc::ECHO | libc::ECHOE | libc::ISIG | libc::IEXTEN;
-    term.c_iflag |= libc::ICRNL | libc::IXON;
-    term.c_oflag |= libc::OPOST | libc::ONLCR;
+    // Establish a complete baseline; flags left by the previous user must not
+    // leak into the next session.
+    term.c_lflag = libc::ICANON | libc::ECHO | libc::ECHOE | libc::ISIG | libc::IEXTEN;
+    term.c_iflag = libc::ICRNL | libc::IXON;
+    term.c_oflag = libc::OPOST | libc::ONLCR;
+    term.c_cc = [0; libc::NCCS];
+    term.c_cc[libc::VINTR] = 3;
+    term.c_cc[libc::VQUIT] = 28;
+    term.c_cc[libc::VERASE] = 127;
+    term.c_cc[libc::VKILL] = 21;
+    term.c_cc[libc::VEOF] = 4;
+    term.c_cc[libc::VSTART] = 17;
+    term.c_cc[libc::VSTOP] = 19;
+    term.c_cc[libc::VSUSP] = 26;
+    term.c_cc[libc::VMIN] = 1;
+    term.c_cc[libc::VTIME] = 0;
     if let Some(speed) = speed(baud) {
         // SAFETY: `term` is a valid termios for these settings.
         unsafe {
             libc::cfsetispeed(term, speed);
             libc::cfsetospeed(term, speed);
+        }
+    }
+}
+
+fn ignore_job_control_signals() {
+    // SAFETY: fixed signal dispositions are process-wide; no handler state.
+    unsafe {
+        for signal in [libc::SIGINT, libc::SIGQUIT, libc::SIGTSTP, libc::SIGTTOU] {
+            libc::signal(signal, libc::SIG_IGN);
+        }
+    }
+}
+
+fn default_job_control_signals() {
+    // SAFETY: restore the default dispositions before exec'ing login/shell.
+    unsafe {
+        for signal in [libc::SIGINT, libc::SIGQUIT, libc::SIGTSTP, libc::SIGTTOU] {
+            libc::signal(signal, libc::SIG_DFL);
         }
     }
 }
@@ -201,6 +232,13 @@ fn open_tty(path: &str, local: bool, baud: u32) -> Result<(), String> {
     if unsafe { libc::tcsetpgrp(0, pid) } != 0 {
         return Err(format!("tcsetpgrp: {}", io::Error::last_os_error()));
     }
+    // Reclaim the device from the previous session before anyone can log in.
+    if unsafe { libc::fchown(0, 0, 0) } != 0 {
+        return Err(format!("fchown tty: {}", io::Error::last_os_error()));
+    }
+    if unsafe { libc::fchmod(0, 0o600) } != 0 {
+        return Err(format!("fchmod tty: {}", io::Error::last_os_error()));
+    }
 
     let mut term = unsafe { std::mem::zeroed::<libc::termios>() };
     // SAFETY: fd 0 is the tty opened above.
@@ -211,6 +249,11 @@ fn open_tty(path: &str, local: bool, baud: u32) -> Result<(), String> {
     // SAFETY: the settings were read from the same terminal.
     if unsafe { libc::tcsetattr(0, libc::TCSANOW, &term) } != 0 {
         return Err(format!("tcsetattr: {}", io::Error::last_os_error()));
+    }
+    // Drop typeahead typed before the prompt, including input from the
+    // previous session.
+    unsafe {
+        libc::tcflush(0, libc::TCIOFLUSH);
     }
     Ok(())
 }
@@ -298,6 +341,7 @@ fn run(args: &[String], program: &str) -> ExitCode {
         Ok(options) => options,
         Err(error) => return ExitCode::from(usage_error(program, &error)),
     };
+    ignore_job_control_signals();
     if let Err(error) = open_tty(&options.tty, options.local, options.baud) {
         report(program, &error);
         return ExitCode::from(1);
@@ -365,6 +409,7 @@ fn run(args: &[String], program: &str) -> ExitCode {
             if libc::tcsetpgrp(0, pid) != 0 {
                 return Err(io::Error::last_os_error());
             }
+            default_job_control_signals();
             Ok(())
         });
     }
@@ -480,7 +525,13 @@ mod tests {
     #[test]
     fn termios_configuration_sets_8n1_and_local_mode() {
         let mut term = unsafe { std::mem::zeroed::<libc::termios>() };
+        term.c_lflag |= libc::TOSTOP | libc::ECHOCTL;
+        term.c_iflag |= libc::PARMRK;
+        term.c_oflag |= libc::OCRNL;
         configure_termios(&mut term, true, 115200);
+        assert_eq!(term.c_lflag & (libc::TOSTOP | libc::ECHOCTL), 0);
+        assert_eq!(term.c_iflag & libc::PARMRK, 0);
+        assert_eq!(term.c_oflag & libc::OCRNL, 0);
         assert_eq!(term.c_cflag & libc::CSIZE, libc::CS8);
         assert_eq!(term.c_cflag & libc::PARENB, 0);
         assert_eq!(term.c_cflag & libc::CSTOPB, 0);
@@ -536,6 +587,19 @@ mod tests {
             libc::close(fds[0]);
             libc::close(fds[1]);
         }
+    }
+
+    #[test]
+    fn job_control_signals_are_ignored_and_restored() {
+        let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
+        ignore_job_control_signals();
+        // SAFETY: a null handler queries the current disposition.
+        unsafe { libc::sigaction(libc::SIGINT, std::ptr::null(), &mut action) };
+        assert_eq!(action.sa_sigaction, libc::SIG_IGN);
+        default_job_control_signals();
+        // SAFETY: a null handler queries the current disposition.
+        unsafe { libc::sigaction(libc::SIGINT, std::ptr::null(), &mut action) };
+        assert_eq!(action.sa_sigaction, libc::SIG_DFL);
     }
 
     #[test]
