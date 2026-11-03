@@ -682,10 +682,12 @@ The first invocation creates `build/.../out/rinit-<target>.ext4` (at least
 64 MiB; about 65 MiB with the default 32 MiB swap file) from
 the same rootfs tree plus `units/device/`, dropbear and the swap file, then boots the kernel
 with `root=/dev/vda rw rootfstype=ext4 init=/sbin/rinit -- --default
-device.target`. There is no initramfs. The image is **reused if it exists**, so
-changes made in the guest survive the next boot; `make disk-image` is the
-explicit destructive rebuild. `make pack` performs the same rebuild and writes
-the populated rootfs to `build/.../out/rinit-<target>-rootfs.tar.gz`.
+device.target`. There is no initramfs. The image is rebuilt when a tracked
+input (tool sources, `tools.list`, units, `fstab`, or a packing script) is
+newer; unchanged inputs reuse it, so changes made in the guest survive the next
+boot. `make disk-image` is the explicit destructive rebuild. `make pack`
+performs the same rebuild and writes the populated rootfs to
+`build/.../out/rinit-<target>-rootfs.tar.gz`.
 
 `device.target` starts:
 

@@ -301,11 +301,12 @@ QEMU_CMD = $(SCRIPTS)/run-qemu.sh --arch $(QEMU_ARCH) --kernel $(KERNEL_IMAGE) \
 qemu run: $(KERNEL_IMAGE) $(INITRAMFS)
 	$(QEMU_CMD)
 
-# The persistent variant: an ext4 root filesystem instead of an initramfs. The
-# image is built only when missing, so changes made in the guest survive the
-# next `make run-disk`; `make disk-image` is the explicit destructive rebuild.
-# AUTHORIZED_KEY=<file.pub> installs a client key for root; CI uses it to boot
-# the image without a console login.
+# The persistent variant: an ext4 root filesystem instead of an initramfs.
+# `run-disk` rebuilds it when a tracked input (tools, units, fstab, packing
+# scripts) is newer, so it always boots the current toolset. Inputs that have
+# not changed reuse the image and keep guest modifications; `make disk-image`
+# is the explicit destructive rebuild. AUTHORIZED_KEY=<file.pub> installs a
+# client key for root; CI uses it to boot the image without a console login.
 disk-image: rinit tools $(BUSYBOX_BIN) $(DROPBEAR_BIN_DIR)/dropbear \
             $(BOOT_UNIT_FILES) $(DEVICE_UNIT_FILES) $(FSTAB) $(MDEV_CONF) \
             $(INITRAMFS_SCRIPTS) $(SCRIPTS)/mkdisk.sh \
@@ -322,7 +323,14 @@ disk-image: rinit tools $(BUSYBOX_BIN) $(DROPBEAR_BIN_DIR)/dropbear \
 	$(SCRIPTS)/mkswapfile.sh $(ROOTFS_DIR)/swapfile $(SWAP_SIZE_MB)
 	DISK_EXTRA_MB=$(DISK_EXTRA_MB) $(SCRIPTS)/mkdisk.sh $(ROOTFS_DIR) $(DISK_IMAGE)
 
-$(DISK_IMAGE):
+DISK_INPUTS := $(RINIT_BIN) $(RCTL_BIN) $(PROCESSES_BIN) $(TOOLS_STAMP) \
+               $(BUSYBOX_BIN) $(DROPBEAR_BIN_DIR)/dropbear \
+               $(BOOT_UNIT_FILES) $(DEVICE_UNIT_FILES) $(FSTAB) $(MDEV_CONF) \
+               $(INITRAMFS_SCRIPTS) $(SCRIPTS)/mkdisk.sh \
+               $(SCRIPTS)/mkswapfile.sh $(SCRIPTS)/install-tools.sh tools.list \
+               $(if $(AUTHORIZED_KEY),$(AUTHORIZED_KEY))
+
+$(DISK_IMAGE): $(DISK_INPUTS)
 	$(MAKE) disk-image
 
 # Package the populated rootfs as a deployable tarball. `disk-image` already

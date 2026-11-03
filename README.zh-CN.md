@@ -576,9 +576,11 @@ make ARCH=arm32 run-disk
 swap 文件时约 65 MiB），内容来自同一套 rootfs，加上 `units/device/`、dropbear
 和 swap 文件，然后用
 `root=/dev/vda rw rootfstype=ext4 init=/sbin/rinit -- --default device.target`
-启动内核，不再使用 initramfs。**镜像存在时不会重建**，所以客户机里的修改能跨重启
-保留；`make disk-image` 才是显式的破坏性重建。`make pack` 会执行同样的重建，
-并把填充好的 rootfs 打包为 `build/.../out/rinit-<target>-rootfs.tar.gz`。
+启动内核，不再使用 initramfs。工具源码、`tools.list`、unit、`fstab` 或打包脚本
+等输入比镜像新时会自动重建，所以 `run-disk` 总是使用最新工具集；输入没变时复用
+镜像，客户机里的修改能跨重启保留。`make disk-image` 才是显式的破坏性重建。
+`make pack` 会执行同样的重建，并把填充好的 rootfs 打包为
+`build/.../out/rinit-<target>-rootfs.tar.gz`。
 
 `device.target` 会启动：
 
