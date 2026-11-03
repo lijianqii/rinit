@@ -84,6 +84,24 @@ fn kill_missing_pid_reports_esrch() {
 }
 
 #[test]
+fn kill_never_targets_init_or_the_whole_system() {
+    for pid in [0, 1, -1] {
+        assert_eq!(
+            process::kill(pid, libc::SIGTERM)
+                .expect_err("reserved pid must be refused")
+                .errno(),
+            libc::EINVAL
+        );
+        assert_eq!(
+            process::kill_process_group(pid, libc::SIGTERM)
+                .expect_err("reserved process group must be refused")
+                .errno(),
+            libc::EINVAL
+        );
+    }
+}
+
+#[test]
 fn getpid_returns_positive() {
     assert!(process::getpid() > 0);
 }

@@ -2059,10 +2059,30 @@ impl Default for UnitManager {
 /// alive. Falling back to the pid costs one syscall on a path that has already
 /// failed, and it is what keeps a unit's own process inside the unit.
 fn signal_process(pid: libc::pid_t, signal: libc::c_int) -> Result<(), SyscallError> {
-    match process::kill_process_group(pid, signal) {
-        Ok(()) => Ok(()),
-        Err(e) if e.errno() == libc::ESRCH => process::kill(pid, signal),
-        Err(e) => Err(e),
+    // A unit must never signal init or rinit itself. The group helper also
+    // rejects this, but keeping the check here names the policy at the call
+    // site that has a pid from a unit.
+    if pid <= 1 || pid == process::getpid() {
+        return Err(SyscallError::new("signal", libc::EINVAL));
+    }
+    process::kill_process_group(pid, signal)
+}
+
+/// The UID fields of `/proc/<pid>/status`, or `None` when they are not all
+/// equal (a process that retained a different real/saved/fs uid is not a safe
+/// identity match) or the file cannot be read.
+fn process_uid(pid: libc::pid_t) -> Option<u32> {
+    let text = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let line = text.lines().find(|line| line.starts_with("Uid:"))?;
+    let mut fields = line
+        .split_whitespace()
+        .skip(1)
+        .filter_map(|value| value.parse::<u32>().ok());
+    let first = fields.next()?;
+    if fields.all(|value| value == first) {
+        Some(first)
+    } else {
+        None
     }
 }
 
@@ -2117,19 +2137,48 @@ fn find_daemon(
         }
     };
 
-    if pid <= 0 {
-        return Err(format!("pid {pid} is not a process"));
+    if pid <= 1 {
+        return Err(format!("pid {pid} is not a service process"));
+    }
+    if pid == process::getpid() {
+        return Err("PIDFile names rinit itself".to_string());
     }
     // SAFETY: signal 0 only probes whether the pid exists.
     if unsafe { libc::kill(pid, 0) } != 0 {
         return Err(format!("pid {pid} is not running"));
     }
-    if let Some(members) = cgroup.members(unit)
-        && !members.contains(&pid)
-    {
-        cgroup.place(unit, pid).map_err(|e| {
-            format!("pid {pid} is not in the unit's cgroup and cannot be moved: {e}")
-        })?;
+    if let Some(members) = cgroup.members(unit) {
+        if !members.contains(&pid) {
+            return Err(format!(
+                "pid {pid} is not in {unit}'s cgroup; refusing to move an unrelated process"
+            ));
+        }
+    } else {
+        // Without a cgroup there is no namespace to check. At least require the
+        // daemon to run with exactly the identity the unit asked for; otherwise
+        // a low-privilege service could point PIDFile at a root process.
+        let expected = if config.user.trim().is_empty() {
+            // rinit running as root (production) means uid 0; `--dev` on a host
+            // runs the child as rinit's own uid, so use that instead.
+            process::geteuid()
+        } else {
+            crate::sandbox::resolve(config)
+                .map_err(|error| format!("cannot resolve User= for PIDFile validation: {error}"))?
+                .uid
+        };
+        match process_uid(pid) {
+            Some(uid) if uid == expected => {}
+            Some(uid) => {
+                return Err(format!(
+                    "pid {pid} runs as uid {uid}, but {unit} runs as uid {expected}"
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "cannot verify the identity of pid {pid} from /proc"
+                ));
+            }
+        }
     }
     Ok(pid)
 }
@@ -2310,48 +2359,67 @@ mod tests {
         m.signal_cgroup_members(&UnitName::parse("app.service").unwrap(), libc::SIGKILL);
     }
 
-    /// Plan §7.10's PIDFile rules, one at a time: the daemon must exist, and one
-    /// that is not already in the unit's cgroup is *moved* into it - being in the
-    /// cgroup is what makes the unit's limits, its stop signalling and its
-    /// cleanup apply to it.
+    /// A PIDFile that names a live process outside the unit cgroup is refused;
+    /// rinit must not adopt an unrelated process just because a file said so.
     #[test]
-    fn a_located_daemon_outside_its_cgroup_is_moved_into_it() {
+    fn a_located_daemon_outside_its_cgroup_is_refused() {
+        let _guard = crate::test_support::children_lock();
         let fake = FakeCgroup::new("place");
         let unit = UnitName::parse("app.service").unwrap();
         let mut cfg = config("app.service", RestartPolicy::No);
         let pid_file = fake.root.join("app.pid");
-        // rinit's own pid: it exists, and `find_daemon` only probes it with
-        // signal 0, so nothing is signalled.
-        let pid = std::process::id() as libc::pid_t;
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("stand-in daemon");
+        let pid = child.id() as libc::pid_t;
         std::fs::write(&pid_file, format!("{pid}\n")).expect("pid file");
         cfg.pid_file = Some(pid_file.display().to_string());
         fake.set_procs("app.service", &[]);
 
-        let located = find_daemon(&cfg, &fake.cgroup(), &unit).expect("the daemon is found");
-
-        assert_eq!(located, pid);
-        assert_eq!(
-            fake.procs("app.service"),
-            pid.to_string(),
-            "a daemon outside its cgroup must be moved into it"
-        );
+        let why = find_daemon(&cfg, &fake.cgroup(), &unit)
+            .expect_err("an unrelated process must not be adopted");
+        assert!(why.contains("not in"), "unexpected reason: {why}");
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
-    /// A daemon that is already in the cgroup is left alone: writing the same pid
-    /// back is a no-op the kernel does not need.
+    /// A daemon that is already in the cgroup is returned unchanged.
     #[test]
-    fn a_daemon_already_in_its_cgroup_is_not_moved() {
+    fn a_daemon_already_in_its_cgroup_is_returned() {
+        let _guard = crate::test_support::children_lock();
         let fake = FakeCgroup::new("already");
         let unit = UnitName::parse("app.service").unwrap();
         let mut cfg = config("app.service", RestartPolicy::No);
         let pid_file = fake.root.join("app.pid");
-        let pid = std::process::id() as libc::pid_t;
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("stand-in daemon");
+        let pid = child.id() as libc::pid_t;
         std::fs::write(&pid_file, format!("{pid}\n")).expect("pid file");
         cfg.pid_file = Some(pid_file.display().to_string());
         fake.set_procs("app.service", &[pid]);
 
         assert_eq!(find_daemon(&cfg, &fake.cgroup(), &unit).unwrap(), pid);
         assert_eq!(fake.procs("app.service"), pid.to_string());
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn pid_one_and_rinit_itself_are_never_daemons() {
+        let fake = FakeCgroup::new("reserved");
+        let unit = UnitName::parse("app.service").unwrap();
+        for pid in [1, std::process::id() as libc::pid_t] {
+            let mut cfg = config("app.service", RestartPolicy::No);
+            let pid_file = fake.root.join(format!("app-{pid}.pid"));
+            std::fs::write(&pid_file, format!("{pid}\n")).expect("pid file");
+            cfg.pid_file = Some(pid_file.display().to_string());
+            let why = find_daemon(&cfg, &fake.cgroup(), &unit)
+                .expect_err("reserved pids must be refused");
+            assert!(why.contains("not a service process") || why.contains("rinit itself"));
+        }
     }
 
     /// A `PIDFile=` naming a pid that is not running is an error, not a start:
@@ -2381,12 +2449,17 @@ mod tests {
     /// exactly one process, or the daemon is not determined.
     #[test]
     fn without_a_pid_file_the_cgroup_must_name_exactly_one_process() {
+        let _guard = crate::test_support::children_lock();
         let fake = FakeCgroup::new("members");
         let unit = UnitName::parse("app.service").unwrap();
         let cfg = config("app.service", RestartPolicy::No);
         assert!(cfg.pid_file.is_none(), "this test is about the fallback");
 
-        let me = std::process::id() as libc::pid_t;
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("stand-in daemon");
+        let me = child.id() as libc::pid_t;
         fake.set_procs("app.service", &[me]);
         assert_eq!(
             find_daemon(&cfg, &fake.cgroup(), &unit).expect("one member is the daemon"),
@@ -2400,6 +2473,8 @@ mod tests {
             why.contains("not uniquely determined"),
             "unexpected reason: {why}"
         );
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     /// And a unit with neither a `PIDFile=` nor a cgroup of its own has nothing

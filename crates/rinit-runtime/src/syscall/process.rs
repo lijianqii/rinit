@@ -785,6 +785,9 @@ fn die_reporting_step(report_write: libc::c_int, step: SandboxStep, errno: i32) 
 /// forked it, so [`kill_process_group`] can address a group that no longer
 /// exists while the daemon itself is very much alive.
 pub fn kill(pid: libc::pid_t, signal: libc::c_int) -> Result<(), SyscallError> {
+    if pid <= 1 {
+        return Err(SyscallError::new("kill", libc::EINVAL));
+    }
     // SAFETY: `kill` has no memory-safety preconditions for a scalar pid/signal.
     let rc = unsafe { libc::kill(pid, signal) };
     if rc == 0 {
@@ -804,9 +807,22 @@ pub fn kill(pid: libc::pid_t, signal: libc::c_int) -> Result<(), SyscallError> {
 /// Returns `ESRCH` if the group is already empty, which is the normal outcome
 /// when the service exited between the check and the signal.
 pub fn kill_process_group(pid: libc::pid_t, signal: libc::c_int) -> Result<(), SyscallError> {
-    // SAFETY: a negative pid addresses a process group; no memory-safety
-    // preconditions apply to a scalar argument.
-    let rc = unsafe { libc::kill(-pid, signal) };
+    if pid <= 1 {
+        return Err(SyscallError::new("killpg", libc::EINVAL));
+    }
+    // A negative pid addresses a group. Only use it when the pid really leads
+    // its group; a forking daemon may have inherited another group, and
+    // `kill(-pid)` would then address the wrong processes. Fall back to the
+    // single pid, which is the unit's own daemon.
+    // SAFETY: `getpgid` only reads process metadata.
+    let group = unsafe { libc::getpgid(pid) };
+    if group < 0 {
+        return Err(SyscallError::last_os_error("getpgid"));
+    }
+    let target = if group == pid { -pid } else { pid };
+    // SAFETY: `target` is a pid or a process-group id; no memory-safety
+    // preconditions apply to scalar arguments.
+    let rc = unsafe { libc::kill(target, signal) };
     if rc == 0 {
         Ok(())
     } else {
