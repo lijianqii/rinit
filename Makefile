@@ -59,6 +59,9 @@ endif
 KERNEL_VERSION   ?= 6.6.158
 # 1.36.1 is the latest patch release of the busybox 1.36 line.
 BUSYBOX_VERSION  ?= 1.36.1
+KERNEL_SHA256    := 9eb33173b0e04e898d431587c78c47ee6e19e3fdf2ea007323de82af14bb2a4f
+BUSYBOX_SHA256   := b8cc24c9574d809e7279c3be349795c5d5ceb6fdf19ca709f80cde50e47de314
+DROPBEAR_SHA256  := e098034a843699200c8c977a991fff73159735bf795d5f72ef672c41a6b1ae81
 
 # Tsinghua mirror first; official upstream as fallback.
 MIRROR           ?= https://mirrors.tuna.tsinghua.edu.cn
@@ -179,7 +182,7 @@ $(RINIT_BIN) $(RCTL_BIN) $(PROCESSES_BIN) &: $(RINIT_SRCS)
 
 # --- Linux kernel ---------------------------------------------------------
 $(KERNEL_TARBALL):
-	$(SCRIPTS)/fetch.sh $@ $(KERNEL_URLS)
+	SHA256=$(KERNEL_SHA256) $(SCRIPTS)/fetch.sh $@ $(KERNEL_URLS)
 
 $(KERNEL_SRC)/.config: $(KERNEL_TARBALL)
 	mkdir -p $(SRC_DIR)
@@ -228,7 +231,7 @@ $(KERNEL_IMAGE): $(KERNEL_SRC)/.config
 
 # --- busybox (static target) ----------------------------------------------
 $(BUSYBOX_TARBALL):
-	$(SCRIPTS)/fetch.sh $@ $(BUSYBOX_URLS)
+	SHA256=$(BUSYBOX_SHA256) $(SCRIPTS)/fetch.sh $@ $(BUSYBOX_URLS)
 
 $(BUSYBOX_SRC)/.config: $(BUSYBOX_TARBALL)
 	mkdir -p $(SRC_DIR)
@@ -266,7 +269,7 @@ $(DROPBEAR_VERSION_STAMP):
 $(DROPBEAR_BIN_DIR)/dropbear: $(SCRIPTS)/build-dropbear.sh \
                               $(SCRIPTS)/dropbear-pty.patch \
                               $(DROPBEAR_VERSION_STAMP)
-	DROPBEAR_VERSION=$(DROPBEAR_VERSION) \
+	DROPBEAR_VERSION=$(DROPBEAR_VERSION) DROPBEAR_SHA256=$(DROPBEAR_SHA256) \
 	    $(SCRIPTS)/build-dropbear.sh $(TARGET) $(DROPBEAR_BIN_DIR)
 
 # --- initramfs ------------------------------------------------------------
@@ -331,12 +334,22 @@ disk-image: rinit tools $(BUSYBOX_BIN) $(DROPBEAR_BIN_DIR)/dropbear \
 	$(SCRIPTS)/mkswapfile.sh $(ROOTFS_DIR)/swapfile $(SWAP_SIZE_MB)
 	DISK_EXTRA_MB=$(DISK_EXTRA_MB) $(SCRIPTS)/mkdisk.sh $(ROOTFS_DIR) $(DISK_IMAGE)
 
+KEY_ID := $(if $(AUTHORIZED_KEY),$(shell sha256sum "$(AUTHORIZED_KEY)" 2>/dev/null | cut -d' ' -f1),none)
+KEY_STAMP := $(OUT_DIR)/.authorized-key
+
+$(KEY_STAMP): FORCE
+	@mkdir -p $(OUT_DIR)
+	@printf '%s\n' "$(KEY_ID)" > $@.tmp
+	@if ! cmp -s $@.tmp $@; then mv $@.tmp $@; else rm -f $@.tmp; fi
+
+FORCE:
+
 DISK_INPUTS := $(RINIT_BIN) $(RCTL_BIN) $(PROCESSES_BIN) $(TOOLS_STAMP) \
                $(BUSYBOX_BIN) $(DROPBEAR_BIN_DIR)/dropbear \
                $(BOOT_UNIT_FILES) $(DEVICE_UNIT_FILES) $(FSTAB) $(MDEV_CONF) \
                $(INITRAMFS_SCRIPTS) $(SCRIPTS)/mkdisk.sh \
                $(SCRIPTS)/mkswapfile.sh $(SCRIPTS)/install-tools.sh tools.list \
-               $(if $(AUTHORIZED_KEY),$(AUTHORIZED_KEY))
+               $(KEY_STAMP)
 
 $(DISK_IMAGE): $(DISK_INPUTS)
 	$(MAKE) disk-image

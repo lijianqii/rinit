@@ -24,6 +24,11 @@ use crate::log::rlog;
 /// How much of a read is buffered before splitting into lines.
 const READ_CHUNK: usize = 4096;
 
+/// Hard bound for a single line that has not seen a newline yet. Without this,
+/// a service writing an endless line grows `pending` until PID 1 runs out of
+/// memory.
+const MAX_PENDING_LINE: usize = 64 * 1024;
+
 /// How large the persisted log file may grow before it is truncated
 /// (plan §1.3(7)).
 ///
@@ -266,6 +271,7 @@ async fn pump(reader: OwnedFd, unit: UnitName, sink: Arc<Mutex<Sink>>) {
                     let line: String = pending.drain(..=newline).collect();
                     lines.push(trim_line(&line));
                 }
+                cap_pending(&mut pending);
                 if !lines.is_empty() {
                     let mut sink = lock(&sink);
                     for line in lines {
@@ -289,6 +295,19 @@ async fn pump(reader: OwnedFd, unit: UnitName, sink: Arc<Mutex<Sink>>) {
         let line = trim_line(&pending);
         lock(&sink).push(&unit, &line);
     }
+}
+
+/// Keep an unterminated line bounded and tell the reader it was truncated.
+fn cap_pending(pending: &mut String) {
+    if pending.len() <= MAX_PENDING_LINE {
+        return;
+    }
+    let mut cut = MAX_PENDING_LINE;
+    while cut > 0 && !pending.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    pending.truncate(cut);
+    pending.push_str("[truncated]\n");
 }
 
 /// Strip the line terminator from a captured line.
@@ -381,6 +400,14 @@ mod tests {
             "keeping the newest lines, not the oldest: {written}"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_unterminated_line_is_capped() {
+        let mut pending = "x".repeat(MAX_PENDING_LINE + 1);
+        cap_pending(&mut pending);
+        assert!(pending.len() <= MAX_PENDING_LINE + "[truncated]\n".len());
+        assert!(pending.ends_with("[truncated]\n"));
     }
 
     /// A line left without a trailing newline is still logged.

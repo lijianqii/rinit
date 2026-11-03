@@ -375,7 +375,8 @@ Every tool must pass:
 2. `readelf -d` NEEDED allowlist:
    - `libc.so.6`
    - `libgcc_s.so.1`
-   - `libm.so.6` when genuinely required
+   - `libm.so.6` only after it is also added to the image's runtime libraries
+     (it is not shipped today)
    - `libnss_files.so.2` only if name lookup is explicitly enabled
 3. no static executable, no musl interpreter, no undeclared shared object;
 4. execution from a rootfs that contains only the image's loader and libraries;

@@ -47,6 +47,8 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+[[ "$prefix" =~ ^[A-Za-z0-9._-]+$ ]] ||
+    { echo "soak-matrix: --tag-prefix must match [A-Za-z0-9._-]+" >&2; exit 2; }
 [[ -n "$key" ]] || { echo "soak-matrix: --key is required" >&2; exit 2; }
 for f in "$key" "$aarch64_image" "$arm_image" "$aarch64_kernel" "$arm_kernel"; do
     [[ -e "$f" ]] || { echo "soak-matrix: missing $f" >&2; exit 2; }
@@ -108,6 +110,12 @@ echo "soak-matrix: arm32=$tag_arm pid=$child_arm port=$port_arm"
 echo "soak-matrix: seconds=$seconds feature=$feature"
 
 failed=0
+# Stop the other architecture as soon as the first one fails; waiting for a
+# 24-hour run that is already known to be discarded only wastes QEMU and time.
+wait -n "$child_aarch64" "$child_arm" || failed=1
+if ((failed)); then
+    kill "$child_aarch64" "$child_arm" 2>/dev/null || true
+fi
 wait "$child_aarch64" || failed=1
 wait "$child_arm" || failed=1
 

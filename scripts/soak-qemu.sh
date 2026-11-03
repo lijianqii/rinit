@@ -48,6 +48,8 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+[[ "$tag" =~ ^[A-Za-z0-9._-]+$ ]] ||
+    { echo "error: --tag must match [A-Za-z0-9._-]+" >&2; exit 2; }
 [[ "$port" =~ ^[0-9]+$ ]] && ((10#$port >= 1 && 10#$port <= 65535)) ||
     { echo "error: --port must be 1..65535" >&2; exit 2; }
 [[ "$checkpoint_interval" =~ ^[0-9]+$ ]] ||

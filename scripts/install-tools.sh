@@ -60,10 +60,12 @@ case "$arch" in
 esac
 command -v readelf >/dev/null || die "readelf is not installed"
 
+# Keep this in sync with the runtime libraries copied by build-initramfs.sh.
+# libm is deliberately absent: the image does not ship it, so allowing it here
+# would pass the build and fail at exec time in the guest.
 allowed_needed=(
     libc.so.6
     libgcc_s.so.1
-    libm.so.6
 )
 check_elf() {
     local bin=$1 install_path=$2 budget_kib=$3

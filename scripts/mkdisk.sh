@@ -34,10 +34,12 @@ size_kb=$((used_kb + used_kb / 4 + 16384 + extra_mb * 1024))
 blocks=$(( (size_kb + 3) / 4 ))
 
 mkdir -p "$(dirname "${out}")"
-rm -f "${out}"
+tmp="${out}.tmp.$$"
+tarball=""
+cleanup() { rm -f "${tmp}" "${tarball}"; }
+trap cleanup EXIT
 
 mke2fs_args=(-q -t ext4 -b 4096 -I 256 -m 0 -L rinit -F)
-tarball=""
 use_tar=0
 mke2fs_help="$("${mke2fs}" -h 2>&1 || true)"
 if [[ "${MKDISK_FORCE_DIR:-0}" != 1 ]] &&
@@ -47,11 +49,10 @@ fi
 
 if ((use_tar)); then
     tarball="${out}.tar"
-    trap 'rm -f "${tarball}"' EXIT
     # Older e2fsprogs accepts a tarball directly; its entries are explicitly
     # root:root, so /etc/dropbear, /root/.ssh and the units keep their owner.
     tar --owner=0:0 --group=0:0 -C "${root}" -cf "${tarball}" .
-    "${mke2fs}" "${mke2fs_args[@]}" -d "${tarball}" "${out}" "${blocks}"
+    "${mke2fs}" "${mke2fs_args[@]}" -d "${tarball}" "${tmp}" "${blocks}"
 elif command -v fakeroot >/dev/null 2>&1; then
     # e2fsprogs 1.47.0 and older only accept a directory. `chown` inside
     # fakeroot changes the metadata mke2fs sees, not the build tree.
@@ -59,13 +60,16 @@ elif command -v fakeroot >/dev/null 2>&1; then
         chown -R 0:0 "$1" || exit 1
         shift
         exec "$@"
-    ' sh "${root}" "${mke2fs}" "${mke2fs_args[@]}" -d "${root}" "${out}" "${blocks}"
+    ' sh "${root}" "${mke2fs}" "${mke2fs_args[@]}" -d "${root}" "${tmp}" "${blocks}"
 elif command -v unshare >/dev/null 2>&1 && unshare -r true 2>/dev/null; then
     # Same root-owned view through a user namespace, without fakeroot.
     unshare -r --map-root-user "${mke2fs}" "${mke2fs_args[@]}" \
-        -d "${root}" "${out}" "${blocks}"
+        -d "${root}" "${tmp}" "${blocks}"
 else
     echo "mkdisk: warning: no fakeroot/user namespace; image files keep build-user ownership" >&2
-    "${mke2fs}" "${mke2fs_args[@]}" -d "${root}" "${out}" "${blocks}"
+    "${mke2fs}" "${mke2fs_args[@]}" -d "${root}" "${tmp}" "${blocks}"
 fi
+mv -f "${tmp}" "${out}"
+rm -f "${tarball}"
+trap - EXIT
 echo "mkdisk: wrote ${out} ($(du -h "${out}" | cut -f1), root ${used_kb} KiB)"

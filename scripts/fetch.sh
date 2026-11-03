@@ -14,10 +14,24 @@ if [[ $# -eq 0 ]]; then
     echo "fetch: no URLs given for ${dest}" >&2
     exit 2
 fi
+expected="${SHA256:-}"
+
+verify() {
+    [[ -z "${expected}" ]] && return 0
+    if printf '%s  %s\n' "${expected}" "${dest}" | sha256sum -c --status -; then
+        return 0
+    fi
+    echo "fetch: SHA-256 mismatch for ${dest}" >&2
+    return 1
+}
 
 if [[ -s "${dest}" ]]; then
-    echo "fetch: using cached $(basename "${dest}")"
-    exit 0
+    if verify; then
+        echo "fetch: using cached $(basename "${dest}")"
+        exit 0
+    fi
+    echo "fetch: discarding cached ${dest}" >&2
+    rm -f "${dest}"
 fi
 
 mkdir -p "$(dirname "${dest}")"
@@ -39,6 +53,10 @@ for url in "$@"; do
     echo "fetch: trying ${url}"
     if download "${url}"; then
         mv "${part}" "${dest}"
+        if ! verify; then
+            rm -f "${dest}"
+            exit 1
+        fi
         echo "fetch: saved ${dest} ($(du -h "${dest}" | cut -f1))"
         exit 0
     fi

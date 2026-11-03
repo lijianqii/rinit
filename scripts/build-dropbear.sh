@@ -16,6 +16,7 @@ out="${2:?usage: build-dropbear.sh <target-triple> <out-dir>}"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${here}/.." && pwd)"
 version="${DROPBEAR_VERSION:-2026.94}"
+expected="${DROPBEAR_SHA256:-}"
 tarball="${repo_root}/build/dl/dropbear-${version}.tar.bz2"
 src_root="${repo_root}/build/src"
 case "${triple}" in
@@ -38,6 +39,20 @@ src="${src_root}/dropbear-${version}"
 
 mkdir -p "${repo_root}/build/dl" "${src_root}" "${out}"
 out="$(cd "${out}" && pwd)"
+
+verify() {
+    [[ -z "${expected}" ]] && return 0
+    if printf '%s  %s\n' "${expected}" "${tarball}" | sha256sum -c --status -; then
+        return 0
+    fi
+    echo "error: SHA-256 mismatch for ${tarball}" >&2
+    return 1
+}
+
+if [[ -f "${tarball}" ]] && ! verify; then
+    echo "discarding invalid cached ${tarball}" >&2
+    rm -f "${tarball}"
+fi
 if [[ ! -f "${tarball}" ]]; then
     echo "downloading dropbear ${version}..." >&2
     curl -fsSL --retry 3 --max-time 180 \
@@ -46,6 +61,12 @@ if [[ ! -f "${tarball}" ]]; then
         echo "error: could not download dropbear; put dropbear-${version}.tar.bz2 in build/dl/" >&2
         exit 1
     }
+    if ! verify; then
+        rm -f "${tarball}"
+        exit 1
+    fi
+else
+    verify || exit 1
 fi
 if [[ ! -d "${src}" ]]; then
     tar -C "${src_root}" -xf "${tarball}"

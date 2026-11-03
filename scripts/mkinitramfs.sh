@@ -8,6 +8,8 @@ root="${1:?usage: mkinitramfs.sh <root-dir> <output.cpio.gz>}"
 out="${2:?usage: mkinitramfs.sh <root-dir> <output.cpio.gz>}"
 
 mkdir -p "$(dirname "${out}")"
+tmp="${out}.tmp.$$"
+trap 'rm -f "${tmp}"' EXIT
 # Every entry gets the epoch as its mtime, so the same sources pack into the same
 # bytes. `install` (and busybox's own `make install`) stamp each file with the
 # build time and cpio records it, so without this the image differs by a few bytes
@@ -33,5 +35,7 @@ find "${root}" -exec touch -h -d @0 {} +
 # It does *not* touch mtimes (that is the `touch` above) - a build needs both, and
 # with both the same tree packs to the same bytes, which is what lets the README
 # quote a size instead of an approximation.
-( cd "${root}" && find . -print0 | cpio --null -o --format=newc --quiet --owner=0:0 --reproducible | gzip -9 ) >"${out}"
+( cd "${root}" && find . -print0 | cpio --null -o --format=newc --quiet --owner=0:0 --reproducible | gzip -9 ) >"${tmp}"
+mv -f "${tmp}" "${out}"
+trap - EXIT
 echo "mkinitramfs: wrote ${out} ($(du -h "${out}" | cut -f1))"
