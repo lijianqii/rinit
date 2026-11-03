@@ -7,11 +7,12 @@
 
 use std::ffi::{CStr, CString};
 use std::os::fd::AsRawFd;
+use std::time::{Duration, Instant};
 
 use rinit_core::unit::sandbox::{Sandbox, SandboxStep};
 
 use crate::error::SyscallError;
-use crate::syscall::{cred, fs, ioctl_request, wait};
+use crate::syscall::{cred, fs, ioctl_request};
 
 /// The attributes a spawned service gets.
 ///
@@ -616,7 +617,35 @@ fn die_reporting(report_write: libc::c_int, step: ChildStep, errno: i32) -> ! {
 fn read_report(fd: libc::c_int) -> Result<Option<(ChildStep, i32)>, SyscallError> {
     let mut buf = [0u8; REPORT_LEN];
     let mut filled = 0usize;
+    let deadline = Instant::now() + Duration::from_secs(5);
     while filled < REPORT_LEN {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(SyscallError::new("child report", libc::ETIMEDOUT));
+        }
+        let mut descriptor = libc::pollfd {
+            fd,
+            events: libc::POLLIN | libc::POLLHUP,
+            revents: 0,
+        };
+        // SAFETY: `descriptor` is one valid pollfd for the child report pipe.
+        let ready = unsafe {
+            libc::poll(
+                &mut descriptor,
+                1,
+                remaining.as_millis().min(i32::MAX as u128) as i32,
+            )
+        };
+        if ready < 0 {
+            let error = SyscallError::last_os_error("poll");
+            if error.errno() == libc::EINTR {
+                continue;
+            }
+            return Err(error);
+        }
+        if ready == 0 {
+            return Err(SyscallError::new("child report", libc::ETIMEDOUT));
+        }
         let Some(destination) = buf.get_mut(filled..) else {
             break;
         };
@@ -659,9 +688,35 @@ fn read_report(fd: libc::c_int) -> Result<Option<(ChildStep, i32)>, SyscallError
 /// point is that the caller's error does not leave a corpse behind for the main
 /// loop's reaper to find later.
 fn reap_failed_spawn(pid: libc::pid_t) {
-    // ECHILD here would mean the main loop's reaper got there first, which is
-    // the outcome this is trying to produce anyway.
-    let _ = wait::wait_child(pid);
+    let mut status = 0;
+    // If it is still alive (for example, stuck before exec), kill it. If it has
+    // already exited, waitpid reaps it without ever sending a signal to a pid
+    // that might have been reused.
+    // SAFETY: `status` is valid storage and `pid` is the child we forked.
+    let rc = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+    if rc == pid || (rc < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD))
+    {
+        return;
+    }
+    if rc == 0 {
+        // SAFETY: this is our unreaped child (waitpid said it is still alive).
+        let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        // SAFETY: `status` is valid storage and `pid` is our child.
+        let rc = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        if rc == pid
+            || (rc < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD))
+        {
+            return;
+        }
+        if Instant::now() >= deadline {
+            // The main loop will reap it if it ever leaves the kernel.
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }
 
 /// The NULL-terminated `char *` array `execve` wants.

@@ -1589,6 +1589,11 @@ impl UnitManager {
                     // to signal cannot leave the flag dangling.
                     rt.state = UnitState::Deactivating;
                     rt.restart_after_stop = true;
+                    if rt.config.timeout_stop_sec == 0 {
+                        let _ = process::kill_process_group(pid, libc::SIGKILL);
+                    } else {
+                        rt.kill_at = Some(crate::deadline::after_secs(rt.config.timeout_stop_sec));
+                    }
                 }
                 Err(e) if e.errno() == libc::ESRCH => {
                     // The unit died on its own and its exit is on its way; let

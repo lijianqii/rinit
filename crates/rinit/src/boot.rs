@@ -377,7 +377,13 @@ async fn supervise(
             // up, and either way the clock on being idle starts again.
             manager.note_connection(&unit);
             if !manager.is_running(&unit) {
-                match start_unit(manager, supervised.notify, supervised.logs, &unit).await {
+                // Register the start in the Job queue as well as spawning it:
+                // the queue is what `shutdown_order()` reads, so a
+                // socket-activated service must have a `Started` target or
+                // shutdown would leave it running while filesystems unmount.
+                let effect = manager.request_start(&unit, RequestSource::Dependency);
+                match apply_effect(manager, supervised.notify, supervised.logs, &unit, effect).await
+                {
                     Ok(true) => rlog!("{unit}: started by a connection"),
                     Ok(false) => rlog!("warning: {unit} did not start for its connection"),
                     Err(e) => rlog!("error: cannot start {unit} for its connection: {e}"),
