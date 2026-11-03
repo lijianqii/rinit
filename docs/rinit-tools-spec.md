@@ -132,16 +132,17 @@ stat [-L] [-c FORMAT] [-t] FILE...
 `-m` allows missing components. `which` searches `PATH`, not the shell's
 command table.
 
-The console login pair is installed at the standard paths:
+The console login pair uses the r-prefixed names. `replace-system` removes the
+old BusyBox links:
 
 | BusyBox applet | install path | source binary |
 | --- | --- | --- |
-| `getty` | `/sbin/getty` | `rgetty` |
-| `login` | `/bin/login` | `rlogin` |
+| `getty` | `/sbin/rgetty` | `rgetty` |
+| `login` | `/bin/rlogin` | `rlogin` |
 
 `rgetty` opens the tty, creates the session, configures the terminal, writes a
 `LOGIN_PROCESS` utmp/wtmp record, prints the login prompt and waits for
-`rlogin`. `rlogin` reads `/etc/passwd` and `/etc/shadow`, verifies `$1$` MD5,
+`/bin/rlogin`. `rlogin` reads `/etc/passwd` and `/etc/shadow`, verifies `$1$` MD5,
 `$5$` SHA-256 and `$6$` SHA-512 crypt hashes in-process (the target image has no
 libcrypt), writes a `USER_PROCESS` record, drops privileges and execs the
 user's shell; `rgetty` writes `DEAD_PROCESS` when the session ends. Root login

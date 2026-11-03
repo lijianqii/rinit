@@ -6,8 +6,8 @@
 # actual restart; from M1 the directive is parsed and honoured by the contract
 # but nothing acts on it yet.
 #
-# The path is `/sbin/getty`; the replace-system image installs the independent
-# `rgetty` ELF there, which opens the tty and hands it to `/bin/login` (`rlogin`).
+# The replace-system image installs the independent `rgetty` ELF at
+# `/sbin/rgetty`; it opens the tty and hands it to `/bin/rlogin`.
 [Unit]
 Description=Serial console getty
 Requires=rinit-init.target
@@ -15,5 +15,5 @@ After=rinit-init.target
 
 [Service]
 Type=simple
-ExecStart=/sbin/getty -L ttyAMA0 115200 vt100
+ExecStart=/sbin/rgetty -L ttyAMA0 115200 vt100
 Restart=always

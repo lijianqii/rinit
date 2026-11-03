@@ -30,7 +30,7 @@ fn parse_baud(value: &str) -> Result<u32, String> {
 fn parse_args(args: &[String]) -> Result<Options, String> {
     let mut options = Options {
         local: false,
-        login: "/bin/login".to_string(),
+        login: "/bin/rlogin".to_string(),
         host: None,
         no_prompt: false,
         tty: String::new(),
@@ -420,7 +420,7 @@ mod tests {
         assert_eq!(options.tty, "ttyAMA0");
         assert_eq!(options.baud, 115200);
         assert_eq!(options.term.as_deref(), Some("vt100"));
-        assert_eq!(options.login, "/bin/login");
+        assert_eq!(options.login, "/bin/rlogin");
     }
 
     #[test]

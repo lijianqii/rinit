@@ -261,7 +261,7 @@ After=rinit-init.target
 
 [Service]
 Type=simple
-ExecStart=/sbin/getty -L ttyAMA0 115200 vt100
+ExecStart=/sbin/rgetty -L ttyAMA0 115200 vt100
 Restart=always
 ```
 
