@@ -431,6 +431,11 @@ impl UnitManager {
         self.listen_fds.get(unit).copied()
     }
 
+    /// Forget a listening socket a reload removed or replaced.
+    pub fn clear_listener(&mut self, unit: &UnitName) {
+        self.listen_fds.remove(unit);
+    }
+
     /// Give the manager the directory's template units (plan §7.7).
     pub fn set_templates(&mut self, templates: BTreeMap<String, String>) {
         self.templates = templates;
@@ -955,11 +960,17 @@ impl UnitManager {
     /// A dependent that already has a process is left alone: it is running, and
     /// stopping it here would turn one failure into a cascade.
     pub fn fail_start(&mut self, unit: &UnitName) -> Vec<UnitName> {
-        if let Some(rt) = self.units.get_mut(unit)
-            && !matches!(rt.state, UnitState::Failed(_))
-        {
-            rt.pid = None;
-            rt.state = UnitState::Failed(FailedReason::StartFailure);
+        if let Some(rt) = self.units.get_mut(unit) {
+            // A failed start is terminal until an explicit `start` or
+            // `reset-failed`: a retry armed by the exit that caused the failure
+            // must not survive it.
+            rt.restart_at = None;
+            rt.start_deadline = None;
+            rt.kill_at = None;
+            if !matches!(rt.state, UnitState::Failed(_)) {
+                rt.pid = None;
+                rt.state = UnitState::Failed(FailedReason::StartFailure);
+            }
         }
 
         // `Requires=` is transitive: a target that hard-requires another target
@@ -2188,12 +2199,41 @@ fn find_daemon(
     Ok(pid)
 }
 
+/// One pass of the global child reaper.
+pub struct ReapReport {
+    /// State changes for the units the reaper recognised.
+    pub outcomes: Vec<Outcome>,
+    /// Exits the manager does not own: `ExecStartPre=`/`ExecStartPost=`
+    /// commands, or orphans reparented to PID 1. The caller decides whether it
+    /// was waiting for one; discarding them here would turn a command's real
+    /// exit status into a lost status.
+    pub unclaimed: Vec<(libc::pid_t, ExitOutcome)>,
+}
+
+impl UnitManager {
+    /// Whether `pid` belongs to a unit, a probe, or an `ExecStop=` command.
+    ///
+    /// Checked before reaping because [`on_child_exit`](Self::on_child_exit)
+    /// returns `None` both for a child it handled and for one it has never
+    /// heard of; the two cases need different treatment now that auxiliary
+    /// commands also wait for their exit.
+    fn owns_child(&self, pid: libc::pid_t) -> bool {
+        self.units.values().any(|rt| {
+            rt.pid == Some(pid) || rt.probe_pid == Some(pid) || rt.exec_stop_pid == Some(pid)
+        })
+    }
+}
+
 /// Reap every exited child and feed the results to the manager.
 ///
-/// Returns what each exit meant, in reap order. A pid rinit does not own is
-/// skipped: it was reaped by someone else, or already accounted for.
-pub fn reap_into_manager(manager: &mut UnitManager) -> Vec<Outcome> {
-    let mut out = Vec::new();
+/// Unit, probe and `ExecStop=` children are applied here; an exit the manager
+/// does not own is returned to the caller, which may be waiting for an
+/// `ExecStartPre=`/`ExecStartPost=` command's real status.
+pub fn reap_into_manager(manager: &mut UnitManager) -> ReapReport {
+    let mut report = ReapReport {
+        outcomes: Vec::new(),
+        unclaimed: Vec::new(),
+    };
     for ev in wait::reap_children() {
         let (pid, outcome) = match ev {
             wait::ChildExit::Exited { pid, code } => (
@@ -2206,12 +2246,15 @@ pub fn reap_into_manager(manager: &mut UnitManager) -> Vec<Outcome> {
             ),
             wait::ChildExit::Signaled { pid, signal } => (pid, ExitOutcome::Signalled(signal)),
         };
+        let owned = manager.owns_child(pid);
         if let Some(result) = manager.on_child_exit(pid, outcome) {
             rlog!("reaped pid {pid}");
-            out.push(result);
+            report.outcomes.push(result);
+        } else if !owned {
+            report.unclaimed.push((pid, outcome));
         }
     }
-    out
+    report
 }
 
 fn proc_usage(pid: libc::pid_t) -> ResourceUsage {
@@ -3572,6 +3615,28 @@ mod tests {
         assert_eq!(rt.state, UnitState::Inactive);
         assert!(rt.pid.is_none(), "it must not be started");
         assert_eq!(rt.backoff.failures_in_window(), 0);
+    }
+
+    /// A failed start is terminal even if the exit that caused it armed a
+    /// restart: `Restart=` must not resurrect a unit whose start failed.
+    #[test]
+    fn a_failed_start_cancels_an_armed_restart() {
+        let mut m = manager_with("a.service", RestartPolicy::Always);
+        let unit = UnitName::parse("a.service").unwrap();
+        {
+            let rt = m.units.get_mut(&unit).unwrap();
+            rt.restart_at = Some(Instant::now());
+            rt.start_deadline = Some(Instant::now());
+            rt.kill_at = Some(Instant::now());
+        }
+
+        m.fail_start(&unit);
+
+        let rt = m.get(&unit).unwrap();
+        assert!(matches!(rt.state, UnitState::Failed(_)));
+        assert!(rt.restart_at.is_none());
+        assert!(rt.start_deadline.is_none());
+        assert!(rt.kill_at.is_none());
     }
 
     /// `target_of` reports what the queue is asking for, which is what

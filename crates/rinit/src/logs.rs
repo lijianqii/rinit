@@ -9,6 +9,7 @@
 //! end the child inherits stays *blocking*: a service that fills the pipe must
 //! block, not lose output or get an error it does not expect.
 
+use std::collections::VecDeque;
 use std::io::Write;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
@@ -38,26 +39,108 @@ const MAX_PENDING_LINE: usize = 64 * 1024;
 /// go.
 const LOG_FILE_MAX_BYTES: u64 = 1024 * 1024;
 
+/// How many lines may wait for the persisted log to catch up.
+///
+/// This is the bound the file's own ring used to lack: a service that logs in a
+/// tight loop must cost a fixed amount of memory even when the disk is slower
+/// than the service, and the oldest line is the one worth losing.
+const LOG_QUEUE_MAX_LINES: usize = 4096;
+/// Byte bound for the same queue. A line is at most `MAX_PENDING_LINE` plus
+/// its unit prefix, so a handful of the largest lines still fit.
+const LOG_QUEUE_MAX_BYTES: usize = 256 * 1024;
+/// How much one supervisor pass writes. Bounded so a backlog cannot hold the
+/// loop for an unbounded time; the rest waits for the next pass.
+const LOG_DRAIN_MAX_LINES: usize = 256;
+const LOG_DRAIN_MAX_BYTES: usize = 32 * 1024;
+
 /// The shared log ring and the tasks filling it.
 pub struct ServiceLogs {
-    /// The ring, and the file it is mirrored to if there is one. One lock, so a
-    /// line reaches both in the same order it was produced.
-    sink: Arc<Mutex<Sink>>,
+    /// The in-memory ring. Captured lines reach it without any file I/O.
+    buffer: Arc<Mutex<LogBuffer>>,
+    /// The persisted sink, when one was configured. Arc so a pump task created
+    /// before `persist_to` still sees the file once it is installed.
+    file: Arc<Mutex<Option<Arc<FileQueue>>>>,
 }
 
-/// Where captured lines go: the ring always, a file when one was configured.
-struct Sink {
-    buffer: LogBuffer,
-    file: Option<LogFile>,
+/// Lines waiting for the writer, and the writer itself.
+///
+/// The queue and the file have separate locks so enqueueing never waits for a
+/// disk write. The supervisor drains the queue in bounded batches; rinit stays
+/// single-threaded, which is what keeps `fork()` safe (plan §2.1⑤).
+struct FileQueue {
+    state: Mutex<QueueState>,
+    writer: Mutex<LogFile>,
 }
 
-impl Sink {
-    /// The one place a line enters the log, in either direction.
-    fn push(&mut self, unit: &UnitName, line: &str) {
-        self.buffer.push(unit, line);
-        if let Some(file) = self.file.as_mut() {
-            file.append(unit, line);
+#[derive(Default)]
+struct QueueState {
+    lines: VecDeque<String>,
+    bytes: usize,
+    /// Lines dropped because the queue was full, reported on the next drain.
+    dropped: u64,
+}
+
+impl FileQueue {
+    fn new(file: LogFile) -> Self {
+        FileQueue {
+            state: Mutex::new(QueueState::default()),
+            writer: Mutex::new(file),
         }
+    }
+
+    fn enqueue(&self, text: String) {
+        let mut state = lock(&self.state);
+        state.bytes = state.bytes.saturating_add(text.len());
+        state.lines.push_back(text);
+        while state.lines.len() > LOG_QUEUE_MAX_LINES || state.bytes > LOG_QUEUE_MAX_BYTES {
+            let Some(oldest) = state.lines.pop_front() else {
+                break;
+            };
+            state.bytes = state.bytes.saturating_sub(oldest.len());
+            state.dropped += 1;
+        }
+    }
+
+    /// Write at most one bounded batch, returning how many lines were written.
+    fn drain(&self) -> usize {
+        let (batch, dropped) = {
+            let mut state = lock(&self.state);
+            let mut batch = VecDeque::new();
+            let mut bytes = 0usize;
+            while batch.len() < LOG_DRAIN_MAX_LINES {
+                let Some(next) = state.lines.front() else {
+                    break;
+                };
+                if !batch.is_empty() && bytes + next.len() > LOG_DRAIN_MAX_BYTES {
+                    break;
+                }
+                let Some(line) = state.lines.pop_front() else {
+                    break;
+                };
+                state.bytes = state.bytes.saturating_sub(line.len());
+                bytes += line.len();
+                batch.push_back(line);
+            }
+            let dropped = state.dropped;
+            state.dropped = 0;
+            (batch, dropped)
+        };
+
+        let mut text = String::new();
+        if dropped > 0 {
+            text.push_str(&format!(
+                "rinit: warning: dropped {dropped} queued log line(s)\n"
+            ));
+        }
+        for line in &batch {
+            text.push_str(line);
+        }
+        if !text.is_empty() {
+            // One write per batch: a serialized log is worth the extra buffer,
+            // and it keeps a slow disk from costing one syscall per line.
+            lock(&self.writer).append_text(&text);
+        }
+        batch.len()
     }
 }
 
@@ -108,12 +191,12 @@ impl LogFile {
         })
     }
 
-    /// Append one line, truncating first if that would pass the bound.
-    fn append(&mut self, unit: &UnitName, line: &str) {
+    /// Append one already-formatted record, truncating first if that would pass
+    /// the bound.
+    fn append_text(&mut self, text: &str) {
         if self.written >= self.max_bytes {
             self.truncate();
         }
-        let text = format!("{unit}: {line}\n");
         match self.file.write_all(text.as_bytes()) {
             Ok(()) => {
                 self.written += text.len() as u64;
@@ -153,10 +236,8 @@ impl ServiceLogs {
     /// A logs store with the default buffer bounds and no file.
     pub fn new() -> Self {
         ServiceLogs {
-            sink: Arc::new(Mutex::new(Sink {
-                buffer: LogBuffer::with_defaults(),
-                file: None,
-            })),
+            buffer: Arc::new(Mutex::new(LogBuffer::with_defaults())),
+            file: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -168,7 +249,7 @@ impl ServiceLogs {
     pub fn persist_to(&self, path: &Path) {
         match LogFile::open(path, LOG_FILE_MAX_BYTES) {
             Ok(file) => {
-                lock(&self.sink).file = Some(file);
+                *lock(&self.file) = Some(Arc::new(FileQueue::new(file)));
                 rlog!("logging to {}", path.display());
             }
             Err(e) => {
@@ -192,24 +273,57 @@ impl ServiceLogs {
         let (reader, writer) = fs::pipe()?;
         fs::set_nonblocking(reader.as_raw_fd(), true)?;
 
-        let sink = Arc::clone(&self.sink);
+        let buffer = Arc::clone(&self.buffer);
+        let file = Arc::clone(&self.file);
         let unit = unit.clone();
         // Spawning here is safe: `capture` is only called from the async boot
         // path, which runs inside the runtime.
-        tokio::spawn(async move { pump(reader, unit, sink).await });
+        tokio::spawn(async move { pump(reader, unit, buffer, file).await });
         Ok(writer)
+    }
+
+    /// Write one bounded batch of queued lines to the persisted log.
+    ///
+    /// Called from the supervisor loop, not from a log pump: a service that
+    /// writes faster than the disk then costs queue space, never an unbounded
+    /// wait inside the reader task.
+    pub fn drain_file(&self) {
+        let Some(queue) = lock(&self.file).as_ref().map(Arc::clone) else {
+            return;
+        };
+        queue.drain();
+    }
+
+    /// Drain the persisted log completely, for shutdown.
+    pub fn flush_file(&self) {
+        let Some(queue) = lock(&self.file).as_ref().map(Arc::clone) else {
+            return;
+        };
+        // Bounded: a service still flooding at shutdown must not hold the
+        // machine here. The queue itself is bounded, so this always ends.
+        for _ in 0..LOG_QUEUE_MAX_LINES {
+            if queue.drain() == 0 {
+                break;
+            }
+        }
     }
 
     /// The most recent lines, from one unit or from all of them.
     ///
     /// `count == 0` means "everything buffered".
     pub fn tail(&self, unit: Option<&UnitName>, count: usize) -> Vec<LogLine> {
-        let sink = lock(&self.sink);
+        let buffer = lock(&self.buffer);
         let count = if count == 0 { usize::MAX } else { count };
         match unit {
-            Some(unit) => sink.buffer.tail_for(unit, count),
-            None => sink.buffer.tail(count),
+            Some(unit) => buffer.tail_for(unit, count),
+            None => buffer.tail(count),
         }
+    }
+
+    /// Test seam: the same path a captured line takes.
+    #[cfg(test)]
+    fn push(&self, unit: &UnitName, line: &str) {
+        push_captured(&self.buffer, &self.file, unit, line);
     }
 }
 
@@ -219,17 +333,42 @@ impl Default for ServiceLogs {
     }
 }
 
-/// Lock the buffer, surviving a poisoned mutex.
+/// Lock a log mutex, surviving poisoning.
 ///
-/// A panic *while holding this lock* would mean a bug in `LogBuffer`, and the
-/// data behind it is plain text: recovering is strictly better than turning
-/// logs into a crash.
-fn lock(sink: &Arc<Mutex<Sink>>) -> std::sync::MutexGuard<'_, Sink> {
-    sink.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+/// A panic *while holding one* would mean a bug in the buffer or the file
+/// writer, and the data behind it is plain text: recovering is strictly better
+/// than turning logs into a crash.
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Record one captured line in the ring and enqueue it for the file.
+///
+/// The buffer lock is held while enqueueing so the two destinations see the same
+/// order across concurrent pumps. Enqueueing is the only work done here: the
+/// disk write belongs to the supervisor.
+fn push_captured(
+    buffer: &Arc<Mutex<LogBuffer>>,
+    file: &Arc<Mutex<Option<Arc<FileQueue>>>>,
+    unit: &UnitName,
+    line: &str,
+) {
+    let mut buffer = lock(buffer);
+    buffer.push(unit, line);
+    if let Some(queue) = lock(file).as_ref() {
+        queue.enqueue(format!("{unit}: {line}\n"));
+    }
 }
 
 /// Read `reader` until end-of-file, appending whole lines to `buffer`.
-async fn pump(reader: OwnedFd, unit: UnitName, sink: Arc<Mutex<Sink>>) {
+async fn pump(
+    reader: OwnedFd,
+    unit: UnitName,
+    buffer: Arc<Mutex<LogBuffer>>,
+    file: Arc<Mutex<Option<Arc<FileQueue>>>>,
+) {
     // SAFETY: `reader` is an `OwnedFd`, so this call owns a valid descriptor and
     // never closes or replaces it while the `AsyncFd` lives; that is exactly the
     // obligation `register` documents. The safe alternative, `AsyncFd::new`, is
@@ -272,11 +411,8 @@ async fn pump(reader: OwnedFd, unit: UnitName, sink: Arc<Mutex<Sink>>) {
                     lines.push(trim_line(&line));
                 }
                 cap_pending(&mut pending);
-                if !lines.is_empty() {
-                    let mut sink = lock(&sink);
-                    for line in lines {
-                        sink.push(&unit, &line);
-                    }
+                for line in lines {
+                    push_captured(&buffer, &file, &unit, &line);
                 }
             }
             // A real read error (not "would block", which `try_io` turns into
@@ -293,7 +429,7 @@ async fn pump(reader: OwnedFd, unit: UnitName, sink: Arc<Mutex<Sink>>) {
     // A final partial line with no trailing newline still belongs in the log.
     if !pending.is_empty() {
         let line = trim_line(&pending);
-        lock(&sink).push(&unit, &line);
+        push_captured(&buffer, &file, &unit, &line);
     }
 }
 
@@ -366,8 +502,9 @@ mod tests {
         let logs = ServiceLogs::new();
         logs.persist_to(&path);
         let app = unit("app.service");
-        lock(&logs.sink).push(&app, "first");
-        lock(&logs.sink).push(&app, "second");
+        logs.push(&app, "first");
+        logs.push(&app, "second");
+        logs.drain_file();
 
         assert_eq!(logs.tail(Some(&app), 0).len(), 2, "the ring still has them");
         let written = std::fs::read_to_string(&path).expect("the log file");
@@ -385,7 +522,7 @@ mod tests {
         let mut file = LogFile::open(&path, 64).expect("open");
         let app = unit("app.service");
         for _ in 0..20 {
-            file.append(&app, "0123456789");
+            file.append_text(&format!("{app}: 0123456789\n"));
         }
 
         let written = std::fs::read_to_string(&path).expect("read back");
@@ -398,6 +535,36 @@ mod tests {
         assert!(
             written.ends_with("app.service: 0123456789\n"),
             "keeping the newest lines, not the oldest: {written}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The persisted queue is bounded: a service logging faster than the disk
+    /// costs memory in the queue, not in PID 1's address space. The oldest line
+    /// goes and the file says how many.
+    #[test]
+    fn a_full_file_queue_drops_the_oldest_and_reports_it() {
+        let path = std::env::temp_dir().join(format!("rinit-logs-queue-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let queue = FileQueue::new(LogFile::open(&path, 1 << 20).expect("open"));
+        let total = LOG_QUEUE_MAX_LINES + 10;
+        for line in 0..total {
+            queue.enqueue(format!("app.service: line {line}\n"));
+        }
+        while queue.drain() > 0 {}
+
+        let written = std::fs::read_to_string(&path).expect("read back");
+        assert!(
+            written.contains("dropped 10 queued log line(s)"),
+            "the loss must be visible: {written}"
+        );
+        assert!(
+            !written.contains("app.service: line 0\n"),
+            "the oldest lines are the ones dropped"
+        );
+        assert!(
+            written.contains(&format!("app.service: line {}\n", total - 1)),
+            "the newest line must survive"
         );
         let _ = std::fs::remove_file(&path);
     }

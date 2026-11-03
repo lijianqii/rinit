@@ -26,12 +26,14 @@
 //! references to it, in the same reload.
 
 use std::collections::BTreeSet;
+use std::path::Path;
 
-use rinit_core::{RequestSource, UnitName};
+use rinit_core::{RequestSource, UnitConfig, UnitName};
 use rinit_runtime::RuntimeError;
 
+use crate::activation::Activated;
 use crate::args::Config;
-use crate::boot::apply_effect;
+use crate::boot::{StartCoordinator, apply_effect};
 use crate::log::rlog;
 use crate::logs::ServiceLogs;
 use crate::manager;
@@ -126,6 +128,8 @@ pub async fn reload(
     manager: &mut UnitManager,
     notify: &mut NotifyHub,
     logs: &ServiceLogs,
+    activation: &mut Activated,
+    starts: &mut StartCoordinator,
 ) -> Result<Report, RuntimeError> {
     // The one fallible step, and it is fallible *before* anything changes.
     let plan = manager::plan_boot(&cfg.unit_dir, &cfg.default_target)?;
@@ -153,6 +157,10 @@ pub async fn reload(
             apply_effect(manager, notify, logs, &name, effect).await?;
             report.stopped.push(name.clone());
         }
+        // A removed unit must not keep a live socket: a connection would still
+        // wake the main loop for a name the directory no longer defines.
+        activation.remove(&name);
+        manager.clear_listener(&name);
         manager.retire(&name);
         report.removed.push(name);
     }
@@ -170,6 +178,12 @@ pub async fn reload(
             ConfigChange::Deferred => report.deferred.push(name),
             ConfigChange::Unchanged => report.unchanged += 1,
         }
+        // Socket activation is an rinit-owned resource, not the service's
+        // process, so the directory's current definition wins even when the
+        // running unit defers the rest of the change: a socket that moved must
+        // not keep pointing at the old path, and a removed one must stop
+        // waking the loop for a unit that will never start.
+        reconcile_socket(activation, manager, config);
     }
 
     // 3. Start only what the boot target pulls in, and in the schedule's order -
@@ -180,9 +194,20 @@ pub async fn reload(
         if !added.contains(name) {
             continue;
         }
-        let effect = manager.request_start(name, RequestSource::Dependency);
-        if apply_effect(manager, notify, logs, name, effect).await? {
-            report.started.push(name.clone());
+        // Like boot, a socket-activated unit is bound rather than started: the
+        // first connection is what brings it up.
+        if manager::config_of(&plan, name).is_some_and(|config| config.socket_activate.is_some()) {
+            rlog!("{name}: waiting for a connection");
+            continue;
+        }
+        match manager.request_start(name, RequestSource::Dependency) {
+            Some(effect) => match starts.begin_effect(manager, name, effect) {
+                Ok(()) => report.started.push(name.clone()),
+                Err(e) => rlog!("warning: cannot start {name}: {e}"),
+            },
+            // A stopping unit is queued by the manager; the supervisor will
+            // start it when the stop lands.
+            None => rlog!("{name}: start queued behind its stop"),
         }
     }
 
@@ -200,6 +225,43 @@ pub async fn reload(
     }
     rlog!("{}", report.summary());
     Ok(report)
+}
+
+/// Make rinit's held socket match `config`'s `SocketActivate=`.
+///
+/// Binding is idempotent for an unchanged path; a changed path replaces the old
+/// socket and its watcher. A bind failure is logged and leaves the unit without
+/// a listener, which is visible both in `rctl status` and in the fact that the
+/// service is not started by a connection.
+fn reconcile_socket(activation: &mut Activated, manager: &mut UnitManager, config: &UnitConfig) {
+    let unit = &config.name;
+    let desired = config.socket_activate.as_deref();
+    let current = activation.path_of(unit).map(Path::to_path_buf);
+    match (desired, current.as_deref()) {
+        (None, None) => {}
+        (None, Some(_)) => {
+            activation.remove(unit);
+            manager.clear_listener(unit);
+            rlog!("{unit}: socket activation removed");
+        }
+        (Some(path), Some(current)) if current == Path::new(path) => {
+            if let Some(fd) = activation.listener_fd(unit) {
+                manager.set_listener(unit, fd);
+            }
+        }
+        (Some(path), _) => {
+            activation.remove(unit);
+            manager.clear_listener(unit);
+            match activation.bind(unit, Path::new(path)) {
+                Ok(()) => {
+                    if let Some(fd) = activation.listener_fd(unit) {
+                        manager.set_listener(unit, fd);
+                    }
+                }
+                Err(e) => rlog!("error: {unit}: cannot bind {path}: {e}"),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -220,6 +282,39 @@ mod tests {
             report.summary(),
             "reload: 0 added (0 started), 0 changed (0 deferred), 0 removed (0 stopped), 0 unchanged"
         );
+    }
+
+    /// A changed `SocketActivate=` is rebound immediately, and removing the
+    /// directive takes the socket and watcher away. A stale socket would keep
+    /// waking the loop for a path the unit no longer owns.
+    #[tokio::test(flavor = "current_thread")]
+    async fn socket_activation_follows_the_reloaded_definition() {
+        let dir = std::env::temp_dir().join(format!("rinit-reload-socket-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let first = dir.join("first.sock");
+        let second = dir.join("second.sock");
+
+        let unit = name("api.service");
+        let mut manager = UnitManager::new();
+        let mut activation = Activated::disabled();
+        let mut config = UnitConfig::new(unit.clone());
+        config.socket_activate = Some(first.display().to_string());
+
+        reconcile_socket(&mut activation, &mut manager, &config);
+        assert!(first.exists());
+        assert!(manager.listener_fd(&unit).is_some());
+
+        config.socket_activate = Some(second.display().to_string());
+        reconcile_socket(&mut activation, &mut manager, &config);
+        assert!(!first.exists(), "the old path must be released");
+        assert!(second.exists());
+        assert!(manager.listener_fd(&unit).is_some());
+
+        config.socket_activate = None;
+        reconcile_socket(&mut activation, &mut manager, &config);
+        assert!(!second.exists());
+        assert!(manager.listener_fd(&unit).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The lines name each action once, in the order a reader needs: what went

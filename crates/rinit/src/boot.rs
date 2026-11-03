@@ -9,7 +9,9 @@
 //! unit directory, resolves the dependency graph, and starts each *level* of
 //! the schedule in parallel before moving on (plan §3 M1).
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::os::fd::AsRawFd;
+use std::time::{Duration, Instant};
 
 use rinit_core::{
     Effect, ExitOutcome, JobTarget, ListFormat, Request, RequestSource, ServiceKind, Status,
@@ -17,6 +19,7 @@ use rinit_core::{
 };
 use rinit_runtime::syscall::{process, reboot, signal};
 use rinit_runtime::{RuntimeError, Signal, SignalSet};
+use tokio::sync::oneshot;
 
 use crate::activation::Activated;
 use crate::args::Config;
@@ -45,13 +48,6 @@ const SHUTDOWN_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 /// fresh signal. Draining once a second independently of the signal closes that
 /// gap without turning the loop into a busy poll.
 const HOUSEKEEPING_POLL: std::time::Duration = std::time::Duration::from_secs(1);
-
-/// How often a `NeedsSocket=` wait looks for the path (plan §7.8).
-///
-/// A directory lookup, not a syscall on the socket: frequent enough that a
-/// provider which creates it a moment later is not a visible delay, cheap enough
-/// that the wait costs nothing while it is happening.
-const SOCKET_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// Per-unit stop timeout under power failure (plan §7.1): essentially no time
 /// to be graceful, so the budget is capped hard.
@@ -165,6 +161,9 @@ pub async fn run(cfg: Config) -> Result<(), RuntimeError> {
             &mut activation,
         )
         .await;
+        // The service pipes are closed by now; write whatever they queued before
+        // the machine goes down. The ring remains the in-memory source of truth.
+        logs.flush_file();
         activation.disarm();
         // Graceful shutdown disarms the hardware (plan §7.5's magic close). A
         // hung loop never gets here, and that is the mechanism.
@@ -248,34 +247,41 @@ async fn supervise(
     // much smaller budget (plan §7.1).
     let mut fast = false;
     let mut action = ShutdownAction::Reboot;
+    let mut starts = StartCoordinator::default();
+    // Last activation per socket, so a listener that stays readable does not
+    // spawn the service on every watcher tick.
+    let mut socket_activations: BTreeMap<UnitName, Instant> = BTreeMap::new();
     loop {
-        // Drain every exited child before doing anything else. The signal path
-        // below covers the normal case, but a zombie that was reparented to PID 1
-        // after its parent died may arrive without a fresh SIGCHLD; the periodic
-        // arm in `select!` guarantees this also runs on an otherwise idle loop.
-        for outcome in reap_into_manager(manager) {
+        // Drain every exited child before advancing starts: a `oneshot` or
+        // `forking` unit's readiness is a state change the reaper makes, and an
+        // `ExecStartPre=` exit has to reach its flow rather than be discarded.
+        for outcome in starts.reap(manager) {
             log_outcome(&outcome);
         }
+        // Advance each start one step. Nothing here waits: a slow socket, a
+        // conflicting unit or a long `ExecStartPre=` returns to this loop.
+        starts.advance(manager, supervised.notify, supervised.logs);
         // Plan §7.5's health checkpoint: the feed happens here, in the loop that
         // starts services, reaps children and answers `rctl` - so a loop that
         // stops iterating stops feeding, and the hardware resets the machine. A
         // timer thread would keep feeding a wedged init.
         watchdog.feed_if_due();
+        // Persist one bounded batch of captured lines. The log pumps only
+        // enqueue, so a slow disk can delay the file without delaying a service
+        // or holding the log mutex across a write. Feeding before this keeps a
+        // slow write from eating the feed's whole margin.
+        supervised.logs.drain_file();
         // Service anything already due before blocking, so a zero-length timer
         // does not wait for the next unrelated wake-up.
         for unit in manager.due_restarts() {
-            match start_unit(manager, supervised.notify, supervised.logs, &unit).await {
-                Ok(true) => run_start_post(manager, &unit).await,
-                Ok(false) => {}
-                Err(e) => rlog!("error: restart of {unit} failed: {e}"),
+            if let Err(e) = starts.begin(manager, &unit, StartCompletion::AtReady) {
+                rlog!("error: restart of {unit} failed: {e}");
             }
         }
         // A start that arrived while its unit was stopping (plan §1.3(13)).
         for unit in manager.due_queued_starts() {
-            match start_unit(manager, supervised.notify, supervised.logs, &unit).await {
-                Ok(true) => run_start_post(manager, &unit).await,
-                Ok(false) => {}
-                Err(e) => rlog!("error: queued start of {unit} failed: {e}"),
+            if let Err(e) = starts.begin(manager, &unit, StartCompletion::AtReady) {
+                rlog!("error: queued start of {unit} failed: {e}");
             }
         }
         for unit in manager.due_start_timeouts() {
@@ -295,6 +301,7 @@ async fn supervise(
         // directive exists to reclaim.
         for unit in manager.due_idle_units() {
             rlog!("stopping {unit}: idle");
+            starts.cancel(&unit);
             let effect = manager.request_stop(&unit, RequestSource::UserStop);
             if let Err(e) =
                 apply_effect(manager, supervised.notify, supervised.logs, &unit, effect).await
@@ -305,19 +312,21 @@ async fn supervise(
 
         // Never block past the earliest pending deadline - which includes the
         // next watchdog feed, or a pending feed would be slept through and the
-        // hardware would reset a perfectly healthy init.
-        let wait = next_deadline(manager).min(watchdog.next_feed_in());
+        // hardware would reset a perfectly healthy init - or a start flow that
+        // has something to poll.
+        let wait = next_deadline(manager)
+            .min(watchdog.next_feed_in())
+            .min(starts.next_wait());
         // Plan §7.9: a connection on an activated socket. Collected here rather
         // than handled in the `select!` arm, because the arm cannot borrow the
         // socket set while its own `recv` is one of the branches.
         let mut woke_socket: Option<UnitName> = None;
         tokio::select! {
             signal = signals.recv() => match signal {
-                Signal::Child => {
-                    for outcome in reap_into_manager(manager) {
-                        log_outcome(&outcome);
-                    }
-                }
+                // The reap happens at the top of the loop, where auxiliary exits
+                // can be routed to the flow waiting for them. Reaping here would
+                // consume a command's status before its flow ever saw it.
+                Signal::Child => {}
                 Signal::Term => {
                     rlog!("received SIGTERM");
                     break;
@@ -349,14 +358,42 @@ async fn supervise(
                 if let Some(requested) = requested {
                     action = requested;
                 }
-                let (status, text) = handle_control(cfg, manager, supervised.notify, supervised.logs, &request).await;
-                if status == Status::Ok {
-                    rlog!("control: {} ok", request.describe());
-                } else {
-                    rlog!("control: {} -> {status:?}", request.describe());
+                if let Request::Stop(unit) = &request {
+                    starts.cancel(unit);
                 }
-                // The client may have hung up; that is not rinit's problem.
-                let _ = reply.send((status, text));
+                let reloaded = matches!(&request, Request::Reload);
+                match handle_control(
+                    cfg,
+                    manager,
+                    supervised.notify,
+                    supervised.logs,
+                    activation,
+                    &mut starts,
+                    &request,
+                )
+                .await
+                {
+                    ControlAction::Reply(status, text) => {
+                        if reloaded {
+                            starts.after_reload(manager);
+                        }
+                        if status == Status::Ok {
+                            rlog!("control: {} ok", request.describe());
+                        } else {
+                            rlog!("control: {} -> {status:?}", request.describe());
+                        }
+                        // The client may have hung up; that is not rinit's problem.
+                        let _ = reply.send((status, text));
+                    }
+                    ControlAction::Start(mut job) => {
+                        // The reply waits until the unit is actually up: a
+                        // oneshot has exited, a forking daemon has been located,
+                        // and a notify service has said READY=1.
+                        job.reply = Some(reply);
+                        rlog!("control: {} accepted", request.describe());
+                        starts.controls.push(job);
+                    }
+                }
                 if requested.is_some() {
                     break;
                 }
@@ -376,33 +413,48 @@ async fn supervise(
             // A connection is the request: start the service if it is not already
             // up, and either way the clock on being idle starts again.
             manager.note_connection(&unit);
-            if !manager.is_running(&unit) {
+            let cooling_down = socket_activations
+                .get(&unit)
+                .is_some_and(|at| at.elapsed() < SOCKET_ACTIVATION_COOLDOWN);
+            if !manager.is_running(&unit)
+                && !starts.flows.contains_key(&unit)
+                && !manager.is_failed(&unit)
+                && !cooling_down
+            {
                 // Register the start in the Job queue as well as spawning it:
                 // the queue is what `shutdown_order()` reads, so a
                 // socket-activated service must have a `Started` target or
                 // shutdown would leave it running while filesystems unmount.
                 let effect = manager.request_start(&unit, RequestSource::Dependency);
-                match apply_effect(manager, supervised.notify, supervised.logs, &unit, effect).await
-                {
-                    Ok(true) => rlog!("{unit}: started by a connection"),
-                    Ok(false) => rlog!("warning: {unit} did not start for its connection"),
-                    Err(e) => rlog!("error: cannot start {unit} for its connection: {e}"),
+                match effect {
+                    Some(effect) => match starts.begin_effect(manager, &unit, effect) {
+                        Ok(()) => {
+                            socket_activations.insert(unit.clone(), Instant::now());
+                            rlog!("{unit}: started by a connection");
+                        }
+                        Err(e) => rlog!("error: cannot start {unit} for its connection: {e}"),
+                    },
+                    None => rlog!("{unit}: start queued behind its stop"),
                 }
             }
         }
     }
 
-    // Shutdown is a `ShutdownStop` request for everything the queue still
-    // wants running. Going through the queue rather than stopping each unit by
-    // hand is what gives shutdown its precedence (plan §1.3(11)): its source
-    // outranks a dependency start, so a unit cannot be pulled back up while the
-    // system is going down.
+    // A start that has not reached `ExecStart=` yet has no unit process for the
+    // stop path to signal: kill its `ExecStartPre=`/`Post=` command here, and
+    // release any control client still waiting for the reply.
+    starts.shutdown();
     if fast {
         manager.compress_stop_timeouts(FAST_STOP_SECS);
     }
     for line in manager.summary() {
         rlog!("shutdown: {line}");
     }
+    // Shutdown is a `ShutdownStop` request for everything the queue still
+    // wants running. Going through the queue rather than stopping each unit by
+    // hand is what gives shutdown its precedence (plan §1.3(11)): its source
+    // outranks a dependency start, so a unit cannot be pulled back up while the
+    // system is going down.
     for unit in manager.shutdown_order() {
         let effect = manager.request_stop(&unit, RequestSource::ShutdownStop);
         if let Err(e) =
@@ -413,7 +465,7 @@ async fn supervise(
     }
     supervised.notify.disarm_all();
     let budget = fast.then_some(FAST_SHUTDOWN_BUDGET);
-    stop_and_reap(manager, budget).await;
+    stop_and_reap(manager, budget, watchdog).await;
     action
 }
 
@@ -428,10 +480,18 @@ async fn supervise(
 /// `budget` is the total time allowed, used for the power-failure path where
 /// plan §7.1 caps the whole shutdown at a few seconds. `None` means "as long as
 /// the per-unit timeouts take".
-async fn stop_and_reap(manager: &mut UnitManager, budget: Option<std::time::Duration>) {
+async fn stop_and_reap(
+    manager: &mut UnitManager,
+    budget: Option<std::time::Duration>,
+    watchdog: &mut Watchdog,
+) {
     let give_up = budget.map(crate::deadline::after);
     loop {
-        for outcome in reap_into_manager(manager) {
+        // The shutdown wait is bounded by each unit's `TimeoutStopSec=`, but
+        // that can still be tens of seconds. A watchdog armed for a shorter
+        // period must not reset a machine that is shutting down correctly.
+        watchdog.feed_if_due();
+        for outcome in reap_into_manager(manager).outcomes {
             log_outcome(&outcome);
         }
         if manager.running_count() == 0 {
@@ -525,136 +585,1004 @@ fn spawn_unit(
     Ok(manager.get(unit).is_some_and(|rt| rt.pid.is_some()))
 }
 
-/// Start `unit`: `ExecStartPre`, then `ExecStart`.
+/// How often a start flow is polled while it is waiting.
 ///
-/// An `ExecStartPre` failure is a unit failure, not an infrastructure one
-/// (plan §1.1), so it is recorded through [`fail_unit`] and reported as "did not
-/// spawn". Only a genuine infrastructure failure (the notify socket) is
-/// returned as an error.
+/// A start can wait on a socket path, a conflicting unit, an `ExecStartPre=`
+/// process or a service's readiness. Polling at this interval keeps every one of
+/// those responsive without turning the supervisor loop into a busy spin.
+const START_POLL: Duration = Duration::from_millis(20);
+
+/// How long after a socket-activated start the same still-readable socket may
+/// trigger another one.
 ///
-/// `ExecStartPost` is deliberately *not* run here: for a `oneshot` it must run
-/// after the command has exited, so the caller runs it at the right moment.
+/// The watcher is level-triggered: a connection the service did not accept keeps
+/// the listener readable, so without a floor a failed or short-lived start would
+/// be retried every `WATCH_FLOOR` (10 ms). A failed unit is not retried at all;
+/// this covers the successful-but-already-exited case.
+const SOCKET_ACTIVATION_COOLDOWN: Duration = Duration::from_secs(1);
+
+/// When a flow finishes after the main process is spawned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartCompletion {
+    /// Return as soon as `ExecStart=` is running. Boot uses this so a whole
+    /// level is still spawned before its `oneshot` units are waited for.
+    AtSpawn,
+    /// Run `ExecStartPost=` and, for `oneshot`/`forking`, wait until the unit
+    /// has actually finished starting. The supervisor uses this.
+    AtReady,
+}
+
+/// One in-flight start, advanced one non-blocking step at a time.
+///
+/// The supervisor must stay responsive while a service starts: a slow
+/// `ExecStartPre=`, a `NeedsSocket=` provider or a conflicting unit can take
+/// seconds, and blocking the loop for that long would also stop the watchdog
+/// feed, `rctl` replies and signal handling. Everything that used to be an
+/// `await` in `start_unit` is a stage here; [`StartFlow::advance`] performs at
+/// most the work that is ready and returns.
+struct StartFlow {
+    unit: UnitName,
+    completion: StartCompletion,
+    stage: StartStage,
+    spawned: bool,
+}
+
+enum StartStage {
+    /// Wait for every path a `NeedsSocket=` named (plan §7.8).
+    Sockets {
+        paths: Vec<String>,
+        deadline: Instant,
+    },
+    /// Stop every conflicting unit and wait for it to go (plan §1.1).
+    Conflicts {
+        waits: Option<Vec<ConflictWait>>,
+    },
+    /// Run `ExecStartPre=` one command at a time.
+    Pre {
+        commands: Vec<rinit_core::ExecCommand>,
+        next: usize,
+        running: Option<AuxRun>,
+    },
+    /// Spawn `ExecStart=`.
+    Spawn,
+    /// Wait until a `oneshot`/`forking` unit has finished its start.
+    WaitReady,
+    /// Run `ExecStartPost=` one command at a time.
+    Post {
+        commands: Vec<rinit_core::ExecCommand>,
+        next: usize,
+        running: Option<AuxRun>,
+    },
+    Done,
+}
+
+struct ConflictWait {
+    unit: UnitName,
+    deadline: Instant,
+    escalated: bool,
+    done: bool,
+}
+
+struct AuxRun {
+    pid: libc::pid_t,
+    deadline: Instant,
+}
+
+impl StartFlow {
+    /// Snapshot the start path for `unit`.
+    ///
+    /// `adopt_pending_config` runs here, before any stage reads the definition,
+    /// so a reload that deferred a change to this start cannot make
+    /// `ExecStartPre=` see one definition and `ExecStart=` another.
+    fn new(
+        manager: &mut UnitManager,
+        unit: &UnitName,
+        completion: StartCompletion,
+    ) -> Result<Self, String> {
+        manager.adopt_pending_config(unit);
+        let Some(rt) = manager.get(unit) else {
+            return Err(format!("{unit} is not registered"));
+        };
+        let paths = rt.config.needs_socket.clone();
+        let stage = if paths.is_empty() {
+            StartStage::Conflicts { waits: None }
+        } else {
+            StartStage::Sockets {
+                paths,
+                deadline: start_deadline(rt.config.timeout_start_sec),
+            }
+        };
+        Ok(StartFlow {
+            unit: unit.clone(),
+            completion,
+            stage,
+            spawned: false,
+        })
+    }
+
+    /// The auxiliary command this flow is waiting for, if any.
+    fn running_aux_pid(&self) -> Option<libc::pid_t> {
+        match &self.stage {
+            StartStage::Pre {
+                running: Some(run), ..
+            }
+            | StartStage::Post {
+                running: Some(run), ..
+            } => Some(run.pid),
+            _ => None,
+        }
+    }
+
+    /// Whether `pid` is one this flow is still waiting for.
+    fn wants_pid(&self, pid: libc::pid_t) -> bool {
+        self.running_aux_pid() == Some(pid)
+    }
+
+    /// Conflicting units this flow is still waiting to exit.
+    ///
+    /// The supervisor's global reaper clears these; the boot driver has no
+    /// reaper of its own, so it polls exactly these pids and reports their
+    /// exits to the manager.
+    fn waiting_conflict_pids(&self, manager: &UnitManager) -> Vec<libc::pid_t> {
+        match &self.stage {
+            StartStage::Conflicts { waits: Some(waits) } => waits
+                .iter()
+                .filter(|wait| !wait.done)
+                .filter_map(|wait| manager.get(&wait.unit).and_then(|rt| rt.pid))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Advance to the next thing that is ready now.
+    ///
+    /// `None` means "still waiting"; `Some(Ok(spawned))` is a completed start
+    /// and `Some(Err(reason))` a failed one. A failed flow has already recorded
+    /// the failure with [`fail_unit`].
+    fn advance(
+        &mut self,
+        manager: &mut UnitManager,
+        notify: &mut NotifyHub,
+        logs: &ServiceLogs,
+        aux: &mut BTreeMap<libc::pid_t, ExitOutcome>,
+    ) -> Option<Result<bool, String>> {
+        // A stop can arrive between any two steps now that the start path no
+        // longer owns the loop. Before the spawn, the stop target is enough;
+        // after it, the unit's own state says whether a stop has taken over.
+        if manager.target_of(&self.unit) == Some(JobTarget::Stopped) {
+            return Some(Err(format!("{} start cancelled by a stop", self.unit)));
+        }
+        if self.spawned
+            && matches!(
+                manager.get(&self.unit).map(|rt| rt.state),
+                Some(UnitState::Deactivating)
+            )
+        {
+            return Some(Err(format!("{} start cancelled by a stop", self.unit)));
+        }
+
+        loop {
+            let stage = std::mem::replace(&mut self.stage, StartStage::Done);
+            match stage {
+                StartStage::Sockets { paths, deadline } => {
+                    if let Some(missing) = paths
+                        .iter()
+                        .find(|path| !std::path::Path::new(path).exists())
+                    {
+                        if Instant::now() < deadline {
+                            self.stage = StartStage::Sockets { paths, deadline };
+                            return None;
+                        }
+                        return Some(self.failed(
+                            manager,
+                            format!(
+                                "{}: NeedsSocket={missing} did not appear in time",
+                                self.unit
+                            ),
+                        ));
+                    }
+                    self.stage = StartStage::Conflicts { waits: None };
+                }
+                StartStage::Conflicts { waits } => {
+                    let mut waits = match waits {
+                        Some(waits) => waits,
+                        None => {
+                            let mut waits = Vec::new();
+                            for other in manager.stop_conflicts(&self.unit) {
+                                let secs = manager
+                                    .get(&other)
+                                    .map_or(1, |rt| rt.config.timeout_stop_sec.max(1));
+                                rlog!("stopping {other}: it conflicts with {}", self.unit);
+                                waits.push(ConflictWait {
+                                    unit: other,
+                                    deadline: crate::deadline::after_secs(secs),
+                                    escalated: false,
+                                    done: false,
+                                });
+                            }
+                            waits
+                        }
+                    };
+
+                    let now = Instant::now();
+                    for wait in &mut waits {
+                        if wait.done {
+                            continue;
+                        }
+                        let Some(pid) = manager.get(&wait.unit).and_then(|rt| rt.pid) else {
+                            if !wait.done {
+                                rlog!("{} stopped; {} may start", wait.unit, self.unit);
+                                wait.done = true;
+                            }
+                            continue;
+                        };
+                        if now < wait.deadline {
+                            continue;
+                        }
+                        if !wait.escalated {
+                            rlog!(
+                                "warning: {} did not stop for {}; killing it",
+                                wait.unit,
+                                self.unit
+                            );
+                            let _ = process::kill_process_group(pid, libc::SIGKILL);
+                            wait.escalated = true;
+                            wait.deadline = crate::deadline::after_secs(5);
+                        } else {
+                            rlog!(
+                                "warning: {} is still running; starting {} anyway",
+                                wait.unit,
+                                self.unit
+                            );
+                            wait.done = true;
+                        }
+                    }
+                    if waits.iter().any(|wait| !wait.done) {
+                        self.stage = StartStage::Conflicts { waits: Some(waits) };
+                        return None;
+                    }
+                    let pre = manager
+                        .get(&self.unit)
+                        .map(|rt| rt.config.exec_start_pre.clone())
+                        .unwrap_or_default();
+                    self.stage = StartStage::Pre {
+                        commands: pre,
+                        next: 0,
+                        running: None,
+                    };
+                }
+                StartStage::Pre {
+                    commands,
+                    mut next,
+                    running,
+                } => {
+                    if let Some(run) = running {
+                        match aux.remove(&run.pid) {
+                            Some(ExitOutcome::Success) => {
+                                next += 1;
+                                self.stage = StartStage::Pre {
+                                    commands,
+                                    next,
+                                    running: None,
+                                };
+                                continue;
+                            }
+                            Some(outcome) => {
+                                return Some(self.failed(
+                                    manager,
+                                    format!(
+                                        "{}: ExecStartPre '{}' failed ({})",
+                                        self.unit,
+                                        command_text(&commands, next),
+                                        describe_exit(outcome)
+                                    ),
+                                ));
+                            }
+                            None if Instant::now() >= run.deadline => {
+                                let _ = process::kill_process_group(run.pid, libc::SIGKILL);
+                                return Some(self.failed(
+                                    manager,
+                                    format!(
+                                        "{}: ExecStartPre '{}' timed out",
+                                        self.unit,
+                                        command_text(&commands, next)
+                                    ),
+                                ));
+                            }
+                            None => {
+                                self.stage = StartStage::Pre {
+                                    commands,
+                                    next,
+                                    running: Some(run),
+                                };
+                                return None;
+                            }
+                        }
+                    }
+
+                    let Some(cmd) = commands.get(next) else {
+                        self.stage = StartStage::Spawn;
+                        continue;
+                    };
+                    match plan_aux_command(manager, &self.unit, cmd) {
+                        Ok(plan) => match spawn_aux_command(&self.unit, &plan) {
+                            Ok(pid) => {
+                                self.stage = StartStage::Pre {
+                                    commands,
+                                    next,
+                                    running: Some(AuxRun {
+                                        pid,
+                                        deadline: start_deadline(plan.timeout_sec),
+                                    }),
+                                };
+                                return None;
+                            }
+                            Err(reason) => return Some(self.failed(manager, reason)),
+                        },
+                        Err(reason) => return Some(self.failed(manager, reason)),
+                    }
+                }
+                StartStage::Spawn => match spawn_unit(manager, notify, logs, &self.unit) {
+                    Ok(spawned) => {
+                        self.spawned = spawned;
+                        if self.completion == StartCompletion::AtSpawn {
+                            self.stage = StartStage::Done;
+                            return Some(Ok(spawned));
+                        }
+                        let kind = manager
+                            .get(&self.unit)
+                            .map_or(ServiceKind::Simple, |rt| rt.config.service_kind);
+                        self.stage = if matches!(kind, ServiceKind::Oneshot | ServiceKind::Forking)
+                        {
+                            StartStage::WaitReady
+                        } else {
+                            let post = manager
+                                .get(&self.unit)
+                                .map(|rt| rt.config.exec_start_post.clone())
+                                .unwrap_or_default();
+                            StartStage::Post {
+                                commands: post,
+                                next: 0,
+                                running: None,
+                            }
+                        };
+                    }
+                    Err(e) => {
+                        return Some(self.failed(
+                            manager,
+                            format!(
+                                "{}: cannot start '{}': {e}",
+                                self.unit,
+                                exec_start_of(manager, &self.unit)
+                            ),
+                        ));
+                    }
+                },
+                StartStage::WaitReady => {
+                    let Some(rt) = manager.get(&self.unit) else {
+                        return Some(Err(format!("{} is no longer registered", self.unit)));
+                    };
+                    match rt.state {
+                        UnitState::Active | UnitState::ActiveExited => {
+                            let post = rt.config.exec_start_post.clone();
+                            self.stage = StartStage::Post {
+                                commands: post,
+                                next: 0,
+                                running: None,
+                            };
+                        }
+                        UnitState::Starting => {
+                            self.stage = StartStage::WaitReady;
+                            return None;
+                        }
+                        UnitState::Failed(_)
+                        | UnitState::RestartWait
+                        | UnitState::Inactive
+                        | UnitState::Deactivating => {
+                            return Some(Err(format!("{} failed to start", self.unit)));
+                        }
+                    }
+                }
+                StartStage::Post {
+                    commands,
+                    mut next,
+                    running,
+                } => {
+                    if let Some(run) = running {
+                        match aux.remove(&run.pid) {
+                            Some(ExitOutcome::Success) => {}
+                            Some(outcome) => rlog!(
+                                "warning: {}: ExecStartPost '{}' failed ({})",
+                                self.unit,
+                                command_text(&commands, next),
+                                describe_exit(outcome)
+                            ),
+                            None if Instant::now() >= run.deadline => {
+                                let _ = process::kill_process_group(run.pid, libc::SIGKILL);
+                                rlog!(
+                                    "warning: {}: ExecStartPost '{}' timed out",
+                                    self.unit,
+                                    command_text(&commands, next)
+                                );
+                            }
+                            None => {
+                                self.stage = StartStage::Post {
+                                    commands,
+                                    next,
+                                    running: Some(run),
+                                };
+                                return None;
+                            }
+                        }
+                        next += 1;
+                    }
+
+                    let Some(cmd) = commands.get(next) else {
+                        self.stage = StartStage::Done;
+                        return Some(Ok(self.spawned));
+                    };
+                    match plan_aux_command(manager, &self.unit, cmd) {
+                        Ok(plan) => match spawn_aux_command(&self.unit, &plan) {
+                            Ok(pid) => {
+                                self.stage = StartStage::Post {
+                                    commands,
+                                    next,
+                                    running: Some(AuxRun {
+                                        pid,
+                                        deadline: start_deadline(plan.timeout_sec),
+                                    }),
+                                };
+                                return None;
+                            }
+                            Err(reason) => {
+                                rlog!("warning: {reason}");
+                                next += 1;
+                                self.stage = StartStage::Post {
+                                    commands,
+                                    next,
+                                    running: None,
+                                };
+                            }
+                        },
+                        Err(reason) => {
+                            rlog!("warning: {reason}");
+                            next += 1;
+                            self.stage = StartStage::Post {
+                                commands,
+                                next,
+                                running: None,
+                            };
+                        }
+                    }
+                }
+                StartStage::Done => return Some(Ok(self.spawned)),
+            }
+        }
+    }
+
+    fn failed(&mut self, manager: &mut UnitManager, reason: String) -> Result<bool, String> {
+        rlog!("error: {reason}");
+        fail_unit(manager, &self.unit);
+        Err(reason)
+    }
+}
+
+/// A deadline for `secs`, or the largest one rinit can represent for `0`.
+fn start_deadline(secs: u64) -> Instant {
+    if secs == 0 {
+        crate::deadline::after(crate::deadline::MAX_TIMEOUT)
+    } else {
+        crate::deadline::after_secs(secs)
+    }
+}
+
+/// Turn one `waitpid` result into the manager's exit vocabulary.
+fn child_outcome(exit: rinit_runtime::syscall::wait::ChildExit) -> ExitOutcome {
+    match exit {
+        rinit_runtime::syscall::wait::ChildExit::Exited { code: 0, .. } => ExitOutcome::Success,
+        rinit_runtime::syscall::wait::ChildExit::Exited { code, .. } => ExitOutcome::Failure(code),
+        rinit_runtime::syscall::wait::ChildExit::Signaled { signal, .. } => {
+            ExitOutcome::Signalled(signal)
+        }
+    }
+}
+
+/// Describe an auxiliary command's exit for its log line.
+fn describe_exit(outcome: ExitOutcome) -> String {
+    match outcome {
+        ExitOutcome::Success => "exit code 0".to_string(),
+        ExitOutcome::Failure(code) => format!("exit code {code}"),
+        ExitOutcome::Signalled(signal) => format!("killed by signal {signal}"),
+        ExitOutcome::TimedOut => "timed out".to_string(),
+    }
+}
+
+/// The command line for a log message, or an empty string for a vanished step.
+fn command_text(commands: &[rinit_core::ExecCommand], index: usize) -> String {
+    commands
+        .get(index)
+        .map(|cmd| cmd.argv().join(" "))
+        .unwrap_or_default()
+}
+
+/// One `ExecStartPre=`/`ExecStartPost=` command, resolved against the unit's
+/// current definition.
+struct AuxCommandPlan {
+    argv: Vec<String>,
+    env: Vec<String>,
+    cwd: String,
+    sandbox: rinit_core::unit::sandbox::Sandbox,
+    timeout_sec: u64,
+}
+
+fn plan_aux_command(
+    manager: &UnitManager,
+    unit: &UnitName,
+    cmd: &rinit_core::ExecCommand,
+) -> Result<AuxCommandPlan, String> {
+    let Some(rt) = manager.get(unit) else {
+        return Err(format!("{unit} is not registered"));
+    };
+    let argv = cmd.argv().to_vec();
+    let sandbox = crate::sandbox::resolve(&rt.config)
+        .map_err(|e| format!("{unit}: cannot start '{}': {e}", argv.join(" ")))?;
+    Ok(AuxCommandPlan {
+        argv,
+        env: build_service_env(&rt.config, &[]),
+        cwd: rt.config.working_directory.clone(),
+        sandbox,
+        timeout_sec: rt.config.timeout_start_sec,
+    })
+}
+
+fn spawn_aux_command(unit: &UnitName, plan: &AuxCommandPlan) -> Result<libc::pid_t, String> {
+    // As before the state machine: preparation is not the service. It runs
+    // outside the unit's cgroup and without its `TTYPath=`.
+    spawn_service_in_group(
+        &plan.argv,
+        &plan.env,
+        Some(&plan.cwd),
+        None,
+        &plan.sandbox,
+        crate::service::ChildPlacement::default(),
+    )
+    .map_err(|e| format!("{unit}: cannot start '{}': {e}", plan.argv.join(" ")))
+}
+
+/// Run one auxiliary command to completion for the boot path.
+///
+/// Boot ordering is synchronous by design, so the boot half of the start path
+/// keeps a direct wait while the supervisor uses [`StartFlow`].
+async fn run_aux_command(
+    manager: &UnitManager,
+    unit: &UnitName,
+    cmd: &rinit_core::ExecCommand,
+) -> Option<i32> {
+    let plan = match plan_aux_command(manager, unit, cmd) {
+        Ok(plan) => plan,
+        Err(reason) => {
+            rlog!("error: {reason}");
+            return None;
+        }
+    };
+    let pid = match spawn_aux_command(unit, &plan) {
+        Ok(pid) => pid,
+        Err(reason) => {
+            rlog!("error: {reason}");
+            return None;
+        }
+    };
+    let timeout = if plan.timeout_sec == 0 {
+        crate::deadline::MAX_TIMEOUT
+    } else {
+        Duration::from_secs(plan.timeout_sec)
+    };
+    match readiness::wait_for_exit(pid, timeout).await {
+        Ok(code) => code,
+        Err(()) => {
+            // Timed out: make sure it is gone before carrying on.
+            let _ = process::kill_process_group(pid, libc::SIGKILL);
+            let _ = readiness::wait_for_exit(pid, Duration::from_secs(5)).await;
+            rlog!("error: {unit}: '{}' timed out", plan.argv.join(" "));
+            None
+        }
+    }
+}
+
+/// Drive a [`StartFlow`] to completion for the boot path.
+///
+/// Boot has no supervisor loop yet, so it waits directly. The flow still owns
+/// the rules; only the wait is synchronous here.
 async fn start_unit(
     manager: &mut UnitManager,
     notify: &mut NotifyHub,
     logs: &ServiceLogs,
     unit: &UnitName,
 ) -> Result<bool, RuntimeError> {
-    // Plan §7.6: a reload that changed a *running* unit left its new definition
-    // waiting for exactly this moment. It is taken before anything reads the
-    // config, so `ExecStartPre`, the notify socket and the spawn all see the same
-    // definition.
-    manager.adopt_pending_config(unit);
-
-    // Plan §7.8: wait for the sockets this unit declared it needs, *before* it
-    // starts. The dependency edge already ordered it after the provider; what
-    // this adds is the part a start order cannot give - a daemon is not done
-    // being ready merely because it was exec'd, and its socket is the thing the
-    // consumer actually needs.
-    if let Err(path) = wait_for_sockets(manager, unit).await {
-        rlog!("error: {unit}: NeedsSocket={path} did not appear in time");
-        fail_unit(manager, unit);
-        return Ok(false);
-    }
-
-    // `Conflicts=` first: the other unit must be gone before this one starts
-    // (plan §1.1).
-    stop_conflicts(manager, unit).await;
-
-    let pre = manager
-        .get(unit)
-        .map(|rt| rt.config.exec_start_pre.clone())
-        .unwrap_or_default();
-    for cmd in &pre {
-        if run_aux_command(manager, unit, cmd).await != Some(0) {
-            rlog!(
-                "error: {unit}: ExecStartPre '{}' failed",
-                cmd.argv().join(" ")
-            );
-            fail_unit(manager, unit);
+    let mut flow = match StartFlow::new(manager, unit, StartCompletion::AtSpawn) {
+        Ok(flow) => flow,
+        Err(reason) => {
+            rlog!("error: {reason}");
             return Ok(false);
         }
-    }
-
-    match spawn_unit(manager, notify, logs, unit) {
-        Ok(spawned) => Ok(spawned),
-        Err(e) => {
-            // A spawn failure (missing binary, bad WorkingDirectory, ...) is a
-            // unit failure too: plan §1.1 models it as a failed start, and the
-            // rest of the boot must still come up.
-            rlog!(
-                "error: {unit}: cannot start '{}': {e}",
-                exec_start_of(manager, unit)
-            );
-            fail_unit(manager, unit);
-            Ok(false)
+    };
+    let mut aux = BTreeMap::new();
+    loop {
+        if let Some(pid) = flow.running_aux_pid()
+            && let Ok(Some(exit)) = rinit_runtime::syscall::wait::poll_child(pid)
+        {
+            aux.insert(pid, child_outcome(exit));
+        }
+        // Boot has no global reaper, so the conflicting units this flow stopped
+        // are polled here. Their exits still go through the manager, which owns
+        // the state transition and the cgroup cleanup.
+        for pid in flow.waiting_conflict_pids(manager) {
+            if let Ok(Some(exit)) = rinit_runtime::syscall::wait::poll_child(pid)
+                && let Some(outcome) = manager.on_child_exit(pid, child_outcome(exit))
+            {
+                log_outcome(&outcome);
+            }
+        }
+        match flow.advance(manager, notify, logs, &mut aux) {
+            Some(Ok(spawned)) => return Ok(spawned),
+            Some(Err(_)) => return Ok(false),
+            None => tokio::time::sleep(START_POLL).await,
         }
     }
 }
 
-/// Run one of a unit's auxiliary commands to completion, as the service user.
+/// Every start the supervisor is driving, one step per loop iteration.
 ///
-/// `ExecStartPre=`/`ExecStartPost=` (plan §1.1) are best-effort from this
-/// function's point of view: it returns the exit code, or `None` when the
-/// command could not be started, was signalled, or timed out. The caller
-/// decides whether that is fatal (it is for `ExecStartPre`) or merely logged
-/// (for `ExecStartPost`).
-async fn run_aux_command(
-    manager: &UnitManager,
-    unit: &UnitName,
-    cmd: &rinit_core::ExecCommand,
-) -> Option<i32> {
-    let rt = manager.get(unit)?;
-    let env = build_service_env(&rt.config, &[]);
-    let cwd = rt.config.working_directory.clone();
-    let timeout = rt.config.timeout_start_sec;
-    let argv = cmd.argv().to_vec();
-    // Plan §7.4: every `Exec*` command runs as the service user, so a
-    // preparation step cannot do what the service itself is not allowed to.
-    let sandbox = match crate::sandbox::resolve(&rt.config) {
-        Ok(sandbox) => sandbox,
-        Err(e) => {
-            rlog!("error: {unit}: cannot start '{}': {e}", argv.join(" "));
-            return None;
-        }
-    };
+/// The map is keyed by unit so a restart due, a queued start and a connection
+/// that all arrive together cannot spawn the same unit twice.
+#[derive(Default)]
+pub(crate) struct StartCoordinator {
+    flows: BTreeMap<UnitName, StartFlow>,
+    controls: Vec<ControlStart>,
+    /// Exits of auxiliary commands, put here by the global reaper.
+    aux_exits: BTreeMap<libc::pid_t, ExitOutcome>,
+}
 
-    // An `ExecStartPre=`/`ExecStartPost=` command runs outside the unit's
-    // cgroup: preparation is not the service, and these run before the cgroup
-    // is arranged (or while the service itself already fills it).
-    // An `ExecStartPre=`/`ExecStartPost=` command runs *outside* the unit's
-    // cgroup and without its `TTYPath=`: it is preparation, not the service.
-    let pid = match spawn_service_in_group(
-        &argv,
-        &env,
-        Some(&cwd),
-        None,
-        &sandbox,
-        crate::service::ChildPlacement::default(),
-    ) {
-        Ok(pid) => pid,
-        Err(e) => {
-            rlog!("error: {unit}: cannot start '{}': {e}", argv.join(" "));
-            return None;
+impl StartCoordinator {
+    /// Add `unit` to the flows if it is not already being started.
+    fn begin(
+        &mut self,
+        manager: &mut UnitManager,
+        unit: &UnitName,
+        completion: StartCompletion,
+    ) -> Result<(), String> {
+        if self.flows.contains_key(unit) {
+            return Ok(());
         }
-    };
-    let limit = if timeout == 0 {
-        // `TimeoutStartSec=0` means "wait forever" (plan §1.1). There is no
-        // infinite `Instant`, so this is the longest deadline rinit computes -
-        // the same value `deadline` clamps an absurd timeout to.
-        crate::deadline::MAX_TIMEOUT
-    } else {
-        std::time::Duration::from_secs(timeout)
-    };
-    match readiness::wait_for_exit(pid, limit).await {
-        Ok(code) => code,
-        Err(()) => {
-            // Timed out: make sure it is gone before carrying on.
+        let flow = StartFlow::new(manager, unit, completion)?;
+        self.flows.insert(unit.clone(), flow);
+        Ok(())
+    }
+
+    /// Apply a start effect by creating the flow it asks for.
+    pub(crate) fn begin_effect(
+        &mut self,
+        manager: &mut UnitManager,
+        unit: &UnitName,
+        effect: Effect,
+    ) -> Result<(), String> {
+        apply_start_effect(manager, &mut self.flows, unit, effect)
+    }
+
+    /// Reap children, keeping exits an in-flight auxiliary command is waiting
+    /// for. The unit outcomes are returned for the caller's usual logging.
+    fn reap(&mut self, manager: &mut UnitManager) -> Vec<Outcome> {
+        let report = reap_into_manager(manager);
+        for (pid, outcome) in report.unclaimed {
+            if self.flows.values().any(|flow| flow.wants_pid(pid)) {
+                self.aux_exits.insert(pid, outcome);
+            }
+        }
+        report.outcomes
+    }
+
+    /// Advance every start and control job once.
+    fn advance(&mut self, manager: &mut UnitManager, notify: &mut NotifyHub, logs: &ServiceLogs) {
+        let units: Vec<UnitName> = self.flows.keys().cloned().collect();
+        for unit in units {
+            let done = match self.flows.get_mut(&unit) {
+                Some(flow) => flow.advance(manager, notify, logs, &mut self.aux_exits),
+                None => None,
+            };
+            if done.is_some() {
+                self.flows.remove(&unit);
+            }
+        }
+
+        let mut index = 0;
+        while index < self.controls.len() {
+            // The control server gives a client 60 s; if it has gone away, the
+            // start can keep running but its reply no longer needs a slot.
+            if self
+                .controls
+                .get(index)
+                .and_then(|job| job.reply.as_ref())
+                .is_some_and(oneshot::Sender::is_closed)
+            {
+                self.controls.remove(index);
+                continue;
+            }
+            let done = match self.controls.get_mut(index) {
+                Some(job) => {
+                    job.advance(manager, &mut self.flows, notify, logs, &mut self.aux_exits)
+                }
+                None => break,
+            };
+            if let Some((status, text)) = done {
+                let mut job = self.controls.remove(index);
+                if let Some(reply) = job.reply.take() {
+                    let _ = reply.send((status, text.clone()));
+                }
+                if status == Status::Ok {
+                    rlog!("control: start {} ok", job.target);
+                } else {
+                    rlog!("control: start {} -> {status:?}", job.target);
+                }
+            } else {
+                index += 1;
+            }
+        }
+    }
+
+    /// Abandon an in-flight start because the unit was asked to stop.
+    ///
+    /// Killing the auxiliary command is the part the normal stop path cannot do:
+    /// it has no pid for an `ExecStartPre=` process, so without this the command
+    /// would outlive the stop and could still create the state the start was
+    /// preparing.
+    fn cancel(&mut self, unit: &UnitName) {
+        let Some(flow) = self.flows.remove(unit) else {
+            return;
+        };
+        if let Some(pid) = flow.running_aux_pid() {
             let _ = process::kill_process_group(pid, libc::SIGKILL);
-            let _ = readiness::wait_for_exit(pid, std::time::Duration::from_secs(5)).await;
-            rlog!("error: {unit}: '{}' timed out", argv.join(" "));
-            None
+            self.aux_exits.remove(&pid);
         }
+    }
+
+    /// Drop work whose unit a reload removed.
+    ///
+    /// A start that has not spawned yet has no process for the reload's stop
+    /// pass to signal, and a deferred control client waiting for a unit that no
+    /// longer exists needs an answer rather than a timeout.
+    fn after_reload(&mut self, manager: &mut UnitManager) {
+        let units: Vec<UnitName> = self.flows.keys().cloned().collect();
+        for unit in units {
+            if !manager.exists(&unit) {
+                self.cancel(&unit);
+            }
+        }
+
+        let mut index = 0;
+        while index < self.controls.len() {
+            let target = match self.controls.get(index) {
+                Some(job) => job.target.clone(),
+                None => break,
+            };
+            if manager.exists(&target) {
+                index += 1;
+                continue;
+            }
+            let mut job = self.controls.remove(index);
+            if let Some(reply) = job.reply.take() {
+                let _ = reply.send((Status::NoSuchUnit, format!("no such unit: {target}")));
+            }
+        }
+    }
+
+    /// How long the supervisor may sleep with starts in flight.
+    fn next_wait(&self) -> Duration {
+        if self.flows.is_empty() && self.controls.is_empty() {
+            Duration::from_secs(3600)
+        } else {
+            START_POLL
+        }
+    }
+
+    /// Abandon every in-flight start on shutdown, killing any auxiliary command
+    /// that is still running so it is not orphaned past the service tree.
+    fn shutdown(&mut self) {
+        for flow in self.flows.values() {
+            if let Some(pid) = flow.running_aux_pid() {
+                let _ = process::kill_process_group(pid, libc::SIGKILL);
+                self.aux_exits.remove(&pid);
+            }
+        }
+        for job in &mut self.controls {
+            if let Some(reply) = job.reply.take() {
+                let _ = reply.send((Status::Error, "shutting down".to_string()));
+            }
+        }
+        self.flows.clear();
+        self.controls.clear();
+        self.aux_exits.clear();
+    }
+}
+
+/// A deferred `rctl start`: dependencies are brought up in boot order, each
+/// waited for before the next starts, and the reply is sent when the target is
+/// actually up (or failed).
+struct ControlStart {
+    target: UnitName,
+    order: Vec<UnitName>,
+    required: BTreeSet<UnitName>,
+    index: usize,
+    waiting: Option<UnitName>,
+    reply: Option<oneshot::Sender<(Status, String)>>,
+    target_was_active: bool,
+}
+
+impl ControlStart {
+    fn new(manager: &UnitManager, unit: &UnitName) -> Result<Self, String> {
+        let mut order = manager.start_order(unit)?;
+        order.push(unit.clone());
+        let required = manager.required_closure(unit).into_iter().collect();
+        let target_was_active = manager
+            .get(unit)
+            .is_some_and(|rt| matches!(rt.state, UnitState::Active | UnitState::ActiveExited));
+        Ok(ControlStart {
+            target: unit.clone(),
+            order,
+            required,
+            index: 0,
+            waiting: None,
+            reply: None,
+            target_was_active,
+        })
+    }
+
+    fn advance(
+        &mut self,
+        manager: &mut UnitManager,
+        flows: &mut BTreeMap<UnitName, StartFlow>,
+        notify: &mut NotifyHub,
+        logs: &ServiceLogs,
+        aux: &mut BTreeMap<libc::pid_t, ExitOutcome>,
+    ) -> Option<(Status, String)> {
+        loop {
+            if let Some(waiting) = self.waiting.clone() {
+                if flows.contains_key(&waiting) {
+                    return None;
+                }
+                let Some(rt) = manager.get(&waiting) else {
+                    return Some((Status::NoSuchUnit, format!("no such unit: {waiting}")));
+                };
+                match rt.state {
+                    UnitState::Active | UnitState::ActiveExited => {
+                        self.waiting = None;
+                    }
+                    UnitState::Starting => return None,
+                    UnitState::Failed(_) => {
+                        if waiting == self.target || self.required.contains(&waiting) {
+                            return Some((Status::Error, failure_text(&waiting, &self.target)));
+                        }
+                        rlog!(
+                            "warning: {waiting} failed, but {} does not require it",
+                            self.target
+                        );
+                        self.waiting = None;
+                    }
+                    UnitState::RestartWait | UnitState::Inactive | UnitState::Deactivating => {
+                        if waiting == self.target || self.required.contains(&waiting) {
+                            return Some((Status::Error, failure_text(&waiting, &self.target)));
+                        }
+                        self.waiting = None;
+                    }
+                }
+                continue;
+            }
+
+            let Some(unit) = self.order.get(self.index).cloned() else {
+                let text = if self.target_was_active {
+                    format!("{} is already active", self.target)
+                } else {
+                    format!("started {}", self.target)
+                };
+                return Some((Status::Ok, text));
+            };
+            self.index += 1;
+
+            if manager
+                .get(&unit)
+                .is_some_and(|rt| matches!(rt.state, UnitState::Active | UnitState::ActiveExited))
+            {
+                continue;
+            }
+            if flows.contains_key(&unit) {
+                self.waiting = Some(unit);
+                continue;
+            }
+
+            let source = if unit == self.target {
+                RequestSource::UserStart
+            } else {
+                RequestSource::Dependency
+            };
+            let effect = manager.request_start(&unit, source);
+            match effect {
+                Some(Effect::None) => {
+                    self.waiting = Some(unit);
+                }
+                None => {
+                    if unit == self.target {
+                        return Some((
+                            Status::Ok,
+                            format!("{unit} is stopping; it will start afterwards"),
+                        ));
+                    }
+                    return Some((
+                        Status::Error,
+                        format!("dependency {unit} is still stopping"),
+                    ));
+                }
+                Some(effect) => {
+                    if let Err(reason) = apply_start_effect(manager, flows, &unit, effect) {
+                        let what = if unit == self.target {
+                            format!("cannot start {unit}: {reason}")
+                        } else {
+                            format!("cannot start dependency {unit}: {reason}")
+                        };
+                        return Some((Status::Error, what));
+                    }
+                    // Advance the freshly created flow once, right here. A
+                    // `simple` unit with no `ExecStartPre=` then spawns and
+                    // finishes inside this loop, so a `rctl start` does not pay
+                    // a 20 ms polling tick just to see the flow it just made.
+                    if let Some(flow) = flows.get_mut(&unit)
+                        && flow.advance(manager, notify, logs, aux).is_some()
+                    {
+                        flows.remove(&unit);
+                    }
+                    self.waiting = Some(unit);
+                }
+            }
+        }
+    }
+}
+
+fn failure_text(failed: &UnitName, target: &UnitName) -> String {
+    if failed == target {
+        format!("{target} failed to start")
+    } else {
+        format!("required dependency {failed} failed to start")
+    }
+}
+
+/// Turn a start effect into a flow. The stop variants cannot come from a start
+/// request; treating them as an error keeps an unexpected effect visible.
+fn apply_start_effect(
+    manager: &mut UnitManager,
+    flows: &mut BTreeMap<UnitName, StartFlow>,
+    unit: &UnitName,
+    effect: Effect,
+) -> Result<(), String> {
+    match effect {
+        Effect::SpawnProcess | Effect::CancelBackoffAndStart => {
+            if !flows.contains_key(unit) {
+                let flow = StartFlow::new(manager, unit, StartCompletion::AtReady)?;
+                flows.insert(unit.clone(), flow);
+            }
+            Ok(())
+        }
+        Effect::ClearStartLimitAndStart => {
+            manager.clear_start_limit(unit);
+            if !flows.contains_key(unit) {
+                let flow = StartFlow::new(manager, unit, StartCompletion::AtReady)?;
+                flows.insert(unit.clone(), flow);
+            }
+            Ok(())
+        }
+        Effect::None => Ok(()),
+        Effect::SendStopSignal | Effect::CancelBackoffAndStop => {
+            manager.stop_unit(unit);
+            Err(format!("{unit} was asked to stop while starting"))
+        }
+        Effect::ScheduleBackoff { .. } => Err(format!("unexpected start effect for {unit}")),
     }
 }
 
@@ -678,46 +1606,6 @@ async fn run_start_post(manager: &UnitManager, unit: &UnitName) {
 fn fail_unit(manager: &mut UnitManager, unit: &UnitName) {
     for dependent in manager.fail_start(unit) {
         rlog!("error: {dependent} requires {unit}, which failed; not starting it");
-    }
-}
-
-/// Stop everything `unit` conflicts with and wait for it to actually go.
-///
-/// Plan §1.1 makes `Conflicts=` mutual exclusion with "stop the other one
-/// first" semantics, so the conflicting unit is waited for by its own pid -
-/// which keeps the wait from stealing the exit of an unrelated unit that boot
-/// is still going to wait for.
-async fn stop_conflicts(manager: &mut UnitManager, unit: &UnitName) {
-    for other in manager.stop_conflicts(unit) {
-        rlog!("stopping {other}: it conflicts with {unit}");
-        let Some(pid) = manager.get(&other).and_then(|rt| rt.pid) else {
-            continue;
-        };
-        let timeout = manager
-            .get(&other)
-            .map_or(1, |rt| rt.config.timeout_stop_sec.max(1));
-        let outcome =
-            match readiness::wait_for_exit(pid, std::time::Duration::from_secs(timeout)).await {
-                Ok(code) => exit_outcome(code),
-                Err(()) => {
-                    // It did not stop in time: escalate, as the stop path would.
-                    let _ = process::kill_process_group(pid, libc::SIGKILL);
-                    let _ = readiness::wait_for_exit(pid, std::time::Duration::from_secs(5)).await;
-                    ExitOutcome::Signalled(libc::SIGKILL)
-                }
-            };
-        manager.on_child_exit(pid, outcome);
-        rlog!("{other} stopped; {unit} may start");
-    }
-}
-
-/// Turn a `wait_for_exit` result into the outcome the manager records.
-fn exit_outcome(code: Option<i32>) -> ExitOutcome {
-    match code {
-        Some(0) => ExitOutcome::Success,
-        Some(code) => ExitOutcome::Failure(code),
-        // We signalled it, so a missing exit code means it died on a signal.
-        None => ExitOutcome::Signalled(libc::SIGTERM),
     }
 }
 
@@ -774,18 +1662,30 @@ pub(crate) async fn apply_effect(
 /// This is where a request stops being bytes and starts being a change to the
 /// running system, so it lives with the manager and the notify hub rather than
 /// with the socket that delivered it.
+enum ControlAction {
+    /// The request is answered now.
+    Reply(Status, String),
+    /// A start is in flight; the supervisor owns its reply so the main loop can
+    /// keep running while the unit comes up.
+    Start(ControlStart),
+}
+
 async fn handle_control(
     cfg: &Config,
     manager: &mut UnitManager,
     notify: &mut NotifyHub,
     logs: &ServiceLogs,
+    activation: &mut Activated,
+    starts: &mut StartCoordinator,
     request: &Request,
-) -> (Status, String) {
+) -> ControlAction {
     match request {
         Request::List | Request::Status { unit: None, .. } => {
-            (Status::Ok, manager.summary().join("\n"))
+            ControlAction::Reply(Status::Ok, manager.summary().join("\n"))
         }
-        Request::ListFormatted { format } => (Status::Ok, render_list(manager, *format)),
+        Request::ListFormatted { format } => {
+            ControlAction::Reply(Status::Ok, render_list(manager, *format))
+        }
         Request::Status {
             unit: Some(unit),
             tail,
@@ -801,9 +1701,9 @@ async fn handle_control(
                         text.push('\n');
                     }
                 }
-                (Status::Ok, text)
+                ControlAction::Reply(Status::Ok, text)
             }
-            None => (Status::NoSuchUnit, format!("no such unit: {unit}")),
+            None => ControlAction::Reply(Status::NoSuchUnit, format!("no such unit: {unit}")),
         },
         Request::StatusFormatted {
             unit: Some(unit),
@@ -831,9 +1731,9 @@ async fn handle_control(
                         }
                     }
                 }
-                (Status::Ok, text)
+                ControlAction::Reply(Status::Ok, text)
             }
-            None => (Status::NoSuchUnit, format!("no such unit: {unit}")),
+            None => ControlAction::Reply(Status::NoSuchUnit, format!("no such unit: {unit}")),
         },
         Request::StatusFormatted {
             unit: None, format, ..
@@ -845,26 +1745,35 @@ async fn handle_control(
             } else {
                 lines.join("\n")
             };
-            (Status::Ok, text)
+            ControlAction::Reply(Status::Ok, text)
         }
-        Request::Start(unit) => control_start(manager, notify, logs, unit).await,
-        Request::Stop(unit) => control_stop(manager, notify, logs, unit).await,
-        Request::Restart(unit) => control_restart(manager, notify, logs, unit).await,
+        Request::Start(unit) => control_start(manager, unit),
+        Request::Stop(unit) => {
+            let (status, text) = control_stop(manager, notify, logs, unit).await;
+            ControlAction::Reply(status, text)
+        }
+        Request::Restart(unit) => control_restart(manager, unit),
         Request::ResetFailed(unit) => {
             if !manager.exists(unit) {
-                return (Status::NoSuchUnit, format!("no such unit: {unit}"));
+                return ControlAction::Reply(Status::NoSuchUnit, format!("no such unit: {unit}"));
             }
             manager.reset_failed(unit);
-            (Status::Ok, format!("{unit}: cleared"))
+            ControlAction::Reply(Status::Ok, format!("{unit}: cleared"))
         }
-        Request::Log { unit, tail } => (Status::Ok, render_logs(logs, unit.as_ref(), *tail)),
+        Request::Log { unit, tail } => {
+            ControlAction::Reply(Status::Ok, render_logs(logs, unit.as_ref(), *tail))
+        }
         // Plan §7.6. The reply is the report: what was added, changed, removed
         // and deferred, so a reload is never a silent act.
-        Request::Reload => control_reload(cfg, manager, notify, logs).await,
+        Request::Reload => {
+            let (status, text) =
+                control_reload(cfg, manager, notify, logs, activation, starts).await;
+            ControlAction::Reply(status, text)
+        }
         // The supervisor handles the side effect (it owns the shutdown path);
         // this reply only tells the client the request was understood.
-        Request::Reboot => (Status::Ok, "reboot requested".to_string()),
-        Request::Poweroff => (Status::Ok, "poweroff requested".to_string()),
+        Request::Reboot => ControlAction::Reply(Status::Ok, "reboot requested".to_string()),
+        Request::Poweroff => ControlAction::Reply(Status::Ok, "poweroff requested".to_string()),
     }
 }
 
@@ -878,8 +1787,10 @@ async fn control_reload(
     manager: &mut UnitManager,
     notify: &mut NotifyHub,
     logs: &ServiceLogs,
+    activation: &mut Activated,
+    starts: &mut StartCoordinator,
 ) -> (Status, String) {
-    match crate::reload::reload(cfg, manager, notify, logs).await {
+    match crate::reload::reload(cfg, manager, notify, logs, activation, starts).await {
         Ok(report) => {
             let mut lines = report.lines();
             let summary = report.summary();
@@ -894,17 +1805,12 @@ async fn control_reload(
 }
 
 /// `rctl start`: plan §1.3(13)'s action-derivation for a user request.
-async fn control_start(
-    manager: &mut UnitManager,
-    notify: &mut NotifyHub,
-    logs: &ServiceLogs,
-    unit: &UnitName,
-) -> (Status, String) {
+fn control_start(manager: &mut UnitManager, unit: &UnitName) -> ControlAction {
     if !manager.exists(unit) {
         // Plan §7.7's boundary: a template is a name to instantiate, not a unit,
         // and saying which is which is the whole message.
         if manager.is_template(unit) {
-            return (
+            return ControlAction::Reply(
                 Status::Error,
                 format!(
                     "{unit} is a template; start an instance, e.g. {}@<name>.service",
@@ -914,72 +1820,18 @@ async fn control_start(
         }
         // An instance of a template does not exist until someone asks for it.
         if let Err(why) = manager.instantiate(unit) {
-            return (Status::NoSuchUnit, format!("no such unit: {unit} ({why})"));
-        }
-    }
-    let order = match manager.start_order(unit) {
-        Ok(order) => order,
-        Err(e) => {
-            return (
-                Status::Error,
-                format!("cannot resolve dependencies for {unit}: {e}"),
-            );
-        }
-    };
-    let required = manager.required_closure(unit);
-    for dependency in order {
-        match manager.request_start(&dependency, RequestSource::Dependency) {
-            Some(Effect::None) => {}
-            Some(effect) => {
-                if let Err(e) = apply_effect(manager, notify, logs, &dependency, Some(effect)).await
-                {
-                    return (
-                        Status::Error,
-                        format!("cannot start dependency {dependency}: {e}"),
-                    );
-                }
-                run_start_post(manager, &dependency).await;
-            }
-            None => {
-                // A dependency that is still stopping is not ready for this
-                // start; the target must not pretend it came up.
-                return (
-                    Status::Error,
-                    format!("dependency {dependency} is still stopping"),
-                );
-            }
-        }
-        if required.contains(&dependency) && manager.is_failed(&dependency) {
-            return (
-                Status::Error,
-                format!("required dependency {dependency} failed to start"),
+            return ControlAction::Reply(
+                Status::NoSuchUnit,
+                format!("no such unit: {unit} ({why})"),
             );
         }
     }
-
-    let effect = manager.request_start(unit, RequestSource::UserStart);
-    match effect {
-        Some(Effect::None) => (Status::Ok, format!("{unit} is already active")),
-        // Queued behind a stop in progress; the main loop will finish it.
-        None => (
-            Status::Ok,
-            format!("{unit} is stopping; it will start afterwards"),
+    match ControlStart::new(manager, unit) {
+        Ok(job) => ControlAction::Start(job),
+        Err(e) => ControlAction::Reply(
+            Status::Error,
+            format!("cannot resolve dependencies for {unit}: {e}"),
         ),
-        Some(effect) => match apply_effect(manager, notify, logs, unit, Some(effect)).await {
-            Ok(_) => {
-                // A start can fail synchronously - a failed `ExecStartPre=`, a
-                // `NeedsSocket=` that never appeared - and the unit's state is the
-                // truth about that. Saying "started" would be the one answer an
-                // operator cannot check.
-                if manager.is_failed(unit) {
-                    (Status::Error, format!("{unit} failed to start"))
-                } else {
-                    run_start_post(manager, unit).await;
-                    (Status::Ok, format!("started {unit}"))
-                }
-            }
-            Err(e) => (Status::Error, format!("cannot start {unit}: {e}")),
-        },
     }
 }
 
@@ -1016,22 +1868,17 @@ async fn control_stop(
 ///
 /// A unit that has no process to restart and nothing to redo is a conflict
 /// (plan §3 M3's exit code 4).
-async fn control_restart(
-    manager: &mut UnitManager,
-    notify: &mut NotifyHub,
-    logs: &ServiceLogs,
-    unit: &UnitName,
-) -> (Status, String) {
+fn control_restart(manager: &mut UnitManager, unit: &UnitName) -> ControlAction {
     if !manager.exists(unit) {
-        return (Status::NoSuchUnit, format!("no such unit: {unit}"));
+        return ControlAction::Reply(Status::NoSuchUnit, format!("no such unit: {unit}"));
     }
     match manager.restart_unit(unit) {
         RestartPlan::Stopping => {
             rlog!("restarting {unit}");
-            (Status::Ok, format!("restarting {unit}"))
+            ControlAction::Reply(Status::Ok, format!("restarting {unit}"))
         }
-        RestartPlan::Start => control_start(manager, notify, logs, unit).await,
-        RestartPlan::NotApplicable => (
+        RestartPlan::Start => control_start(manager, unit),
+        RestartPlan::NotApplicable => ControlAction::Reply(
             Status::Conflict,
             format!("{unit} has no process to restart"),
         ),
@@ -1509,42 +2356,6 @@ fn fit(value: &str, width: usize) -> String {
     out
 }
 
-/// Wait for the paths a unit's `NeedsSocket=` names (plan §7.8).
-///
-/// Returns the path that never appeared when the unit's start timeout runs out,
-/// which the caller turns into a failed start: a client that came up against a
-/// missing socket is the race this directive exists to remove.
-///
-/// Waiting polls the filesystem: the plan's readiness signal is the *path*, and
-/// there is nothing to wait on otherwise - the provider is a process rinit may
-/// not even track, since the socket could be created by a service that is still
-/// starting or by something it forked.
-async fn wait_for_sockets(manager: &UnitManager, unit: &UnitName) -> Result<(), String> {
-    let Some(rt) = manager.get(unit) else {
-        return Ok(());
-    };
-    let paths = rt.config.needs_socket.clone();
-    if paths.is_empty() {
-        return Ok(());
-    }
-    let timeout = if rt.config.timeout_start_sec == 0 {
-        crate::deadline::MAX_TIMEOUT
-    } else {
-        std::time::Duration::from_secs(rt.config.timeout_start_sec)
-    };
-
-    let deadline = crate::deadline::after(timeout);
-    for path in paths {
-        while !std::path::Path::new(&path).exists() {
-            if std::time::Instant::now() >= deadline {
-                return Err(path);
-            }
-            tokio::time::sleep(SOCKET_POLL).await;
-        }
-    }
-    Ok(())
-}
-
 /// Report what a reaped exit meant to a unit.
 ///
 /// The manager applies the state change itself as it reaps; this only narrates
@@ -1583,6 +2394,75 @@ fn next_deadline(manager: &UnitManager) -> std::time::Duration {
     soonest.map_or(std::time::Duration::from_secs(3600), |d| {
         d.max(std::time::Duration::from_millis(1))
     })
+}
+
+/// How a boot-time wait for `Type=notify` readiness ended.
+enum NotifyWait {
+    Ready,
+    /// The process exited, or the unit otherwise left `Starting`, without
+    /// reporting readiness.
+    Failed,
+    TimedOut,
+}
+
+/// Wait for `unit` to send `READY=1` (plan §1.3(12)).
+///
+/// Boot cannot use the supervisor's notify arm yet, so it pumps the same hub
+/// here. Messages for other units are still delivered to the manager: a notify
+/// service that becomes ready while this one is being awaited must not have its
+/// readiness dropped.
+async fn wait_for_notify(
+    manager: &mut UnitManager,
+    notify: &mut NotifyHub,
+    unit: &UnitName,
+    pid: libc::pid_t,
+    timeout: Duration,
+) -> NotifyWait {
+    let deadline = crate::deadline::after(timeout);
+    loop {
+        match manager.get(unit).map(|rt| rt.state) {
+            Some(UnitState::Active | UnitState::ActiveExited) => return NotifyWait::Ready,
+            Some(UnitState::Starting) => {}
+            _ => return NotifyWait::Failed,
+        }
+
+        // A notify service that dies before `READY=1` is a failed start, not a
+        // zombie boot is waiting on. Reap it through the manager so its policy
+        // and cgroup cleanup still apply.
+        match rinit_runtime::syscall::wait::poll_child(pid) {
+            Ok(Some(exit)) => {
+                if let Some(outcome) = manager.on_child_exit(pid, child_outcome(exit)) {
+                    log_outcome(&outcome);
+                }
+                continue;
+            }
+            Ok(None) => {}
+            Err(e) if e.errno() == libc::EINTR => continue,
+            Err(_) => return NotifyWait::Failed,
+        }
+
+        if Instant::now() >= deadline {
+            let _ = process::kill_process_group(pid, libc::SIGKILL);
+            manager.signal_cgroup_members(unit, libc::SIGKILL);
+            // Reap the killed process, but leave the state change to the
+            // caller's `fail_unit`: going through `on_child_exit` first would
+            // let `Restart=` arm a retry that the failed start must not get.
+            let _ = readiness::wait_for_exit(pid, Duration::from_secs(5)).await;
+            return NotifyWait::TimedOut;
+        }
+
+        tokio::select! {
+            Some((source, message)) = notify.recv() => {
+                if let Some(status) = &message.status {
+                    rlog!("{source}: {status}");
+                }
+                if manager.on_notify(&source, &message) {
+                    rlog!("{source} is ready");
+                }
+            }
+            _ = tokio::time::sleep(START_POLL) => {}
+        }
+    }
 }
 
 /// Resolve the unit directory and start every level of the schedule.
@@ -1694,11 +2574,16 @@ async fn start_units(
                     first_service_uptime_ms = rinit_runtime::time::uptime_ms();
                 }
             }
+            // A start that already failed has no readiness to wait for, and
+            // running `ExecStartPost=` for it would be a command after a start
+            // that never happened.
+            if units.is_failed(name) {
+                continue;
+            }
 
-            // `oneshot` and `forking` are only ready once the command has
-            // exited 0; `simple` and the M2 stand-in for `notify` are ready at
-            // exec.
-            if readiness::readiness_of(entry.kind) == readiness::Readiness::OnExitSuccess
+            // `oneshot`/`forking` are ready once the command exits 0; `notify`
+            // once it sends `READY=1`; `simple` at exec.
+            if readiness::readiness_of(entry.kind) != readiness::Readiness::Immediate
                 && let Some(pid) = units.get(name).and_then(|rt| rt.pid)
             {
                 pending.push((name.clone(), pid, entry.timeout_start_sec, entry.kind));
@@ -1721,46 +2606,63 @@ async fn start_units(
             } else {
                 std::time::Duration::from_secs(*timeout_sec)
             };
-            match readiness::wait_for_exit(*pid, timeout).await {
-                Ok(Some(0)) => match kind {
-                    // Plan §7.10: the exit is the middle of a `forking` unit's
-                    // start, so the daemon it left behind is what makes it
-                    // `Active` - and not being able to find it fails the start
-                    // rather than leaving a unit that claims to be running.
-                    ServiceKind::Forking => match units.finish_forking_start(name) {
-                        Ok(daemon) => {
-                            rlog!("{name}: main process exited; daemon is pid {daemon}");
-                            run_start_post(&units, name).await;
-                        }
-                        Err(why) => {
-                            rlog!("error: {name}: cannot locate the daemon: {why}");
+            match readiness::readiness_of(*kind) {
+                readiness::Readiness::OnReady => {
+                    match wait_for_notify(&mut units, notify, name, *pid, timeout).await {
+                        NotifyWait::Ready => run_start_post(&units, name).await,
+                        NotifyWait::Failed => {
+                            rlog!("error: {name} failed before reporting readiness");
                             fail_unit(&mut units, name);
                         }
+                        NotifyWait::TimedOut => {
+                            rlog!("error: {name} did not report readiness within {timeout_sec}s");
+                            units.signal_cgroup_members(name, libc::SIGKILL);
+                            fail_unit(&mut units, name);
+                        }
+                    }
+                }
+                _ => match readiness::wait_for_exit(*pid, timeout).await {
+                    Ok(Some(0)) => match kind {
+                        // Plan §7.10: the exit is the middle of a `forking`
+                        // unit's start, so the daemon it left behind is what
+                        // makes it `Active` - and not being able to find it
+                        // fails the start rather than leaving a unit that
+                        // claims to be running.
+                        ServiceKind::Forking => match units.finish_forking_start(name) {
+                            Ok(daemon) => {
+                                rlog!("{name}: main process exited; daemon is pid {daemon}");
+                                run_start_post(&units, name).await;
+                            }
+                            Err(why) => {
+                                rlog!("error: {name}: cannot locate the daemon: {why}");
+                                fail_unit(&mut units, name);
+                            }
+                        },
+                        _ => {
+                            rlog!("{name} completed (Active(Exited))");
+                            units.mark_oneshot_done(name);
+                            run_start_post(&units, name).await;
+                        }
                     },
-                    _ => {
-                        rlog!("{name} completed (Active(Exited))");
-                        units.mark_oneshot_done(name);
-                        run_start_post(&units, name).await;
+                    Ok(Some(code)) => {
+                        rlog!("error: {name} exited {code}");
+                        fail_unit(&mut units, name);
+                    }
+                    Ok(None) => {
+                        rlog!("error: {name} was killed by a signal");
+                        fail_unit(&mut units, name);
+                    }
+                    Err(()) => {
+                        rlog!("error: {name} did not finish within {timeout_sec}s");
+                        let _ = process::kill_process_group(*pid, libc::SIGKILL);
+                        // And whatever the process group cannot reach: a
+                        // `forking` unit that never detached has already started
+                        // the daemon it never named, and abandoning the start
+                        // must not leave it running (plan §7.10).
+                        units.signal_cgroup_members(name, libc::SIGKILL);
+                        fail_unit(&mut units, name);
                     }
                 },
-                Ok(Some(code)) => {
-                    rlog!("error: {name} exited {code}");
-                    fail_unit(&mut units, name);
-                }
-                Ok(None) => {
-                    rlog!("error: {name} was killed by a signal");
-                    fail_unit(&mut units, name);
-                }
-                Err(()) => {
-                    rlog!("error: {name} did not finish within {timeout_sec}s");
-                    let _ = process::kill_process_group(*pid, libc::SIGKILL);
-                    // And whatever the process group cannot reach: a `forking`
-                    // unit that never detached has already started the daemon it
-                    // never named, and abandoning the start must not leave it
-                    // running (plan §7.10).
-                    units.signal_cgroup_members(name, libc::SIGKILL);
-                    fail_unit(&mut units, name);
-                }
             }
         }
 
@@ -2024,6 +2926,58 @@ mod tests {
         }
     }
 
+    /// Drive a control request to its reply.
+    ///
+    /// Production defers a start reply to the supervisor loop; this helper is
+    /// the smallest version of that loop, so the tests exercise the same state
+    /// machine rather than a second synchronous start path.
+    async fn control(
+        manager: &mut UnitManager,
+        notify: &mut NotifyHub,
+        logs: &ServiceLogs,
+        request: &Request,
+    ) -> (Status, String) {
+        let mut activation = Activated::disabled();
+        let mut starts = StartCoordinator::default();
+        let action = handle_control(
+            &test_config(),
+            manager,
+            notify,
+            logs,
+            &mut activation,
+            &mut starts,
+            request,
+        )
+        .await;
+        let mut job = match action {
+            ControlAction::Reply(status, text) => return (status, text),
+            ControlAction::Start(job) => job,
+        };
+        let (sender, mut receiver) = oneshot::channel();
+        job.reply = Some(sender);
+        starts.controls.push(job);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            for outcome in starts.reap(manager) {
+                log_outcome(&outcome);
+            }
+            starts.advance(manager, notify, logs);
+            match receiver.try_recv() {
+                Ok(reply) => return reply,
+                Err(oneshot::error::TryRecvError::Empty) => {}
+                Err(oneshot::error::TryRecvError::Closed) => {
+                    panic!("the start flow dropped its reply")
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the start did not finish within 5s"
+            );
+            tokio::time::sleep(START_POLL).await;
+        }
+    }
+
     #[test]
     fn formatted_list_has_a_table_and_machine_readable_shapes() {
         let manager = manager_with("app.service");
@@ -2083,8 +3037,7 @@ mod tests {
             Request::Restart(ghost.clone()),
             Request::ResetFailed(ghost.clone()),
         ] {
-            let (status, text) =
-                handle_control(&test_config(), &mut manager, &mut notify, &logs, &request).await;
+            let (status, text) = control(&mut manager, &mut notify, &logs, &request).await;
             assert_eq!(status, Status::NoSuchUnit, "{}: {text}", request.describe());
         }
     }
@@ -2098,8 +3051,7 @@ mod tests {
         let logs = ServiceLogs::new();
         let app = unit("app.service");
 
-        let (status, _) = handle_control(
-            &test_config(),
+        let (status, _) = control(
             &mut manager,
             &mut notify,
             &logs,
@@ -2112,32 +3064,17 @@ mod tests {
             "the unit must run"
         );
 
-        let (status, text) = handle_control(
-            &test_config(),
-            &mut manager,
-            &mut notify,
-            &logs,
-            &status_request(&app),
-        )
-        .await;
+        let (status, text) = control(&mut manager, &mut notify, &logs, &status_request(&app)).await;
         assert_eq!(status, Status::Ok);
         assert!(text.contains("app.service"), "{text}");
         assert!(text.contains("active"), "{text}");
         assert!(text.contains("target: started"), "{text}");
 
-        let (status, text) = handle_control(
-            &test_config(),
-            &mut manager,
-            &mut notify,
-            &logs,
-            &Request::List,
-        )
-        .await;
+        let (status, text) = control(&mut manager, &mut notify, &logs, &Request::List).await;
         assert_eq!(status, Status::Ok);
         assert!(text.contains("app.service"), "{text}");
 
-        let (status, _) = handle_control(
-            &test_config(),
+        let (status, _) = control(
             &mut manager,
             &mut notify,
             &logs,
@@ -2162,16 +3099,14 @@ mod tests {
         let logs = ServiceLogs::new();
         let app = unit("app.service");
 
-        handle_control(
-            &test_config(),
+        control(
             &mut manager,
             &mut notify,
             &logs,
             &Request::Start(app.clone()),
         )
         .await;
-        let (status, text) = handle_control(
-            &test_config(),
+        let (status, text) = control(
             &mut manager,
             &mut notify,
             &logs,
@@ -2184,6 +3119,101 @@ mod tests {
         let pid = manager.get(&app).unwrap().pid.expect("pid");
         let _ = process::kill_process_group(pid, libc::SIGKILL);
         let _ = rinit_runtime::syscall::wait::reap_children();
+    }
+
+    /// `rctl start` must not answer before a `oneshot` has actually finished,
+    /// and its `ExecStartPost=` belongs after the command has exited.
+    #[tokio::test(flavor = "current_thread")]
+    async fn control_start_waits_for_a_oneshot_to_finish() {
+        let _guard = crate::test_support::children_lock_async().await;
+        let dir =
+            std::env::temp_dir().join(format!("rinit-control-oneshot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch directory");
+        let main_marker = dir.join("main");
+        let post_marker = dir.join("post");
+
+        let once = unit("once.service");
+        let mut cfg = UnitConfig::new(once.clone());
+        cfg.service_kind = ServiceKind::Oneshot;
+        cfg.exec_start = rinit_core::ExecCommand::new(vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            format!("sleep 0.2; echo main > {}", main_marker.display()),
+        ]);
+        cfg.exec_start_post = vec![rinit_core::ExecCommand::new(vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            format!(
+                "test -f {} && echo post > {}",
+                main_marker.display(),
+                post_marker.display()
+            ),
+        ])];
+        let mut manager = UnitManager::new();
+        manager.add(cfg);
+        let mut notify = test_hub("oneshot-start");
+        let logs = ServiceLogs::new();
+
+        let (status, text) = control(
+            &mut manager,
+            &mut notify,
+            &logs,
+            &Request::Start(once.clone()),
+        )
+        .await;
+        assert_eq!(status, Status::Ok, "{text}");
+        assert_eq!(manager.get(&once).unwrap().state, UnitState::ActiveExited);
+        assert!(main_marker.exists(), "the command must have run: {text}");
+        assert!(
+            post_marker.exists(),
+            "ExecStartPost must run after the exit, before the reply: {text}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A start flow returns to the supervisor while a `NeedsSocket=` path does
+    /// not exist yet; the path appearing is what lets the next call spawn.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_needs_socket_flow_yields_until_the_path_appears() {
+        let _guard = crate::test_support::children_lock_async().await;
+        let dir = std::env::temp_dir().join(format!("rinit-flow-socket-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch directory");
+        let socket = dir.join("ready.sock");
+        let app = unit("app.service");
+
+        let mut cfg = UnitConfig::new(app.clone());
+        cfg.exec_start =
+            rinit_core::ExecCommand::new(vec!["/bin/sleep".to_string(), "30".to_string()]);
+        cfg.restart = RestartPolicy::No;
+        cfg.needs_socket = vec![socket.display().to_string()];
+        cfg.timeout_start_sec = 5;
+        let mut manager = UnitManager::new();
+        manager.add(cfg);
+        let mut notify = test_hub("flow-socket");
+        let logs = ServiceLogs::new();
+        let mut aux = BTreeMap::new();
+
+        let mut flow = StartFlow::new(&mut manager, &app, StartCompletion::AtReady).expect("flow");
+        assert!(
+            flow.advance(&mut manager, &mut notify, &logs, &mut aux)
+                .is_none(),
+            "the flow must yield to the supervisor while the path is missing"
+        );
+        assert!(manager.get(&app).unwrap().pid.is_none());
+
+        std::fs::write(&socket, b"").expect("create the socket path");
+        assert_eq!(
+            flow.advance(&mut manager, &mut notify, &logs, &mut aux),
+            Some(Ok(true)),
+            "the path appearing lets the start finish"
+        );
+        let pid = manager.get(&app).unwrap().pid.expect("pid");
+        let _ = process::kill_process_group(pid, libc::SIGKILL);
+        let _ = rinit_runtime::syscall::wait::reap_children();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Plan §3 M3: `restart` of a unit with no process to restart is a
@@ -2206,8 +3236,7 @@ mod tests {
             RestartPlan::NotApplicable
         );
 
-        let (status, text) = handle_control(
-            &test_config(),
+        let (status, text) = control(
             &mut manager,
             &mut notify,
             &logs,
@@ -2242,8 +3271,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
 
-        let (status, text) = handle_control(
-            &test_config(),
+        let (status, text) = control(
             &mut manager,
             &mut notify,
             &logs,
@@ -2272,8 +3300,7 @@ mod tests {
         manager.fail_start(&app);
         assert!(manager.is_failed(&app));
 
-        let (status, _) = handle_control(
-            &test_config(),
+        let (status, _) = control(
             &mut manager,
             &mut notify,
             &logs,

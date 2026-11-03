@@ -8,7 +8,7 @@
 //! |------------|---------------------------------------------------|
 //! | `simple`   | the process has been exec'd                       |
 //! | `oneshot`  | the command has exited with code 0 (`Active(Exited)`) |
-//! | `notify`   | `READY=1` arrives - deferred to M2                 |
+//! | `notify`   | `READY=1` arrives                                  |
 //!
 //! Getting `oneshot` wrong is not cosmetic. An `After=db-init.service` unit
 //! that starts before the database finished initialising fails in a way that
@@ -29,7 +29,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// What a unit needed before the next startup level could begin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Readiness {
-    /// Ready as soon as it was exec'd (`simple`, `notify`, and targets).
+    /// Ready as soon as it was exec'd (`simple`, and targets).
     Immediate,
     /// Ready once the command exits 0.
     ///
@@ -39,6 +39,8 @@ pub enum Readiness {
     /// loop waits for the exit in both cases and tells them apart by the kind,
     /// because the wait is the same and only what follows it differs.
     OnExitSuccess,
+    /// Ready once the service sends `READY=1` on its notify socket.
+    OnReady,
 }
 
 /// The readiness rule implied by a unit's `Type=`.
@@ -46,11 +48,7 @@ pub const fn readiness_of(kind: ServiceKind) -> Readiness {
     match kind {
         ServiceKind::Simple => Readiness::Immediate,
         ServiceKind::Oneshot | ServiceKind::Forking => Readiness::OnExitSuccess,
-        // M1 has no sd_notify protocol yet, so a `notify` unit is treated as
-        // ready on exec. That is a known simplification, not an oversight: the
-        // `READY=1` protocol and `TimeoutStartSec` enforcement arrive with the
-        // state machine in M2 (plan §1.3(3)).
-        ServiceKind::Notify => Readiness::Immediate,
+        ServiceKind::Notify => Readiness::OnReady,
     }
 }
 
@@ -104,7 +102,7 @@ mod tests {
         let _guard = crate::test_support::children_lock();
         assert_eq!(readiness_of(ServiceKind::Oneshot), Readiness::OnExitSuccess);
         assert_eq!(readiness_of(ServiceKind::Simple), Readiness::Immediate);
-        assert_eq!(readiness_of(ServiceKind::Notify), Readiness::Immediate);
+        assert_eq!(readiness_of(ServiceKind::Notify), Readiness::OnReady);
         assert_eq!(
             readiness_of(ServiceKind::Forking),
             Readiness::OnExitSuccess,

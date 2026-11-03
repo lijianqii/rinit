@@ -168,6 +168,10 @@ fn boot_units_inspect<T>(
         .arg(target)
         .args(extra)
         .env("RINIT_CONTROL_DIR", &control_dir)
+        // A `Type=notify` unit needs a writable socket directory even when the
+        // test is not the one sending `READY=1`; `/run/rinit/notify` is root's
+        // and this suite runs unprivileged.
+        .env("RINIT_NOTIFY_DIR", units.0.join("notify"))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -855,6 +859,39 @@ fn a_notify_unit_becomes_active_when_it_reports_ready() {
     assert!(
         log.contains("app.service is ready"),
         "READY=1 must complete start-up:\n{log}"
+    );
+}
+
+/// A `notify` unit that never reports readiness fails its start at
+/// `TimeoutStartSec=`, and `Restart=always` must not turn that failed start into
+/// an endless boot-time retry.
+#[test]
+fn a_notify_unit_that_never_reports_readiness_fails_its_target() {
+    let dir = TempDir::new("notify-timeout");
+    dir.write("all.target", "[Unit]\nType=target\nRequires=app.service\n");
+    dir.write(
+        "app.service",
+        "[Service]\nType=notify\nTimeoutStartSec=1\nRestart=always\n\
+         ExecStart=/bin/sh -c \"sleep 30\"\n",
+    );
+
+    let log = boot_units(&dir, "all.target");
+
+    assert!(
+        log.contains("app.service did not report readiness within"),
+        "the timeout must name the unit:\n{log}"
+    );
+    assert!(
+        log.contains("all.target requires app.service, which failed"),
+        "a dependent must not treat a failed notify start as ready:\n{log}"
+    );
+    assert!(
+        !log.contains("app.service will restart in"),
+        "a failed start must not be retried:\n{log}"
+    );
+    assert!(
+        log.contains("boot complete"),
+        "boot must still finish:\n{log}"
     );
 }
 

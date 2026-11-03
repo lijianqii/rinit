@@ -131,6 +131,20 @@ impl Activated {
             .map(|bound| bound.listener.as_raw_fd())
     }
 
+    /// The path currently bound for `unit`, if any.
+    pub fn path_of(&self, unit: &UnitName) -> Option<&Path> {
+        self.sockets.get(unit).map(|bound| bound.path.as_path())
+    }
+
+    /// Drop `unit`'s socket and watcher, for a reload that removed or changed
+    /// `SocketActivate=`.
+    pub fn remove(&mut self, unit: &UnitName) {
+        if let Some(bound) = self.sockets.remove(unit) {
+            bound._watch.abort();
+            let _ = std::fs::remove_file(&bound.path);
+        }
+    }
+
     /// A unit whose socket has a connection waiting, if any.
     pub async fn recv(&mut self) -> Option<UnitName> {
         self.ready.recv().await
