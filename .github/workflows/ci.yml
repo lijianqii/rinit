@@ -112,7 +112,7 @@ jobs:
         run: make size-check
 
   arm32:
-    name: cross-compile (armv7, dynamic)
+    name: armv7 build and system test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -122,10 +122,12 @@ jobs:
           rustup component add rustfmt clippy
           rustup target add armv7-unknown-linux-gnueabihf
 
-      - name: Cross toolchain
+      - name: Cross toolchain and qemu
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-arm-linux-gnueabihf
+          sudo apt-get install -y \
+            gcc-arm-linux-gnueabihf qemu-system-arm bc flex bison \
+            libssl-dev libelf-dev cpio
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -155,6 +157,18 @@ jobs:
 
       - name: Size gate
         run: make ARCH=arm32 size-check
+
+      - name: Kernel and initramfs cache
+        uses: actions/cache@v4
+        with:
+          path: build/dl
+          key: kernel-${{ runner.os }}-6.6.158-arm32
+
+      - name: Build kernel and initramfs
+        run: make ARCH=arm32 initramfs kernel
+
+      - name: Boot and assert
+        run: make ARCH=arm32 test-system
 
   guest:
     name: qemu system test (aarch64)
