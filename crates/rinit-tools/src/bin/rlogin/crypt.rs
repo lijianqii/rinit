@@ -216,6 +216,231 @@ fn compress(state: &mut [u64; 8], block: &[u8; 128]) {
     ];
 }
 
+const K256: [u32; 64] = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+];
+
+const H256: [u32; 8] = [
+    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+];
+
+struct Sha256 {
+    state: [u32; 8],
+    buffer: [u8; 64],
+    buffer_len: usize,
+    length: u128,
+}
+
+impl Sha256 {
+    fn new() -> Self {
+        Self {
+            state: H256,
+            buffer: [0; 64],
+            buffer_len: 0,
+            length: 0,
+        }
+    }
+
+    fn update(&mut self, mut data: &[u8]) {
+        self.length += data.len() as u128;
+        if self.buffer_len > 0 {
+            let space = 64 - self.buffer_len;
+            let take = data.len().min(space);
+            self.buffer[self.buffer_len..self.buffer_len + take].copy_from_slice(&data[..take]);
+            self.buffer_len += take;
+            data = &data[take..];
+            if self.buffer_len == 64 {
+                let block = self.buffer;
+                compress256(&mut self.state, &block);
+                self.buffer_len = 0;
+            }
+        }
+        while data.len() >= 64 {
+            let Ok(block): Result<&[u8; 64], _> = data[..64].try_into() else {
+                break;
+            };
+            compress256(&mut self.state, block);
+            data = &data[64..];
+        }
+        if !data.is_empty() {
+            self.buffer[..data.len()].copy_from_slice(data);
+            self.buffer_len = data.len();
+        }
+    }
+
+    fn finalize(mut self) -> [u8; 32] {
+        let bit_len = self.length * 8;
+        let mut padding = vec![0x80_u8];
+        let remainder = (self.buffer_len + 1) % 64;
+        let zeros = if remainder <= 56 {
+            56 - remainder
+        } else {
+            120 - remainder
+        };
+        padding.extend(std::iter::repeat_n(0_u8, zeros));
+        padding.extend_from_slice(&(bit_len as u64).to_be_bytes());
+        self.update(&padding);
+        let mut out = [0_u8; 32];
+        for (index, word) in self.state.iter().enumerate() {
+            out[index * 4..index * 4 + 4].copy_from_slice(&word.to_be_bytes());
+        }
+        out
+    }
+}
+
+fn compress256(state: &mut [u32; 8], block: &[u8; 64]) {
+    let mut schedule = [0_u32; 64];
+    for (index, slot) in schedule.iter_mut().take(16).enumerate() {
+        *slot = u32::from_be_bytes(block[index * 4..index * 4 + 4].try_into().unwrap_or([0; 4]));
+    }
+    for index in 16..64 {
+        let s0 = schedule[index - 15].rotate_right(7)
+            ^ schedule[index - 15].rotate_right(18)
+            ^ (schedule[index - 15] >> 3);
+        let s1 = schedule[index - 2].rotate_right(17)
+            ^ schedule[index - 2].rotate_right(19)
+            ^ (schedule[index - 2] >> 10);
+        schedule[index] = schedule[index - 16]
+            .wrapping_add(s0)
+            .wrapping_add(schedule[index - 7])
+            .wrapping_add(s1);
+    }
+    let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = *state;
+    for index in 0..64 {
+        let sigma1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+        let choose = (e & f) ^ (!e & g);
+        let temp1 = h
+            .wrapping_add(sigma1)
+            .wrapping_add(choose)
+            .wrapping_add(K256[index])
+            .wrapping_add(schedule[index]);
+        let sigma0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+        let majority = (a & b) ^ (a & c) ^ (b & c);
+        let temp2 = sigma0.wrapping_add(majority);
+        h = g;
+        g = f;
+        f = e;
+        e = d.wrapping_add(temp1);
+        d = c;
+        c = b;
+        b = a;
+        a = temp1.wrapping_add(temp2);
+    }
+    *state = [
+        state[0].wrapping_add(a),
+        state[1].wrapping_add(b),
+        state[2].wrapping_add(c),
+        state[3].wrapping_add(d),
+        state[4].wrapping_add(e),
+        state[5].wrapping_add(f),
+        state[6].wrapping_add(g),
+        state[7].wrapping_add(h),
+    ];
+}
+
+fn encode_sha256(hash: &[u8; 32]) -> String {
+    let mut out = String::new();
+    let mut index = 0;
+    loop {
+        let mut j = index + 10;
+        let mut k = index + 20;
+        if j >= 30 {
+            j -= 30;
+        }
+        if k >= 30 {
+            k -= 30;
+        }
+        b64_from_24bit(&mut out, hash[index], hash[j], hash[k], 4);
+        if k == 29 {
+            break;
+        }
+        index = k + 1;
+    }
+    b64_from_24bit(&mut out, 0, hash[31], hash[30], 3);
+    out
+}
+
+/// Compute the `$5$` crypt representation of `password` for `setting`.
+pub fn sha256_crypt(password: &str, setting: &str) -> Option<String> {
+    let mut rest = setting.strip_prefix("$5$")?;
+    let mut rounds = 5000_u32;
+    let mut explicit_rounds = false;
+    if let Some(value) = rest.strip_prefix("rounds=") {
+        let end = value.find('$')?;
+        rounds = value.get(..end)?.parse::<u32>().ok()?;
+        rounds = rounds.clamp(1000, 999_999_999);
+        rest = value.get(end + 1..)?;
+        explicit_rounds = true;
+    }
+    let salt_end = rest.find('$').unwrap_or(rest.len());
+    let salt = rest.get(..salt_end)?.as_bytes();
+    let salt = salt.get(..salt.len().min(16))?;
+    let key = password.as_bytes();
+
+    let mut context = Sha256::new();
+    context.update(key);
+    context.update(salt);
+    let mut alternate = Sha256::new();
+    alternate.update(key);
+    alternate.update(salt);
+    alternate.update(key);
+    let mut alt = alternate.finalize();
+
+    let mut count = key.len();
+    while count > 32 {
+        context.update(&alt);
+        count -= 32;
+    }
+    context.update(&alt[..count]);
+    let mut bits = key.len();
+    while bits != 0 {
+        context.update(if bits & 1 != 0 { &alt } else { key });
+        bits >>= 1;
+    }
+    alt = context.finalize();
+
+    let mut p_context = Sha256::new();
+    for _ in 0..key.len() {
+        p_context.update(key);
+    }
+    let p_bytes = repeat_to_len(&p_context.finalize(), key.len());
+
+    let mut s_context = Sha256::new();
+    for _ in 0..(16 + alt[0] as usize) {
+        s_context.update(salt);
+    }
+    let s_bytes = repeat_to_len(&s_context.finalize(), salt.len());
+
+    for round in 0..rounds {
+        let mut context = Sha256::new();
+        context.update(if round & 1 != 0 { &p_bytes } else { &alt });
+        if round % 3 != 0 {
+            context.update(&s_bytes);
+        }
+        if round % 7 != 0 {
+            context.update(&p_bytes);
+        }
+        context.update(if round & 1 != 0 { &alt } else { &p_bytes });
+        alt = context.finalize();
+    }
+
+    let mut out = String::from("$5$");
+    if explicit_rounds {
+        out.push_str(&format!("rounds={rounds}$"));
+    }
+    out.push_str(std::str::from_utf8(salt).ok()?);
+    out.push('$');
+    out.push_str(&encode_sha256(&alt));
+    Some(out)
+}
+
 #[cfg(test)]
 fn digest(data: &[u8]) -> [u8; 64] {
     let mut context = Sha512::new();
@@ -223,10 +448,17 @@ fn digest(data: &[u8]) -> [u8; 64] {
     context.finalize()
 }
 
-fn repeat_to_len(bytes: &[u8; 64], length: usize) -> Vec<u8> {
+#[cfg(test)]
+fn digest256(data: &[u8]) -> [u8; 32] {
+    let mut context = Sha256::new();
+    context.update(data);
+    context.finalize()
+}
+
+fn repeat_to_len(bytes: &[u8], length: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(length);
     while out.len() < length {
-        let take = (length - out.len()).min(64);
+        let take = (length - out.len()).min(bytes.len());
         out.extend_from_slice(&bytes[..take]);
     }
     out
@@ -343,7 +575,16 @@ pub fn sha512_crypt(password: &str, setting: &str) -> Option<String> {
 
 /// Compare a password against a `$6$` hash in constant time.
 pub fn verify(password: &str, hash: &str) -> bool {
-    let Some(computed) = sha512_crypt(password, hash) else {
+    let computed = if hash.starts_with("$6$") {
+        sha512_crypt(password, hash)
+    } else if hash.starts_with("$5$") {
+        sha256_crypt(password, hash)
+    } else if hash.starts_with("$1$") {
+        md5_crypt(password, hash)
+    } else {
+        None
+    };
+    let Some(computed) = computed else {
         return false;
     };
     let left = computed.as_bytes();
@@ -356,6 +597,191 @@ pub fn verify(password: &str, hash: &str) -> bool {
         difference |= a ^ b;
     }
     difference == 0
+}
+
+const MD5_K: [u32; 64] = [
+    0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
+    0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
+    0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
+    0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed, 0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
+    0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
+    0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
+    0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+    0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391,
+];
+
+const MD5_S: [u32; 64] = [
+    7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9,
+    14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10, 15,
+    21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+];
+
+struct Md5 {
+    state: [u32; 4],
+    buffer: [u8; 64],
+    buffer_len: usize,
+    length: u64,
+}
+
+impl Md5 {
+    fn new() -> Self {
+        Self {
+            state: [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476],
+            buffer: [0; 64],
+            buffer_len: 0,
+            length: 0,
+        }
+    }
+
+    fn update(&mut self, mut data: &[u8]) {
+        self.length += data.len() as u64;
+        if self.buffer_len > 0 {
+            let space = 64 - self.buffer_len;
+            let take = data.len().min(space);
+            self.buffer[self.buffer_len..self.buffer_len + take].copy_from_slice(&data[..take]);
+            self.buffer_len += take;
+            data = &data[take..];
+            if self.buffer_len == 64 {
+                let block = self.buffer;
+                compress_md5(&mut self.state, &block);
+                self.buffer_len = 0;
+            }
+        }
+        while data.len() >= 64 {
+            let Ok(block): Result<&[u8; 64], _> = data[..64].try_into() else {
+                break;
+            };
+            compress_md5(&mut self.state, block);
+            data = &data[64..];
+        }
+        if !data.is_empty() {
+            self.buffer[..data.len()].copy_from_slice(data);
+            self.buffer_len = data.len();
+        }
+    }
+
+    fn finalize(mut self) -> [u8; 16] {
+        let bit_len = self.length * 8;
+        let mut padding = vec![0x80_u8];
+        let remainder = (self.buffer_len + 1) % 64;
+        let zeros = if remainder <= 56 {
+            56 - remainder
+        } else {
+            120 - remainder
+        };
+        padding.extend(std::iter::repeat_n(0_u8, zeros));
+        padding.extend_from_slice(&bit_len.to_le_bytes());
+        self.update(&padding);
+        let mut out = [0_u8; 16];
+        for (index, word) in self.state.iter().enumerate() {
+            out[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        out
+    }
+}
+
+fn compress_md5(state: &mut [u32; 4], block: &[u8; 64]) {
+    let mut words = [0_u32; 16];
+    for (index, slot) in words.iter_mut().enumerate() {
+        *slot = u32::from_le_bytes(block[index * 4..index * 4 + 4].try_into().unwrap_or([0; 4]));
+    }
+    let [mut a, mut b, mut c, mut d] = *state;
+    for index in 0..64 {
+        let (function, word) = match index {
+            0..=15 => ((b & c) | (!b & d), index),
+            16..=31 => ((d & b) | (!d & c), (5 * index + 1) % 16),
+            32..=47 => (b ^ c ^ d, (3 * index + 5) % 16),
+            _ => (c ^ (b | !d), (7 * index) % 16),
+        };
+        let next = b.wrapping_add(
+            a.wrapping_add(function)
+                .wrapping_add(MD5_K[index])
+                .wrapping_add(words[word])
+                .rotate_left(MD5_S[index]),
+        );
+        a = d;
+        d = c;
+        c = b;
+        b = next;
+    }
+    *state = [
+        state[0].wrapping_add(a),
+        state[1].wrapping_add(b),
+        state[2].wrapping_add(c),
+        state[3].wrapping_add(d),
+    ];
+}
+
+/// Compute the `$1$` MD5 crypt representation of `password` for `setting`.
+pub fn md5_crypt(password: &str, setting: &str) -> Option<String> {
+    let rest = setting.strip_prefix("$1$")?;
+    let salt_end = rest.find('$').unwrap_or(rest.len());
+    let salt = rest.get(..salt_end.min(8))?;
+    let key = password.as_bytes();
+    let salt_bytes = salt.as_bytes();
+
+    let mut context = Md5::new();
+    context.update(key);
+    context.update(b"$1$");
+    context.update(salt_bytes);
+
+    let mut alternate = Md5::new();
+    alternate.update(key);
+    alternate.update(salt_bytes);
+    alternate.update(key);
+    let mut final_result = alternate.finalize();
+
+    let mut remaining = key.len();
+    while remaining > 0 {
+        let take = remaining.min(16);
+        context.update(&final_result[..take]);
+        remaining -= take;
+    }
+    let zero = [0_u8; 1];
+    let mut bits = key.len();
+    while bits != 0 {
+        context.update(if bits & 1 != 0 { &zero } else { &key[..1] });
+        bits >>= 1;
+    }
+    final_result = context.finalize();
+
+    for round in 0..1000 {
+        let mut context = Md5::new();
+        context.update(if round & 1 != 0 { key } else { &final_result });
+        if round % 3 != 0 {
+            context.update(salt_bytes);
+        }
+        if round % 7 != 0 {
+            context.update(key);
+        }
+        context.update(if round & 1 != 0 { &final_result } else { key });
+        final_result = context.finalize();
+    }
+
+    let mut encoded = [0_u8; 17];
+    encoded[..16].copy_from_slice(&final_result);
+    encoded[16] = final_result[5];
+    let mut out = String::from("$1$");
+    out.push_str(salt);
+    out.push('$');
+    for index in 0..5 {
+        b64_from_24bit(
+            &mut out,
+            encoded[index],
+            encoded[index + 6],
+            encoded[index + 12],
+            4,
+        );
+    }
+    b64_from_24bit(&mut out, 0, 0, final_result[11], 2);
+    Some(out)
+}
+
+#[cfg(test)]
+fn digest_md5(data: &[u8]) -> [u8; 16] {
+    let mut context = Md5::new();
+    context.update(data);
+    context.finalize()
 }
 
 #[cfg(test)]
@@ -380,6 +806,38 @@ mod tests {
              2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
                 .replace(char::is_whitespace, "")
         );
+    }
+
+    #[test]
+    fn sha256_matches_known_vectors() {
+        assert_eq!(
+            hex(&digest256(b"")),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            hex(&digest256(b"abc")),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn md5_matches_known_vectors() {
+        assert_eq!(hex(&digest_md5(b"")), "d41d8cd98f00b204e9800998ecf8427e");
+        assert_eq!(hex(&digest_md5(b"abc")), "900150983cd24fb0d6963f7d28e17f72");
+    }
+
+    #[test]
+    fn verifies_an_md5_hash() {
+        let hash = "$1$rinit$TgEj7YentAlBjR1IVAQLG1";
+        assert!(verify("toor", hash));
+        assert!(!verify("wrong", hash));
+    }
+
+    #[test]
+    fn verifies_a_sha256_hash() {
+        let hash = "$5$rinit$3J/IImUzg9LF.7ZabNp3wB5/C1QgamiQI92FXaJf7s/";
+        assert!(verify("toor", hash));
+        assert!(!verify("wrong", hash));
     }
 
     #[test]

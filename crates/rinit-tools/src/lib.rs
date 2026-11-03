@@ -25,6 +25,7 @@ pub mod control;
 pub mod fsutil;
 pub mod pathutil;
 pub mod users;
+pub mod utmp;
 
 /// Exit code for a successful invocation.
 pub const EXIT_OK: u8 = 0;

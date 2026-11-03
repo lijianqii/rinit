@@ -5,8 +5,9 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, ExitCode};
+use std::time::{Duration, Instant};
 
-use rinit_tools::{EXIT_OK, program_name, usage_error};
+use rinit_tools::{EXIT_OK, program_name, usage_error, utmp};
 
 struct Options {
     local: bool,
@@ -16,6 +17,8 @@ struct Options {
     tty: String,
     baud: u32,
     term: Option<String>,
+    timeout: Option<u32>,
+    init: Option<String>,
 }
 
 fn parse_baud(value: &str) -> Result<u32, String> {
@@ -33,6 +36,8 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
         tty: String::new(),
         baud: 115200,
         term: None,
+        timeout: None,
+        init: None,
     };
     let mut positional: Vec<String> = Vec::new();
     let mut index = 0;
@@ -53,6 +58,24 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
                     return Err("-h needs a host".to_string());
                 };
                 options.host = Some(value.clone());
+            }
+            "-t" | "--timeout" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err("-t needs a timeout".to_string());
+                };
+                options.timeout = Some(
+                    value
+                        .parse::<u32>()
+                        .map_err(|_| format!("invalid timeout '{value}'"))?,
+                );
+            }
+            "-I" | "--init-string" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err("-I needs an init string".to_string());
+                };
+                options.init = Some(value.clone());
             }
             value if value.starts_with('-') && value != "-" => {
                 return Err(format!("unknown option '{value}'"));
@@ -192,15 +215,69 @@ fn open_tty(path: &str, local: bool, baud: u32) -> Result<(), String> {
     Ok(())
 }
 
-fn prompt_username() -> io::Result<String> {
+fn read_username() -> io::Result<String> {
+    let mut line = String::new();
+    io::stdin().read_line(&mut line)?;
+    Ok(line.trim_end_matches(['\n', '\r']).to_string())
+}
+
+fn read_username_timeout(seconds: u32) -> io::Result<String> {
+    let deadline = Instant::now() + Duration::from_secs(seconds as u64);
+    let mut bytes = Vec::new();
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "login timed out"));
+        }
+        let remaining = deadline
+            .duration_since(now)
+            .as_millis()
+            .min(i32::MAX as u128) as i32;
+        let mut descriptor = libc::pollfd {
+            fd: 0,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `descriptor` points at one valid pollfd.
+        let ready = unsafe { libc::poll(&mut descriptor, 1, remaining) };
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if ready == 0 {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "login timed out"));
+        }
+        let mut byte = [0_u8; 1];
+        // SAFETY: fd 0 is the tty and `byte` is a one-byte destination.
+        let read = unsafe { libc::read(0, byte.as_mut_ptr().cast(), 1) };
+        if read <= 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "login input closed",
+            ));
+        }
+        match byte[0] {
+            b'\n' => break,
+            b'\r' => continue,
+            value => bytes.push(value),
+        }
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn prompt_username(timeout: Option<u32>) -> io::Result<String> {
     if let Ok(issue) = fs::read_to_string("/etc/issue") {
         print!("{issue}");
     }
     print!("rinit login: ");
     io::stdout().flush()?;
-    let mut line = String::new();
-    io::stdin().read_line(&mut line)?;
-    Ok(line.trim_end_matches(['\n', '\r']).to_string())
+    match timeout {
+        Some(seconds) if seconds > 0 => read_username_timeout(seconds),
+        _ => read_username(),
+    }
 }
 
 fn report(program: &str, message: &str) {
@@ -212,7 +289,9 @@ fn report(program: &str, message: &str) {
 
 fn run(args: &[String], program: &str) -> ExitCode {
     if args.iter().any(|arg| arg == "--help") {
-        println!("Usage: rgetty [-L] [-l LOGIN] [-h HOST] [-n] TTY [BAUD [TERM]]");
+        println!(
+            "Usage: rgetty [-L] [-l LOGIN] [-h HOST] [-n] [-t SEC] [-I STRING] TTY [BAUD [TERM]]"
+        );
         return ExitCode::from(EXIT_OK);
     }
     let options = match parse_args(args) {
@@ -223,6 +302,22 @@ fn run(args: &[String], program: &str) -> ExitCode {
         report(program, &error);
         return ExitCode::from(1);
     }
+    let getty_pid = unsafe { libc::getpid() };
+    if let Err(error) =
+        utmp::login_record(getty_pid, &options.tty, "LOGIN", options.host.as_deref())
+    {
+        report(program, &format!("utmp: {error}"));
+    }
+    if let Some(init) = &options.init {
+        let mut stdout = io::stdout().lock();
+        if let Err(error) = stdout
+            .write_all(init.as_bytes())
+            .and_then(|()| stdout.flush())
+        {
+            report(program, &error.to_string());
+            return ExitCode::from(1);
+        }
+    }
     if let Some(term) = &options.term {
         // SAFETY: the process is single-threaded here and has not exec'd yet.
         unsafe { std::env::set_var("TERM", term) };
@@ -230,12 +325,19 @@ fn run(args: &[String], program: &str) -> ExitCode {
     let mut username = String::new();
     if !options.no_prompt {
         for _ in 0..3 {
-            match prompt_username() {
+            match prompt_username(options.timeout) {
                 Ok(value) if !value.is_empty() => {
                     username = value;
                     break;
                 }
                 Ok(_) => continue,
+                Err(error) if error.kind() == io::ErrorKind::TimedOut => {
+                    println!(
+                        "\r\nLogin timed out after {} seconds",
+                        options.timeout.unwrap_or(0)
+                    );
+                    return ExitCode::from(1);
+                }
                 Err(error) => {
                     report(program, &error.to_string());
                     return ExitCode::from(1);
@@ -251,12 +353,47 @@ fn run(args: &[String], program: &str) -> ExitCode {
     if !username.is_empty() {
         command.arg(&username);
     }
-    let error = command.exec();
-    report(
-        program,
-        &format!("cannot execute {}: {error}", options.login),
-    );
-    ExitCode::from(1)
+    // The child owns the foreground process group, so the shell gets the tty
+    // signals while this parent waits for the session to end and records it.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let pid = libc::getpid();
+            libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+            if libc::tcsetpgrp(0, pid) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            report(
+                program,
+                &format!("cannot execute {}: {error}", options.login),
+            );
+            return ExitCode::from(1);
+        }
+    };
+    let status = child.wait();
+    if let Err(error) = utmp::dead_record(child.id() as i32, &options.tty) {
+        report(program, &format!("utmp: {error}"));
+    }
+    match status {
+        Ok(status) => ExitCode::from(
+            status
+                .code()
+                .and_then(|code| u8::try_from(code).ok())
+                .unwrap_or(1),
+        ),
+        Err(error) => {
+            report(program, &format!("wait: {error}"));
+            ExitCode::from(1)
+        }
+    }
 }
 
 fn main() -> ExitCode {
@@ -320,6 +457,18 @@ mod tests {
         assert_eq!(options.host.as_deref(), Some("host"));
         assert_eq!(options.baud, 9600);
         assert_eq!(options.term, None);
+
+        let options = parse_args(&[
+            "-t".to_string(),
+            "30".to_string(),
+            "-I".to_string(),
+            "ATZ\\r".to_string(),
+            "ttyS0".to_string(),
+        ])
+        .expect("timeout/init");
+        assert_eq!(options.timeout, Some(30));
+        assert_eq!(options.init.as_deref(), Some("ATZ\\r"));
+        assert!(parse_args(&["-t".to_string(), "bad".to_string()]).is_err());
     }
 
     #[test]
@@ -358,6 +507,35 @@ mod tests {
             assert_eq!(speed(baud), Some(expected));
         }
         assert_eq!(speed(12345), None);
+    }
+
+    #[test]
+    fn timeout_reader_reads_a_line_and_reports_timeouts() {
+        let mut fds = [0_i32; 2];
+        // SAFETY: `fds` is writable storage for a pipe pair.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: save and replace stdin for this test only.
+        let saved = unsafe { libc::dup(0) };
+        assert!(saved >= 0);
+        assert_eq!(unsafe { libc::dup2(fds[0], 0) }, 0);
+        let input = b"root\n";
+        // SAFETY: the write end is open and the buffer is valid.
+        assert_eq!(
+            unsafe { libc::write(fds[1], input.as_ptr().cast(), input.len()) },
+            input.len() as isize
+        );
+        assert_eq!(read_username_timeout(5).expect("line"), "root");
+        assert_eq!(
+            read_username_timeout(0).expect_err("timeout").kind(),
+            io::ErrorKind::TimedOut
+        );
+        // SAFETY: restore the original stdin and close the temporary ends.
+        unsafe {
+            libc::dup2(saved, 0);
+            libc::close(saved);
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
     }
 
     #[test]

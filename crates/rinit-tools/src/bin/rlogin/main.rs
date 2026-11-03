@@ -2,7 +2,7 @@
 
 mod crypt;
 
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::fs;
 use std::io::{self, Write};
 use std::os::unix::process::CommandExt;
@@ -87,7 +87,7 @@ fn verify_hash(password: &str, hash: &str) -> bool {
     if hash.starts_with('!') || hash.starts_with('*') {
         return false;
     }
-    if !hash.starts_with("$6$") {
+    if !(hash.starts_with("$6$") || hash.starts_with("$5$") || hash.starts_with("$1$")) {
         return false;
     }
     crypt::verify(password, hash)
@@ -144,6 +144,50 @@ fn authenticate(user: &User, force: bool) -> io::Result<bool> {
     }
     let password = read_password("Password: ")?;
     Ok(verify_hash(&password, &hash))
+}
+
+fn short_tty(name: &str) -> String {
+    name.strip_prefix("/dev/").unwrap_or(name).to_string()
+}
+
+fn securetty_allows(short: &str, text: Option<&str>) -> bool {
+    let Some(text) = text else {
+        return true;
+    };
+    let mut listed = false;
+    for line in text.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        listed = true;
+        if line == short || line == format!("/dev/{short}") {
+            return true;
+        }
+    }
+    !listed
+}
+
+fn tty_name() -> Option<String> {
+    let mut buffer = [0 as libc::c_char; 128];
+    // SAFETY: `buffer` is writable storage for the NUL-terminated result.
+    if unsafe { libc::ttyname_r(0, buffer.as_mut_ptr(), buffer.len()) } != 0 {
+        return None;
+    }
+    // SAFETY: ttyname_r succeeded, so the buffer is NUL-terminated.
+    Some(
+        unsafe { CStr::from_ptr(buffer.as_ptr()) }
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
+fn secure_tty() -> bool {
+    let Some(name) = tty_name() else {
+        return true;
+    };
+    let text = fs::read_to_string("/etc/securetty").ok();
+    securetty_allows(&short_tty(&name), text.as_deref())
 }
 
 fn nologin_text(user: &User, text: Option<&str>) -> bool {
@@ -365,6 +409,7 @@ fn run(args: &[String], program: &str) -> ExitCode {
         let candidate = parse_passwd(&passwd, &username);
         let force = parsed.force_user.as_deref() == Some(username.as_str());
         let ok = match candidate.as_ref() {
+            Some(candidate) if candidate.uid == 0 && !secure_tty() => false,
             Some(candidate) => match authenticate(candidate, force) {
                 Ok(ok) => ok,
                 Err(error) => {
@@ -390,6 +435,16 @@ fn run(args: &[String], program: &str) -> ExitCode {
     };
     if nologin(&user) {
         return ExitCode::from(1);
+    }
+    if let Some(tty) = tty_name()
+        && let Err(error) = rinit_tools::utmp::user_record(
+            unsafe { libc::getpid() },
+            &tty,
+            &user.name,
+            parsed.host.as_deref(),
+        )
+    {
+        eprintln!("{program}: utmp: {error}");
     }
     if let Err(error) = change_identity(&user) {
         eprintln!("{program}: {error}");
@@ -467,7 +522,27 @@ mod tests {
         assert!(verify_hash("anything", ""));
         assert!(!verify_hash("anything", "!"));
         assert!(!verify_hash("anything", "*"));
-        assert!(!verify_hash("anything", "$1$salt$hash"));
+        assert!(!verify_hash("anything", "$2b$salt$hash"));
+        assert!(verify_hash(
+            "toor",
+            "$5$rinit$3J/IImUzg9LF.7ZabNp3wB5/C1QgamiQI92FXaJf7s/"
+        ));
+        assert!(verify_hash("toor", "$1$rinit$TgEj7YentAlBjR1IVAQLG1"));
+    }
+
+    #[test]
+    fn securetty_is_honoured_only_when_populated() {
+        assert!(securetty_allows("ttyAMA0", None));
+        assert!(securetty_allows("ttyAMA0", Some("")));
+        assert!(securetty_allows("ttyAMA0", Some("# comment\n\n")));
+        assert!(securetty_allows(
+            "ttyAMA0",
+            Some("ttyS0\nttyAMA0 # console\n")
+        ));
+        assert!(securetty_allows("ttyAMA0", Some("/dev/ttyAMA0\n")));
+        assert!(!securetty_allows("ttyS0", Some("ttyAMA0\n")));
+        assert_eq!(short_tty("/dev/ttyAMA0"), "ttyAMA0");
+        assert_eq!(short_tty("ttyAMA0"), "ttyAMA0");
     }
 
     #[test]
