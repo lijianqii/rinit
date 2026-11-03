@@ -132,6 +132,21 @@ stat [-L] [-c FORMAT] [-t] FILE...
 `-m` allows missing components. `which` searches `PATH`, not the shell's
 command table.
 
+The console login pair is installed at the standard paths:
+
+| BusyBox applet | install path | source binary |
+| --- | --- | --- |
+| `getty` | `/sbin/getty` | `rgetty` |
+| `login` | `/bin/login` | `rlogin` |
+
+`rgetty` opens the tty, creates the session, configures the terminal, prints
+the login prompt and execs `rlogin`. `rlogin` reads `/etc/passwd` and
+`/etc/shadow`, verifies `$6$` SHA-512 crypt hashes in-process (the target image
+has no libcrypt), drops privileges and execs the user's shell. It supports
+`-p`, `-h HOST` and root-only `-f USER`; `rgetty` supports `-L`, `-l LOGIN`,
+`-h HOST` and `-n`. PAM, utmp/wtmp accounting and `/etc/securetty` are not
+implemented.
+
 Still out of scope:
 
 - `sh`, `ash`;
@@ -381,7 +396,7 @@ Provisional first-version budgets, to be replaced by measured values:
 | profile | tools | total budget |
 | --- | --- | --- |
 | minimal | `rinit` only | 1.2 MB |
-| `replace-system` (first three waves) | 37 including existing | 20 MB |
+| `replace-system` (first three waves + console) | 39 including existing | 20 MB |
 | full toolbox (later) | 50+ | 24 MB |
 
 Each tool also has its own budget in `tools.list`. CI fails on either a per-tool
@@ -400,6 +415,7 @@ shared `librinit-tools.so` for non-init tools; do not add it pre-emptively.
   removal guards, hard/symbolic links and `touch -t`;
 - script basics: PATH search, environment handling, user/group lookup, path
   resolution, temporary names and `stat` formatting;
+- console login: tty setup, shadow SHA-512 authentication and shell exec;
 - reboot/poweroff through a fake control socket and then a real guest.
 
 ### Multi-binary/install

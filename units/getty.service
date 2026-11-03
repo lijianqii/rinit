@@ -6,8 +6,8 @@
 # actual restart; from M1 the directive is parsed and honoured by the contract
 # but nothing acts on it yet.
 #
-# The path is `/sbin/getty`, which is where busybox installs this applet; the
-# plan's example wrote `/bin/getty`, which does not exist in the initramfs.
+# The path is `/sbin/getty`; the replace-system image installs the independent
+# `rgetty` ELF there, which opens the tty and hands it to `/bin/login` (`rlogin`).
 [Unit]
 Description=Serial console getty
 Requires=rinit-init.target

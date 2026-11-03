@@ -53,3 +53,7 @@ readlink   readlink   /usr/bin/readlink /usr/bin/readlink 600 crates/rinit-tools
 mktemp     mktemp     /bin/mktemp      /bin/mktemp      600  crates/rinit-tools/src/bin/mktemp.rs
 sync       sync       /bin/sync        /bin/sync        600  crates/rinit-tools/src/bin/sync.rs
 stat       stat       /bin/stat        /bin/stat        800  crates/rinit-tools/src/bin/stat.rs
+
+# Console login: independent replacements for BusyBox login/getty.
+rlogin     rlogin     /bin/login       /bin/login       800  crates/rinit-tools/src/bin/rlogin/main.rs
+rgetty     rgetty     /sbin/getty      /sbin/getty      800  crates/rinit-tools/src/bin/rgetty.rs

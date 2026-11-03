@@ -111,12 +111,12 @@ qemu_pid=$!
 wait_ssh || { echo "FAIL: SSH did not come up" >&2; tail -30 "$serial" >&2; exit 3; }
 
 for path in mount umount hostname ps free uptime dmesg df sysctl top reboot poweroff \
-    ls cat cp mv rm mkdir ln touch echo sleep uname mktemp sync stat \
-    id whoami env which dirname basename realpath readlink; do
+    ls cat cp mv rm mkdir ln touch echo sleep uname mktemp sync stat login \
+    id whoami env which dirname basename realpath readlink getty; do
     case "$path" in
-        mount | umount | hostname | ps | dmesg | df | ls | cat | cp | mv | rm | mkdir | ln | touch | echo | sleep | uname | mktemp | sync | stat) full="/bin/$path" ;;
+        mount | umount | hostname | ps | dmesg | df | ls | cat | cp | mv | rm | mkdir | ln | touch | echo | sleep | uname | mktemp | sync | stat | login) full="/bin/$path" ;;
         free | uptime | top | id | whoami | env | which | dirname | basename | realpath | readlink) full="/usr/bin/$path" ;;
-        sysctl | reboot | poweroff) full="/sbin/$path" ;;
+        sysctl | reboot | poweroff | getty) full="/sbin/$path" ;;
     esac
     check "$full is a real executable" "ssh_guest 'test -x $full && ! test -L $full'"
 done
@@ -166,6 +166,8 @@ check 'readlink prints a symlink target' "ssh_guest 'ln -s /etc/hostname /tmp/to
 check 'mktemp creates a file' "ssh_guest 'p=\$(mktemp /tmp/tool-tmp.XXXXXX) && test -f \"\$p\" && rm -f \"\$p\"'"
 check 'sync succeeds' "ssh_guest 'sync'"
 check 'stat prints a file name and size' "ssh_guest 'stat -c \"%n %s\" /etc/hostname' | grep -q hostname"
+check 'rlogin --help' "ssh_guest '/bin/login --help' | grep -q Usage"
+check 'rgetty --help' "ssh_guest '/sbin/getty --help' | grep -q Usage"
 ssh_guest 'rm -rf /tmp/tool-dir /tmp/tool-link /tmp/tool-touch /tmp/tool-cp-dir /tmp/tool-readlink' >/dev/null 2>&1 || true
 
 if ((power_cycle)); then
