@@ -80,7 +80,12 @@ impl Entry {
                 "nodev" => flags |= libc::MS_NODEV,
                 "exec" => flags &= !libc::MS_NOEXEC,
                 "noexec" => flags |= libc::MS_NOEXEC,
-                "defaults" => {}
+                // mount(8)/systemd user-space options. They select *which*
+                // entries to mount, not how the filesystem mounts; passing
+                // them in `mount(2)`'s data makes ext4/tmpfs reject the mount.
+                "defaults" | "auto" | "noauto" | "nofail" | "user" | "users" | "owner"
+                | "group" | "_netdev" => {}
+                other if other.starts_with("x-") || other.starts_with("comment=") => {}
                 other => data.push(other),
             }
         }
@@ -156,11 +161,12 @@ pub fn parse(text: &str) -> (Vec<Entry>, Vec<String>) {
 /// here as `None` rather than as a panic in PID 1.
 fn read_entry(line: &str) -> Option<(String, String, String, String)> {
     let mut fields = line.split_whitespace();
+    let decode = crate::mounts::unescape_mount_field;
     Some((
-        fields.next()?.to_string(),
-        fields.next()?.to_string(),
-        fields.next()?.to_string(),
-        fields.next()?.to_string(),
+        decode(fields.next()?),
+        decode(fields.next()?),
+        decode(fields.next()?),
+        decode(fields.next()?),
     ))
 }
 
@@ -370,6 +376,25 @@ mod tests {
         assert_ne!(flags & libc::MS_RDONLY, 0);
         assert_eq!(flags & libc::MS_NOSUID, 0);
         assert_eq!(data, None, "nothing left for the filesystem");
+    }
+
+    /// mount(8)/systemd options are not filesystem data, and the fstab
+    /// octet escapes must decode before the path reaches `mount(2)`.
+    #[test]
+    fn user_space_options_are_dropped_and_octet_escapes_are_decoded() {
+        let entry = Entry {
+            device: "tmpfs".into(),
+            mountpoint: PathBuf::from("/data"),
+            fstype: "tmpfs".into(),
+            options: "defaults,nofail,auto,user,_netdev,x-systemd.device-timeout=10,mode=0755"
+                .into(),
+        };
+        let (_, data) = entry.flags_and_data();
+        assert_eq!(data.as_deref(), Some("mode=0755"));
+
+        let (entries, warnings) = parse("tmpfs /with\\040space tmpfs defaults,nofail 0 0\n");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(entries[0].mountpoint, PathBuf::from("/with space"));
     }
 
     /// The sequence: file order, the mountpoint created first, and a failure that

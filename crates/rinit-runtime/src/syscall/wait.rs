@@ -85,6 +85,13 @@ fn decode_status(pid: libc::pid_t, status: libc::c_int) -> Option<ChildExit> {
 /// - `Err(e)` if `waitpid` itself failed. `EINTR` is the caller's to retry, and
 ///   `ECHILD` means the child was already reaped or never existed.
 pub fn poll_child(pid: libc::pid_t) -> Result<Option<ChildExit>, SyscallError> {
+    // `waitpid(0)` waits for any child in the caller's process group and
+    // `waitpid(-1)` waits for any child at all. This function promises one
+    // specific child, so those (and init) must be refused rather than silently
+    // stealing another caller's exit status.
+    if pid <= 1 {
+        return Err(SyscallError::new("waitpid", libc::EINVAL));
+    }
     let mut status: libc::c_int = 0;
     // SAFETY: `status` is a valid out-pointer, and `WNOHANG` keeps this a poll
     // rather than a block - which is what lets the async caller honour its own
@@ -116,6 +123,9 @@ pub fn poll_child(pid: libc::pid_t) -> Result<Option<ChildExit>, SyscallError> {
 /// # Errors
 /// The `errno` from `waitpid`; `ECHILD` means the child was already reaped.
 pub fn wait_child(pid: libc::pid_t) -> Result<ChildExit, SyscallError> {
+    if pid <= 1 {
+        return Err(SyscallError::new("waitpid", libc::EINVAL));
+    }
     loop {
         let mut status: libc::c_int = 0;
         // SAFETY: `status` is a valid out-pointer; a blocking waitpid writes it

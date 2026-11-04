@@ -5,8 +5,9 @@
 //! SAFETY note, are three `AsyncFd::register` calls (`crate::signals`,
 //! `rinit/src/logs.rs`, `rinit/src/activation.rs`) - the safe `AsyncFd::new` is
 //! deprecated as *unsound*, because it cannot know the caller keeps the
-//! descriptor valid - and the `kill(pid, 0)` existence probe in
-//! `rinit/src/unit_manager.rs`. Everything else - `mounts`, `fstab`, `units`, and
+//! descriptor valid - the `kill(pid, 0)` existence probe and the two `sysconf`
+//! reads (`_SC_PAGESIZE`, `_SC_CLK_TCK`) in `rinit/src/unit_manager.rs`.
+//! Everything else - `mounts`, `fstab`, `units`, and
 //! the whole of `rinit-core` (which is `#![forbid(unsafe_code)]`) - is safe code.
 //! Every wrapper here returns
 //! `Result<_, SyscallError>` and records the `errno` on failure, so business logic

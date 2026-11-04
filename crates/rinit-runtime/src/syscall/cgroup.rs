@@ -84,15 +84,18 @@ pub fn create(dir: &Path) -> Result<(), SyscallError> {
 }
 
 /// Write one limit file inside `dir` (e.g. `memory.max` = `33554432`).
-pub fn write_limit(dir: &Path, file: &str, value: &str) -> Result<(), SyscallError> {
-    // Naming the attribute is what makes a failed start diagnosable; the names
-    // are the closed set `CgroupLimits::files()` produces.
+///
+/// `file` is a `'static` name from the closed set `CgroupLimits::files()`
+/// produces. The match is the validation: an arbitrary string (especially one
+/// containing `/` or `..`) is refused before `dir.join` can escape the unit's
+/// cgroup and truncate an unrelated file as root.
+pub fn write_limit(dir: &Path, file: &'static str, value: &str) -> Result<(), SyscallError> {
     let op: &'static str = match file {
         "cpu.max" => "cgroup cpu.max",
         "memory.max" => "cgroup memory.max",
         "memory.high" => "cgroup memory.high",
         "pids.max" => "cgroup pids.max",
-        _ => "cgroup limit",
+        _ => return Err(SyscallError::new("cgroup limit", libc::EINVAL)),
     };
     write_file(&dir.join(file), value, op)
 }
@@ -384,6 +387,16 @@ mod tests {
             std::fs::read_to_string(dir.join("memory.max")).unwrap(),
             "33554432"
         );
+    }
+
+    /// The public helper must not become a root-owned arbitrary-file writer if a
+    /// caller ever passes a path-like string.
+    #[test]
+    fn an_arbitrary_limit_file_name_is_refused() {
+        let scratch = Scratch::new("traversal");
+        let dir = scratch.subdir("rinit");
+        let err = write_limit(&dir, "../../etc/passwd", "x").expect_err("must refuse");
+        assert_eq!(err.errno(), libc::EINVAL);
     }
 
     /// An attribute that is not there - the controller was never enabled - must

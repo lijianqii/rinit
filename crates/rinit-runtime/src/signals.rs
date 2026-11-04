@@ -16,7 +16,7 @@
 
 use std::collections::VecDeque;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 
 use tokio::io::unix::AsyncFd;
 
@@ -25,8 +25,22 @@ use crate::error::SyscallError;
 /// Write end of the self-pipe. `-1` means no [`SignalSet`] exists yet.
 ///
 /// A process-global is required because `sigaction` handlers receive no
-/// user-data pointer. rinit create exactly one [`SignalSet`] for its lifetime.
+/// user-data pointer. rinit creates exactly one [`SignalSet`] for its lifetime.
 static WRITE_FD: AtomicI32 = AtomicI32::new(-1);
+
+/// Whether a [`SignalSet`] exists. The process-global handler and pipe allow
+/// exactly one: a second set would overwrite [`WRITE_FD`], split signal
+/// delivery between two queues, and make the first set's `Drop` clear state the
+/// second still owns.
+static LIVE: AtomicBool = AtomicBool::new(false);
+
+/// Handlers currently inside [`dispatch`].
+///
+/// `Drop` uninstalls the handlers, clears [`WRITE_FD`], then waits for this to
+/// reach zero before the pipe descriptors close. A handler that already loaded
+/// a valid fd is therefore still counted and cannot write into a descriptor
+/// number the kernel has recycled for an unrelated file.
+static ACTIVE_HANDLERS: AtomicUsize = AtomicUsize::new(0);
 
 /// Report a problem to the console.
 ///
@@ -82,26 +96,23 @@ impl Signal {
 ///
 /// The read-modify-write of [`WRITE_FD`] is deliberately ordered: it is loaded
 /// with `Acquire` and the descriptor is only cleared (with `Release`) after
-/// the pipe itself is gone. See [`SignalSet::drop_owned`] for why.
+/// the pipe itself is gone. See the [`Drop`] implementation for why.
 extern "C" fn dispatch(signal: libc::c_int) {
+    // Published before the fd load, so `Drop` can wait for a handler that may
+    // already be about to write. Both operations are lock-free atomics and safe
+    // in signal context.
+    ACTIVE_HANDLERS.fetch_add(1, Ordering::AcqRel);
     let fd = WRITE_FD.load(Ordering::Acquire);
     if fd >= 0 {
         let byte = [signal as u8];
         // SAFETY: `fd` is a valid, non-blocking pipe write end created by
         // `SignalSet::new`; `write` is async-signal-safe. Errors (e.g. a full
         // pipe) are ignored on purpose - the signal is already latched.
-        //
-        // The `fd >= 0` check is not a guarantee that the descriptor is still
-        // open: dropping a `SignalSet` un-installs the handlers before it
-        // closes the pipe, and an in-flight handler that already passed the
-        // check may still write. Writing to a closed or recycled descriptor
-        // is harmless here - the worst case is one lost signal during teardown
-        // - whereas tearing the pipe down while a handler could still touch it
-        // is not something we can prevent from signal context.
         unsafe {
             libc::write(fd, byte.as_ptr().cast(), 1);
         }
     }
+    ACTIVE_HANDLERS.fetch_sub(1, Ordering::Release);
 }
 
 /// An async stream of the signals rinit cares about.
@@ -130,10 +141,14 @@ impl SignalSet {
     /// Returns a [`SyscallError`] if `pipe2` or `sigaction` fails. A failure
     /// part-way through rolls back the handlers already installed.
     pub fn new(signals: &[Signal]) -> Result<Self, SyscallError> {
+        if LIVE.swap(true, Ordering::AcqRel) {
+            return Err(SyscallError::new("SignalSet::new", libc::EBUSY));
+        }
         // Non-blocking so the handler's write can never block.
         let mut fds = [0i32; 2];
         // SAFETY: `fds` is a valid 2-element out-buffer.
         if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
+            LIVE.store(false, Ordering::Release);
             return Err(SyscallError::last_os_error("pipe2"));
         }
         // SAFETY: both descriptors are fresh from `pipe2` and are now owned by
@@ -153,6 +168,7 @@ impl SignalSet {
                     // Roll back so a failed construction leaves no handlers
                     // pointing at a pipe that is about to close.
                     WRITE_FD.store(-1, Ordering::Release);
+                    LIVE.store(false, Ordering::Release);
                     for (number, previous) in restore.into_iter().rev() {
                         restore_disposition(number, &previous);
                     }
@@ -172,6 +188,7 @@ impl SignalSet {
                 // pipe that is about to close with `writer`/`reader`.
                 let (_fd, io) = e.into_parts();
                 WRITE_FD.store(-1, Ordering::Release);
+                LIVE.store(false, Ordering::Release);
                 for (number, previous) in restore.iter().rev() {
                     restore_disposition(*number, previous);
                 }
@@ -253,10 +270,22 @@ impl Drop for SignalSet {
         for (number, previous) in self.restore.drain(..).rev() {
             restore_disposition(number, &previous);
         }
-        // `Release` pairs with the handler's `Acquire` load, so a handler
-        // either sees `-1` and does nothing, or has already written.
+        // `Release` pairs with the handler's `Acquire` load, so a handler that
+        // starts after this point does nothing.
         WRITE_FD.store(-1, Ordering::Release);
+        // A handler that already loaded the descriptor is still counted; wait
+        // for it before the fields close the pipe. No new handler can start
+        // because the dispositions are restored above. The bound only guards
+        // against a signal handler stuck on a frozen thread; the body is a
+        // load and a one-byte write, so it is not expected to spin at all.
+        for _ in 0..1_000_000 {
+            if ACTIVE_HANDLERS.load(Ordering::Acquire) == 0 {
+                break;
+            }
+            std::hint::spin_loop();
+        }
         // `self.writer` and `self.reader` close here.
+        LIVE.store(false, Ordering::Release);
     }
 }
 
@@ -355,6 +384,24 @@ mod tests {
 
         assert!(writer >= 0);
         assert_eq!(received, Signal::Int);
+    }
+
+    /// The process-global self-pipe has exactly one owner. A second live set
+    /// would silently overwrite the handler's descriptor and lose signals.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_second_signal_set_is_refused() {
+        let _guard = SIGNAL_LOCK.lock().await;
+
+        let first = SignalSet::new(&[Signal::Child]).expect("the first set");
+        let error = match SignalSet::new(&[Signal::Term]) {
+            Ok(_) => panic!("the second set must be refused"),
+            Err(error) => error,
+        };
+        assert_eq!(error.errno(), libc::EBUSY);
+
+        drop(first);
+        let after = SignalSet::new(&[Signal::Term]).expect("a set after the first is dropped");
+        drop(after);
     }
 
     /// The regression test for the stale-descriptor bug: after the set is

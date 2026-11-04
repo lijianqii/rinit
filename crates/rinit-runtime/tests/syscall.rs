@@ -6,6 +6,7 @@
 
 use std::ffi::CString;
 use std::os::fd::AsRawFd;
+use std::os::unix::net::UnixListener;
 use std::sync::Mutex;
 
 use rinit_core::unit::sandbox::Sandbox;
@@ -95,6 +96,24 @@ fn kill_never_targets_init_or_the_whole_system() {
         assert_eq!(
             process::kill_process_group(pid, libc::SIGTERM)
                 .expect_err("reserved process group must be refused")
+                .errno(),
+            libc::EINVAL
+        );
+    }
+}
+
+#[test]
+fn wait_helpers_refuse_group_and_any_child_pids() {
+    for pid in [0, 1, -1] {
+        assert_eq!(
+            wait::poll_child(pid)
+                .expect_err("poll_child must refuse a non-specific pid")
+                .errno(),
+            libc::EINVAL
+        );
+        assert_eq!(
+            wait::wait_child(pid)
+                .expect_err("wait_child must refuse a non-specific pid")
                 .errno(),
             libc::EINVAL
         );
@@ -414,6 +433,66 @@ fn a_sandboxed_spawn_runs_the_command() {
     let (output, code) = run_captured("echo hello; exit 9", &Sandbox::inherit(), None);
     assert_eq!(output, "hello\n");
     assert_eq!(code, 9);
+}
+
+/// A socket-activated child gets the listening fd on 3 and a `LISTEN_PID` that
+/// matches its own pid, which is what `sd_listen_fds()` checks.
+#[test]
+fn a_sandboxed_child_gets_listen_fd_and_listen_pid() {
+    let _guard = REAP_LOCK.lock().unwrap();
+    let path = std::env::temp_dir().join(format!(
+        "rinit-listen-{}-{}.sock",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("test")
+    ));
+    let _ = std::fs::remove_file(&path);
+    let listener = UnixListener::bind(&path).expect("listener");
+    let argv = [
+        cs("/bin/sh"),
+        cs("-c"),
+        cs("test -S /proc/self/fd/3 && test \"$LISTEN_PID\" = \"$$\""),
+    ];
+    let pid = process::spawn_sandboxed(
+        c"/bin/sh",
+        &argv,
+        &[],
+        process::SpawnOptions::with_session().with_listen_fd(listener.as_raw_fd()),
+        None,
+        &Sandbox::inherit(),
+        process::ChildPaths::default(),
+    )
+    .expect("spawn");
+    let exit = wait::wait_child(pid).expect("wait");
+    assert!(
+        matches!(exit, ChildExit::Exited { code: 0, .. }),
+        "child did not find fd 3 and itself in LISTEN_PID: {exit:?}"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A user's own `LISTEN_PID` is only replaced when rinit is actually
+/// handing over a socket. Dropping it on every spawn would silently change
+/// a service's environment.
+#[test]
+fn a_user_listen_pid_survives_a_spawn_without_a_socket() {
+    let _guard = REAP_LOCK.lock().unwrap();
+    let argv = [cs("/bin/sh"), cs("-c"), cs("test \"$LISTEN_PID\" = user")];
+    let env = [cs("LISTEN_PID=user")];
+    let pid = process::spawn_sandboxed(
+        c"/bin/sh",
+        &argv,
+        &env,
+        process::SpawnOptions::default(),
+        None,
+        &Sandbox::inherit(),
+        process::ChildPaths::default(),
+    )
+    .expect("spawn");
+    let exit = wait::wait_child(pid).expect("wait");
+    assert!(
+        matches!(exit, ChildExit::Exited { code: 0, .. }),
+        "the child did not keep its own LISTEN_PID: {exit:?}"
+    );
 }
 
 /// `NoNewPrivileges=true` is only useful if it is actually set in the child,

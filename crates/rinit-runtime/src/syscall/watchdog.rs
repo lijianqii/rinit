@@ -134,11 +134,14 @@ impl Watchdog {
             return Err(SyscallError::last_os_error("ioctl(WDIOC_SETTIMEOUT)"));
         }
         // The kernel may answer with 0 for "unchanged"; 0 is not a timeout.
-        Ok(if seconds > 0 {
-            seconds as u64
+        // Ask the driver what is actually armed rather than assuming the
+        // request took effect: a driver with a shorter existing timeout would
+        // otherwise be fed too slowly and reset a healthy machine.
+        if seconds > 0 {
+            Ok(seconds as u64)
         } else {
-            timeout_sec
-        })
+            self.timeout()
+        }
     }
 
     /// What the driver says its timeout is, in seconds.

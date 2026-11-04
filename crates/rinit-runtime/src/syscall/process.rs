@@ -2,11 +2,13 @@
 //!
 //! M0 uses `posix_spawn` for the hardcoded test service. The controlled
 //! `fork`+`exec` path (for `User=`, capabilities, `WorkingDirectory=` and
-//! cgroup limits) arrives in M5 and must obey the single-threaded-fork
-//! constraint documented in plan §2.1⑤.
+//! cgroup limits) runs between `fork` and `exec` under the async-signal-safe
+//! constraint documented in plan §2.1⑤: the child calls only `libc`, allocates
+//! nothing and takes no locks.
 
 use std::ffi::{CStr, CString};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, OwnedFd};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use rinit_core::unit::sandbox::{Sandbox, SandboxStep};
@@ -77,9 +79,10 @@ pub struct SpawnOptions {
     pub new_session: bool,
     /// The listening socket to hand the child on [`LISTEN_FD`] (plan §7.9).
     ///
-    /// `dup2` clears `O_CLOEXEC` on the new descriptor, which is what makes it
-    /// survive the `execve` - and rinit's own copy keeps the flag, so a service
-    /// exiting takes only its own reference with it.
+    /// This is only usable through [`spawn_sandboxed`]: the child must also
+    /// write its own pid into `LISTEN_PID`, which `posix_spawn` cannot do
+    /// before exec. [`posix_spawn_full`] rejects the option rather than
+    /// starting a service that cannot find its socket.
     pub listen_fd: Option<libc::c_int>,
     /// Redirect the child's `stdout` and `stderr` onto this descriptor.
     ///
@@ -172,30 +175,60 @@ pub fn posix_spawn_full(
         .collect();
     env_ptrs.push(std::ptr::null_mut());
 
-    // POSIX_SPAWN_SETSID asks the child to `setsid()`, which glibc performs
-    // before `exec`. Building attrs by hand (rather than the libc
-    // `posix_spawnattr_t` wrapper, which glibc exposes but musl does not) keeps
-    // this file buildable on both targets.
+    if options.listen_fd.is_some() {
+        // A listening socket also needs the child's real pid in `LISTEN_PID`,
+        // which `posix_spawn` cannot know before the exec. Only the controlled
+        // fork path can satisfy the sd_listen_fds contract.
+        return Err(SyscallError::new("posix_spawn", libc::EINVAL));
+    }
+
+    // Attributes are always used: even without `setsid`, the child must start
+    // with default signal dispositions. POSIX_SPAWN_SETSID asks the child to
+    // `setsid()`, which glibc performs before `exec`. Building attrs by hand
+    // (rather than the libc `posix_spawnattr_t` wrapper, which glibc exposes
+    // but musl does not) keeps this file buildable on both targets.
     let mut attrs: libc::posix_spawnattr_t = unsafe { std::mem::zeroed() };
-    let use_attrs = options.new_session;
+    let use_attrs = true;
     if use_attrs {
         // SAFETY: a zeroed attr struct with a flags field is the documented
         // starting point for `posix_spawnattr_init`; it is only read back
         // inside this call.
-        if unsafe { libc::posix_spawnattr_init(&mut attrs) } != 0 {
-            return Err(SyscallError::last_os_error("posix_spawnattr_init"));
+        let rc = unsafe { libc::posix_spawnattr_init(&mut attrs) };
+        if rc != 0 {
+            return Err(SyscallError::new("posix_spawnattr_init", rc));
         }
         let mut flags: libc::c_short = 0;
-        // SAFETY: `posix_spawnattr_getflags` takes the attributes by const
-        // pointer and writes the flags through the pointer it is given; both
-        // are valid locals.
-        let rc = unsafe { libc::posix_spawnattr_getflags(&attrs, &mut flags) };
+        if options.new_session {
+            flags |= libc::POSIX_SPAWN_SETSID as libc::c_short;
+        }
+
+        // `SIG_IGN` survives exec; reset the whole set to default and clear the
+        // inherited mask, just as the controlled fork path does.
+        // SAFETY: both sets are valid locals initialised by the libc helpers.
+        let mut defaults: libc::sigset_t = unsafe { std::mem::zeroed() };
+        let mut mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::sigfillset(&mut defaults);
+            libc::sigdelset(&mut defaults, libc::SIGKILL);
+            libc::sigdelset(&mut defaults, libc::SIGSTOP);
+            libc::sigemptyset(&mut mask);
+        }
+        // SAFETY: `attrs` is initialized, and both sets outlive the calls.
+        let rc = unsafe { libc::posix_spawnattr_setsigdefault(&mut attrs, &defaults) };
         if rc != 0 {
             // SAFETY: `attrs` was initialised above.
             unsafe { libc::posix_spawnattr_destroy(&mut attrs) };
-            return Err(SyscallError::new("posix_spawnattr_getflags", rc));
+            return Err(SyscallError::new("posix_spawnattr_setsigdefault", rc));
         }
-        flags |= libc::POSIX_SPAWN_SETSID as libc::c_short;
+        // SAFETY: as above.
+        let rc = unsafe { libc::posix_spawnattr_setsigmask(&mut attrs, &mask) };
+        if rc != 0 {
+            // SAFETY: `attrs` was initialised above.
+            unsafe { libc::posix_spawnattr_destroy(&mut attrs) };
+            return Err(SyscallError::new("posix_spawnattr_setsigmask", rc));
+        }
+        flags |= libc::POSIX_SPAWN_SETSIGDEF as libc::c_short
+            | libc::POSIX_SPAWN_SETSIGMASK as libc::c_short;
         // SAFETY: as above.
         let rc = unsafe { libc::posix_spawnattr_setflags(&mut attrs, flags) };
         if rc != 0 {
@@ -204,23 +237,18 @@ pub fn posix_spawn_full(
             return Err(SyscallError::new("posix_spawnattr_setflags", rc));
         }
     }
-    let attr_ptr = if use_attrs {
-        &attrs as *const libc::posix_spawnattr_t
-    } else {
-        std::ptr::null()
-    };
+    let attr_ptr = &attrs as *const libc::posix_spawnattr_t;
 
     let mut file_actions: libc::posix_spawn_file_actions_t = unsafe { std::mem::zeroed() };
     let use_file_actions = working_directory.is_some() || options.stdio.is_some();
     if use_file_actions {
         // SAFETY: a zeroed file-actions struct is the documented starting point
         // for `posix_spawn_file_actions_init`.
-        if unsafe { libc::posix_spawn_file_actions_init(&mut file_actions) } != 0 {
-            if use_attrs {
-                // SAFETY: `attrs` was initialised above.
-                unsafe { libc::posix_spawnattr_destroy(&mut attrs) };
-            }
-            return Err(SyscallError::last_os_error("posix_spawn_file_actions_init"));
+        let rc = unsafe { libc::posix_spawn_file_actions_init(&mut file_actions) };
+        if rc != 0 {
+            // SAFETY: `attrs` was initialised above.
+            unsafe { libc::posix_spawnattr_destroy(&mut attrs) };
+            return Err(SyscallError::new("posix_spawn_file_actions_init", rc));
         }
         if let Some(cwd) = working_directory {
             let rc = unsafe {
@@ -329,9 +357,11 @@ fn fail_file_actions(
 /// with no limits), and the child joins it *before* the identity steps below -
 /// see [`cgroup::join_from_child`] for why the child is the side that writes it.
 ///
-/// rinit is single-threaded by design (plan §2.1⑤), so the child inherits no
-/// other thread's locks; it still calls only `libc` and allocates nothing,
-/// because between `fork` and `exec` nothing else is safe to assume. Everything
+/// rinit's async runtime is current-thread, but blocking-pool threads exist
+/// (mounts, reload), so the child does not rely on the process being
+/// single-threaded. It calls only async-signal-safe `libc`, allocates nothing
+/// and takes no locks, which is the POSIX requirement for a child of a
+/// multi-threaded process. Everything
 /// the child needs - the argument vectors, the working directory, the sandbox
 /// steps, the cgroup path - is built in the parent and lives in the address space
 /// the child is sharing.
@@ -347,7 +377,68 @@ fn fail_file_actions(
 /// cgroup join or sandbox step failing in the child; `execve` failing (e.g.
 /// `ENOENT` for a command that does not exist, which plan §1.1 contracts as a
 /// start failure).
-pub fn spawn_sandboxed(
+/// A forked child whose exec confirmation has not been read yet.
+///
+/// The fork and all child-side setup have already happened; only the report
+/// pipe remains. `wait_blocking` preserves the old synchronous behaviour, while
+/// the main start flow hands the wait to a blocking task so PID 1 keeps running.
+pub struct PendingSpawn {
+    pid: libc::pid_t,
+    report: OwnedFd,
+    completed: bool,
+}
+
+impl PendingSpawn {
+    /// The child's pid, valid before the report is consumed.
+    pub const fn pid(&self) -> libc::pid_t {
+        self.pid
+    }
+
+    /// Wait for the report, killing and reaping the child if it never execs.
+    ///
+    /// `cancel` is checked between short poll slices; a flow that is cancelled
+    /// while a child is stuck before `execve` must not leave that child behind.
+    pub fn wait_blocking(mut self, cancel: &AtomicBool) -> Result<libc::pid_t, SyscallError> {
+        let report = read_report(self.report.as_raw_fd(), cancel);
+        self.completed = true;
+        match report {
+            Ok(ChildReport::Exec) => Ok(self.pid),
+            Ok(ChildReport::Failed(step, errno)) => {
+                reap_failed_spawn(self.pid);
+                Err(SyscallError::new(step.op(), errno))
+            }
+            Ok(ChildReport::DiedBeforeExec) => {
+                reap_failed_spawn(self.pid);
+                Err(SyscallError::new(
+                    "child setup (process died before exec)",
+                    libc::EIO,
+                ))
+            }
+            Err(err) => {
+                // Timeout and cancellation both need the unconfirmed child
+                // gone; `reap_failed_spawn` kills it if it is still alive.
+                reap_failed_spawn(self.pid);
+                Err(err)
+            }
+        }
+    }
+}
+
+impl Drop for PendingSpawn {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        // Nobody consumed the confirmation: the safest outcome is that the
+        // child never becomes an untracked service.
+        // SAFETY: `pid` is our unreaped child and SIGKILL takes no pointer.
+        unsafe { libc::kill(self.pid, libc::SIGKILL) };
+        reap_failed_spawn(self.pid);
+    }
+}
+
+/// Fork and return the pending confirmation, without waiting for it.
+pub fn spawn_sandboxed_begin(
     path: &CStr,
     argv: &[CString],
     envp: &[CString],
@@ -355,21 +446,45 @@ pub fn spawn_sandboxed(
     working_directory: Option<&CStr>,
     sandbox: &Sandbox,
     paths: ChildPaths<'_>,
-) -> Result<libc::pid_t, SyscallError> {
+) -> Result<PendingSpawn, SyscallError> {
+    // The child knows its pid only after fork, but `sd_listen_fds()` checks
+    // `LISTEN_PID` against its own pid. Reserve an environment slot in the
+    // parent; the child fills a private COW buffer with "LISTEN_PID=<pid>"
+    // before exec. No allocation happens between fork and exec.
+    let mut listen_pid_buf = [0u8; 32];
+    let provides_listen_pid = options.listen_fd.is_some();
+    let mut env_ptrs: Vec<*const libc::c_char> = envp
+        .iter()
+        // Only replace `LISTEN_PID` when this child is actually being handed a
+        // socket. A service that sets the variable for its own reasons must
+        // keep it on the ordinary path.
+        .filter(|entry| !provides_listen_pid || !entry.to_bytes().starts_with(b"LISTEN_PID="))
+        .map(|entry| entry.as_ptr())
+        .collect();
+    let listen_pid = if provides_listen_pid {
+        let pointer = listen_pid_buf.as_mut_ptr().cast::<libc::c_char>();
+        env_ptrs.push(pointer);
+        Some(pointer.cast::<u8>())
+    } else {
+        None
+    };
+    env_ptrs.push(std::ptr::null());
+
     let setup = ChildSetup {
         path,
         argv: null_terminated(argv),
-        envp: null_terminated(envp),
+        envp: env_ptrs,
         options,
         working_directory,
         sandbox,
         steps: sandbox.steps(),
         paths,
+        listen_pid,
     };
 
-    // Close-on-exec, which is what makes "empty read" mean "the child exec'd":
-    // the child's copy of the write end disappears the moment `execve`
-    // succeeds, and until then a failure can be reported through it.
+    // Close-on-exec, which is what makes the marker plus EOF mean "the child
+    // reached `execve`": the child's copy of the write end disappears on a
+    // successful exec, and a failure can still be reported through it.
     let (report_read, report_write) = fs::pipe()?;
 
     // SAFETY: `fork` takes no arguments. The child only calls `libc` directly
@@ -383,24 +498,32 @@ pub fn spawn_sandboxed(
         child_exec(&setup, report_read.as_raw_fd(), report_write.as_raw_fd());
     }
 
-    // The parent's copy of the write end has to go, or the read below would
-    // block until every copy is closed - which, for a child that exec'd, would
-    // be never.
+    // The parent's copy of the write end has to go, or the report read would
+    // wait for a copy that never closes.
     drop(report_write);
+    Ok(PendingSpawn {
+        pid,
+        report: report_read,
+        completed: false,
+    })
+}
 
-    let report = read_report(report_read.as_raw_fd());
-    match report {
-        // End-of-file with nothing written: the child reached `execve`.
-        Ok(None) => Ok(pid),
-        Ok(Some((step, errno))) => {
-            reap_failed_spawn(pid);
-            Err(SyscallError::new(step.op(), errno))
-        }
-        Err(err) => {
-            reap_failed_spawn(pid);
-            Err(err)
-        }
-    }
+/// Spawn and wait for the exec confirmation.
+///
+/// Kept for callers that cannot yield (tests, auxiliary commands). The main
+/// service start uses [`spawn_sandboxed_begin`] and waits off the event loop.
+pub fn spawn_sandboxed(
+    path: &CStr,
+    argv: &[CString],
+    envp: &[CString],
+    options: SpawnOptions,
+    working_directory: Option<&CStr>,
+    sandbox: &Sandbox,
+    paths: ChildPaths<'_>,
+) -> Result<libc::pid_t, SyscallError> {
+    let cancel = AtomicBool::new(false);
+    spawn_sandboxed_begin(path, argv, envp, options, working_directory, sandbox, paths)?
+        .wait_blocking(&cancel)
 }
 
 /// Everything the work of a child needs, prepared in the parent before the
@@ -422,6 +545,76 @@ struct ChildSetup<'a> {
     steps: Vec<SandboxStep>,
     /// The files the child opens and acts on after the fork (plan §7.3, §7.11).
     paths: ChildPaths<'a>,
+    /// A parent-owned buffer the child fills with `LISTEN_PID=<pid>` before
+    /// exec, when it was given a listening socket.
+    listen_pid: Option<*mut u8>,
+}
+
+/// Reset signal dispositions and the signal mask for a child that is about to
+/// `exec`.
+///
+/// `SIG_IGN` is inherited across `exec`, while handled signals are reset by the
+/// kernel. rinit ignores several signals for its own lifecycle, so a child must
+/// start from `SIG_DFL` or a service would silently inherit an init's matrix.
+/// Only async-signal-safe libc calls are used.
+fn reset_child_signals() {
+    // SAFETY: `action` is zeroed then filled with valid fields; `sigemptyset`
+    // initialises the mask.
+    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+    action.sa_sigaction = libc::SIG_DFL;
+    action.sa_flags = 0;
+    // SAFETY: `action.sa_mask` is valid storage for `sigemptyset`.
+    unsafe { libc::sigemptyset(&mut action.sa_mask) };
+    for signal in 1..=64 {
+        if signal == libc::SIGKILL || signal == libc::SIGSTOP {
+            continue;
+        }
+        // SAFETY: `action` is initialized; an invalid signal number is simply
+        // ignored, and SIGKILL/SIGSTOP are never passed.
+        unsafe {
+            libc::sigaction(signal, &action, std::ptr::null_mut());
+        }
+    }
+
+    // SAFETY: a zeroed signal set is initialised by `sigemptyset`; passing it
+    // as SIG_SETMASK with no old-set pointer is the documented form.
+    let mut mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::sigemptyset(&mut mask);
+        libc::sigprocmask(libc::SIG_SETMASK, &mask, std::ptr::null_mut());
+    }
+}
+
+/// Fill `buffer` with `LISTEN_PID=<getpid()>` without allocating.
+///
+/// The buffer is reserved in the parent and its pointer is part of the child's
+/// environment vector; after `fork` the child owns a private copy, so writing
+/// it cannot affect the parent.
+fn write_listen_pid(buffer: *mut u8) {
+    const PREFIX: &[u8] = b"LISTEN_PID=";
+    // SAFETY: `getpid` has no preconditions.
+    let mut pid = unsafe { libc::getpid() } as u64;
+    let mut digits = [0u8; 20];
+    let mut count = 0usize;
+    for slot in &mut digits {
+        *slot = b'0' + (pid % 10) as u8;
+        count += 1;
+        pid /= 10;
+        if pid == 0 {
+            break;
+        }
+    }
+    // SAFETY: the caller reserved at least PREFIX + 20 digits + NUL bytes in
+    // `buffer`, and the writes stay inside that reservation.
+    unsafe {
+        std::ptr::copy_nonoverlapping(PREFIX.as_ptr(), buffer, PREFIX.len());
+        let mut offset = PREFIX.len();
+        for digit in digits.iter().take(count).rev() {
+            *buffer.add(offset) = *digit;
+            offset += 1;
+        }
+        *buffer.add(offset) = 0;
+    }
 }
 
 /// The work of a child created by [`spawn_sandboxed`], which never returns.
@@ -433,6 +626,17 @@ fn child_exec(setup: &ChildSetup<'_>, report_read: libc::c_int, report_write: li
     // open would not hurt, but there is no reason to.
     // SAFETY: both descriptors are valid, and this one is not used again.
     unsafe { libc::close(report_read) };
+
+    // `SIG_IGN` survives exec. rinit ignores SIGPIPE/SIGHUP/SIGWINCH and
+    // friends, so without this every service would inherit an init's signal
+    // matrix instead of the one its shell or runtime expects. Handlers are
+    // reset by exec itself, but the ignored set is not; resetting every
+    // disposition also closes the fork-to-exec window where a service-directed
+    // signal would run rinit's handler.
+    reset_child_signals();
+    if let Some(buffer) = setup.listen_pid {
+        write_listen_pid(buffer);
+    }
 
     if setup.options.new_session {
         // SAFETY: `setsid` takes no arguments. The child is not a process-group
@@ -447,11 +651,22 @@ fn child_exec(setup: &ChildSetup<'_>, report_read: libc::c_int, report_write: li
     // the flag that would otherwise close it at `exec`, and because a unit that
     // drops privileges may not be able to do it afterwards.
     if let Some(fd) = setup.options.listen_fd {
-        // SAFETY: `fd` is a listening socket the parent opened and holds open for
-        // the child's sake; `dup2` closes the target first and cannot fail here
-        // except out of descriptors.
-        if unsafe { libc::dup2(fd, LISTEN_FD) } < 0 {
-            die(report_write, ChildStep::Dup2);
+        if fd == LISTEN_FD {
+            // `dup2(fd, fd)` is a no-op and would leave `FD_CLOEXEC` set on the
+            // descriptor, so the service would lose it at exec. Clear the flag
+            // explicitly in that one case.
+            // SAFETY: `fd` is the listening socket the parent opened; the
+            // third argument is a plain flag value.
+            if unsafe { libc::fcntl(fd, libc::F_SETFD, 0) } < 0 {
+                die(report_write, ChildStep::Dup2);
+            }
+        } else {
+            // SAFETY: `fd` is a listening socket the parent opened and holds open
+            // for the child's sake; `dup2` closes the target first and cannot
+            // fail here except out of descriptors.
+            if unsafe { libc::dup2(fd, LISTEN_FD) } < 0 {
+                die(report_write, ChildStep::Dup2);
+            }
         }
     }
 
@@ -530,6 +745,18 @@ fn child_exec(setup: &ChildSetup<'_>, report_read: libc::c_int, report_write: li
         }
     }
 
+    // All child-side setup succeeded. Tell the parent that the next call is
+    // `execve`, so a later EOF can be told apart from a death during setup.
+    // SAFETY: the report pipe is the parent/child protocol, and one byte is an
+    // atomic pipe write.
+    unsafe {
+        libc::write(
+            report_write,
+            (&READY_BYTE as *const u8).cast::<libc::c_void>(),
+            1,
+        )
+    };
+
     // SAFETY: `path` and both arrays are valid, NUL-terminated, and live in the
     // memory this child inherited from the parent. `execve` does not return on
     // success.
@@ -557,8 +784,19 @@ fn setup_tty(tty: &ChildTty<'_>, report_write: libc::c_int) {
     // `O_NOCTTY` so the open itself does not acquire the terminal implicitly:
     // taking it over is the explicit `TIOCSCTTY` below, which is also what
     // makes "this failed" and "this was never attempted" tell apart.
+    //
+    // `O_NONBLOCK` matters for a serial console with no carrier: a blocking
+    // `open` can wait indefinitely, and this call happens between `fork` and
+    // `exec` while PID 1 is synchronously waiting for the spawn report. The
+    // flag is cleared on the open file description below, so the service gets
+    // the blocking terminal it expects.
     // SAFETY: `path` is a valid, NUL-terminated path.
-    let fd = unsafe { libc::open(tty.path.as_ptr(), libc::O_RDWR | libc::O_NOCTTY) };
+    let fd = unsafe {
+        libc::open(
+            tty.path.as_ptr(),
+            libc::O_RDWR | libc::O_NOCTTY | libc::O_NONBLOCK,
+        )
+    };
     if fd < 0 {
         die(report_write, ChildStep::OpenTty);
     }
@@ -577,6 +815,19 @@ fn setup_tty(tty: &ChildTty<'_>, report_write: libc::c_int) {
         if unsafe { libc::dup2(fd, target) } < 0 {
             die(report_write, ChildStep::Dup2);
         }
+    }
+    // The duplicated descriptors share the open file description, so the flag
+    // change applies to every standard descriptor. Done on `fd` even when it is
+    // 0/1/2 (the child inherited a closed standard descriptor, so `open`
+    // returned one of those numbers).
+    // SAFETY: `fd` is the descriptor opened above.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        die(report_write, ChildStep::OpenTty);
+    }
+    // SAFETY: as above; clearing a status flag on our own descriptor.
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) } < 0 {
+        die(report_write, ChildStep::OpenTty);
     }
     if fd > libc::STDERR_FILENO {
         // SAFETY: `fd` is ours and no longer needed: it is 0, 1 and 2 now.
@@ -608,21 +859,96 @@ fn die_reporting(report_write: libc::c_int, step: ChildStep, errno: i32) -> ! {
     unsafe { libc::_exit(127) }
 }
 
-/// Read a child's failure report: `Ok(None)` is end-of-file, which means the
-/// child `exec`'d.
+/// The byte the child writes immediately before `execve`.
 ///
-/// A short read means the child died while reporting - a signal between the
-/// `write` and the `_exit` - and is reported as a child that never reached
-/// `exec`, with `EIO` standing in for an `errno` the child never sent.
-fn read_report(fd: libc::c_int) -> Result<Option<(ChildStep, i32)>, SyscallError> {
-    let mut buf = [0u8; REPORT_LEN];
-    let mut filled = 0usize;
+/// It is outside the [`ChildStep`] code range, so the first byte of the pipe
+/// unambiguously says whether the child finished setup.
+const READY_BYTE: u8 = 0xff;
+
+/// What happened to a child between `fork` and `exec`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChildReport {
+    /// The child wrote [`READY_BYTE`], then closed the pipe: it is now running
+    /// the command.
+    Exec,
+    /// A named setup step failed; the child reported its `errno` and exited.
+    Failed(ChildStep, i32),
+    /// The pipe closed before the ready marker: the child died during setup.
+    DiedBeforeExec,
+}
+
+/// Read a child's report from the close-on-exec pipe.
+///
+/// The protocol is: a failed setup step writes an 8-byte `(step, errno)`
+/// report; a completed setup writes [`READY_BYTE`] and then either `execve`s
+/// (closing the pipe) or writes its `execve` failure report. A pipe that closes
+/// before the marker therefore means the child died during setup, which is a
+/// failed start rather than a successful one.
+///
+/// The remaining, unavoidable race is a signal delivered between the marker
+/// write and `execve`: EOF can only prove setup completed, not that the image
+/// was loaded. Closing that window needs an exec event (`ptrace`) or a helper
+/// process, which is not worth the cost for an init that already owns the
+/// status of its children.
+fn read_report(fd: libc::c_int, cancel: &AtomicBool) -> Result<ChildReport, SyscallError> {
     let deadline = Instant::now() + Duration::from_secs(5);
-    while filled < REPORT_LEN {
+    let mut first = [0u8; 1];
+    if read_until(fd, &mut first, deadline, "child report", cancel)? == 0 {
+        return Ok(ChildReport::DiedBeforeExec);
+    }
+    if first[0] == READY_BYTE {
+        let mut buf = [0u8; REPORT_LEN];
+        let filled = read_until(fd, &mut buf, deadline, "child report", cancel)?;
+        if filled == 0 {
+            return Ok(ChildReport::Exec);
+        }
+        // A complete report after the marker is an `execve` failure; a short
+        // one means the child died while reporting it.
+        return match decode_report(&buf) {
+            Some((step, errno)) if filled == REPORT_LEN => Ok(ChildReport::Failed(step, errno)),
+            _ => Ok(ChildReport::DiedBeforeExec),
+        };
+    }
+
+    let mut buf = [0u8; REPORT_LEN];
+    buf[0] = first[0];
+    let Some(rest) = buf.get_mut(1..) else {
+        return Ok(ChildReport::DiedBeforeExec);
+    };
+    let filled = read_until(fd, rest, deadline, "child report", cancel)?;
+    if filled < REPORT_LEN - 1 {
+        return Ok(ChildReport::DiedBeforeExec);
+    }
+    match decode_report(&buf) {
+        Some((step, errno)) => Ok(ChildReport::Failed(step, errno)),
+        None => Ok(ChildReport::DiedBeforeExec),
+    }
+}
+
+/// Read up to `buf.len()` bytes, returning how many arrived before EOF.
+///
+/// A timeout or a read error is reported; EOF is a normal return with whatever
+/// was read, because a child that dies mid-report is a distinct outcome from
+/// one that died before writing anything.
+fn read_until(
+    fd: libc::c_int,
+    buf: &mut [u8],
+    deadline: Instant,
+    op: &'static str,
+    cancel: &AtomicBool,
+) -> Result<usize, SyscallError> {
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(SyscallError::new(op, libc::ECANCELED));
+        }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err(SyscallError::new("child report", libc::ETIMEDOUT));
+            return Err(SyscallError::new(op, libc::ETIMEDOUT));
         }
+        // Poll in short slices so a cancellation is noticed while a child is
+        // stuck in setup, rather than only at the five-second deadline.
+        let slice = remaining.min(Duration::from_millis(10));
         let mut descriptor = libc::pollfd {
             fd,
             events: libc::POLLIN | libc::POLLHUP,
@@ -633,7 +959,7 @@ fn read_report(fd: libc::c_int) -> Result<Option<(ChildStep, i32)>, SyscallError
             libc::poll(
                 &mut descriptor,
                 1,
-                remaining.as_millis().min(i32::MAX as u128) as i32,
+                slice.as_millis().min(i32::MAX as u128) as i32,
             )
         };
         if ready < 0 {
@@ -644,7 +970,7 @@ fn read_report(fd: libc::c_int) -> Result<Option<(ChildStep, i32)>, SyscallError
             return Err(error);
         }
         if ready == 0 {
-            return Err(SyscallError::new("child report", libc::ETIMEDOUT));
+            continue;
         }
         let Some(destination) = buf.get_mut(filled..) else {
             break;
@@ -659,27 +985,23 @@ fn read_report(fd: libc::c_int) -> Result<Option<(ChildStep, i32)>, SyscallError
             return Err(err);
         }
         if rc == 0 {
-            break;
+            return Ok(filled);
         }
         filled += rc as usize;
     }
+    Ok(filled)
+}
 
-    if filled == 0 {
-        return Ok(None);
-    }
-    if filled < REPORT_LEN {
-        return Ok(Some((ChildStep::Exec, libc::EIO)));
-    }
-    let report = u64::from_le_bytes(buf);
+/// Decode an 8-byte `(step, errno)` report.
+fn decode_report(buf: &[u8; REPORT_LEN]) -> Option<(ChildStep, i32)> {
+    let report = u64::from_le_bytes(*buf);
     let code = (report & 0xff) as u8;
     let errno = ((report >> 8) & 0xffff_ffff) as u32 as i32;
     // An unknown code cannot come from this build's child, so it is a bug worth
-    // reporting rather than labelling `execve`: the previous `_ => Exec` fallback
-    // did exactly that, and every step added after it silently reported itself as
-    // a failed `exec`.
-    let step =
-        ChildStep::from_code(code).ok_or_else(|| SyscallError::new("child report", libc::EIO))?;
-    Ok(Some((step, errno)))
+    // reporting rather than labelling `execve`: the previous `_ => Exec`
+    // fallback did exactly that, and every step added after it silently
+    // reported itself as a failed `exec`.
+    ChildStep::from_code(code).map(|step| (step, errno))
 }
 
 /// Reap a child that failed before `exec`.
@@ -885,6 +1207,83 @@ pub fn kill_process_group(pid: libc::pid_t, signal: libc::c_int) -> Result<(), S
     }
 }
 
+/// Signal a process group by its id.
+///
+/// Unlike [`kill_process_group`], this does not ask the kernel for the group of
+/// a live member: the caller recorded the group while its leader existed. That
+/// matters after the leader has been reaped - the group can still hold the
+/// service's children, and `getpgid(leader)` would then fail with `ESRCH`.
+///
+/// A process-group id cannot be reused while any process still belongs to the
+/// group, so a recorded id is safe to signal until it is observed empty.
+pub fn kill_group(pgid: libc::pid_t, signal: libc::c_int) -> Result<(), SyscallError> {
+    if pgid <= 1 {
+        return Err(SyscallError::new("killpg", libc::EINVAL));
+    }
+    // SAFETY: a negative pid addresses the process group; scalar arguments.
+    let rc = unsafe { libc::kill(-pgid, signal) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(SyscallError::last_os_error("killpg"))
+    }
+}
+
+/// Whether any process still belongs to `pgid`.
+pub fn group_alive(pgid: libc::pid_t) -> bool {
+    if pgid <= 1 {
+        return false;
+    }
+    // SAFETY: signal 0 performs the permission/existence check and delivers
+    // nothing.
+    unsafe { libc::kill(-pgid, 0) == 0 }
+}
+
+/// Whether any process other than `except` belongs to `pgid`.
+///
+/// Used after a service's leader has been reaped: the leader may still be a
+/// zombie at this point and therefore still counted by [`group_alive`], while
+/// the question is whether *children* remain. `/proc/<pid>/stat` field 5 is the
+/// process group; `comm` can contain spaces and parentheses, so the fields are
+/// read after the last `)`.
+pub fn group_has_other_members(pgid: libc::pid_t, except: libc::pid_t) -> bool {
+    if pgid <= 1 {
+        return false;
+    }
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<libc::pid_t>().ok())
+        else {
+            continue;
+        };
+        if pid == except {
+            continue;
+        }
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        let Some(close) = stat.rfind(')') else {
+            continue;
+        };
+        let mut fields = stat.get(close + 1..).unwrap_or_default().split_whitespace();
+        let _state = fields.next();
+        let _ppid = fields.next();
+        if fields
+            .next()
+            .and_then(|group| group.parse::<libc::pid_t>().ok())
+            == Some(pgid)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Return the current process ID.
 pub fn getpid() -> libc::pid_t {
     // SAFETY: `getpid` takes no arguments and cannot fail.
@@ -911,5 +1310,104 @@ pub fn getpgid(pid: libc::pid_t) -> Result<libc::pid_t, SyscallError> {
         Ok(rc)
     } else {
         Err(SyscallError::last_os_error("getpgid"))
+    }
+}
+
+#[cfg(test)]
+mod report_tests {
+    use super::*;
+
+    /// Write `bytes` to a fresh pipe and return the read end with the write end
+    /// already closed, which is what the child's exit does.
+    fn pipe_with(bytes: &[u8]) -> std::os::fd::OwnedFd {
+        let (read_end, write_end) = fs::pipe().expect("pipe");
+        if !bytes.is_empty() {
+            // SAFETY: `write_end` is a valid descriptor and `bytes` is a valid
+            // buffer of the given length.
+            let rc = unsafe {
+                libc::write(
+                    write_end.as_raw_fd(),
+                    bytes.as_ptr().cast::<libc::c_void>(),
+                    bytes.len(),
+                )
+            };
+            assert_eq!(rc, bytes.len() as isize, "test pipe write");
+        }
+        drop(write_end);
+        read_end
+    }
+
+    fn report_bytes(step: ChildStep, errno: i32) -> [u8; REPORT_LEN] {
+        let report = u64::from(step as u8) | (u64::from(errno as u32) << 8);
+        report.to_le_bytes()
+    }
+
+    #[test]
+    fn the_ready_marker_is_not_a_step_code() {
+        assert!(ChildStep::from_code(READY_BYTE).is_none());
+    }
+
+    /// Closing the pipe before the marker means the child never reached
+    /// `execve`; treating that as success is exactly the bug the marker fixes.
+    #[test]
+    fn eof_before_the_marker_is_a_setup_death() {
+        let read_end = pipe_with(&[]);
+        assert_eq!(
+            read_report(read_end.as_raw_fd(), &AtomicBool::new(false)).expect("read"),
+            ChildReport::DiedBeforeExec
+        );
+    }
+
+    /// The marker followed by EOF is the success case.
+    #[test]
+    fn marker_then_eof_is_exec() {
+        let read_end = pipe_with(&[READY_BYTE]);
+        assert_eq!(
+            read_report(read_end.as_raw_fd(), &AtomicBool::new(false)).expect("read"),
+            ChildReport::Exec
+        );
+    }
+
+    /// A failed setup step still reports its name and errno.
+    #[test]
+    fn a_failure_report_names_the_step() {
+        let bytes = report_bytes(ChildStep::Chdir, libc::EACCES);
+        let read_end = pipe_with(&bytes);
+        assert_eq!(
+            read_report(read_end.as_raw_fd(), &AtomicBool::new(false)).expect("read"),
+            ChildReport::Failed(ChildStep::Chdir, libc::EACCES)
+        );
+    }
+
+    /// `execve` itself can fail after the marker; its report must win over the
+    /// earlier success signal.
+    #[test]
+    fn a_failure_report_after_the_marker_is_a_failed_exec() {
+        let report = report_bytes(ChildStep::Exec, libc::ENOENT);
+        let mut bytes = Vec::new();
+        bytes.push(READY_BYTE);
+        bytes.extend_from_slice(&report);
+        let read_end = pipe_with(&bytes);
+        assert_eq!(
+            read_report(read_end.as_raw_fd(), &AtomicBool::new(false)).expect("read"),
+            ChildReport::Failed(ChildStep::Exec, libc::ENOENT)
+        );
+    }
+
+    /// A signal between the marker and the rest of a report is a death, not a
+    /// success and not a fabricated step.
+    #[test]
+    fn a_short_report_is_a_setup_death() {
+        let read_end = pipe_with(&[READY_BYTE, 0, 1]);
+        assert_eq!(
+            read_report(read_end.as_raw_fd(), &AtomicBool::new(false)).expect("read"),
+            ChildReport::DiedBeforeExec
+        );
+        let bytes = report_bytes(ChildStep::SetUser, libc::EPERM);
+        let read_end = pipe_with(&bytes[..3]);
+        assert_eq!(
+            read_report(read_end.as_raw_fd(), &AtomicBool::new(false)).expect("read"),
+            ChildReport::DiedBeforeExec
+        );
     }
 }
