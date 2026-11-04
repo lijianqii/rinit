@@ -107,44 +107,47 @@ pub struct MergedTarget {
     pub at: Millis,
 }
 
-/// Per-unit merged targets, plus the pending jobs that produced them.
+/// Per-unit merged targets.
+///
+/// The merge keeps only the request that currently holds each unit's target.
+/// A losing request has no future effect: the comparison is against the
+/// current holder, so an older/lower-priority job that lost cannot become
+/// relevant later. Keeping a separate "pending jobs" vector would therefore
+/// grow without bound while changing no decision.
 #[derive(Debug, Clone, Default)]
 pub struct JobQueue {
-    jobs: Vec<Job>,
     merged: Vec<(UnitName, MergedTarget)>,
 }
 
 impl JobQueue {
     /// An empty queue.
     pub const fn new() -> Self {
-        JobQueue {
-            jobs: Vec::new(),
-            merged: Vec::new(),
-        }
+        JobQueue { merged: Vec::new() }
     }
 
-    /// Number of unconsumed jobs.
+    /// Number of units with an outstanding target.
     pub fn len(&self) -> usize {
-        self.jobs.len()
+        self.merged.len()
     }
 
-    /// Whether nothing is pending.
+    /// Whether no unit has an outstanding target.
     pub fn is_empty(&self) -> bool {
-        self.jobs.is_empty()
+        self.merged.is_empty()
     }
 
     /// Submit a job, merging it into the unit's target state.
     ///
     /// Returns `true` if this request *won* the merge - i.e. it is now the one
-    /// holding the unit's target. A job that loses is still recorded (it may
-    /// matter to a later comparison), but it did not become authoritative.
+    /// holding the unit's target. A losing request is not retained: the
+    /// comparison is always against the current holder, so an older or
+    /// lower-priority job cannot become relevant later.
     ///
     /// Note that winning does not imply the *value* changed: a second
     /// `Started` from a later user request wins the comparison but leaves the
     /// target at `Started`. Callers care about authority, not change, because
     /// authority is what a later `ShutdownStop` has to override.
     pub fn submit(&mut self, job: Job) -> bool {
-        let won = match self.merged.iter_mut().find(|(u, _)| *u == job.unit) {
+        match self.merged.iter_mut().find(|(u, _)| *u == job.unit) {
             Some((_, current)) => {
                 // Compare against the request that currently holds the target,
                 // not against the target itself: two `Started` jobs from
@@ -173,9 +176,7 @@ impl JobQueue {
                 ));
                 true
             }
-        };
-        self.jobs.push(job);
-        won
+        }
     }
 
     /// The merged target for `unit`, if one was requested.
@@ -195,7 +196,6 @@ impl JobQueue {
     /// Used when a unit is reaped, so a finished unit does not keep a stale
     /// `Started` target that would re-spawn it on the next reconcile.
     pub fn forget(&mut self, unit: &UnitName) {
-        self.jobs.retain(|j| &j.unit != unit);
         self.merged.retain(|(u, _)| u != unit);
     }
 
@@ -207,85 +207,32 @@ impl JobQueue {
     ///
     /// Returns `None` when the unit has no target at all - nothing was asked,
     /// so nothing should happen.
-    pub fn reconcile(&self, unit: &UnitName, actual: UnitState) -> Option<(Effect, UnitState)> {
+    pub fn reconcile(&self, unit: &UnitName, actual: UnitState) -> Option<Effect> {
         let merged = self.target_of(unit)?;
 
-        // A unit with no target and no pending job is left entirely alone.
+        // This is the *action* half of plan §1.3(13): target versus actual
+        // yields an effect. The resulting state is owned by the state machine
+        // and the manager; returning a second copy of it here was how the two
+        // started to drift.
         match merged.target {
             JobTarget::Started => match actual {
-                // Already there: plan §1.3(13) treats both active states as
-                // satisfied, so a oneshot that already ran is not re-run.
-                // Listed explicitly rather than via `is_satisfied()` so the
-                // match stays exhaustive and adding a state forces a decision.
-                UnitState::Active | UnitState::ActiveExited => Some((Effect::None, actual)),
-
-                // Waiting out a backoff: a manual start cancels the timer
-                // rather than queueing behind it.
-                UnitState::RestartWait => {
-                    Some((Effect::CancelBackoffAndStart, UnitState::Starting))
-                }
-
-                // Starting a failed unit clears the breaker first; that is
-                // what makes `rctl start` an escape hatch from StartLimitHit.
-                UnitState::Failed(_) => {
-                    Some((Effect::ClearStartLimitAndStart, UnitState::Starting))
-                }
-
-                // A stop in progress is not cancelled: the start is queued
-                // until it finishes (plan §1.3(13), the safe choice).
+                UnitState::Active | UnitState::ActiveExited => Some(Effect::None),
+                UnitState::RestartWait => Some(Effect::CancelBackoffAndStart),
+                UnitState::Failed(_) => Some(Effect::ClearStartLimitAndStart),
                 UnitState::Deactivating => None,
-
-                UnitState::Inactive | UnitState::Starting => {
-                    Some((Effect::SpawnProcess, UnitState::Starting))
-                }
+                UnitState::Inactive => Some(Effect::SpawnProcess),
+                UnitState::Starting => Some(Effect::None),
             },
 
             JobTarget::Stopped => match actual {
-                UnitState::Inactive => Some((Effect::None, UnitState::Inactive)),
-                // Plan §1.3(3): Active(Exited) has no process, so it goes
-                // straight to Inactive instead of spinning in Deactivating.
-                UnitState::ActiveExited => Some((Effect::None, UnitState::Inactive)),
-                // Stop beats a pending restart.
-                UnitState::RestartWait => {
-                    Some((Effect::CancelBackoffAndStop, UnitState::Deactivating))
+                UnitState::Inactive | UnitState::ActiveExited | UnitState::Failed(_) => {
+                    Some(Effect::None)
                 }
-                UnitState::Active | UnitState::Starting => {
-                    Some((Effect::SendStopSignal, UnitState::Deactivating))
-                }
-                // A failed unit is not running; stopping it is already done.
-                UnitState::Failed(_) => Some((Effect::None, UnitState::Inactive)),
+                UnitState::RestartWait => Some(Effect::CancelBackoffAndStop),
+                UnitState::Active | UnitState::Starting => Some(Effect::SendStopSignal),
                 UnitState::Deactivating => None,
             },
         }
-    }
-
-    /// Mark every unit reachable from `blocked` as failed because a hard
-    /// dependency did not start (plan §1.3(13)).
-    ///
-    /// Returns the units affected. `blocked` is the unit that failed; anything
-    /// that `Requires=` it cannot proceed.
-    pub fn propagate_failure(
-        &mut self,
-        blocked: &UnitName,
-        dependents: &[UnitName],
-        source: RequestSource,
-        at: Millis,
-    ) -> Vec<UnitName> {
-        let _ = blocked;
-        let mut affected = Vec::new();
-        for unit in dependents {
-            // A stop target already wins, so do not overwrite it.
-            if let Some(current) = self.target_of(unit)
-                && current.target == JobTarget::Stopped
-            {
-                continue;
-            }
-            // The dependent is failed, not started: record it as failed via a
-            // stop-shaped target so `reconcile` will not try to spawn it.
-            self.submit(Job::new(unit.clone(), JobTarget::Stopped, source, at));
-            affected.push(unit.clone());
-        }
-        affected
     }
 }
 
@@ -469,7 +416,24 @@ mod tests {
         ));
         assert_eq!(
             q.reconcile(&name("a.service"), UnitState::Inactive),
-            Some((Effect::SpawnProcess, UnitState::Starting))
+            Some(Effect::SpawnProcess)
+        );
+    }
+
+    /// A start against an in-progress start waits for it; it does not spawn a
+    /// second process or re-run readiness bookkeeping.
+    #[test]
+    fn start_against_a_starting_unit_waits() {
+        let mut q = JobQueue::new();
+        q.submit(Job::new(
+            name("a.service"),
+            JobTarget::Started,
+            RequestSource::UserStart,
+            0,
+        ));
+        assert_eq!(
+            q.reconcile(&name("a.service"), UnitState::Starting),
+            Some(Effect::None)
         );
     }
 
@@ -487,7 +451,7 @@ mod tests {
         for state in [UnitState::Active, UnitState::ActiveExited] {
             assert_eq!(
                 q.reconcile(&name("a.service"), state),
-                Some((Effect::None, state)),
+                Some(Effect::None),
                 "{state} is already running"
             );
         }
@@ -505,7 +469,7 @@ mod tests {
         ));
         assert_eq!(
             q.reconcile(&name("a.service"), UnitState::RestartWait),
-            Some((Effect::CancelBackoffAndStart, UnitState::Starting))
+            Some(Effect::CancelBackoffAndStart)
         );
     }
 
@@ -523,7 +487,7 @@ mod tests {
         for reason in [FailedReason::StartFailure, FailedReason::StartLimitHit] {
             assert_eq!(
                 q.reconcile(&name("a.service"), UnitState::Failed(reason)),
-                Some((Effect::ClearStartLimitAndStart, UnitState::Starting)),
+                Some(Effect::ClearStartLimitAndStart),
                 "{reason:?}"
             );
         }
@@ -558,7 +522,7 @@ mod tests {
         for state in [UnitState::Active, UnitState::Starting] {
             assert_eq!(
                 q.reconcile(&name("a.service"), state),
-                Some((Effect::SendStopSignal, UnitState::Deactivating))
+                Some(Effect::SendStopSignal)
             );
         }
     }
@@ -575,7 +539,7 @@ mod tests {
         ));
         assert_eq!(
             q.reconcile(&name("a.service"), UnitState::ActiveExited),
-            Some((Effect::None, UnitState::Inactive))
+            Some(Effect::None)
         );
     }
 
@@ -591,7 +555,7 @@ mod tests {
         ));
         assert_eq!(
             q.reconcile(&name("a.service"), UnitState::RestartWait),
-            Some((Effect::CancelBackoffAndStop, UnitState::Deactivating))
+            Some(Effect::CancelBackoffAndStop)
         );
     }
 
@@ -606,7 +570,7 @@ mod tests {
         ));
         assert_eq!(
             q.reconcile(&name("a.service"), UnitState::RestartWait),
-            Some((Effect::CancelBackoffAndStop, UnitState::Deactivating))
+            Some(Effect::CancelBackoffAndStop)
         );
     }
 
@@ -645,53 +609,7 @@ mod tests {
 
     /// A dependent whose required unit failed must not be started.
     #[test]
-    fn a_failed_dependency_does_not_start_its_dependents() {
-        let mut q = JobQueue::new();
-        q.submit(Job::new(
-            name("db.service"),
-            JobTarget::Started,
-            RequestSource::Dependency,
-            0,
-        ));
-        let affected = q.propagate_failure(
-            &name("db.service"),
-            &[name("app.service")],
-            RequestSource::Dependency,
-            10,
-        );
-        assert_eq!(affected, [name("app.service")]);
-        assert_eq!(
-            q.target_of(&name("app.service")).map(|t| t.target),
-            Some(JobTarget::Stopped),
-            "a dependent of a failed unit must not be started"
-        );
-    }
-
-    /// An explicit stop is not overwritten by a dependency failure.
-    #[test]
-    fn propagation_does_not_overwrite_a_stop() {
-        let mut q = JobQueue::new();
-        q.submit(Job::new(
-            name("app.service"),
-            JobTarget::Stopped,
-            RequestSource::UserStop,
-            0,
-        ));
-        let affected = q.propagate_failure(
-            &name("db.service"),
-            &[name("app.service")],
-            RequestSource::Dependency,
-            10,
-        );
-        assert!(affected.is_empty(), "{affected:?}");
-        assert_eq!(
-            q.target_of(&name("app.service")).map(|t| t.source),
-            Some(RequestSource::UserStop)
-        );
-    }
-
-    #[test]
-    fn a_start_job_is_queued_even_when_it_loses_the_merge() {
+    fn a_losing_start_does_not_replace_the_target() {
         let mut q = JobQueue::new();
         q.submit(Job::new(
             name("a.service"),
@@ -705,7 +623,7 @@ mod tests {
             RequestSource::Dependency,
             1,
         ));
-        assert_eq!(q.len(), 2, "both requests are recorded");
+        assert_eq!(q.len(), 1, "only the authoritative target is kept");
         assert_eq!(
             q.target_of(&name("a.service")).map(|t| t.target),
             Some(JobTarget::Stopped)

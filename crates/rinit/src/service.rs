@@ -8,6 +8,7 @@
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 
 use rinit_core::unit::sandbox::Sandbox;
 use rinit_runtime::RuntimeError;
@@ -84,14 +85,26 @@ impl ServiceSet {
 /// # Errors
 /// `argv` must be non-empty and contain no interior NUL bytes, and the spawn
 /// itself must succeed.
-pub fn spawn_service_in_group(
+/// A service spawn that may still be waiting for its exec confirmation.
+pub enum SpawnBegin {
+    /// `posix_spawn` already reported success.
+    Ready(libc::pid_t),
+    /// The controlled fork path; the caller must wait for the report.
+    Pending(process::PendingSpawn),
+}
+
+/// Start a service without waiting for the controlled fork's exec report.
+///
+/// The `posix_spawn` fast path returns `Ready` synchronously; the fork path
+/// returns a [`process::PendingSpawn`] so the main loop can wait off-thread.
+pub fn begin_spawn_service_in_group(
     argv: &[String],
     env: &[String],
     working_directory: Option<&str>,
     output: Option<libc::c_int>,
     sandbox: &Sandbox,
     place: ChildPlacement<'_>,
-) -> Result<libc::pid_t, RuntimeError> {
+) -> Result<SpawnBegin, RuntimeError> {
     let Prepared { argv, envp, cwd } = prepare(argv, env, working_directory)?;
     let Some(path) = argv.first().map(CString::as_c_str) else {
         // `prepare` rejects an empty command, so this is unreachable; reporting
@@ -116,9 +129,10 @@ pub fn spawn_service_in_group(
     // handing it a listening socket (plan §7.9) all happen inside the child.
     if sandbox.is_inherited() && procs.is_none() && place.tty.is_none() && listen_fd.is_none() {
         process::posix_spawn_full(path, &argv, &envp, options, cwd.as_deref())
+            .map(SpawnBegin::Ready)
             .map_err(RuntimeError::from)
     } else {
-        process::spawn_sandboxed(
+        process::spawn_sandboxed_begin(
             path,
             &argv,
             &envp,
@@ -130,7 +144,27 @@ pub fn spawn_service_in_group(
                 tty: place.tty,
             },
         )
+        .map(SpawnBegin::Pending)
         .map_err(RuntimeError::from)
+    }
+}
+
+/// Start a service and wait for the exec report.
+///
+/// This is the synchronous wrapper for tests, probes, `ExecStop=` and auxiliary
+/// commands. The main service start uses [`begin_spawn_service_in_group`].
+pub fn spawn_service_in_group(
+    argv: &[String],
+    env: &[String],
+    working_directory: Option<&str>,
+    output: Option<libc::c_int>,
+    sandbox: &Sandbox,
+    place: ChildPlacement<'_>,
+) -> Result<libc::pid_t, RuntimeError> {
+    let cancel = AtomicBool::new(false);
+    match begin_spawn_service_in_group(argv, env, working_directory, output, sandbox, place)? {
+        SpawnBegin::Ready(pid) => Ok(pid),
+        SpawnBegin::Pending(pending) => pending.wait_blocking(&cancel).map_err(RuntimeError::from),
     }
 }
 

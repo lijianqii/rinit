@@ -11,11 +11,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::fd::AsRawFd;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use rinit_core::{
-    Effect, ExitOutcome, JobTarget, ListFormat, Request, RequestSource, ServiceKind, Status,
-    StatusFormat, UnitName, UnitState,
+    Effect, ExitOutcome, JobTarget, ListFormat, MAX_FRAME_BYTES, Request, RequestSource,
+    ServiceKind, Status, StatusFormat, UnitName, UnitState,
 };
 use rinit_runtime::syscall::{process, reboot, signal};
 use rinit_runtime::{RuntimeError, Signal, SignalSet};
@@ -32,8 +34,8 @@ use crate::notify::NotifyHub;
 use crate::readiness;
 use crate::service::{ServiceSet, reap_and_log, shutdown, spawn_service_in_group};
 use crate::unit_manager::{
-    Outcome, ResourceUsage, RestartPlan, UnitListEntry, UnitManager, UnitRuntime,
-    build_service_env, reap_into_manager,
+    Outcome, ResourceUsage, RestartPlan, SpawnBeginUnit, UnitListEntry, UnitManager, UnitRuntime,
+    UnitSpawn, build_service_env, reap_into_manager,
 };
 use crate::watchdog::Watchdog;
 
@@ -169,9 +171,6 @@ pub async fn run(cfg: Config) -> Result<(), RuntimeError> {
         // the machine goes down. The ring remains the in-memory source of truth.
         logs.flush_file();
         activation.disarm();
-        // Graceful shutdown disarms the hardware (plan §7.5's magic close). A
-        // hung loop never gets here, and that is the mechanism.
-        watchdog.disarm();
         control.disarm();
         // Whatever the console limiter folded and has not reported yet: a flood
         // that stopped leaves its count in the table, and the log would otherwise
@@ -180,13 +179,17 @@ pub async fn run(cfg: Config) -> Result<(), RuntimeError> {
         // A dev-mode boot (`--dev`) is a host smoke test, not PID 1: returning
         // lets the test process exit instead of spinning in `reboot_now`,
         // where `reboot(2)` would fail without `CAP_SYS_BOOT`.
-        if !cfg.skip_mounts {
-            match shutdown {
-                ShutdownAction::Reboot => reboot_now(),
-                ShutdownAction::PowerOff => poweroff_now(),
-            }
+        if cfg.skip_mounts {
+            watchdog.disarm();
+            return Ok(());
         }
-        return Ok(());
+        // Keep the watchdog armed through unmount/sync; it is the fallback if
+        // that part of shutdown hangs. The magic close happens just before the
+        // final reboot(2), inside these functions.
+        match shutdown {
+            ShutdownAction::Reboot => reboot_now_with(watchdog),
+            ShutdownAction::PowerOff => poweroff_now_with(watchdog),
+        }
     }
 
     let pid = services.spawn(&cfg.service_argv)?;
@@ -284,8 +287,17 @@ fn sync_socket_activation(
     starts: &StartCoordinator,
     activation: &mut Activated,
     activations: &BTreeMap<UnitName, Instant>,
+    boot_active: bool,
+    pending: &BTreeSet<UnitName>,
 ) {
     for unit in activation.units() {
+        // While boot is walking its levels, a connection is queued rather than
+        // started. Handing the watcher another permit here would make the
+        // still-readable listener wake the loop every 10 ms for the rest of
+        // boot, which is exactly what the permit handshake exists to prevent.
+        if boot_active || pending.contains(&unit) {
+            continue;
+        }
         if starts.flows.contains_key(&unit) {
             continue;
         }
@@ -298,6 +310,10 @@ fn sync_socket_activation(
                 UnitState::Starting | UnitState::RestartWait | UnitState::Deactivating
             )
             || manager.is_failed(&unit)
+            || manager
+                .required_closure(&unit)
+                .iter()
+                .any(|dependency| manager.is_failed(dependency))
         {
             continue;
         }
@@ -541,6 +557,45 @@ impl Boot {
     }
 }
 
+/// Start a socket-activated unit if no other reason says not to.
+fn try_start_socket(
+    manager: &mut UnitManager,
+    starts: &mut StartCoordinator,
+    socket_activations: &mut BTreeMap<UnitName, Instant>,
+    unit: &UnitName,
+) {
+    manager.note_connection(unit);
+    let cooling_down = socket_activations
+        .get(unit)
+        .is_some_and(|at| at.elapsed() < SOCKET_ACTIVATION_COOLDOWN);
+    if manager.is_running(unit)
+        || starts.flows.contains_key(unit)
+        || manager.is_failed(unit)
+        || cooling_down
+    {
+        return;
+    }
+    if manager
+        .required_closure(unit)
+        .iter()
+        .any(|dependency| manager.is_failed(dependency))
+    {
+        rlog!("error: {unit}: a required dependency failed; not starting it for a connection");
+        return;
+    }
+    // Use the same dependency-closed start job as `rctl start`: a socket
+    // connection is a request to run the unit, and a `Requires=` that failed
+    // while the system was idle must still stop it. The job also registers the
+    // `Started` target, which is what `shutdown_order()` reads.
+    match starts.start_async(manager, unit) {
+        Ok(()) => {
+            socket_activations.insert(unit.clone(), Instant::now());
+            rlog!("{unit}: started by a connection");
+        }
+        Err(e) => rlog!("error: cannot start {unit} for its connection: {e}"),
+    }
+}
+
 /// The supervised main loop (plan §3 M2).
 ///
 /// Four things can wake it: a child exited, a `notify` service signalled
@@ -566,6 +621,10 @@ async fn supervise(
     // Last activation per socket, so a listener that stays readable does not
     // spawn the service on every watcher tick.
     let mut socket_activations: BTreeMap<UnitName, Instant> = BTreeMap::new();
+    // Connections that arrived while boot was still walking its levels. They
+    // must not start a unit ahead of its dependencies, so they wait here until
+    // the schedule has settled.
+    let mut pending_socket_wakes: BTreeSet<UnitName> = BTreeSet::new();
     loop {
         // Drain every exited child before advancing starts: a `oneshot` or
         // `forking` unit's readiness is a state change the reaper makes, and an
@@ -583,7 +642,19 @@ async fn supervise(
                 boot = None;
             }
         }
-        sync_socket_activation(manager, &starts, activation, &socket_activations);
+        if boot.is_none() && !pending_socket_wakes.is_empty() {
+            for unit in std::mem::take(&mut pending_socket_wakes) {
+                try_start_socket(manager, &mut starts, &mut socket_activations, &unit);
+            }
+        }
+        sync_socket_activation(
+            manager,
+            &starts,
+            activation,
+            &socket_activations,
+            boot.is_some(),
+            &pending_socket_wakes,
+        );
         // Plan §7.5's health checkpoint: the feed happens here, in the loop that
         // starts services, reaps children and answers `rctl` - so a loop that
         // stops iterating stops feeding, and the hardware resets the machine. A
@@ -744,33 +815,21 @@ async fn supervise(
         }
 
         if let Some(unit) = woke_socket {
-            // A connection is the request: start the service if it is not already
-            // up, and either way the clock on being idle starts again.
-            manager.note_connection(&unit);
-            let cooling_down = socket_activations
-                .get(&unit)
-                .is_some_and(|at| at.elapsed() < SOCKET_ACTIVATION_COOLDOWN);
-            if !manager.is_running(&unit)
-                && !starts.flows.contains_key(&unit)
-                && !manager.is_failed(&unit)
-                && !cooling_down
-            {
-                // Register the start in the Job queue as well as spawning it:
-                // the queue is what `shutdown_order()` reads, so a
-                // socket-activated service must have a `Started` target or
-                // shutdown would leave it running while filesystems unmount.
-                let effect = manager.request_start(&unit, RequestSource::Dependency);
-                match effect {
-                    Some(effect) => match starts.begin_effect(manager, &unit, effect) {
-                        Ok(()) => {
-                            socket_activations.insert(unit.clone(), Instant::now());
-                            rlog!("{unit}: started by a connection");
-                        }
-                        Err(e) => rlog!("error: cannot start {unit} for its connection: {e}"),
-                    },
-                    None => rlog!("{unit}: start queued behind its stop"),
-                }
+            // The watcher task may have queued a report just before a reload
+            // removed the unit or its socket. Starting a retired unit here
+            // would resurrect a name every protocol answer already hides.
+            if !manager.exists(&unit) || activation.path_of(&unit).is_none() {
+                continue;
             }
+            if boot.is_some() {
+                // A connection during boot is queued until the level walk is
+                // done; starting it now would run ahead of its `Requires=`.
+                pending_socket_wakes.insert(unit);
+                continue;
+            }
+            // A connection is the request: start the service if it is not
+            // already up, and either way the clock on being idle starts again.
+            try_start_socket(manager, &mut starts, &mut socket_activations, &unit);
         }
     }
 
@@ -874,12 +933,12 @@ async fn stop_and_reap(
 ///
 /// Returns whether a process was spawned. A unit that spawns nothing (a target)
 /// returns `true`: it still became active.
-fn spawn_unit(
+fn begin_spawn_unit(
     manager: &mut UnitManager,
     notify: &mut NotifyHub,
     logs: &ServiceLogs,
     unit: &UnitName,
-) -> Result<bool, RuntimeError> {
+) -> Result<SpawnBeginUnit, RuntimeError> {
     let config = manager.get(unit).map(|rt| rt.config.clone());
     let mut env: Vec<String> = match config {
         Some(config) if config.service_kind == ServiceKind::Notify => {
@@ -907,7 +966,7 @@ fn spawn_unit(
             None
         }
     };
-    let spawned = manager.spawn_unit_with_output(
+    let spawned = manager.begin_spawn_unit(
         unit,
         &env,
         output.as_ref().map(|fd| fd.as_raw_fd()),
@@ -916,8 +975,7 @@ fn spawn_unit(
     // Close rinit's copy of the write end: as long as it is open the reader
     // never sees end-of-file, and the pump task would live forever.
     drop(output);
-    spawned?;
-    Ok(manager.get(unit).is_some_and(|rt| rt.pid.is_some()))
+    spawned
 }
 
 /// How often a start flow is polled while it is waiting.
@@ -947,6 +1005,13 @@ const SOCKET_ACTIVATION_COOLDOWN: Duration = Duration::from_secs(1);
 struct StartFlow {
     unit: UnitName,
     stage: StartStage,
+    /// The single `TimeoutStartSec=` budget for the whole start.
+    ///
+    /// Before this existed, every `ExecStartPre=`, `ExecStartPost=` and
+    /// `NeedsSocket=` wait got its own full timeout, so a unit with N commands
+    /// could take (N + 1) times the configured limit. The budget is absolute
+    /// and every stage spends from it.
+    deadline: Instant,
     spawned: bool,
 }
 
@@ -954,7 +1019,6 @@ enum StartStage {
     /// Wait for every path a `NeedsSocket=` named (plan §7.8).
     Sockets {
         paths: Vec<String>,
-        deadline: Instant,
     },
     /// Stop every conflicting unit and wait for it to go (plan §1.1).
     Conflicts {
@@ -968,6 +1032,12 @@ enum StartStage {
     },
     /// Spawn `ExecStart=`.
     Spawn,
+    /// The child is forked; wait for the exec confirmation off the main loop.
+    SpawnWait {
+        spawn: UnitSpawn,
+        receiver: oneshot::Receiver<Result<libc::pid_t, rinit_runtime::SyscallError>>,
+        cancel: Arc<AtomicBool>,
+    },
     /// Wait until a `oneshot`/`forking` unit has finished its start.
     WaitReady,
     /// Run `ExecStartPost=` one command at a time.
@@ -1003,22 +1073,31 @@ impl StartFlow {
             return Err(format!("{unit} is not registered"));
         };
         let paths = rt.config.needs_socket.clone();
+        let deadline = start_deadline(rt.config.timeout_start_sec);
         let stage = if paths.is_empty() {
             StartStage::Conflicts { waits: None }
         } else {
-            StartStage::Sockets {
-                paths,
-                deadline: start_deadline(rt.config.timeout_start_sec),
-            }
+            StartStage::Sockets { paths }
         };
         Ok(StartFlow {
             unit: unit.clone(),
             stage,
+            deadline,
             spawned: false,
         })
     }
 
     /// The auxiliary command this flow is waiting for, if any.
+    /// Tell a pending fork that its flow is gone.
+    ///
+    /// The blocking task owns the child; without this flag a cancellation
+    /// during a stuck `execve` would let it finish and run unowned.
+    fn cancel_pending(&self) {
+        if let StartStage::SpawnWait { cancel, .. } = &self.stage {
+            cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
     fn running_aux_pid(&self) -> Option<libc::pid_t> {
         match &self.stage {
             StartStage::Pre {
@@ -1062,17 +1141,36 @@ impl StartFlow {
         {
             return Some(Err(format!("{} start cancelled by a stop", self.unit)));
         }
+        // A `Requires=` failure marks its dependents failed without owning
+        // their flows. Do not let a flow that was already past `Sockets` or
+        // `ExecStartPre` spawn into a unit the graph has already rejected.
+        if manager.is_failed(&self.unit) && !matches!(self.stage, StartStage::SpawnWait { .. }) {
+            // Let a pending spawn report its own named failure first; the
+            // reaper may have marked the unit failed a moment before the
+            // report task delivers the `setuid`/`execve` error.
+            return Some(Err(format!(
+                "{} failed before its start completed",
+                self.unit
+            )));
+        }
 
         loop {
+            // A `NeedsSocket=` miss has its own message that names the path, so
+            // let that stage report the timeout rather than replacing it with
+            // the generic one here.
+            if Instant::now() >= self.deadline && !matches!(self.stage, StartStage::Sockets { .. })
+            {
+                return Some(self.failed(manager, format!("{}: start timed out", self.unit)));
+            }
             let stage = std::mem::replace(&mut self.stage, StartStage::Done);
             match stage {
-                StartStage::Sockets { paths, deadline } => {
+                StartStage::Sockets { paths } => {
                     if let Some(missing) = paths
                         .iter()
                         .find(|path| !std::path::Path::new(path).exists())
                     {
-                        if Instant::now() < deadline {
-                            self.stage = StartStage::Sockets { paths, deadline };
+                        if Instant::now() < self.deadline {
+                            self.stage = StartStage::Sockets { paths };
                             return None;
                         }
                         return Some(self.failed(
@@ -1097,7 +1195,7 @@ impl StartFlow {
                                 rlog!("stopping {other}: it conflicts with {}", self.unit);
                                 waits.push(ConflictWait {
                                     unit: other,
-                                    deadline: crate::deadline::after_secs(secs),
+                                    deadline: crate::deadline::after_secs(secs).min(self.deadline),
                                     escalated: false,
                                     done: false,
                                 });
@@ -1129,7 +1227,7 @@ impl StartFlow {
                             );
                             let _ = process::kill_process_group(pid, libc::SIGKILL);
                             wait.escalated = true;
-                            wait.deadline = crate::deadline::after_secs(5);
+                            wait.deadline = crate::deadline::after_secs(5).min(self.deadline);
                         } else {
                             rlog!(
                                 "warning: {} is still running; starting {} anyway",
@@ -1214,7 +1312,8 @@ impl StartFlow {
                                     next,
                                     running: Some(AuxRun {
                                         pid,
-                                        deadline: start_deadline(plan.timeout_sec),
+                                        deadline: start_deadline(plan.timeout_sec)
+                                            .min(self.deadline),
                                     }),
                                 };
                                 return None;
@@ -1224,9 +1323,46 @@ impl StartFlow {
                         Err(reason) => return Some(self.failed(manager, reason)),
                     }
                 }
-                StartStage::Spawn => match spawn_unit(manager, notify, logs, &self.unit) {
-                    Ok(spawned) => {
-                        self.spawned = spawned;
+                StartStage::Spawn => match begin_spawn_unit(manager, notify, logs, &self.unit) {
+                    Ok(SpawnBeginUnit::Spawn(mut spawn)) => {
+                        if let Some(pending) = spawn.take_pending() {
+                            let (sender, receiver) = oneshot::channel();
+                            let cancel = Arc::new(AtomicBool::new(false));
+                            let task_cancel = Arc::clone(&cancel);
+                            tokio::spawn(async move {
+                                let result = tokio::task::spawn_blocking(move || {
+                                    pending.wait_blocking(&task_cancel)
+                                })
+                                .await
+                                .unwrap_or_else(|error| {
+                                    Err(rinit_runtime::SyscallError::new("spawn task", libc::EIO)
+                                        .with_context(error.to_string()))
+                                });
+                                match result {
+                                    Ok(pid) => {
+                                        if sender.send(Ok(pid)).is_err() {
+                                            // The flow was cancelled after the
+                                            // exec succeeded; nobody would own
+                                            // the child.
+                                            let _ = process::kill(pid, libc::SIGKILL);
+                                        }
+                                    }
+                                    Err(error) => {
+                                        let _ = sender.send(Err(error));
+                                    }
+                                }
+                            });
+                            self.stage = StartStage::SpawnWait {
+                                spawn,
+                                receiver,
+                                cancel,
+                            };
+                            return None;
+                        }
+                        self.spawned = true;
+                        // The unit's own readiness deadline must spend from the
+                        // same budget, not from a fresh `TimeoutStartSec=`.
+                        manager.cap_start_deadline(&self.unit, self.deadline);
                         let kind = manager
                             .get(&self.unit)
                             .map_or(ServiceKind::Simple, |rt| rt.config.service_kind);
@@ -1245,6 +1381,14 @@ impl StartFlow {
                             }
                         };
                     }
+                    Ok(SpawnBeginUnit::NoProcess | SpawnBeginUnit::AlreadyRunning) => {
+                        self.spawned = false;
+                        self.stage = StartStage::Post {
+                            commands: Vec::new(),
+                            next: 0,
+                            running: None,
+                        };
+                    }
                     Err(e) => {
                         return Some(self.failed(
                             manager,
@@ -1253,6 +1397,57 @@ impl StartFlow {
                                 self.unit,
                                 exec_start_of(manager, &self.unit)
                             ),
+                        ));
+                    }
+                },
+                StartStage::SpawnWait {
+                    spawn,
+                    mut receiver,
+                    cancel,
+                } => match receiver.try_recv() {
+                    Ok(Ok(_pid)) => {
+                        self.spawned = true;
+                        manager.cap_start_deadline(&self.unit, self.deadline);
+                        let kind = manager
+                            .get(&self.unit)
+                            .map_or(ServiceKind::Simple, |rt| rt.config.service_kind);
+                        self.stage = if matches!(kind, ServiceKind::Oneshot | ServiceKind::Forking)
+                        {
+                            StartStage::WaitReady
+                        } else {
+                            let post = manager
+                                .get(&self.unit)
+                                .map(|rt| rt.config.exec_start_post.clone())
+                                .unwrap_or_default();
+                            StartStage::Post {
+                                commands: post,
+                                next: 0,
+                                running: None,
+                            }
+                        };
+                    }
+                    Ok(Err(e)) => {
+                        return Some(self.failed(
+                            manager,
+                            format!(
+                                "{}: cannot start '{}': {e}",
+                                self.unit,
+                                exec_start_of(manager, &self.unit)
+                            ),
+                        ));
+                    }
+                    Err(oneshot::error::TryRecvError::Empty) => {
+                        self.stage = StartStage::SpawnWait {
+                            spawn,
+                            receiver,
+                            cancel,
+                        };
+                        return None;
+                    }
+                    Err(oneshot::error::TryRecvError::Closed) => {
+                        return Some(self.failed(
+                            manager,
+                            format!("{}: spawn task ended without a result", self.unit),
                         ));
                     }
                 },
@@ -1270,6 +1465,12 @@ impl StartFlow {
                             };
                         }
                         UnitState::Starting => {
+                            if Instant::now() >= self.deadline {
+                                return Some(self.failed(
+                                    manager,
+                                    format!("{}: readiness timed out", self.unit),
+                                ));
+                            }
                             self.stage = StartStage::WaitReady;
                             return None;
                         }
@@ -1327,7 +1528,8 @@ impl StartFlow {
                                     next,
                                     running: Some(AuxRun {
                                         pid,
-                                        deadline: start_deadline(plan.timeout_sec),
+                                        deadline: start_deadline(plan.timeout_sec)
+                                            .min(self.deadline),
                                     }),
                                 };
                                 return None;
@@ -1469,6 +1671,25 @@ impl StartCoordinator {
         apply_start_effect(manager, &mut self.flows, unit, effect)
     }
 
+    /// Whether `unit` has a start flow in flight.
+    pub(crate) fn is_starting(&self, unit: &UnitName) -> bool {
+        self.flows.contains_key(unit)
+    }
+
+    /// Queue a start that waits for its dependency closure without a client
+    /// reply. Used by reload, where the reply is the report and the starts
+    /// continue in the background.
+    pub(crate) fn start_async(
+        &mut self,
+        manager: &mut UnitManager,
+        unit: &UnitName,
+    ) -> Result<(), String> {
+        let mut job = ControlStart::new(manager, unit)?;
+        job.quiet = true;
+        self.controls.push(job);
+        Ok(())
+    }
+
     /// Reap children, keeping exits an in-flight auxiliary command is waiting
     /// for. The unit outcomes are returned for the caller's usual logging.
     fn reap(&mut self, manager: &mut UnitManager) -> Vec<Outcome> {
@@ -1506,14 +1727,18 @@ impl StartCoordinator {
                 spawned.push(unit.clone());
             }
             if done.is_some() {
-                self.flows.remove(&unit);
+                // An `ExecStartPre=` that was running when the flow failed or
+                // was cancelled is not owned by the unit manager; dropping the
+                // flow without this would leave it running.
+                self.remove_flow(&unit);
             }
         }
 
         let mut index = 0;
         while index < self.controls.len() {
-            // The control server gives a client 60 s; if it has gone away, the
-            // start can keep running but its reply no longer needs a slot.
+            // A client that has gone away no longer needs a reply slot; the
+            // start can keep running. This is not a time bound - the control
+            // server owns that.
             if self
                 .controls
                 .get(index)
@@ -1534,10 +1759,12 @@ impl StartCoordinator {
                 if let Some(reply) = job.reply.take() {
                     let _ = reply.send((status, text.clone()));
                 }
-                if status == Status::Ok {
-                    rlog!("control: start {} ok", job.target);
-                } else {
-                    rlog!("control: start {} -> {status:?}", job.target);
+                if !job.quiet {
+                    if status == Status::Ok {
+                        rlog!("control: start {} ok", job.target);
+                    } else {
+                        rlog!("control: start {} -> {status:?}", job.target);
+                    }
                 }
             } else {
                 index += 1;
@@ -1552,14 +1779,19 @@ impl StartCoordinator {
     /// it has no pid for an `ExecStartPre=` process, so without this the command
     /// would outlive the stop and could still create the state the start was
     /// preparing.
-    fn cancel(&mut self, unit: &UnitName) {
+    fn remove_flow(&mut self, unit: &UnitName) {
         let Some(flow) = self.flows.remove(unit) else {
             return;
         };
+        flow.cancel_pending();
         if let Some(pid) = flow.running_aux_pid() {
             let _ = process::kill_process_group(pid, libc::SIGKILL);
             self.aux_exits.remove(&pid);
         }
+    }
+
+    fn cancel(&mut self, unit: &UnitName) {
+        self.remove_flow(unit);
     }
 
     /// Drop work whose unit a reload removed.
@@ -1605,6 +1837,7 @@ impl StartCoordinator {
     /// that is still running so it is not orphaned past the service tree.
     fn shutdown(&mut self) {
         for flow in self.flows.values() {
+            flow.cancel_pending();
             if let Some(pid) = flow.running_aux_pid() {
                 let _ = process::kill_process_group(pid, libc::SIGKILL);
                 self.aux_exits.remove(&pid);
@@ -1632,6 +1865,9 @@ struct ControlStart {
     waiting: Option<UnitName>,
     reply: Option<oneshot::Sender<(Status, String)>>,
     target_was_active: bool,
+    /// Reload starts are background work; do not narrate each one as a control
+    /// request.
+    quiet: bool,
 }
 
 impl ControlStart {
@@ -1650,6 +1886,7 @@ impl ControlStart {
             waiting: None,
             reply: None,
             target_was_active,
+            quiet: false,
         })
     }
 
@@ -1703,6 +1940,20 @@ impl ControlStart {
                 return Some((Status::Ok, text));
             };
             self.index += 1;
+
+            // An explicit start of the target is allowed to clear its breaker,
+            // but a dependency the graph already failed must not be retried as
+            // if nothing happened.
+            if unit != self.target && manager.is_failed(&unit) {
+                if self.required.contains(&unit) {
+                    return Some((Status::Error, failure_text(&unit, &self.target)));
+                }
+                rlog!(
+                    "warning: {unit} is failed, but {} does not require it",
+                    self.target
+                );
+                continue;
+            }
 
             if manager
                 .get(&unit)
@@ -1897,7 +2148,7 @@ async fn handle_control(
             ControlAction::Reply(Status::Ok, manager.summary().join("\n"))
         }
         Request::ListFormatted { format } => {
-            ControlAction::Reply(Status::Ok, render_list(manager, *format))
+            ControlAction::Reply(Status::Ok, render_list_async(manager, *format).await)
         }
         Request::Status {
             unit: Some(unit),
@@ -1930,13 +2181,26 @@ async fn handle_control(
                         if *format == StatusFormat::Json {
                             // The JSON reply is one object; a textual log block
                             // would make it invalid. Drop the object's closing
-                            // brace, add the field, and close it again.
-                            if text.ends_with('}') {
-                                text.pop();
+                            // brace, add the field, and close it again. If the
+                            // escaped log would push the frame past the
+                            // protocol limit, omit it with an explicit marker:
+                            // a truncated object is not JSON at all.
+                            let escaped = json_string(&logs_text);
+                            if text.len().saturating_add(escaped.len()).saturating_add(32)
+                                > MAX_FRAME_BYTES
+                            {
+                                if text.ends_with('}') {
+                                    text.pop();
+                                }
+                                text.push_str(",\"log_omitted\":\"response size limit\"}");
+                            } else {
+                                if text.ends_with('}') {
+                                    text.pop();
+                                }
+                                text.push_str(",\"log\":");
+                                text.push_str(&escaped);
+                                text.push('}');
                             }
-                            text.push_str(",\"log\":");
-                            text.push_str(&json_string(&logs_text));
-                            text.push('}');
                         } else {
                             text.push_str("log:\n");
                             text.push_str(&logs_text);
@@ -2092,11 +2356,32 @@ fn control_restart(manager: &mut UnitManager, unit: &UnitName) -> ControlAction 
 
 /// Render buffered log lines for a `log` or `status --tail` reply.
 fn render_logs(logs: &ServiceLogs, unit: Option<&UnitName>, tail: u32) -> String {
-    logs.tail(unit, tail as usize)
-        .iter()
-        .map(|line| format!("{}: {}", line.unit, line.text))
-        .collect::<Vec<_>>()
-        .join("\n")
+    // Leave room for the status prefix, the JSON field wrapper and the frame
+    // header. The newest lines are kept: a truncated log that drops the newest
+    // output is useless for the failure that just happened.
+    let budget = MAX_FRAME_BYTES.saturating_sub(4096).saturating_sub(1);
+    let lines = logs.tail(unit, tail as usize);
+    let mut selected = Vec::new();
+    let mut used = 0usize;
+    let mut omitted = false;
+    for line in lines.iter().rev() {
+        let text = format!("{}: {}", line.unit, line.text);
+        let needed = text.len().saturating_add(1);
+        if used.saturating_add(needed) > budget {
+            omitted = true;
+            break;
+        }
+        used = used.saturating_add(needed);
+        selected.push(text);
+    }
+    selected.reverse();
+
+    let mut out = String::new();
+    if omitted {
+        out.push_str("[older log lines omitted: response size limit]\n");
+    }
+    out.push_str(&selected.join("\n"));
+    out
 }
 
 /// A unit's detail block for `rctl status UNIT`.
@@ -2135,37 +2420,54 @@ fn describe_unit(manager: &UnitManager, unit: &UnitName) -> Option<String> {
     Some(out)
 }
 
-/// Render `rctl list` in its selected format.
+/// Render `rctl list` without reading per-unit counters on the main loop.
+async fn render_list_async(manager: &UnitManager, format: ListFormat) -> String {
+    if matches!(format, ListFormat::Plain) {
+        return manager.summary().join("\n");
+    }
+    let targets = manager.usage_targets();
+    let usage = tokio::task::spawn_blocking(move || UnitManager::collect_usage(targets))
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+    render_list_entries(format, &manager.list_entries_with_usage(&usage))
+}
+
+/// Render `rctl list` synchronously; tests and small callers use this.
+#[cfg(test)]
 fn render_list(manager: &UnitManager, format: ListFormat) -> String {
+    if matches!(format, ListFormat::Plain) {
+        return manager.summary().join("\n");
+    }
+    render_list_entries(format, &manager.list_entries())
+}
+
+fn render_list_entries(format: ListFormat, entries: &[UnitListEntry]) -> String {
     match format {
-        // Plain is the stable compatibility path: it must not pay for the
-        // per-unit resource reads that the richer views need.
-        ListFormat::Plain => manager.summary().join("\n"),
-        ListFormat::Short => {
-            let entries = manager.list_entries();
-            entries
-                .iter()
-                .map(|entry| {
-                    format!(
-                        "{}  {}  pid={}  target={}  mem={}  cpu={}",
-                        entry.name,
-                        entry.state,
-                        entry
-                            .pid
-                            .map_or_else(|| "-".to_string(), |pid| pid.to_string()),
-                        entry.target,
-                        memory_value(entry.memory_bytes),
-                        cpu_value(entry.cpu_usec)
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        }
+        ListFormat::Plain => String::new(),
+        ListFormat::Short => entries
+            .iter()
+            .map(|entry| {
+                format!(
+                    "{}  {}  pid={}  target={}  mem={}  cpu={}",
+                    entry.name,
+                    entry.state,
+                    entry
+                        .pid
+                        .map_or_else(|| "-".to_string(), |pid| pid.to_string()),
+                    entry.target,
+                    memory_value(entry.memory_bytes),
+                    cpu_value(entry.cpu_usec)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
         ListFormat::Json => {
-            let rows: Vec<String> = manager.list_entries().iter().map(list_entry_json).collect();
+            let rows: Vec<String> = entries.iter().map(list_entry_json).collect();
             format!("[{}]", rows.join(","))
         }
-        ListFormat::Table => render_list_table(&manager.list_entries()),
+        ListFormat::Table => render_list_table(entries),
     }
 }
 
@@ -2680,7 +2982,29 @@ pub fn is_pid1() -> bool {
 /// reboot is attempted and, failing that, we block waiting for a hardware
 /// watchdog (plan §5 risk 1).
 pub fn reboot_now() -> ! {
-    rlog!("rebooting");
+    shutdown_now(ShutdownAction::Reboot, None)
+}
+
+/// Reboot with the boot's watchdog still armed through unmount and sync.
+fn reboot_now_with(watchdog: Watchdog) -> ! {
+    shutdown_now(ShutdownAction::Reboot, Some(watchdog))
+}
+
+fn poweroff_now_with(watchdog: Watchdog) -> ! {
+    shutdown_now(ShutdownAction::PowerOff, Some(watchdog))
+}
+
+/// The common shutdown tail: unmount, sync, magic-close, reboot, then SysRq.
+fn shutdown_now(action: ShutdownAction, watchdog: Option<Watchdog>) -> ! {
+    let (label, command, failure) = match action {
+        ShutdownAction::Reboot => ("rebooting", reboot::RB_AUTOBOOT, "reboot failed"),
+        ShutdownAction::PowerOff => ("powering off", reboot::RB_POWER_OFF, "poweroff failed"),
+    };
+    rlog!("{label}");
+    // The fallback trigger lives under /proc, which the unmount below removes.
+    // Keep a handle open before that, or the last resort would be opening a
+    // path that no longer exists.
+    let mut sysrq = reboot::SysrqTrigger::open().ok();
     // Filesystems first, then one final `sync`, so data on anything but the
     // root is flushed before the reset (plan §1.3(8)). Best effort: the
     // shutdown must reach `reboot(2)` even if a mount refuses to go.
@@ -2692,39 +3016,28 @@ pub fn reboot_now() -> ! {
         rlog!("warning: {warning}");
     }
     reboot::sync();
-    if let Err(e) = reboot::reboot(reboot::RB_AUTOBOOT) {
+    // Magic close only now: the unmount and sync above are the slow part, and
+    // keeping the hardware timer alive through them is the shutdown fallback.
+    if let Some(watchdog) = watchdog {
+        watchdog.disarm();
+    }
+    if let Err(e) = reboot::reboot(command) {
         // `reboot(2)` failed. The kernel's SysRq trigger is the last resort, so
         // PID 1 never ends up in the "cannot shut down" state plan §1.3(8)
         // forbids.
-        rlog!("reboot failed: {e}; trying sysrq");
-        if let Err(e) = reboot::sysrq_reboot() {
-            rlog!("sysrq reset failed: {e}; halting");
-        }
-    }
-    loop {
-        signal::pause();
-    }
-}
-
-/// Power the machine off after the service tree has stopped.
-///
-/// Mirrors [`reboot_now`]: unmount what can be unmounted, sync, then
-/// `reboot(RB_POWER_OFF)`. The SysRq `o` trigger is the last resort so PID 1
-/// never remains alive after a requested poweroff.
-pub fn poweroff_now() -> ! {
-    rlog!("powering off");
-    let report = rinit_runtime::unmount_filesystems();
-    for point in &report.unmounted {
-        rlog!("unmounted {point}");
-    }
-    for warning in &report.warnings {
-        rlog!("warning: {warning}");
-    }
-    reboot::sync();
-    if let Err(e) = reboot::reboot(reboot::RB_POWER_OFF) {
-        rlog!("poweroff failed: {e}; trying sysrq");
-        if let Err(e) = reboot::sysrq_poweroff() {
-            rlog!("sysrq poweroff failed: {e}; halting");
+        rlog!("{failure}: {e}; trying sysrq");
+        let result = match sysrq.as_mut() {
+            Some(trigger) => match action {
+                ShutdownAction::Reboot => trigger.reboot(),
+                ShutdownAction::PowerOff => trigger.poweroff(),
+            },
+            None => match action {
+                ShutdownAction::Reboot => reboot::sysrq_reboot(),
+                ShutdownAction::PowerOff => reboot::sysrq_poweroff(),
+            },
+        };
+        if let Err(e) = result {
+            rlog!("sysrq action failed: {e}; halting");
         }
     }
     loop {
@@ -3172,6 +3485,30 @@ mod tests {
         assert!(
             text.contains("app.service: hello from the unit"),
             "got: {text}"
+        );
+    }
+
+    /// `rctl log` defaults to the whole ring, which is larger than the control
+    /// frame limit. The reply must stay decodable and keep the newest lines.
+    #[test]
+    fn render_logs_keeps_the_newest_lines_within_the_frame_limit() {
+        let logs = ServiceLogs::new();
+        let app = unit("app.service");
+        for i in 0..3000 {
+            logs.push(&app, &format!("line {i} {}", "x".repeat(80)));
+        }
+        logs.push(&app, "newest line");
+
+        let text = render_logs(&logs, None, 0);
+        assert!(
+            text.len() < MAX_FRAME_BYTES,
+            "reply is {} bytes",
+            text.len()
+        );
+        assert!(text.contains("[older log lines omitted"), "{}", &text[..80]);
+        assert!(
+            text.ends_with("newest line"),
+            "the newest line must survive"
         );
     }
 

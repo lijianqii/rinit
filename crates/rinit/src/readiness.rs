@@ -1,23 +1,19 @@
-//! Startup-time synchronisation (plan §1.3(3), §3 M1).
+//! Startup readiness categories (plan §1.3(3)).
 //!
-//! The full lifecycle state machine is M2. M1 only needs one thing from it: a
-//! unit's dependents must not start before it is *ready*, and "ready" is not
-//! the same for every `Type=` (plan §1.3(3)):
+//! A unit's dependents must not start before it is *ready*, and "ready" is not
+//! the same for every `Type=`:
 //!
 //! | `Type=`    | ready when                                        |
 //! |------------|---------------------------------------------------|
 //! | `simple`   | the process has been exec'd                       |
 //! | `oneshot`  | the command has exited with code 0 (`Active(Exited)`) |
+//! | `forking`  | the daemon has been located (`Active`)             |
 //! | `notify`   | `READY=1` arrives                                  |
 //!
-//! Getting `oneshot` wrong is not cosmetic. An `After=db-init.service` unit
-//! that starts before the database finished initialising fails in a way that
-//! looks random, because the failure surfaces much later in whatever depends on
-//! it.
-//!
-//! Waiting polls the specific pid (`wait::poll_child`) rather than draining the
-//! global `SIGCHLD` queue, so a concurrent reaper cannot steal the exit status
-//! this code depends on.
+//! Boot and supervision both evaluate these categories from the manager's state
+//! after the reaper has applied an exit. This module only names the categories;
+//! the test-only [`wait_for_exit`] below keeps the single-child poll/deadline
+//! arithmetic covered without implying that production still blocks on it.
 
 use rinit_core::ServiceKind;
 #[cfg(test)]

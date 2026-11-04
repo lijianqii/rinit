@@ -14,6 +14,7 @@ use std::io::Write;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use rinit_core::{LogBuffer, LogLine, UnitName};
 use rinit_runtime::RuntimeError;
@@ -299,10 +300,14 @@ impl ServiceLogs {
         let Some(queue) = lock(&self.file).as_ref().map(Arc::clone) else {
             return;
         };
-        // Bounded: a service still flooding at shutdown must not hold the
-        // machine here. The queue itself is bounded, so this always ends.
-        for _ in 0..LOG_QUEUE_MAX_LINES {
-            if queue.drain() == 0 {
+        // Bounded in both passes and wall-clock time: a service still
+        // flooding at shutdown, or a disk that has stopped making progress,
+        // must not hold the machine here. Whatever is left is already in the
+        // ring and is lost with the process, which is the same trade the
+        // bounded queue makes.
+        let deadline = Instant::now() + Duration::from_millis(50);
+        for _ in 0..64 {
+            if Instant::now() >= deadline || queue.drain() == 0 {
                 break;
             }
         }
@@ -322,7 +327,7 @@ impl ServiceLogs {
 
     /// Test seam: the same path a captured line takes.
     #[cfg(test)]
-    fn push(&self, unit: &UnitName, line: &str) {
+    pub(crate) fn push(&self, unit: &UnitName, line: &str) {
         push_captured(&self.buffer, &self.file, unit, line);
     }
 }

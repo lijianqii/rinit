@@ -53,18 +53,25 @@ const IO_TIMEOUT: Duration = Duration::from_secs(10);
 /// covers both with room to spare; past that the manager is not going to
 /// answer this request in any useful sense, and holding the connection open
 /// leaves the client blocked in `read` forever.
-const REPLY_TIMEOUT: Duration = Duration::from_secs(60);
+const REPLY_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// How many accepted requests may wait for the main loop.
+///
+/// Each accepted connection has its own task; without a bound, a local client
+/// could make PID 1 allocate an unbounded queue of `Request` values. A full
+/// queue applies backpressure to the connection tasks instead.
+const CONTROL_QUEUE: usize = 64;
 
 /// A request from a client, with the channel to answer on.
 pub type Incoming = (Request, oneshot::Sender<(Status, String)>);
 
 /// The bound control socket and the queue of requests it has read.
 pub struct ControlServer {
-    receiver: mpsc::UnboundedReceiver<Incoming>,
+    receiver: mpsc::Receiver<Incoming>,
     /// Held so `recv` stays *pending* rather than resolving to `None` when
     /// there is no listener: a branch that is always ready would make the main
     /// loop spin.
-    _sender: mpsc::UnboundedSender<Incoming>,
+    _sender: mpsc::Sender<Incoming>,
     /// The socket path to remove on shutdown, when one was bound.
     socket: Option<PathBuf>,
     _accept: Option<JoinHandle<()>>,
@@ -89,7 +96,7 @@ impl ControlServer {
 
     /// A server that never yields a request.
     pub fn disabled() -> Self {
-        let (sender, receiver) = mpsc::unbounded_channel();
+        let (sender, receiver) = mpsc::channel(CONTROL_QUEUE);
         ControlServer {
             receiver,
             _sender: sender,
@@ -138,7 +145,7 @@ impl ControlServer {
         })?;
         fs::chmod(path_str, 0o600)?;
 
-        let (sender, receiver) = mpsc::unbounded_channel();
+        let (sender, receiver) = mpsc::channel(CONTROL_QUEUE);
         let task_sender = sender.clone();
         let accept = tokio::spawn(accept_loop(listener, task_sender, dev));
 
@@ -171,7 +178,7 @@ fn control_dir() -> PathBuf {
 }
 
 /// Accept connections forever, one task each.
-async fn accept_loop(listener: UnixListener, sender: mpsc::UnboundedSender<Incoming>, dev: bool) {
+async fn accept_loop(listener: UnixListener, sender: mpsc::Sender<Incoming>, dev: bool) {
     loop {
         match listener.accept().await {
             Ok((stream, _addr)) => {
@@ -210,7 +217,7 @@ fn peer_allowed(dev: bool, peer_uid: u32, our_uid: u32) -> bool {
 /// Authenticate, read one framed request, dispatch it, write one framed reply.
 async fn serve(
     mut stream: UnixStream,
-    sender: mpsc::UnboundedSender<Incoming>,
+    sender: mpsc::Sender<Incoming>,
     dev: bool,
 ) -> std::io::Result<()> {
     // Authentication first: no command byte is read until the peer is known to
@@ -260,7 +267,7 @@ async fn serve(
     };
 
     let (reply_tx, reply_rx) = oneshot::channel();
-    if sender.send((request, reply_tx)).is_err() {
+    if sender.send((request, reply_tx)).await.is_err() {
         return write_response(&mut stream, Status::Error, "rinit is shutting down").await;
     }
     let (status, text) = await_reply(reply_rx, REPLY_TIMEOUT).await;
@@ -382,7 +389,7 @@ mod tests {
     }
 
     /// A job the manager never finishes still has to produce a reply; the
-    /// production timeout is 60 s, so the test gives the same code 10 ms.
+    /// production timeout is generous, so the test gives the same code 10 ms.
     #[tokio::test(flavor = "current_thread")]
     async fn a_request_that_is_never_answered_times_out() {
         let (_tx, rx) = oneshot::channel();

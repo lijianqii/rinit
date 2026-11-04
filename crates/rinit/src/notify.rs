@@ -44,6 +44,13 @@ const BIND_UMASK: u32 = 0o077;
 /// larger is truncated by the kernel anyway.
 const MAX_DATAGRAM: usize = 4096;
 
+/// How many notify messages may wait for the main loop.
+///
+/// A service can send datagrams faster than PID 1 processes them. A bounded
+/// channel applies backpressure to its own reader (and therefore to its socket)
+/// instead of letting one service grow an unbounded queue in the init process.
+const NOTIFY_QUEUE: usize = 64;
+
 /// One armed unit: its socket path and the task reading it.
 struct Armed {
     path: PathBuf,
@@ -53,8 +60,13 @@ struct Armed {
 /// Owns every notify socket and funnels their messages into one stream.
 pub struct NotifyHub {
     dir: PathBuf,
-    sender: mpsc::UnboundedSender<(UnitName, NotifyMessage)>,
-    receiver: mpsc::UnboundedReceiver<(UnitName, NotifyMessage)>,
+    /// `READY=1` and other readiness transitions. Kept separate from status
+    /// chatter so one service flooding `STATUS=` cannot delay another unit's
+    /// readiness report.
+    ready_sender: mpsc::Sender<(UnitName, NotifyMessage)>,
+    ready_receiver: mpsc::Receiver<(UnitName, NotifyMessage)>,
+    status_sender: mpsc::Sender<(UnitName, NotifyMessage)>,
+    status_receiver: mpsc::Receiver<(UnitName, NotifyMessage)>,
     armed: BTreeMap<UnitName, Armed>,
 }
 
@@ -69,11 +81,14 @@ impl NotifyHub {
 
     /// A hub using a specific directory (tests use a temporary one).
     pub fn new_at<P: Into<PathBuf>>(dir: P) -> Self {
-        let (sender, receiver) = mpsc::unbounded_channel();
+        let (ready_sender, ready_receiver) = mpsc::channel(NOTIFY_QUEUE);
+        let (status_sender, status_receiver) = mpsc::channel(NOTIFY_QUEUE);
         NotifyHub {
             dir: dir.into(),
-            sender,
-            receiver,
+            ready_sender,
+            ready_receiver,
+            status_sender,
+            status_receiver,
             armed: BTreeMap::new(),
         }
     }
@@ -149,7 +164,14 @@ impl NotifyHub {
     /// Never returns `None` while the hub is alive: the hub holds a sender, so
     /// the channel cannot close. It is safe to `select!` on.
     pub async fn recv(&mut self) -> Option<(UnitName, NotifyMessage)> {
-        self.receiver.recv().await
+        tokio::select! {
+            // Readiness first: boot and restart decisions depend on it, while a
+            // status flood is disposable.
+            biased;
+            Some(message) = self.ready_receiver.recv() => Some(message),
+            Some(message) = self.status_receiver.recv() => Some(message),
+            else => None,
+        }
     }
 
     /// Remove `unit`'s socket and stop reading it.
@@ -169,7 +191,8 @@ impl NotifyHub {
     }
 
     fn spawn_reader(&self, unit: UnitName, socket: UnixDatagram) -> JoinHandle<()> {
-        let sender = self.sender.clone();
+        let ready_sender = self.ready_sender.clone();
+        let status_sender = self.status_sender.clone();
         tokio::spawn(async move {
             let mut buf = [0u8; MAX_DATAGRAM];
             // A recv error on a datagram socket means the socket is unusable
@@ -178,7 +201,16 @@ impl NotifyHub {
                 // `recv` never reports more than the buffer holds.
                 match parse_notify(buf.get(..n).unwrap_or(&[])) {
                     Ok(message) => {
-                        if sender.send((unit.clone(), message)).is_err() {
+                        // Bounded: a service that floods STATUS waits in its
+                        // own reader instead of growing PID 1's queue. READY
+                        // has its own queue so it is not stuck behind that
+                        // flood.
+                        let sender = if message.ready {
+                            &ready_sender
+                        } else {
+                            &status_sender
+                        };
+                        if sender.send((unit.clone(), message)).await.is_err() {
                             // The hub is gone; nothing left to notify.
                             break;
                         }

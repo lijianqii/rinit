@@ -210,10 +210,10 @@ fn resolve(dev_mode: bool, device: Option<&std::path::Path>) -> Option<PathBuf> 
 ///
 /// Computed in milliseconds because whole seconds would round a one-second
 /// timeout to zero. The floor is belt-and-braces rather than a case anyone can
-/// reach by configuration - `--watchdog-timeout` refuses `0`, and
-/// [`watchdog::Watchdog::set_timeout`] substitutes the requested value when a
-/// driver answers `0` - but a zero here would mean a feed on every iteration of
-/// the supervisor loop, which is a spin, not a cadence.
+/// reach by configuration - `--watchdog-timeout` refuses `0`, and a driver that
+/// answers `0` to `WDIOC_SETTIMEOUT` is asked for its real timeout instead - but
+/// a zero here would mean a feed on every iteration of the supervisor loop,
+/// which is a spin, not a cadence.
 fn feed_interval(timeout_sec: u64) -> Duration {
     Duration::from_millis(timeout_sec.saturating_mul(1000) / 2).max(Duration::from_millis(1))
 }

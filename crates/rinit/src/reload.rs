@@ -128,7 +128,18 @@ pub async fn reload(
     starts: &mut StartCoordinator,
 ) -> Result<Report, RuntimeError> {
     // The one fallible step, and it is fallible *before* anything changes.
-    let plan = manager::plan_boot(&cfg.unit_dir, &cfg.default_target)?;
+    // Reading and parsing the whole directory happens on the blocking pool:
+    // it can touch a slow filesystem, and doing it inline would stop the main
+    // loop from reaping children, answering control clients and feeding the
+    // watchdog for the duration.
+    let unit_dir = cfg.unit_dir.clone();
+    let default_target = cfg.default_target.clone();
+    let plan = tokio::task::spawn_blocking(move || manager::plan_boot(&unit_dir, &default_target))
+        .await
+        .map_err(|e| RuntimeError::Join {
+            op: "reload plan",
+            detail: e.to_string(),
+        })??;
     for warning in &plan.warnings {
         rlog!("warning: {warning}");
     }
@@ -148,6 +159,16 @@ pub async fn reload(
         if !manager.exists(&name) || manager::config_of(&plan, &name).is_some() {
             continue;
         }
+        // An instance is created at runtime from a template, so it is not in
+        // `plan.configs`. It is removed only when its template is gone; a
+        // reload that still has `worker@.service` must leave `worker@1.service`
+        // running.
+        if name
+            .template()
+            .is_some_and(|template| plan.templates.contains_key(template.canonical()))
+        {
+            continue;
+        }
         if manager.is_up(&name) {
             let effect = manager.request_stop(&name, RequestSource::UserStop);
             apply_effect(manager, &name, effect).await?;
@@ -165,14 +186,24 @@ pub async fn reload(
     let mut added = BTreeSet::new();
     for config in &plan.configs {
         let name = config.name.clone();
-        match manager.add(config.clone()) {
-            ConfigChange::Added => {
-                added.insert(name.clone());
-                report.added.push(name);
+        // A tombstone whose file came back is "added" for the schedule's
+        // purposes even though the runtime entry still exists: it was hidden
+        // and stopped, and the boot target should be able to pull it in again.
+        let was_retired = manager.get(&name).is_some_and(|rt| rt.retired);
+        let change = manager.add_with_in_flight(config.clone(), starts.is_starting(&name));
+        if was_retired {
+            added.insert(name.clone());
+            report.added.push(name);
+        } else {
+            match change {
+                ConfigChange::Added => {
+                    added.insert(name.clone());
+                    report.added.push(name);
+                }
+                ConfigChange::Applied => report.applied.push(name),
+                ConfigChange::Deferred => report.deferred.push(name),
+                ConfigChange::Unchanged => report.unchanged += 1,
             }
-            ConfigChange::Applied => report.applied.push(name),
-            ConfigChange::Deferred => report.deferred.push(name),
-            ConfigChange::Unchanged => report.unchanged += 1,
         }
         // Socket activation is an rinit-owned resource, not the service's
         // process, so the directory's current definition wins even when the
@@ -196,14 +227,13 @@ pub async fn reload(
             rlog!("{name}: waiting for a connection");
             continue;
         }
-        match manager.request_start(name, RequestSource::Dependency) {
-            Some(effect) => match starts.begin_effect(manager, name, effect) {
-                Ok(()) => report.started.push(name.clone()),
-                Err(e) => rlog!("warning: cannot start {name}: {e}"),
-            },
-            // A stopping unit is queued by the manager; the supervisor will
-            // start it when the stop lands.
-            None => rlog!("{name}: start queued behind its stop"),
+        // A `ControlStart` job carries the unit's dependency closure and waits
+        // for each prerequisite to become ready. Queueing one per added unit
+        // keeps reload non-blocking without letting an `After=`/`Requires=`
+        // dependent spawn ahead of what it needs.
+        match starts.start_async(manager, name) {
+            Ok(()) => report.started.push(name.clone()),
+            Err(e) => rlog!("warning: cannot start {name}: {e}"),
         }
     }
 
@@ -246,15 +276,21 @@ fn reconcile_socket(activation: &mut Activated, manager: &mut UnitManager, confi
             }
         }
         (Some(path), _) => {
-            activation.remove(unit);
-            manager.clear_listener(unit);
+            // `bind` binds the replacement before it drops the old listener, so
+            // a failure leaves the old socket (and its watcher) intact.
             match activation.bind(unit, Path::new(path)) {
                 Ok(()) => {
                     if let Some(fd) = activation.listener_fd(unit) {
                         manager.set_listener(unit, fd);
                     }
                 }
-                Err(e) => rlog!("error: {unit}: cannot bind {path}: {e}"),
+                Err(e) => {
+                    rlog!("error: {unit}: cannot bind {path}: {e}");
+                    match activation.listener_fd(unit) {
+                        Some(fd) => manager.set_listener(unit, fd),
+                        None => manager.clear_listener(unit),
+                    }
+                }
             }
         }
     }

@@ -986,6 +986,37 @@ fn a_notify_unit_that_never_reports_readiness_fails_its_target() {
     );
 }
 
+/// `TimeoutStartSec=` is one budget for the whole start, not one per
+/// `ExecStartPre=`. Two commands that each fit alone must still fail the
+/// start when their total exceeds the limit.
+#[test]
+fn the_start_timeout_covers_the_whole_flow() {
+    let dir = TempDir::new("start-budget");
+    dir.write("all.target", "[Unit]\nType=target\nRequires=app.service\n");
+    dir.write(
+        "app.service",
+        "[Service]\nType=oneshot\nTimeoutStartSec=1\n\
+         ExecStartPre=/bin/sleep 0.6\nExecStartPre=/bin/sleep 0.6\n\
+         ExecStart=/bin/sh -c \"echo should-not-run\"\n",
+    );
+
+    let started = std::time::Instant::now();
+    let log = boot_units(&dir, "all.target");
+
+    assert!(
+        log.contains("timed out"),
+        "the shared budget must expire:\n{log}"
+    );
+    assert!(
+        !log.contains("should-not-run"),
+        "the start must not reach ExecStart after its budget:\n{log}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "the two pre-commands share one second, not two:\n{log}"
+    );
+}
+
 /// Plan §1.1: a service that ignores `SIGTERM` must still be
 /// `SIGKILL`ed once `TimeoutStopSec` expires - otherwise shutdown would leave
 /// it running forever.
@@ -2023,7 +2054,7 @@ fn a_socket_activated_unit_starts_on_its_first_connection() {
         "api.service",
         &format!(
             "[Service]\nType=oneshot\nSocketActivate={}\n\
-             ExecStart=/bin/sh -c \"test -S /proc/self/fd/3 && echo activated > {} || echo no-fd > {}\"\n",
+             ExecStart=/bin/sh -c \"test -S /proc/self/fd/3 && test \\\"$LISTEN_PID\\\" = \\\"$$\\\" && echo activated > {} || echo no-fd > {}\"\n",
             sock.display(),
             probe.display(),
             probe.display()
@@ -2357,6 +2388,23 @@ Environment=INSTANCE=%i
     assert!(
         text.contains("instance=2 name=worker@2.service"),
         "got: {text}"
+    );
+
+    // A reload must not mistake a runtime-created instance for a unit file that
+    // disappeared from the directory.
+    let (status, text) = control(&socket, rinit_core::Request::Reload);
+    assert_eq!(status, rinit_core::Status::Ok, "{text}");
+    assert!(text.contains("0 removed"), "{text}");
+    let (_, text) = control(
+        &socket,
+        rinit_core::Request::Status {
+            unit: Some(unit("worker@2.service")),
+            tail: 0,
+        },
+    );
+    assert!(
+        text.contains("worker@2.service") && text.contains("active"),
+        "a reload must leave a template instance alone: {text}"
     );
 
     stop_rinit(child);
@@ -2831,6 +2879,61 @@ fn a_reload_applies_the_difference_without_a_restart() {
         !text.contains("lonely.service"),
         "`list` has to agree with `start`: {text}"
     );
+
+    stop_rinit(child);
+}
+
+/// A reload that adds a dependent and its requirement together must honour the
+/// dependency order. The old reload queued each added unit independently, so
+/// `app` could spawn before `db` was ready.
+#[test]
+fn a_reload_starts_added_units_in_dependency_order() {
+    let dir = TempDir::new("reload-order");
+    dir.write("all.target", "[Unit]\nType=target\n");
+    let (child, socket) = boot_with_control(&dir, "reload-order");
+
+    // The target must pull the pair in, because a reload starts added units
+    // only when the boot target reaches them.
+    dir.write("all.target", "[Unit]\nType=target\nRequires=app.service\n");
+    dir.write(
+        "db.service",
+        "[Service]\nType=oneshot\nExecStart=/bin/sh -c \"echo db-ready\"\n",
+    );
+    dir.write(
+        "app.service",
+        "[Unit]\nRequires=db.service\nAfter=db.service\n\
+         [Service]\nType=oneshot\nExecStart=/bin/sh -c \"echo app-ready\"\n",
+    );
+
+    let (status, text) = control(&socket, rinit_core::Request::Reload);
+    assert_eq!(status, rinit_core::Status::Ok, "{text}");
+    assert!(text.contains("registered db.service"), "got: {text}");
+    assert!(text.contains("registered app.service"), "got: {text}");
+
+    wait_for(
+        Duration::from_secs(5),
+        "app.service's log to appear",
+        || {
+            let (_, logs) = control(
+                &socket,
+                rinit_core::Request::Log {
+                    unit: None,
+                    tail: 0,
+                },
+            );
+            logs.contains("app-ready")
+        },
+    );
+    let (_, logs) = control(
+        &socket,
+        rinit_core::Request::Log {
+            unit: None,
+            tail: 0,
+        },
+    );
+    let db = logs.find("db-ready").expect("db log line");
+    let app = logs.find("app-ready").expect("app log line");
+    assert!(db < app, "the requirement must be ready first:\n{logs}");
 
     stop_rinit(child);
 }

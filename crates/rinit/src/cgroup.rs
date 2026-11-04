@@ -214,11 +214,12 @@ impl Cgroup {
         let Some(dir) = self.dir(unit) else {
             return CgroupUsage::default();
         };
-        CgroupUsage {
-            memory_bytes: read_u64(dir.join("memory.current")),
-            cpu_usec: read_cpu_usage(dir.join("cpu.stat")),
-            tasks: read_u64(dir.join("pids.current")),
-        }
+        usage_at(&dir)
+    }
+
+    /// The unit's cgroup directory, for a blocking usage snapshot.
+    pub(crate) fn dir_for(&self, unit: &UnitName) -> Option<PathBuf> {
+        self.dir(unit)
     }
 
     /// How many times the cgroup OOM killer has killed a process in this unit's
@@ -422,6 +423,17 @@ fn enable_controllers(dir: &Path) {
             "warning: cannot enable '{line}' in {}/cgroup.subtree_control: {e}",
             dir.display()
         );
+    }
+}
+
+/// Read a unit's counters from an already-resolved cgroup directory.
+///
+/// Pure of manager state so `rctl list` can run it on the blocking pool.
+pub(crate) fn usage_at(dir: &Path) -> CgroupUsage {
+    CgroupUsage {
+        memory_bytes: read_u64(dir.join("memory.current")),
+        cpu_usec: read_cpu_usage(dir.join("cpu.stat")),
+        tasks: read_u64(dir.join("pids.current")),
     }
 }
 

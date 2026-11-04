@@ -87,6 +87,15 @@ impl Activated {
     /// whose mode cannot be set - all of which mean the unit has no socket to be
     /// activated on, which its start has to know about.
     pub fn bind(&mut self, unit: &UnitName, path: &Path) -> io::Result<()> {
+        // Re-binding the same path is a no-op. A reload must not unlink and
+        // recreate a live listener just because the definition was re-read.
+        if self
+            .sockets
+            .get(unit)
+            .is_some_and(|bound| bound.path.as_path() == path)
+        {
+            return Ok(());
+        }
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -113,15 +122,21 @@ impl Activated {
             tokio::spawn(async move { watch(watched, sender, permit_rx, watched_unit).await });
 
         rlog!("{unit}: listening on {}", path.display());
-        self.sockets.insert(
-            unit.clone(),
-            Bound {
-                listener,
-                path: path.to_path_buf(),
-                permit,
-                _watch: watch,
-            },
-        );
+        let new = Bound {
+            listener,
+            path: path.to_path_buf(),
+            permit,
+            _watch: watch,
+        };
+        if let Some(old) = self.sockets.insert(unit.clone(), new) {
+            // The new listener is already bound. Only now is it safe to take the
+            // old one down; if the bind above had failed, the old path and its
+            // watcher would still be intact.
+            old._watch.abort();
+            if old.path.as_path() != path {
+                let _ = std::fs::remove_file(&old.path);
+            }
+        }
         Ok(())
     }
 
@@ -265,6 +280,48 @@ mod tests {
         assert!(!path.exists(), "disarm removes the socket file");
 
         drop(activated);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A reload changes the path by binding the new socket first. A failed
+    /// bind must leave the old listener and file in place.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_rebind_keeps_the_old_socket() {
+        let dir = scratch("rebind-fail");
+        let old = dir.join("old.sock");
+        let blocker = dir.join("blocker");
+        std::fs::write(&blocker, b"not a directory").expect("blocker");
+        let bad = blocker.join("new.sock");
+        let unit = name("svc.service");
+        let mut activated = Activated::disabled();
+
+        activated.bind(&unit, &old).expect("old bind");
+        assert!(activated.bind(&unit, &bad).is_err());
+        assert!(old.exists(), "the old path must survive a failed rebind");
+        assert_eq!(activated.path_of(&unit), Some(old.as_path()));
+        assert!(activated.listener_fd(&unit).is_some());
+
+        activated.disarm();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A successful path change binds the replacement before removing the old
+    /// file.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_rebind_replaces_the_path_atomically() {
+        let dir = scratch("rebind");
+        let old = dir.join("old.sock");
+        let new = dir.join("new.sock");
+        let unit = name("svc.service");
+        let mut activated = Activated::disabled();
+
+        activated.bind(&unit, &old).expect("old bind");
+        activated.bind(&unit, &new).expect("new bind");
+        assert!(!old.exists(), "the old path is released after the new bind");
+        assert!(new.exists());
+        assert_eq!(activated.path_of(&unit), Some(new.as_path()));
+
+        activated.disarm();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

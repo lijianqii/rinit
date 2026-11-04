@@ -18,6 +18,8 @@ use rinit_core::unit::restart::BackoffState;
 use rinit_core::{Effect, Event, ExitOutcome, FailedReason, NotifyMessage, UnitState, transition};
 use rinit_core::{Job, JobQueue, JobTarget, RequestSource, UnitConfig, UnitName};
 use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use rinit_runtime::RuntimeError;
@@ -26,7 +28,7 @@ use rinit_runtime::syscall::{process, wait};
 
 use crate::cgroup::Cgroup;
 use crate::log::rlog;
-use crate::service::spawn_service_in_group;
+use crate::service::{begin_spawn_service_in_group, spawn_service_in_group};
 
 /// What registering a unit definition did (plan §7.6).
 ///
@@ -112,6 +114,17 @@ pub struct ResourceUsage {
     pub tasks: Option<u64>,
 }
 
+/// The state needed to read one unit's resource counters off the main loop.
+#[derive(Debug, Clone)]
+pub struct UsageTarget {
+    /// Canonical unit name.
+    pub name: UnitName,
+    /// Main process, when one exists.
+    pub pid: Option<libc::pid_t>,
+    /// The unit's own cgroup, when it has one.
+    pub cgroup_dir: Option<PathBuf>,
+}
+
 /// One row of `rctl list`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnitListEntry {
@@ -133,6 +146,29 @@ pub struct UnitListEntry {
     pub tasks: Option<u64>,
 }
 
+/// A spawn whose exec confirmation may still be pending.
+pub struct UnitSpawn {
+    pending: Option<process::PendingSpawn>,
+}
+
+impl UnitSpawn {
+    /// Take the pending fork handle, if the controlled fork path was used.
+    pub fn take_pending(&mut self) -> Option<process::PendingSpawn> {
+        self.pending.take()
+    }
+}
+
+/// What [`UnitManager::begin_spawn_unit`] decided.
+pub enum SpawnBeginUnit {
+    /// A child exists; wait for `pending` or use `pid` and call
+    /// [`UnitManager::finish_spawn_unit`].
+    Spawn(UnitSpawn),
+    /// A target has no process; it was marked active.
+    NoProcess,
+    /// The unit is already running (or is not known).
+    AlreadyRunning,
+}
+
 /// Everything rinit knows about one running unit.
 #[derive(Debug)]
 pub struct UnitRuntime {
@@ -144,6 +180,13 @@ pub struct UnitRuntime {
     pub backoff: BackoffState,
     /// Its process, if one is running.
     pub pid: Option<libc::pid_t>,
+    /// The process group id recorded while its leader was alive.
+    ///
+    /// A process group outlives its leader. Keeping the id lets a stop reach
+    /// children after the main process has been reaped, when asking the kernel
+    /// for `getpgid(pid)` would fail with `ESRCH` even though the group still
+    /// has members.
+    pub group: Option<libc::pid_t>,
     /// When a pending restart is due.
     pub restart_at: Option<Instant>,
     /// When a `notify` start must have signalled readiness by.
@@ -209,7 +252,7 @@ impl UnitRuntime {
         let seed = fnv1a(config.name.canonical().as_bytes());
         let backoff = BackoffState::new(
             config.restart_delay(),
-            config.start_limit_burst as u32,
+            config.start_limit_burst,
             Duration::from_secs(config.start_limit_interval_sec),
             seed,
         );
@@ -218,6 +261,7 @@ impl UnitRuntime {
             state: UnitState::Inactive,
             backoff,
             pid: None,
+            group: None,
             restart_at: None,
             start_deadline: None,
             kill_at: None,
@@ -515,6 +559,16 @@ impl UnitManager {
     /// either takes over now (nothing is running) or waits for the next start.
     /// See [`UnitRuntime::pending_config`].
     pub fn add(&mut self, config: UnitConfig) -> ConfigChange {
+        self.add_with_in_flight(config, false)
+    }
+
+    /// Register or update a unit, treating an in-flight start as "running".
+    ///
+    /// A start flow has already adopted the definition it began with; applying
+    /// a reload in the middle of it would let `ExecStartPre=` and `ExecStart=`
+    /// come from different files. The new definition waits for the next start,
+    /// exactly as it does for a running unit.
+    pub fn add_with_in_flight(&mut self, config: UnitConfig, in_flight: bool) -> ConfigChange {
         let name = config.name.clone();
         let Some(rt) = self.units.get_mut(&name) else {
             self.units.insert(name, UnitRuntime::new(config));
@@ -529,7 +583,7 @@ impl UnitManager {
             rt.pending_config = None;
             return ConfigChange::Unchanged;
         }
-        if rt.is_up() {
+        if rt.is_up() || in_flight {
             rt.pending_config = Some(config);
             ConfigChange::Deferred
         } else {
@@ -711,9 +765,20 @@ impl UnitManager {
         let Some(actual) = self.units.get(unit).map(|rt| rt.state) else {
             return;
         };
-        if let Some((Effect::None, to)) = self.jobs.reconcile(unit, actual)
-            && let Some(rt) = self.units.get_mut(unit)
-        {
+        if self.jobs.reconcile(unit, actual) != Some(Effect::None) {
+            return;
+        }
+        let Some(target) = self.target_of(unit) else {
+            return;
+        };
+        let to = match (target, actual) {
+            (JobTarget::Stopped, UnitState::Inactive | UnitState::ActiveExited)
+            | (JobTarget::Stopped, UnitState::Failed(_)) => UnitState::Inactive,
+            (JobTarget::Started, UnitState::Active | UnitState::ActiveExited)
+            | (JobTarget::Started, UnitState::Starting) => actual,
+            _ => return,
+        };
+        if let Some(rt) = self.units.get_mut(unit) {
             rt.state = to;
         }
     }
@@ -765,7 +830,7 @@ impl UnitManager {
         let Some(state) = self.units.get(unit).map(|rt| rt.state) else {
             return;
         };
-        if let Some((Effect::None, _)) = self.jobs.reconcile(unit, state) {
+        if self.jobs.reconcile(unit, state) == Some(Effect::None) {
             self.jobs.forget(unit);
         }
     }
@@ -813,9 +878,7 @@ impl UnitManager {
     /// second case, so remembering the queued start belongs with it.
     pub fn effect_for(&self, unit: &UnitName) -> Option<Effect> {
         let actual = self.units.get(unit)?.state;
-        self.jobs
-            .reconcile(unit, actual)
-            .map(|(effect, _to)| effect)
+        self.jobs.reconcile(unit, actual)
     }
 
     /// The merged target for `unit`, if a request set one.
@@ -939,8 +1002,19 @@ impl UnitManager {
         };
         let mut stopped = Vec::new();
         for other in conflicts {
-            // A conflicting unit that is not running is already resolved.
-            if self.units.get(&other).is_some_and(|rt| rt.pid.is_some()) {
+            // "Conflict" includes a unit waiting out a restart and a start
+            // flow that has not spawned yet: both can still bring the service
+            // up after the new unit starts. A stop target is what also cancels
+            // the flow (its `advance` checks for `Stopped`).
+            let needs_stop = self.units.get(&other).is_some_and(|rt| {
+                rt.pid.is_some()
+                    || matches!(
+                        rt.state,
+                        UnitState::Starting | UnitState::RestartWait | UnitState::Deactivating
+                    )
+            });
+            if needs_stop {
+                self.request_stop(&other, RequestSource::UserStop);
                 self.stop_unit(&other);
                 stopped.push(other);
             }
@@ -977,6 +1051,25 @@ impl UnitManager {
     /// A dependent that already has a process is left alone: it is running, and
     /// stopping it here would turn one failure into a cascade.
     pub fn fail_start(&mut self, unit: &UnitName) -> Vec<UnitName> {
+        // A start flow can fail after it has spawned (a readiness or
+        // `ExecStartPost=` deadline, for example). Clearing `pid` without
+        // signalling would leave that process running with no unit pointing at
+        // it, so the tree is killed first. The process group is used while the
+        // id is still known to be the unit's; the cgroup catches daemonized
+        // members as well.
+        let (pid, group) = self
+            .units
+            .get(unit)
+            .map_or((None, None), |rt| (rt.pid, rt.group));
+        if let Some(pid) = pid {
+            if let Some(group) = group {
+                let _ = process::kill_group(group, libc::SIGKILL);
+            }
+            let _ = signal_process(pid, libc::SIGKILL);
+            self.cgroup.signal_members(unit, libc::SIGKILL);
+            rlog!("warning: {unit}: killed its process after a failed start");
+        }
+
         if let Some(rt) = self.units.get_mut(unit) {
             // A failed start is terminal until an explicit `start` or
             // `reset-failed`: a retry armed by the exit that caused the failure
@@ -986,8 +1079,12 @@ impl UnitManager {
             rt.kill_at = None;
             if !matches!(rt.state, UnitState::Failed(_)) {
                 rt.pid = None;
+                rt.group = None;
                 rt.state = UnitState::Failed(FailedReason::StartFailure);
             }
+        }
+        if pid.is_some() {
+            self.cgroup.cleanup(unit);
         }
 
         // `Requires=` is transitive: a target that hard-requires another target
@@ -1074,9 +1171,24 @@ impl UnitManager {
         }
     }
 
-    /// How many units currently have a process.
+    /// How many units still have work to finish.
+    ///
+    /// A unit whose main pid has exited is not necessarily done: an
+    /// `ExecStop=` command or a health probe may still be running. Shutdown
+    /// uses this as its "nothing left" check, so counting only `pid` would let
+    /// it unmount filesystems while a stop command is still writing.
     pub fn running_count(&self) -> usize {
-        self.units.values().filter(|rt| rt.pid.is_some()).count()
+        self.units
+            .values()
+            .filter(|rt| {
+                rt.pid.is_some()
+                    || rt.exec_stop_pid.is_some()
+                    || rt.probe_pid.is_some()
+                    // A leader that exited while its group still drains has no
+                    // pid but is not done stopping; the deadline is the work.
+                    || rt.state == UnitState::Deactivating
+            })
+            .count()
     }
 
     /// Time until the next restart is due, if any.
@@ -1089,39 +1201,49 @@ impl UnitManager {
             .min()
     }
 
-    /// Spawn a unit, adding `extra_env` to the child's environment.
+    /// Prepare a start and fork the child without waiting for exec.
     ///
-    /// The child's environment is the base set, then its `EnvironmentFile=`,
-    /// then its `Environment=` (which wins over the file), then `extra_env`
-    /// (rinit's own additions such as `NOTIFY_SOCKET`). Its
-    /// `WorkingDirectory=` is applied before `exec`.
-    ///
-    /// # Errors
-    /// Propagates a spawn failure; the caller decides whether that is fatal.
-    pub fn spawn_unit_with_output(
+    /// The `posix_spawn` fast path returns ready immediately; the controlled
+    /// fork path returns a pending handle. The caller decides whether to wait
+    /// synchronously (`spawn_unit_with_output`) or off the event loop (the
+    /// start flow).
+    pub fn begin_spawn_unit(
         &mut self,
         unit: &UnitName,
         extra_env: &[String],
         output: Option<libc::c_int>,
         listen_fd: Option<libc::c_int>,
-    ) -> Result<(), RuntimeError> {
-        let now = self.now_millis();
+    ) -> Result<SpawnBeginUnit, RuntimeError> {
+        // A previous instance's process group can outlive its leader. Kill it
+        // before a new start, or a restart would run two trees of the same
+        // service at once and the old one could keep a port or a lock.
+        if let Some(rt) = self.units.get(unit)
+            && rt.pid.is_none()
+            && let Some(group) = rt.group
+            && process::group_alive(group)
+        {
+            let _ = process::kill_group(group, libc::SIGKILL);
+            rlog!("warning: {unit}: killed leftover process group {group} before starting");
+            if let Some(rt) = self.units.get_mut(unit) {
+                rt.group = None;
+            }
+        }
 
         // Everything the spawn needs, read through an immutable borrow so the
         // `EnvironmentFile=` read below cannot race the state update.
         let (argv, env, cwd, kind, sandbox, limits, tty_path, tty_reset, idle_secs) = {
             let Some(rt) = self.units.get(unit) else {
-                return Ok(());
+                return Ok(SpawnBeginUnit::AlreadyRunning);
             };
             if rt.pid.is_some() {
-                return Ok(());
+                return Ok(SpawnBeginUnit::AlreadyRunning);
             }
             // Targets are process-less; starting one is a bookkeeping no-op.
             if !rt.spawns() {
                 if let Some(rt) = self.units.get_mut(unit) {
                     rt.state = UnitState::Active;
                 }
-                return Ok(());
+                return Ok(SpawnBeginUnit::NoProcess);
             }
             (
                 rt.config.exec_start.argv().to_vec(),
@@ -1191,7 +1313,7 @@ impl UnitManager {
         });
 
         // A fresh process group, so a stop reaches the whole tree (plan §1.3(6)).
-        let pid = spawn_service_in_group(
+        let spawned = begin_spawn_service_in_group(
             &argv,
             &env,
             Some(&cwd),
@@ -1203,11 +1325,27 @@ impl UnitManager {
                 listen_fd,
             },
         )?;
+        let (pending, pid) = match spawned {
+            crate::service::SpawnBegin::Ready(pid) => (None, pid),
+            crate::service::SpawnBegin::Pending(pending) => {
+                let pid = pending.pid();
+                (Some(pending), pid)
+            }
+        };
 
+        // The pid is registered before the exec confirmation is awaited. The
+        // reaper may see the child exit while the flow is still in
+        // `SpawnWait`; without this registration that exit would be unclaimed
+        // and a fast `oneshot` would never complete. State is applied here as
+        // well, so an early exit is interpreted against the right `Type=`.
+        let now = self.now_millis();
         let Some(rt) = self.units.get_mut(unit) else {
-            return Ok(());
+            let _ = process::kill(pid, libc::SIGKILL);
+            pending.map(|pending| pending.wait_blocking(&AtomicBool::new(false)));
+            return Ok(SpawnBeginUnit::AlreadyRunning);
         };
         rt.pid = Some(pid);
+        rt.group = process::getpgid(pid).ok().filter(|group| *group == pid);
         rt.state = UnitState::Starting;
         rt.restart_at = None;
         rt.kill_at = None;
@@ -1216,33 +1354,63 @@ impl UnitManager {
         rt.idle_at = idle_secs.and_then(deadline);
 
         match kind {
-            // `simple` is live the moment it is exec'd.
             ServiceKind::Simple => {
                 rt.state = UnitState::Active;
                 rt.backoff.on_active(now);
                 schedule_health(rt);
             }
-            // `oneshot` completes on exit; boot waits for it directly. A
-            // control-driven start still owns the same start deadline, so a
-            // command that never returns is stopped like any other start.
-            ServiceKind::Oneshot => {
-                rt.start_deadline = deadline(rt.config.timeout_start_sec);
-            }
-            // `notify` waits for `READY=1`, bounded by `TimeoutStartSec`
-            // (plan §1.3(12)). A zero timeout means wait forever.
-            ServiceKind::Notify => {
-                rt.start_deadline = deadline(rt.config.timeout_start_sec);
-            }
-            // `forking` waits for the main process to exit *and* for the daemon
-            // it leaves behind to be located (plan §7.10), so it is `Starting`
-            // with the same deadline a `notify` unit gets: a daemon that never
-            // detaches is a hung start, not a running service.
-            ServiceKind::Forking => {
+            ServiceKind::Oneshot | ServiceKind::Notify | ServiceKind::Forking => {
                 rt.start_deadline = deadline(rt.config.timeout_start_sec);
             }
         }
         rlog!("started {unit} as pid {pid}");
+        Ok(SpawnBeginUnit::Spawn(UnitSpawn { pending }))
+    }
+
+    /// Spawn a unit and wait for the exec confirmation.
+    ///
+    /// The synchronous wrapper used by tests and callers that cannot yield. The
+    /// start flow uses [`UnitManager::begin_spawn_unit`] and waits off-thread.
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "sync wrapper for tests and non-yielding callers")
+    )]
+    pub fn spawn_unit_with_output(
+        &mut self,
+        unit: &UnitName,
+        extra_env: &[String],
+        output: Option<libc::c_int>,
+        listen_fd: Option<libc::c_int>,
+    ) -> Result<(), RuntimeError> {
+        let mut spawn = match self.begin_spawn_unit(unit, extra_env, output, listen_fd)? {
+            SpawnBeginUnit::Spawn(spawn) => spawn,
+            SpawnBeginUnit::NoProcess | SpawnBeginUnit::AlreadyRunning => return Ok(()),
+        };
+        let Some(pending) = spawn.take_pending() else {
+            return Ok(());
+        };
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        if let Err(error) = pending.wait_blocking(&cancel) {
+            // State was registered before the wait; make the failure terminal
+            // and clear the pid rather than leaving a dead child as Active.
+            self.fail_start(unit);
+            return Err(error.into());
+        }
         Ok(())
+    }
+
+    /// Cap a unit's readiness deadline to a start flow's overall budget.
+    ///
+    /// `spawn_unit_with_output` arms `TimeoutStartSec=` from the spawn moment;
+    /// the flow's budget started earlier (sockets, conflicts and pre-commands
+    /// already spent part of it). Taking the earlier deadline is what makes
+    /// `TimeoutStartSec=` a bound on the whole start rather than on each step.
+    pub fn cap_start_deadline(&mut self, unit: &UnitName, deadline: Instant) {
+        if let Some(rt) = self.units.get_mut(unit)
+            && let Some(current) = rt.start_deadline
+        {
+            rt.start_deadline = Some(current.min(deadline));
+        }
     }
 
     /// Re-arm an idle unit's deadline, or clear it (plan §7.9).
@@ -1288,11 +1456,26 @@ impl UnitManager {
     /// from both paths.
     pub fn mark_daemon_started(&mut self, unit: &UnitName, daemon: libc::pid_t) {
         let now = self.now_millis();
+        let daemon_group = process::getpgid(daemon).ok();
         if let Some(rt) = self.units.get_mut(unit) {
+            let inherited = rt.group;
             rt.pid = Some(daemon);
+            // Keep the group only when it is the unit's own: the daemon's own
+            // group, or the group the spawned main process created. A daemon
+            // that stayed in rinit's group must not make a later stop signal
+            // PID 1 and every other service.
+            rt.group = daemon_group.filter(|group| *group == daemon || Some(*group) == inherited);
             rt.state = UnitState::Active;
             rt.start_deadline = None;
-            rt.idle_at = None;
+            // The main process's spawn armed the idle clock; taking over from
+            // the forking daemon must not erase it, or `IdleTimeoutSec=` would
+            // silently stop working for `Type=forking`.
+            rt.idle_at = rt
+                .config
+                .socket_activate
+                .as_ref()
+                .filter(|_| rt.config.idle_timeout_sec > 0)
+                .and_then(|_| deadline(rt.config.idle_timeout_sec));
             rt.backoff.on_active(now);
             schedule_health(rt);
         }
@@ -1359,18 +1542,30 @@ impl UnitManager {
                 && at <= now
             {
                 rt.start_deadline = None;
-                // Plan §7.3's first stage reaches whatever the process group
-                // cannot, which for a `forking` unit that never detached is the
-                // daemon it started before hanging (plan §7.10).
-                self.cgroup.signal_members(name, libc::SIGTERM);
-                if let Some(pid) = rt.pid {
-                    match signal_process(pid, libc::SIGTERM) {
-                        Ok(()) => {}
-                        Err(e) if e.errno() == libc::ESRCH => {}
-                        Err(e) => rlog!("warning: SIGTERM to {name} failed: {e}"),
+                // `TimeoutStopSec=0` means "SIGKILL at once", exactly as the
+                // explicit stop path does. Arming a zero deadline through
+                // `deadline(0)` would produce `None` and leave a SIGTERM-ignoring
+                // start stuck forever.
+                if rt.config.timeout_stop_sec == 0 {
+                    self.cgroup.signal_members(name, libc::SIGKILL);
+                    if let Some(pid) = rt.pid {
+                        let _ = signal_process(pid, libc::SIGKILL);
                     }
+                    rt.kill_at = None;
+                } else {
+                    // Plan §7.3's first stage reaches whatever the process group
+                    // cannot, which for a `forking` unit that never detached is
+                    // the daemon it started before hanging (plan §7.10).
+                    self.cgroup.signal_members(name, libc::SIGTERM);
+                    if let Some(pid) = rt.pid {
+                        match signal_process(pid, libc::SIGTERM) {
+                            Ok(()) => {}
+                            Err(e) if e.errno() == libc::ESRCH => {}
+                            Err(e) => rlog!("warning: SIGTERM to {name} failed: {e}"),
+                        }
+                    }
+                    rt.kill_at = deadline(rt.config.timeout_stop_sec);
                 }
-                rt.kill_at = deadline(rt.config.timeout_stop_sec);
                 due.push(name.clone());
             }
         }
@@ -1404,6 +1599,13 @@ impl UnitManager {
                         Err(e) if e.errno() == libc::ESRCH => {}
                         Err(e) => rlog!("warning: SIGKILL to {name} failed: {e}"),
                     }
+                } else if rt.state == UnitState::Deactivating {
+                    // A pid-less stop can only be waiting on cgroup members;
+                    // they were just sent SIGKILL above.
+                    rt.group = None;
+                    rt.state = UnitState::Inactive;
+                    self.cgroup.cleanup(name);
+                    due.push(name.clone());
                 }
             }
         }
@@ -1635,13 +1837,6 @@ impl UnitManager {
     /// `0`) and [`due_kills`](Self::due_kills) fires it. Without that, a service
     /// that ignores the stop would never be killed.
     pub fn stop_unit(&mut self, unit: &UnitName) {
-        // Plan §7.3's stop flow starts here: `SIGTERM` to every pid in the
-        // unit's cgroup, not only to its process group. A service that called
-        // `setsid` itself is out of the group but still in the cgroup, and the
-        // process-group signal below would miss it. Safe to do before the state
-        // update: signalling cannot reorder the manager's own bookkeeping.
-        self.cgroup.signal_members(unit, libc::SIGTERM);
-
         let Some(rt) = self.units.get_mut(unit) else {
             return;
         };
@@ -1660,20 +1855,42 @@ impl UnitManager {
         }
 
         let Some(pid) = rt.pid else {
-            // No process: an `Active(Exited)` oneshot and anything already down
-            // both land straight in Inactive (plan §1.3(3) skips Deactivating
-            // when there is nothing to signal).
-            rt.state = UnitState::Inactive;
-            // Plan §7.3's cleanup. There is no process left to have put anything
-            // in the cgroup, but a stray process from an earlier stop can be
-            // there, and `cleanup` keeps the directory if so.
-            self.cgroup.cleanup(unit);
+            // The leader has been reaped. Its process group was cleared at the
+            // same moment (see `on_child_exit`), so the only leftovers that can
+            // still be addressed safely are the unit's cgroup members.
+            let cgroup_members = self.cgroup.members(unit).unwrap_or_default();
+            if cgroup_members.is_empty() {
+                rt.state = UnitState::Inactive;
+                rt.group = None;
+                // Plan §7.3's cleanup. There is no process left to have put
+                // anything in the cgroup, but a stray process from an earlier
+                // stop can be there, and `cleanup` keeps the directory if so.
+                self.cgroup.cleanup(unit);
+                return;
+            }
+
+            self.cgroup.signal_members(unit, libc::SIGTERM);
+            rt.state = UnitState::Deactivating;
+            if rt.config.timeout_stop_sec == 0 {
+                self.cgroup.signal_members(unit, libc::SIGKILL);
+                // There is no member pid this manager can reap (and therefore
+                // no exit callback that would finish the stop). Arm the next
+                // pass to observe the result and leave Deactivating.
+                rt.kill_at = Some(Instant::now());
+            } else {
+                rt.kill_at = Some(crate::deadline::after_secs(rt.config.timeout_stop_sec));
+            }
+            rlog!("stopping {unit} (leftover cgroup processes)");
             return;
         };
 
         let mut stopping = false;
         let stop_cmd = rt.config.exec_stop.argv().to_vec();
         if stop_cmd.is_empty() {
+            // Plan §7.3's stop flow: `SIGTERM` to every pid in the unit's
+            // cgroup, not only to its process group. A service that called
+            // `setsid` itself is out of the group but still in the cgroup.
+            self.cgroup.signal_members(unit, libc::SIGTERM);
             match signal_process(pid, libc::SIGTERM) {
                 Ok(()) => {
                     rt.state = UnitState::Deactivating;
@@ -1722,6 +1939,7 @@ impl UnitManager {
                     // A stop command that cannot run must not strand the unit:
                     // fall back to the signal.
                     rlog!("warning: {unit}: cannot start ExecStop: {e}; sending SIGTERM");
+                    self.cgroup.signal_members(unit, libc::SIGTERM);
                     match process::kill_process_group(pid, libc::SIGTERM) {
                         Ok(()) => {
                             rt.state = UnitState::Deactivating;
@@ -1811,6 +2029,23 @@ impl UnitManager {
         let oom_baseline = rt.oom_kills_at_start.take();
         rt.pid = None;
         rt.start_deadline = None;
+        // A stop in progress may still have children in the unit's group. Their
+        // exits are reaped by the global reaper but cannot be matched back to
+        // this unit. The leader itself may still be an unreaped zombie here, so
+        // look for members *other* than it.
+        let group_still_running = rt
+            .group
+            .is_some_and(|group| process::group_has_other_members(group, pid));
+        // A group id can be reused once its last member is gone, so it must not
+        // be kept past this reaping: a later stop would then be able to signal
+        // an unrelated process group. The only safe moment to reach the
+        // children is now, while the id is known to still name this unit's
+        // group.
+        if group_still_running && let Some(group) = rt.group {
+            let _ = process::kill_group(group, libc::SIGKILL);
+            rlog!("warning: {unit}: killed leftover processes in group {group}");
+        }
+        rt.group = None;
         rt.kill_at = None;
         rt.health_at = None;
         rt.probe_deadline = None;
@@ -1849,14 +2084,14 @@ impl UnitManager {
                 rt.restart_after_stop = false;
                 return Some(self.schedule_restart(&unit, now));
             }
-            rt.state = UnitState::Inactive;
             // The stop is complete, so plan §7.3's cleanup runs now: an empty
             // directory goes, one that still holds a stray process is kept.
+            // Leftover group members were killed above, while the id was still
+            // known to be this unit's.
+            rt.state = UnitState::Inactive;
+            let state = rt.state;
             self.cgroup.cleanup(&unit);
-            return Some(Outcome::Exited {
-                unit,
-                state: UnitState::Inactive,
-            });
+            return Some(Outcome::Exited { unit, state });
         }
 
         // A unit that was still `Starting` has not "exited" in the sense the
@@ -2008,7 +2243,59 @@ impl UnitManager {
     }
 
     /// Rows for the table/JSON `rctl list` views, sorted by name.
+    ///
+    /// The synchronous form is for tests and small callers. The control server
+    /// uses [`usage_targets`](Self::usage_targets), reads counters on the
+    /// blocking pool, then calls [`list_entries_with_usage`](Self::list_entries_with_usage).
+    #[cfg(test)]
     pub fn list_entries(&self) -> Vec<UnitListEntry> {
+        let usage = Self::collect_usage(self.usage_targets())
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+        self.list_entries_with_usage(&usage)
+    }
+
+    /// Snapshot the state needed for a blocking usage read.
+    pub fn usage_targets(&self) -> Vec<UsageTarget> {
+        self.units
+            .values()
+            .filter(|rt| !rt.retired)
+            .map(|rt| UsageTarget {
+                name: rt.config.name.clone(),
+                pid: rt.pid,
+                cgroup_dir: self.cgroup.dir_for(&rt.config.name),
+            })
+            .collect()
+    }
+
+    /// Read counters for a snapshot. Intended for `spawn_blocking`.
+    pub fn collect_usage(targets: Vec<UsageTarget>) -> Vec<(UnitName, ResourceUsage)> {
+        targets
+            .into_iter()
+            .map(|target| {
+                let cgroup = target
+                    .cgroup_dir
+                    .as_deref()
+                    .map(crate::cgroup::usage_at)
+                    .unwrap_or_default();
+                let process = target.pid.map(proc_usage).unwrap_or_default();
+                (
+                    target.name,
+                    ResourceUsage {
+                        memory_bytes: cgroup.memory_bytes.or(process.memory_bytes),
+                        cpu_usec: cgroup.cpu_usec.or(process.cpu_usec),
+                        tasks: cgroup.tasks.or(process.tasks),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Build list rows from already-read counters.
+    pub fn list_entries_with_usage(
+        &self,
+        usage: &BTreeMap<UnitName, ResourceUsage>,
+    ) -> Vec<UnitListEntry> {
         let mut entries: Vec<UnitListEntry> = self
             .units
             .values()
@@ -2019,7 +2306,7 @@ impl UnitManager {
                     Some(JobTarget::Stopped) => "stopped",
                     None => "-",
                 };
-                let usage = self.resource_usage(&rt.config.name);
+                let usage = usage.get(&rt.config.name).copied().unwrap_or_default();
                 UnitListEntry {
                     name: rt.config.name.canonical().to_string(),
                     kind: if rt.config.is_target() {
@@ -2899,6 +3186,122 @@ mod tests {
         cleanup(&mut m, &unit);
     }
 
+    /// A zero stop timeout means the start-timeout escalation is SIGKILL now,
+    /// not an unarmed deadline that leaves the unit Starting forever.
+    #[test]
+    fn a_zero_stop_timeout_kills_a_timed_out_start_immediately() {
+        let _guard = crate::test_support::children_lock();
+        let (mut m, unit) = notify_running("n.service");
+        {
+            let rt = m.units.get_mut(&unit).unwrap();
+            rt.config.timeout_stop_sec = 0;
+            rt.start_deadline = Some(Instant::now() - Duration::from_secs(1));
+        }
+
+        assert_eq!(
+            m.due_start_timeouts().as_slice(),
+            std::slice::from_ref(&unit)
+        );
+        assert!(
+            m.get(&unit).unwrap().kill_at.is_none(),
+            "zero stop timeout does not arm a follow-up"
+        );
+        cleanup(&mut m, &unit);
+    }
+
+    /// A process group outlives its leader. When the leader is reaped the
+    /// manager must reach the children while the group id is still known to be
+    /// its own, then clear the id so a later stop cannot signal a recycled
+    /// group.
+    #[test]
+    fn reaping_the_leader_kills_the_rest_of_its_group() {
+        let _guard = crate::test_support::children_lock();
+        let mut cfg = config("leftover.service", RestartPolicy::No);
+        cfg.exec_start = rinit_core::ExecCommand::new(vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "sleep 30 & wait".to_string(),
+        ]);
+        cfg.timeout_stop_sec = 10;
+        let mut m = UnitManager::new();
+        m.add(cfg);
+        let unit = UnitName::parse("leftover.service").unwrap();
+        m.spawn_unit_with_output(&unit, &[], None, None)
+            .expect("spawn");
+        let leader = m.get(&unit).unwrap().pid.expect("leader");
+        let group = m.get(&unit).unwrap().group.expect("group");
+        assert_eq!(group, leader, "the spawned service leads its own group");
+
+        // Kill the leader only after the shell has forked `sleep`, so a member
+        // of the group is left behind.
+        let children = format!("/proc/{leader}/task/{leader}/children");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let child = loop {
+            if let Ok(text) = std::fs::read_to_string(&children)
+                && let Some(pid) = text
+                    .split_whitespace()
+                    .next()
+                    .and_then(|value| value.parse::<libc::pid_t>().ok())
+            {
+                break pid;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the shell never forked its background child"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+
+        process::kill(leader, libc::SIGKILL).expect("kill leader");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let reaped = wait::reap_children();
+            if reaped
+                .iter()
+                .any(|exit| matches!(exit, wait::ChildExit::Signaled { pid, .. } if *pid == leader))
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the leader was not reaped");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        m.on_child_exit(leader, ExitOutcome::Signalled(libc::SIGKILL))
+            .expect("the leader belongs to the unit");
+
+        let rt = m.get(&unit).unwrap();
+        assert!(
+            rt.group.is_none(),
+            "a group id must not outlive the reaping that observed it"
+        );
+
+        // The background child was sent SIGKILL. It may be a zombie until the
+        // real init reaps it, but it must no longer be running.
+        let stat = format!("/proc/{child}/stat");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let running = std::fs::read_to_string(&stat)
+                .ok()
+                .and_then(|text| {
+                    let close = text.rfind(')')?;
+                    text.get(close + 1..)?
+                        .split_whitespace()
+                        .next()?
+                        .chars()
+                        .next()
+                })
+                .is_some_and(|state| state == 'S' || state == 'R' || state == 'D');
+            if !running {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the leftover child is still running"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = wait::reap_children();
+    }
+
     /// The follow-up kill fires when its `TimeoutStopSec` elapses.
     #[test]
     fn a_unit_that_ignores_the_stop_signal_is_killed() {
@@ -3612,6 +4015,39 @@ mod tests {
         assert_eq!(m.restart_unit(&unit), RestartPlan::Start);
     }
 
+    /// A start that fails after spawning must not orphan the process. A flow
+    /// deadline can fire while the unit is still `Starting`; clearing `pid`
+    /// without signalling would leave the service running with no owner.
+    #[test]
+    fn failing_a_spawned_start_kills_its_process() {
+        let _guard = crate::test_support::children_lock();
+        let (mut m, unit) = notify_running("n.service");
+        let pid = m.get(&unit).unwrap().pid.expect("pid");
+        let group = m.get(&unit).unwrap().group.expect("group");
+
+        m.fail_start(&unit);
+
+        let rt = m.get(&unit).unwrap();
+        assert!(rt.pid.is_none());
+        assert!(rt.group.is_none());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let reaped = wait::reap_children();
+            if reaped.iter().any(
+                |exit| matches!(exit, wait::ChildExit::Signaled { pid: reaped, .. } if *reaped == pid),
+            ) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the process was not killed");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !process::group_alive(group),
+            "the failed start's process group must be gone"
+        );
+        cleanup(&mut m, &unit);
+    }
+
     /// `reset-failed` clears the failure without starting the unit.
     #[test]
     fn reset_failed_clears_the_state_but_does_not_start() {
@@ -3758,6 +4194,35 @@ mod tests {
     }
 
     // --- §7.6: what a reload does to the manager -------------------
+
+    /// A start flow that has not spawned yet is still using its snapshot. A
+    /// reload must defer the new definition just as it does for a running unit,
+    /// or `ExecStartPre=` and `ExecStart=` would see different files.
+    #[test]
+    fn an_in_flight_start_defers_a_reload() {
+        let mut m = UnitManager::new();
+        let unit = UnitName::parse("app.service").unwrap();
+        let original = config("app.service", RestartPolicy::No);
+        assert_eq!(m.add(original.clone()), ConfigChange::Added);
+
+        let mut changed = original;
+        changed.description = "changed".to_string();
+        assert_eq!(m.add_with_in_flight(changed, true), ConfigChange::Deferred);
+        assert_eq!(
+            m.get(&unit).unwrap().config.description,
+            "",
+            "the in-flight flow keeps the definition it started with"
+        );
+        assert_eq!(
+            m.get(&unit)
+                .unwrap()
+                .pending_config
+                .as_ref()
+                .map(|config| config.description.as_str()),
+            Some("changed"),
+            "the new definition waits for the next start"
+        );
+    }
 
     /// Registering a definition answers one of four things, and the two that
     /// matter are the ones plan §7.6 separates: a *stopped* unit takes the new
