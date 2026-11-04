@@ -231,6 +231,30 @@ umount -f
 `/etc/mtab` file; the kernel's `/proc/mounts` is authoritative. Unsupported
 filesystem types or options are an error, not a silent fallback.
 
+### `/sbin/swapon` and `/sbin/swapoff`
+
+The supported subset is:
+
+```text
+swapon [-a] [-s] [-p PRIORITY] [-v] [DEVICE...]
+swapoff [-a] [-v] [DEVICE...]
+```
+
+`swapon -a` reads `/etc/fstab`, processes every `swap` entry and skips
+`noauto`. `swapoff -a` first reads `/proc/swaps`, then processes every `swap`
+entry in `/etc/fstab` including `noauto`, so a device activated by hand is
+also released. Both commands also accept explicit devices after `-a`, matching
+BusyBox. Under `-a`, an already-active device (`EBUSY`) for `swapon` and an
+absent or inactive device (`ENOENT`/`EINVAL`) for `swapoff` are not failures.
+Like BusyBox, the `/proc/swaps` pass reads the first whitespace-delimited field;
+a path containing whitespace is still reached through its escaped fstab entry.
+
+Fstab `pri=`/`priority=` selects a priority in `0..=32767`; the command-line
+`-p` overrides it. `discard`, `discard=once` and `discard=pages` set the
+corresponding kernel flags. `swapon -s` prints `/proc/swaps` unchanged. UUID
+and LABEL resolution, `mkswap`, and swap-file creation or resizing are out of
+scope.
+
 ### `/sbin/reboot` and `/sbin/poweroff`
 
 Both must go through the rinit control path. They must not call the reboot
@@ -282,6 +306,8 @@ crates/
     src/bin/
       mount.rs
       umount.rs
+      swapon.rs
+      swapoff.rs
       hostname.rs
       reboot.rs
       poweroff.rs
@@ -315,19 +341,21 @@ must not affect PID 1.
 and size budgets:
 
 ```text
-# applet   cargo-bin   install-path   busybox-link   profile
-mount      mount       /bin/mount     /bin/mount     replace-system
-umount     umount      /bin/umount    /bin/umount    replace-system
-hostname   hostname    /bin/hostname  /bin/hostname  replace-system
-reboot     reboot      /sbin/reboot   /sbin/reboot   replace-system
-poweroff   poweroff    /sbin/poweroff /sbin/poweroff replace-system
-sysctl     sysctl      /sbin/sysctl   /sbin/sysctl   replace-system
-ps         ps          /bin/ps        /bin/ps        replace-system
-free       free        /usr/bin/free  /usr/bin/free  replace-system
-uptime     uptime      /usr/bin/uptime /usr/bin/uptime replace-system
-dmesg      dmesg       /bin/dmesg     /bin/dmesg     replace-system
-df         df          /bin/df        /bin/df        replace-system
-top        top         /usr/bin/top   /usr/bin/top   replace-system
+# applet   cargo-bin   install-path    busybox-link    max-kib  source
+mount      mount       /bin/mount      /bin/mount      1024     crates/rinit-tools/src/bin/mount.rs
+umount     umount      /bin/umount     /bin/umount     1024     crates/rinit-tools/src/bin/umount.rs
+swapon     swapon      /sbin/swapon    /sbin/swapon     600     crates/rinit-tools/src/bin/swapon.rs
+swapoff    swapoff     /sbin/swapoff   /sbin/swapoff    600     crates/rinit-tools/src/bin/swapoff.rs
+hostname   hostname    /bin/hostname   /bin/hostname    600     crates/rinit-tools/src/bin/hostname.rs
+reboot     reboot      /sbin/reboot    /sbin/reboot     600     crates/rinit-tools/src/bin/reboot.rs
+poweroff   poweroff    /sbin/poweroff  /sbin/poweroff   600     crates/rinit-tools/src/bin/poweroff.rs
+sysctl     sysctl      /sbin/sysctl    /sbin/sysctl     600     crates/rinit-tools/src/bin/sysctl.rs
+ps         ps          /bin/ps         /bin/ps          800     crates/rinit-tools/src/bin/ps.rs
+free       free        /usr/bin/free   /usr/bin/free    600     crates/rinit-tools/src/bin/free.rs
+uptime     uptime      /usr/bin/uptime /usr/bin/uptime  600     crates/rinit-tools/src/bin/uptime.rs
+dmesg      dmesg       /bin/dmesg      /bin/dmesg       800     crates/rinit-tools/src/bin/dmesg.rs
+df         df          /bin/df         /bin/df          800     crates/rinit-tools/src/bin/df.rs
+top        top         /usr/bin/top    /usr/bin/top     800     crates/rinit-tools/src/bin/top.rs
 ```
 
 The exact BusyBox symlink location may vary by BusyBox configuration; the
@@ -405,7 +433,7 @@ Provisional first-version budgets, to be replaced by measured values:
 | profile | tools | total budget |
 | --- | --- | --- |
 | minimal | `rinit` only | 1.2 MB |
-| `replace-system` (first three waves + console) | 39 including existing | 20 MB |
+| `replace-system` (first three waves + console + swap) | 41 including existing | 20 MB |
 | full toolbox (later) | 50+ | 24 MB |
 
 Each tool also has its own budget in `tools.list`. CI fails on either a per-tool
@@ -419,6 +447,7 @@ shared `librinit-tools.so` for non-init tools; do not add it pre-emptively.
 - argument parsing, missing/invalid options, exit codes;
 - stable output fields compared with BusyBox for the supported subset;
 - mount/umount against real tmpfs/devpts entries, not only `--help`;
+- swap fstab filtering, `pri=`/`discard=` flags and the `-a` idempotency rules;
 - hostname `-F`;
 - file operations: recursive copy, no-clobber, symlink preservation, directory
   removal guards, hard/symbolic links and `touch -t`;
@@ -439,6 +468,7 @@ shared `librinit-tools.so` for non-init tools; do not add it pre-emptively.
 ### Guest
 
 - the existing 105 `make test-system` assertions on the `replace-system` image;
+- a swap round trip: `swapon`, `swapon -s`, `swapoff` and `swapon -a`;
 - T3 reboot/poweroff persistence tests;
 - 24 h and 7 day soaks for `rinit`, with the tools not affecting the PID 1
   memory curve;

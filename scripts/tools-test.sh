@@ -110,13 +110,13 @@ qemu_pid=$!
 
 wait_ssh || { echo "FAIL: SSH did not come up" >&2; tail -30 "$serial" >&2; exit 3; }
 
-for path in mount umount hostname ps free uptime dmesg df sysctl top reboot poweroff \
+for path in mount umount swapon swapoff hostname ps free uptime dmesg df sysctl top reboot poweroff \
     processes ls cat cp mv rm mkdir ln touch echo sleep uname mktemp sync stat rlogin \
     id whoami env which dirname basename realpath readlink rgetty; do
     case "$path" in
         mount | umount | hostname | ps | dmesg | df | processes | ls | cat | cp | mv | rm | mkdir | ln | touch | echo | sleep | uname | mktemp | sync | stat | rlogin) full="/bin/$path" ;;
         free | uptime | top | id | whoami | env | which | dirname | basename | realpath | readlink) full="/usr/bin/$path" ;;
-        sysctl | reboot | poweroff | rgetty) full="/sbin/$path" ;;
+        sysctl | reboot | poweroff | rgetty | swapon | swapoff) full="/sbin/$path" ;;
     esac
     check "$full is a real executable" "ssh_guest 'test -x $full && ! test -L $full'"
 done
@@ -140,6 +140,9 @@ check 'mount -o ro is applied' "ssh_guest 'mkdir -p /tmp/toolmnt-ro; mount -t tm
 check 'mount fails on a missing target' "! ssh_guest 'mount -t tmpfs tmpfs /no/such/tool-target' >/dev/null 2>&1"
 check 'umount fails on an unknown target' "! ssh_guest 'umount /no/such/tool-target' >/dev/null 2>&1"
 check 'BusyBox mount fallback' "ssh_guest 'busybox mount' | grep -q ' / '"
+check 'swapon -s reports the boot swap' "ssh_guest 'swapon -s' | grep -q '/swapfile'"
+check 'swapoff and swapon handle one device' "ssh_guest 'swapoff /swapfile && ! grep -q /swapfile /proc/swaps && swapon /swapfile && grep -q /swapfile /proc/swaps'"
+check 'swapoff -a and swapon -a round trip' "ssh_guest 'swapoff -a && ! grep -q /swapfile /proc/swaps && swapon -a && grep -q /swapfile /proc/swaps'"
 
 check 'ls lists a file' "ssh_guest 'ls /etc/hostname' | grep -q hostname"
 check 'cat reads a file' "ssh_guest 'cat /etc/hostname' | grep -q rinit"

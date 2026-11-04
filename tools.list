@@ -19,6 +19,8 @@ processes  processes  /bin/processes   -                600  crates/processes
 # crates/rinit-tools/src/bin/ as the implementation lands.
 mount      mount      /bin/mount       /bin/mount      1024  crates/rinit-tools/src/bin/mount.rs
 umount     umount     /bin/umount      /bin/umount     1024  crates/rinit-tools/src/bin/umount.rs
+swapon     swapon     /sbin/swapon     /sbin/swapon     600  crates/rinit-tools/src/bin/swapon.rs
+swapoff    swapoff    /sbin/swapoff    /sbin/swapoff    600  crates/rinit-tools/src/bin/swapoff.rs
 hostname   hostname   /bin/hostname    /bin/hostname    600  crates/rinit-tools/src/bin/hostname.rs
 reboot     reboot     /sbin/reboot     /sbin/reboot     600  crates/rinit-tools/src/bin/reboot.rs
 poweroff   poweroff   /sbin/poweroff   /sbin/poweroff   600  crates/rinit-tools/src/bin/poweroff.rs

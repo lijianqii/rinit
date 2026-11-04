@@ -4,7 +4,7 @@ use std::ffi::{CString, OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
 use std::process::ExitCode;
 
-use rinit_tools::{EXIT_OK, program_name, read_trimmed, usage_error};
+use rinit_tools::{EXIT_OK, fstab, program_name, read_trimmed, usage_error};
 
 #[derive(Default)]
 struct ParsedOptions {
@@ -107,34 +107,25 @@ fn list_mounts(root: &std::path::Path) -> Result<(), String> {
 fn mount_fstab(root: &std::path::Path) -> Result<(), String> {
     let text =
         std::fs::read_to_string(root.join("etc/fstab")).map_err(|e| format!("/etc/fstab: {e}"))?;
-    let mut fail = 0;
-    for line in text.lines() {
-        let line = line.split('#').next().unwrap_or("").trim();
-        if line.is_empty() {
-            continue;
-        }
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        if fields.len() < 4 {
-            eprintln!("mount: malformed fstab line: {line}");
-            fail += 1;
-            continue;
-        }
+    let (entries, warnings) = fstab::parse(&text);
+    let mut fail = warnings.len();
+    for warning in warnings {
+        eprintln!("mount: {warning}");
+    }
+    for entry in entries {
         // `swap` is an fstab entry, but switch activation belongs to
         // `swapon -a`; passing it to `mount(2)` against `none` always fails.
-        if fields[2] == "swap" {
+        if entry.fstype == "swap" || fstab::has_option(&entry.options, "noauto") {
             continue;
         }
-        let options = parse_options(fields[3]);
-        if fields[3].split(',').any(|option| option == "noauto") {
-            continue;
-        }
+        let options = parse_options(&entry.options);
         if let Err(e) = mount_one(
-            OsStr::new(fields[0]),
-            OsStr::new(fields[1]),
-            Some(fields[2]),
+            &entry.device,
+            &entry.mountpoint,
+            Some(&entry.fstype),
             &options,
         ) {
-            eprintln!("mount: {}: {e}", fields[1]);
+            eprintln!("mount: {}: {e}", entry.mountpoint.to_string_lossy());
             fail += 1;
         }
     }

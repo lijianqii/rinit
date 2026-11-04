@@ -22,6 +22,7 @@ use std::io;
 use std::path::Path;
 
 pub mod control;
+pub mod fstab;
 pub mod fsutil;
 pub mod pathutil;
 pub mod users;
