@@ -21,7 +21,7 @@
 /// before retrying, whereas a plain start failure can be retried directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailedReason {
-    /// The unit failed to start, or exited and `Restart=` did not apply.
+    /// The unit failed to start, or exited abnormally and `Restart=` did not apply.
     StartFailure,
     /// `StartLimitBurst` failures inside `StartLimitIntervalSec` tripped the
     /// breaker; the unit will not retry on its own.

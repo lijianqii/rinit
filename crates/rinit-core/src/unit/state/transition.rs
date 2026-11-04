@@ -121,6 +121,12 @@ pub fn transition(
         // `simple`/`notify` are live after exec; `oneshot` runs to completion
         // and ends up as Active(Exited) (plan §1.3(3)).
         (S::Inactive, Ev::Start) => (S::Starting, E::SpawnProcess),
+        // Requests whose target is already satisfied are no-ops the caller can
+        // report as success rather than "the unit is already there" errors.
+        (S::Inactive, Ev::Stop) => (S::Inactive, E::None),
+        (S::Starting, Ev::Start) => (S::Starting, E::None),
+        (S::Active, Ev::Start) => (S::Active, E::None),
+        (S::ActiveExited, Ev::Start) => (S::ActiveExited, E::None),
         (S::Starting, Ev::StartUpComplete) => match kind {
             ServiceKind::Oneshot => (S::ActiveExited, E::None),
             // `forking` reaches `Active` the same way: its main process has
@@ -147,6 +153,11 @@ pub fn transition(
                         delay: core::time::Duration::ZERO,
                     },
                 )
+            } else if matches!(outcome, ExitOutcome::Success) {
+                // A service that finished cleanly and is not configured to
+                // restart is inactive, not failed. Only an abnormal exit with
+                // no restart policy left is a failure.
+                (S::Inactive, E::None)
             } else {
                 (S::Failed(FailedReason::StartFailure), E::None)
             }
@@ -187,8 +198,72 @@ pub fn transition(
             return Err(not_allowed());
         }
 
-        // Anything not listed above is invalid in this state.
-        _ => return Err(not_allowed()),
+        // Every remaining combination is listed explicitly. There is no
+        // wildcard: adding a state or an event stops this match from
+        // compiling until the new cells have been decided.
+        (
+            S::Inactive,
+            Ev::StartUpComplete
+            | Ev::StartUpFailed
+            | Ev::StopComplete
+            | Ev::BackoffElapsed
+            | Ev::StartLimitTripped
+            | Ev::ResetFailed,
+        )
+        | (
+            S::Starting,
+            Ev::Exit(_)
+            | Ev::StopComplete
+            | Ev::BackoffElapsed
+            | Ev::StartLimitTripped
+            | Ev::ResetFailed,
+        )
+        | (
+            S::Active,
+            Ev::StartUpComplete
+            | Ev::StartUpFailed
+            | Ev::StopComplete
+            | Ev::BackoffElapsed
+            | Ev::StartLimitTripped
+            | Ev::ResetFailed,
+        )
+        | (
+            S::ActiveExited,
+            Ev::StartUpComplete
+            | Ev::StartUpFailed
+            | Ev::Exit(_)
+            | Ev::StopComplete
+            | Ev::BackoffElapsed
+            | Ev::StartLimitTripped
+            | Ev::ResetFailed,
+        )
+        | (
+            S::Deactivating,
+            Ev::Start
+            | Ev::StartUpComplete
+            | Ev::StartUpFailed
+            | Ev::Exit(_)
+            | Ev::Stop
+            | Ev::BackoffElapsed
+            | Ev::StartLimitTripped
+            | Ev::ResetFailed,
+        )
+        | (
+            S::RestartWait,
+            Ev::StartUpComplete
+            | Ev::StartUpFailed
+            | Ev::Exit(_)
+            | Ev::StopComplete
+            | Ev::ResetFailed,
+        )
+        | (
+            S::Failed(_),
+            Ev::StartUpComplete
+            | Ev::StartUpFailed
+            | Ev::StopComplete
+            | Ev::BackoffElapsed
+            | Ev::StartLimitTripped,
+        ) => return Err(not_allowed()),
     };
 
     Ok(Transition {
@@ -243,6 +318,24 @@ mod tests {
         );
     }
 
+    /// Requests against a state that already satisfies them are explicit
+    /// no-ops, not "illegal event" errors. The runtime reports them as success.
+    #[test]
+    fn satisfied_targets_are_no_ops() {
+        for (state, event) in [
+            (UnitState::Inactive, Event::Stop),
+            (UnitState::Starting, Event::Start),
+            (UnitState::Active, Event::Start),
+            (UnitState::ActiveExited, Event::Start),
+        ] {
+            assert_eq!(
+                go(state, event),
+                (state, Effect::None),
+                "{state:?} + {event:?} must be a no-op"
+            );
+        }
+    }
+
     #[test]
     fn starting_becomes_active_on_completion() {
         assert_eq!(
@@ -276,7 +369,16 @@ mod tests {
 
     // --- exits and the restart policy --------------------------------
 
-    /// Without `Restart=`, an exit is a plain failure.
+    /// A clean exit with no restart policy comes to rest in `Inactive`.
+    #[test]
+    fn a_clean_exit_without_restart_is_inactive() {
+        assert_eq!(
+            go(UnitState::Active, Event::Exit(ExitOutcome::Success)),
+            (UnitState::Inactive, Effect::None)
+        );
+    }
+
+    /// Without `Restart=`, an abnormal exit is a plain failure.
     #[test]
     fn an_exit_without_restart_fails() {
         let (to, effect) = go(UnitState::Active, Event::Exit(ExitOutcome::Failure(1)));
@@ -424,7 +526,7 @@ mod tests {
             (UnitState::Inactive, Event::StartUpComplete),
             (UnitState::Inactive, Event::Exit(ExitOutcome::Success)),
             (UnitState::Active, Event::StartUpComplete),
-            (UnitState::Active, Event::Start),
+            (UnitState::Active, Event::ResetFailed),
             (UnitState::ActiveExited, Event::Exit(ExitOutcome::Success)),
             (UnitState::Starting, Event::BackoffElapsed),
             (

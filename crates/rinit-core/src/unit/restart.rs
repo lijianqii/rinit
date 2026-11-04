@@ -102,7 +102,10 @@ impl BackoffState {
             base,
             consecutive: 0,
             window: VecDeque::new(),
-            burst,
+            // The parser rejects `StartLimitBurst=0`; a programmatic caller
+            // that passes it gets the conservative one-failure breaker rather
+            // than an accidentally disabled one.
+            burst: burst.max(1),
             interval,
             became_active_at: None,
             jitter: Jitter::new(seed),
@@ -149,16 +152,15 @@ impl BackoffState {
         self.became_active_at = None;
         self.consecutive = self.consecutive.saturating_add(1);
 
-        // Plan §1.1: `StartLimitIntervalSec=0` disables the breaker and
-        // `StartLimitBurst=0` means no limit. Neither can ever read the window,
-        // and with a zero interval nothing could expire out of it either, so
-        // recording the failure here would grow the window forever - one
-        // `Millis` per restart, without bound. (The M4 soak caught exactly
-        // that.) When there is a breaker, `is_tripped` already answers `false`
-        // for these configurations, so this is the same rule, applied where the
-        // memory is spent.
+        // Plan §1.1: `StartLimitIntervalSec=0` disables the breaker. It can
+        // never read the window, and with a zero interval nothing could expire
+        // out of it either, so recording the failure here would grow the window
+        // forever - one `Millis` per restart, without bound. (The M4 soak
+        // caught exactly that.) `StartLimitBurst=0` is rejected by the parser,
+        // and the constructor clamps a programmatic zero to one, so there is no
+        // "unlimited burst" mode to account for here.
         let width = as_millis(self.interval);
-        if width == 0 || self.burst == 0 {
+        if width == 0 {
             return Some(self.next_delay());
         }
 
@@ -392,15 +394,6 @@ mod tests {
         assert!(!e.is_tripped());
     }
 
-    /// Plan §1.1: `StartLimitBurst=0` means no limit.
-    #[test]
-    fn a_zero_burst_means_no_limit() {
-        let mut e = engine(1, 0, 10);
-        for i in 0..50 {
-            assert!(e.on_failure(i * 1000).is_some(), "attempt {i}");
-        }
-    }
-
     /// The M4 soak's leak, as a test. With the breaker disabled nothing can read
     /// the window, and a zero interval could never expire anything out of it, so
     /// recording failures there grew it by one `Millis` per restart for as long
@@ -420,17 +413,6 @@ mod tests {
             0,
             "100,000 failures must not be 100,000 remembered timestamps"
         );
-    }
-
-    /// `StartLimitBurst=0` means "no limit", which is the other way to turn the
-    /// breaker off, and it must not record either.
-    #[test]
-    fn a_zero_burst_records_nothing() {
-        let mut e = engine(0, 0, 1_000_000);
-        for _ in 0..100_000 {
-            assert!(e.on_failure(0).is_some());
-        }
-        assert_eq!(e.failures_in_window(), 0);
     }
 
     /// The window holds what the breaker needs and no more: `burst` entries,

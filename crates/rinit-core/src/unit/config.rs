@@ -359,7 +359,7 @@ pub struct UnitConfig {
     /// Backoff base for restarts; `0` means restart immediately.
     pub restart_sec: u64,
     /// Failures allowed within the interval before the circuit breaker opens.
-    pub start_limit_burst: u64,
+    pub start_limit_burst: u32,
     /// Failure counting window; `0` disables the breaker.
     pub start_limit_interval_sec: u64,
     /// Start timeout; `0` means wait forever.

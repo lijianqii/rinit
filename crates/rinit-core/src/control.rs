@@ -507,9 +507,25 @@ pub fn decode_request(body: &[u8]) -> Result<Request, ProtocolError> {
 
 /// Encode a response body (without the length prefix).
 pub fn encode_response(status: Status, text: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(1 + text.len());
+    const MARKER: &str = "\n[truncated: control response exceeds the frame limit]";
+    // One status byte is part of the body; the rest is UTF-8 text.
+    let max_text = MAX_FRAME_BYTES.saturating_sub(1);
+    let mut out = Vec::with_capacity(1 + text.len().min(max_text));
     out.push(status.byte());
-    out.extend_from_slice(text.as_bytes());
+    if text.len() <= max_text {
+        out.extend_from_slice(text.as_bytes());
+        return out;
+    }
+
+    // Keep the beginning of ordinary replies, but never split a UTF-8
+    // codepoint. Log replies are already bounded newest-first by the caller.
+    let keep = max_text.saturating_sub(MARKER.len());
+    let mut end = text.len().min(keep);
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    out.extend_from_slice(text.as_bytes().get(..end).unwrap_or(&[]));
+    out.extend_from_slice(MARKER.as_bytes());
     out
 }
 
@@ -754,6 +770,34 @@ mod tests {
         assert!(text.contains("ghost.service"));
     }
 
+    /// A response can be larger than the protocol frame limit (the log ring
+    /// alone is 256 KiB). The encoder must keep the frame decodable and say
+    /// that it truncated rather than emit a frame its own client rejects.
+    #[test]
+    fn an_oversized_response_is_truncated_to_the_frame_limit() {
+        let text = "x".repeat(MAX_FRAME_BYTES * 2);
+        let body = encode_response(Status::Ok, &text);
+        assert!(
+            body.len() <= MAX_FRAME_BYTES,
+            "body is {} bytes",
+            body.len()
+        );
+        let (status, decoded) = decode_response(&body).expect("still decodable");
+        assert_eq!(status, Status::Ok);
+        assert!(
+            decoded.contains("truncated"),
+            "{}",
+            &decoded[..64.min(decoded.len())]
+        );
+
+        let wire = frame(&body);
+        let prefix: [u8; LENGTH_PREFIX_BYTES] = wire
+            .get(..LENGTH_PREFIX_BYTES)
+            .and_then(|prefix| prefix.try_into().ok())
+            .expect("prefix");
+        assert_eq!(frame_len(prefix), Ok(body.len()));
+    }
+
     /// A version bump must be refused, not ignored: this is the "hard reject"
     /// of plan §1.3(10).
     #[test]
@@ -960,7 +1004,7 @@ mod proptests {
 
         /// Responses round-trip too, including a non-ASCII payload.
         #[test]
-        fn responses_round_trip(text in ".*", status in 0u8..7) {
+        fn responses_round_trip(text in ".{0,1024}", status in 0u8..7) {
             let status = Status::from_byte(status).expect("generated in range");
             let body = encode_response(status, &text);
             prop_assert_eq!(decode_response(&body), Ok((status, text)));

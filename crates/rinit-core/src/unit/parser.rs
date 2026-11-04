@@ -195,6 +195,10 @@ struct Parser {
     /// `Section::key` pairs already seen, so the two `Type` directives (which
     /// legitimately appear once per section) do not collide.
     seen: Vec<(&'static str, String)>,
+    /// Line of `[Service] Type=`, for the cross-directive restart check.
+    service_type_line: Option<usize>,
+    /// Line of `[Service] Restart=`, for the same check.
+    restart_line: Option<usize>,
 }
 
 /// Directives that may legally appear more than once.
@@ -228,6 +232,8 @@ impl Parser {
             declared_unit_type: None,
             current_section: None,
             seen: Vec::new(),
+            service_type_line: None,
+            restart_line: None,
         }
     }
 
@@ -286,6 +292,21 @@ impl Parser {
                 unit: self.name.canonical().to_string(),
             });
         }
+        // A oneshot's exit *is* its start-up result; supervision never restarts
+        // one after it completes, and a failed start is terminal. Accepting a
+        // `Restart=` here would promise behaviour the manager does not have.
+        if self.cfg.service_kind == ServiceKind::Oneshot && self.cfg.restart != RestartPolicy::No {
+            let line = self
+                .restart_line
+                .or(self.service_type_line)
+                .unwrap_or_default();
+            return Err(invalid(
+                line,
+                "Restart",
+                "Type=oneshot",
+                "cannot restart a oneshot; use Type=simple or Restart=no",
+            ));
+        }
         Ok(self.cfg)
     }
 
@@ -338,6 +359,7 @@ impl Parser {
 
             // --- [Service] ------------------------------------------------
             (Section::Service, "Type") => {
+                self.service_type_line = Some(line);
                 let declared = joined();
                 self.cfg.service_kind = ServiceKind::parse(&declared).ok_or_else(|| {
                     invalid(
@@ -376,6 +398,7 @@ impl Parser {
                 self.cfg.health_check = command(&tokens);
             }
             (Section::Service, "Restart") => {
+                self.restart_line = Some(line);
                 let declared = joined();
                 self.cfg.restart = RestartPolicy::parse(&declared).ok_or_else(|| {
                     invalid(
@@ -390,7 +413,10 @@ impl Parser {
                 self.cfg.restart_sec = number(line, key, &tokens, Zero::Allowed)?;
             }
             (Section::Service, "StartLimitBurst") => {
-                self.cfg.start_limit_burst = number(line, key, &tokens, Zero::Rejected)?;
+                let value = number(line, key, &tokens, Zero::Rejected)?;
+                self.cfg.start_limit_burst = u32::try_from(value).map_err(|_| {
+                    invalid(line, key, &join_tokens(&tokens), "must fit in 32 bits")
+                })?;
             }
             (Section::Service, "StartLimitIntervalSec") => {
                 self.cfg.start_limit_interval_sec = number(line, key, &tokens, Zero::Allowed)?;
@@ -1227,6 +1253,35 @@ mod tests {
         assert_eq!(cfg.service_kind, ServiceKind::Oneshot);
     }
 
+    /// A oneshot's exit is its start-up result; the manager never restarts one.
+    /// Accepting `Restart=` here would promise behaviour that does not exist.
+    #[test]
+    fn a_oneshot_cannot_promise_a_restart() {
+        for policy in ["always", "on-success", "on-failure", "on-abnormal"] {
+            let text = format!("[Service]\nType=oneshot\nExecStart=/bin/true\nRestart={policy}\n");
+            assert!(
+                matches!(
+                    err("app.service", &text),
+                    ParseError::InvalidValue { line: 4, ref key, .. } if key == "Restart"
+                ),
+                "{policy} must be rejected"
+            );
+        }
+        // The directive may appear before `Type=`, and the error still points at
+        // `Restart=`.
+        assert!(matches!(
+            err(
+                "app.service",
+                "[Service]\nRestart=always\nType=oneshot\nExecStart=/bin/true\n"
+            ),
+            ParseError::InvalidValue { line: 2, ref key, .. } if key == "Restart"
+        ));
+        ok(
+            "app.service",
+            "[Service]\nType=oneshot\nExecStart=/bin/true\nRestart=no\n",
+        );
+    }
+
     #[test]
     fn a_line_without_an_equals_sign_is_a_syntax_error() {
         assert!(matches!(
@@ -1613,6 +1668,20 @@ mod tests {
                 "app.service",
                 "[Service]\nExecStart=/bin/true\nRestartSec=-1\n"
             ),
+            ParseError::InvalidValue { line: 3, .. }
+        ));
+    }
+
+    /// The breaker stores its burst as `u32`; a larger value must fail here
+    /// rather than silently truncate to a smaller (or zero) limit.
+    #[test]
+    fn a_start_limit_burst_larger_than_32_bits_is_rejected() {
+        let text = format!(
+            "[Service]\nExecStart=/bin/true\nStartLimitBurst={}\n",
+            u64::from(u32::MAX) + 1
+        );
+        assert!(matches!(
+            err("app.service", &text),
             ParseError::InvalidValue { line: 3, .. }
         ));
     }
