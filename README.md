@@ -28,10 +28,10 @@ test (`make check`) or a guest assertion (`make test-system`, 105 of them in
 | --------- | ------- | -------- |
 | M0 | PID 1 via `rdinit=`, first-wave mounts (`/run` → `/proc` → `/sys` → `/dev` → `/tmp` → `/sys/fs/cgroup`) with fatal/degradable rules per plan §1.3(9), the second wave (`/etc/fstab`, plan §1.3(9)) in file order with failures logged and the boot continuing, `SIGCHLD` + `waitpid(-1, WNOHANG)` reaping, panic hook to `/dev/kmsg` | guest: "mounted /run…", "mounted /sys/fs/cgroup", "mounted /data (fstab)", "fstab-tmpfs /data tmpfs", "no rinit panic"; host: `crates/rinit-runtime/src/fstab.rs` (6), `crates/rinit/tests/smoke.rs` |
 | M1 | unit files parsed from `/etc/rinit/units`, dependency graph resolved, units started level by level with each level in parallel | guest: "resolved a boot plan", "startup levels run in dependency order", "no target was exec'd" |
-| M2 | supervision (spawn, track, reap, two-stage stop), restart policy with backoff and a circuit breaker, health probes, `Type=notify` readiness, the in-memory log ring and its optional file mirror (plan §1.3(7)) | guest: "a crashed service is scheduled for restart", "the breaker tripped on the failing unit"; host: `crates/rinit/tests/m2_lifecycle.rs` (45 tests) |
+| M2 | supervision (spawn, track, reap, two-stage stop), restart policy with backoff and a circuit breaker, health probes, `Type=notify` readiness, the in-memory log ring and its optional file mirror (plan §1.3(7)) | guest: "a crashed service is scheduled for restart", "the breaker tripped on the failing unit"; host: `crates/rinit/tests/m2_lifecycle.rs` (50 tests) |
 | M3 | control socket + `rctl` (`list`, `status`, `start`, `stop`, `restart`, `reset-failed`, `log`, `reload`, `reboot`, `poweroff`), with a documented exit-code contract | guest: "rctl list reached the control socket" and the five assertions after it; host: `crates/rctl/tests/control.rs` (9 tests) |
 | M4 | soak harness for sustained churn (`make soak`), leak and descriptor fixes, `--dev` control-socket peer relaxation | `scripts/soak.sh` (see [Testing](#testing)); `crates/rinit-core/tests/allocations.rs` |
-| M5 | **§7.3–§7.11 done.** cgroup v2: `CgroupCPUMax=`, `CgroupMemoryMax=`, `CgroupMemoryHigh=`, `CgroupTasksMax=` under `rinit/<unit>`, the process placing itself, stop-flow signalling of the cgroup's members, `rmdir` cleanup, and OOM-kill detection into the restart policy. Sandboxing: `User=`, `Group=`, `NoNewPrivileges=`, `CapabilityBoundingSet=`, `AmbientCapabilities=`. Hardware watchdog: `/dev/watchdog` armed at boot, fed from the supervisor loop's health checkpoint, magic-closed on shutdown. Reload: `rctl reload` re-reads the unit directory, adds, changes, defers and removes, and refuses a directory that does not resolve. Legacy daemons: `Type=forking` with `PIDFile=`, located through the file or the unit's own cgroup. Terminals: `TTYPath=`/`TTYReset=` give a service a controlling terminal (plan §7.11). Templates: `worker@.service` with `%i`/`%n`/`%p` expanded at instantiation (plan §7.7). Sockets as dependencies: `Sockets=`/`NeedsSocket=`, resolved to a hard edge and a wait for the path (plan §7.8). Socket activation: `SocketActivate=`/`IdleTimeoutSec=`, rinit binding the socket and the connection starting the service (plan §7.9). With that, **every item of the plan's extension list (§7.1–§7.11) is implemented** | guest: "a limited unit was placed in its own cgroup", "the memory hard and soft limits were written in bytes", "a stopped unit's cgroup was removed", "the kernel OOM-killed a process inside the unit's cgroup", "rinit armed the guest's watchdog device", "the driver took the timeout rinit set", "the guest outlived the watchdog timeout with the device armed", "an added unit the boot target does not need was not started", "a changed unit that is running kept it for the next start", "a directory that does not resolve was refused whole", "the unit is active with the daemon the PIDFile named", "stopping a forking unit stopped the daemon it took over", "a TTYPath that is not a terminal fails the start", "a template is not a unit to start", "every specifier was expanded before the command ran", "a socket consumer waited for the path before starting", "a socket that never appears fails the start, naming it", "rinit bound the socket before any unit started", "starting it hands the service the listening socket", "a de-privileged service ran as nobody:nogroup with NoNewPrivs", "an empty CapabilityBoundingSet left a root service with no capabilities", "ambient capabilities reached a de-privileged service"; host: `crates/rinit/src/cgroup.rs` (19 tests), `crates/rinit-core/src/unit/cgroup.rs` (9), `crates/rinit-runtime/src/syscall/cgroup.rs` (14), `crates/rinit/src/watchdog.rs` (6), `crates/rinit-runtime/src/syscall/watchdog.rs` (6), `crates/rinit/src/unit_manager.rs` (5 for the reload itself, `reload.rs` is policy over them), `crates/rinit/tests/m2_lifecycle.rs` (11, end to end), `crates/rinit/src/sandbox.rs` (14), `crates/rinit-core/src/unit/sandbox.rs` (9), `crates/rinit-runtime/src/syscall/cred.rs` (14) |
+| M5 | **§7.3–§7.11 done.** cgroup v2: `CgroupCPUMax=`, `CgroupMemoryMax=`, `CgroupMemoryHigh=`, `CgroupTasksMax=` under `rinit/<unit>`, the process placing itself, stop-flow signalling of the cgroup's members, `rmdir` cleanup, and OOM-kill detection into the restart policy. Sandboxing: `User=`, `Group=`, `NoNewPrivileges=`, `CapabilityBoundingSet=`, `AmbientCapabilities=`. Hardware watchdog: `/dev/watchdog` armed after the first mount wave, fed from the shared boot/supervisor loop's health checkpoint, magic-closed just before the final reboot. Reload: `rctl reload` re-reads the unit directory, adds, changes, defers and removes, and refuses a directory that does not resolve. Legacy daemons: `Type=forking` with `PIDFile=`, located through the file or the unit's own cgroup. Terminals: `TTYPath=`/`TTYReset=` give a service a controlling terminal (plan §7.11). Templates: `worker@.service` with `%i`/`%n`/`%p` expanded at instantiation (plan §7.7). Sockets as dependencies: `Sockets=`/`NeedsSocket=`, resolved to a hard edge and a wait for the path (plan §7.8). Socket activation: `SocketActivate=`/`IdleTimeoutSec=`, rinit binding the socket and the connection starting the service (plan §7.9). With that, **every item of the plan's extension list (§7.1–§7.11) is implemented** | guest: "a limited unit was placed in its own cgroup", "the memory hard and soft limits were written in bytes", "a stopped unit's cgroup was removed", "the kernel OOM-killed a process inside the unit's cgroup", "rinit armed the guest's watchdog device", "the driver took the timeout rinit set", "the guest outlived the watchdog timeout with the device armed", "an added unit the boot target does not need was not started", "a changed unit that is running kept it for the next start", "a directory that does not resolve was refused whole", "the unit is active with the daemon the PIDFile named", "stopping a forking unit stopped the daemon it took over", "a TTYPath that is not a terminal fails the start", "a template is not a unit to start", "every specifier was expanded before the command ran", "a socket consumer waited for the path before starting", "a socket that never appears fails the start, naming it", "rinit bound the socket before any unit started", "starting it hands the service the listening socket", "a de-privileged service ran as nobody:nogroup with NoNewPrivs", "an empty CapabilityBoundingSet left a root service with no capabilities", "ambient capabilities reached a de-privileged service"; host: `crates/rinit/src/cgroup.rs` (19 tests), `crates/rinit-core/src/unit/cgroup.rs` (9), `crates/rinit-runtime/src/syscall/cgroup.rs` (14), `crates/rinit/src/watchdog.rs` (6), `crates/rinit-runtime/src/syscall/watchdog.rs` (6), `crates/rinit/src/unit_manager.rs` (5 for the reload itself, `reload.rs` is policy over them), `crates/rinit/tests/m2_lifecycle.rs` (11, end to end), `crates/rinit/src/sandbox.rs` (14), `crates/rinit-core/src/unit/sandbox.rs` (9), `crates/rinit-runtime/src/syscall/cred.rs` (14) |
 
 A real boot of the committed tree on the serial console (`…` elides kernel
 noise; the lines below are the ones `make test-system` asserts on, except that the
@@ -323,18 +323,19 @@ make test           # check + test-system
 make gates          # acceptance gates: binary size + coverage thresholds
 ```
 
-`cargo test --offline --workspace` (what `make check` runs last) executes **744
-tests** across eleven test binaries. The five shapes, and why each is not
+`cargo test --offline --workspace` (what `make check` runs last) executes **948
+tests** across 51 cargo test targets. The five shapes, and why each is not
 redundant:
 
-- **unit tests** next to the code (core 332, rinit 199, rinit-runtime 105,
-  rctl 15, processes 5), including `proptest` properties over the parser;
+- **unit tests** next to the code (core 334, rinit 213, rinit-runtime 114,
+  rinit-tools 170, rctl 16, processes 5), including `proptest` properties over
+  the parser;
 - **integration tests** in `crates/*/tests/`: the syscall layer against the real
-  kernel (`rinit-runtime` 22: run unprivileged, they assert that each drop is
+  kernel (`rinit-runtime` 26: run unprivileged, they assert that each drop is
   *refused* rather than silently skipped - `EPERM` from `setuid(0)`, `setgroups`,
   `PR_CAPBSET_DROP`, `capset` and the ambient raise, each naming the call that
   failed - with the root-only success paths deferred to the guest), the
-  lifecycle end to end in `--dev` mode (`rinit/tests/m2_lifecycle.rs` 45), the
+  lifecycle end to end in `--dev` mode (`rinit/tests/m2_lifecycle.rs` 50), the
   control CLI (`rctl/tests/control.rs` 9), the smoke test that runs the real
   binary (`rinit/tests/smoke.rs` 2), the allocation guard
   (`rinit-core/tests/allocations.rs` 2), and `shipped_units.rs` 7 - every unit in
@@ -418,12 +419,13 @@ they are measured on the tree as it stands rather than copied from one run:
 
 | crate            | line coverage | functions |
 | ---------------- | ------------- | --------- |
-| `rinit-core`     | **97.82%**    | 585/596   |
-| `rinit-runtime`  | 84.71%        | 283/327   |
-| `rinit`          | 88.46%        | 663/743   |
-| `rctl`           | 94.05%        | 40/48     |
-| `processes`      | 25.00%        | 22/80     |
-| **total**        | **88.48%**    | 1593/1794 |
+| `rinit-core`     | **97.74%**    | 587/598   |
+| `rinit-runtime`  | 83.37%        | 309/359   |
+| `rinit`          | 87.44%        | 764/863   |
+| `rinit-tools`    | 80.81%        | 502/675   |
+| `rctl`           | 93.06%        | 42/50     |
+| `processes`      | 25.04%        | 22/80     |
+| **total**        | **85.61%**    | 2226/2625 |
 
 The plan's checklist asks for ≥80% overall and ≥90% in the core, so these are the
 numbers that answer it rather than a shape:
@@ -458,11 +460,27 @@ cargo llvm-cov --offline --workspace --html                  # target/llvm-cov/h
 
 - **The log *file* is a mirror, not a journal.** Plan §1.3(7)'s optional
   persistence is implemented (`--log-file`, `/var/log/rinit/log` by default,
-  truncated at 1 MiB), but it is a copy of the ring's latest lines written with
-  plain `write_all` - no per-unit files, no `journalctl` query over the file, and
-  no syslog protocol. `rctl log` reads the ring, so a line is only in the file for
-  as long as the file is; whether that outlives a reboot is the filesystem's
-  business (tmpfs does not, a disk does).
+  truncated at 1 MiB). Captured lines are queued to a bounded buffer and written
+  in batches by the main loop, deliberately without a writer thread so `fork()`
+  stays single-threaded; a disk slower than the queue drops its oldest lines and
+  says so in the file. There are no per-unit files, no `journalctl` query over
+  the file, and no syslog protocol. `rctl log` reads the ring, so a line is only
+  in the file for as long as the file is; whether that outlives a reboot is the
+  filesystem's business (tmpfs does not, a disk does).
+- **Byte paths are supported by the core file tools, not every tool.** `rm`,
+  `cp`, `mv`, `cat`, `ls`, `stat`, `mkdir`, `ln`, `touch`, `readlink` and
+  `realpath` treat a non-UTF-8 argument as a path. `mktemp` templates and
+  `mount`/`umount` arguments are still UTF-8, and `ls` renders non-UTF-8
+  directory entries with replacement characters.
+- **The main service spawn now confirms exec off the main loop.** The `fork`
+  still happens on the main thread, then a blocking task reads the report and
+  the start flow polls it, so a stuck `chdir`/`execve` no longer blocks PID 1 for
+  five seconds. `ExecStartPre=`, health probes and `ExecStop=` still use the
+  synchronous wrapper.
+- **A `oneshot` cannot set `Restart=`.** A oneshot's exit is its start-up
+  result, so the manager never restarts it; the parser now rejects any
+  non-`no` `Restart=` instead of accepting a directive that would do nothing.
+  Use a `simple` worker for a long-running loop.
 - **`--dev` cannot de-privilege to another user, or drop a bounding set.** An
   unprivileged rinit gets `EPERM` from `setgid`, `setgroups` and
   `PR_CAPBSET_DROP`, so those units fail rather than run with the drop skipped -
@@ -481,7 +499,7 @@ cargo llvm-cov --offline --workspace --html                  # target/llvm-cov/h
   itself is not exercised: proving it means deliberately wedging PID 1 until the
   hardware fires, which would end the run being validated. What is proven is
   everything short of it - the device is opened and reported, the timeout reaches
-  a real driver, the supervisor loop feeds it (the guest outlives a timeout it
+  a real driver, the shared boot/supervisor loop feeds it (the guest outlives a timeout it
   would not survive unfed), and the guest boots exactly once.
 - **A cgroup limit is only proven against the controllers the running kernel
   has.** The guest's kernel is built with all four the plan's directives need
@@ -537,8 +555,8 @@ repository or a measurement in this README:
 | graceful shutdown, no zombies, no fd leak | `make soak` samples descriptors, threads and zombie children through restart churn, and asserts each comes back to its baseline |
 | 72 h soak with stable RSS | **Passed on the host.** Segment 9 on `8b373d8` completed **4,320/4,320 samples** and **8,640/8,640 control commands**. RSS peak per half fell from 5,168 kB to 4,300 kB, descriptor minima were 11 and 11 (peak 22), the maximum zombie streak was 1 transient sample, and the final quiescent sweep found 0 zombies. |
 | 24 h soak in the target guest | **Passed.** `7a5df04`, aarch64 `run-disk`, guest-side sampler: **1,440/1,440 samples** and **2,880/2,880 control commands** over 86,343 s. RSS stayed within 2,364–2,528 kB (half peaks 2,520/2,528), descriptors within 19–20, no zombie was ever observed, and the final sweep returned `quiescent=0 health_fail=0`. `eth0`, the default route, `udhcpc`, dropbear, `network.service` and `sshd.service` were healthy in every sample; the serial log shows one boot and no panic/OOM. Sampling runs inside the guest (`scripts/soak-qemu.sh` + `scripts/soak-guest.sh`), so a host SSH outage cannot end the run silently. |
-| binaries ≤2 MB dynamic / ≤4 MB static | [Measurements](#measurements-plan-01-calibration-point): 0.88 MiB dynamic arm64 / 0.94 MiB armv7, checked by `make size-check` |
-| unit test coverage ≥80% overall, ≥90% in the core | **88.48%** and **97.82%** (`make coverage-check`, [above](#testing)) |
+| binaries ≤2 MB dynamic / ≤4 MB static | [Measurements](#measurements-plan-01-calibration-point): 1.00 MiB dynamic arm64 / 1.07 MiB armv7, checked by `make size-check` |
+| unit test coverage ≥80% overall, ≥90% in the core | **85.61%** and **97.74%** (`make coverage-check`, [above](#testing)) |
 | documentation: architecture, unit format, `rctl`, porting | this README (architecture, status, measurements), [`docs/units.md`](docs/units.md) (every directive, its value syntax and its default), [`docs/porting.md`](docs/porting.md) (kernel, userspace, build, differences from systemd), and `rinit-开发计划.md` |
 
 One number the checklist does not ask for, but plan §0.1's design goals do: rinit's
@@ -636,8 +654,10 @@ manual step.
 
 This is deliberately not a security boundary: anyone who can reach the serial
 port already has the machine. The image ships `/etc/shadow` with the default
-`root`/`toor` credential for development; change it (or use the key-only
-`sshd.service` path) before deploying.
+`root`/`toor` credential for development; set `RINIT_ROOT_PASSWORD_HASH` when
+running `scripts/build-initramfs.sh` (or use the key-only `sshd.service` path)
+before deploying. Building a `--device-units` image with the default hash prints
+a warning; setting the variable to `!` locks the root password entirely.
 
 `units/shell.service` is the alternative: it skips `login` entirely, so you get
 a `~ #` prompt with no username to type. Both units want `ttyAMA0` and two
@@ -1018,7 +1038,7 @@ open. All are noted here so they are not mistaken for drift:
     supported**, which §7.4 calls out as a decision to record rather than a gap
     to close. Every `Exec*` command - `ExecStart`, `ExecStartPre`,
     `ExecStartPost`, `ExecStop`, `HealthCheck` - runs as `User=`/`Group=`, so a
-    preparation step cannot quietly run as root: `run_aux_command` resolves the
+    preparation step cannot quietly run as root: the start flow resolves the
     same sandbox the service gets. Work that genuinely needs root belongs in a
     system oneshot (`rinit-init.service`), not in an `ExecStartPre=`.
 16. **The watchdog is configured by flags, not by `/etc/rinit.conf`.** §7.5
@@ -1067,12 +1087,14 @@ open. All are noted here so they are not mistaken for drift:
     `Cgroup*=` directive to be locatable at all, and fails closed ("no PIDFile=
     and no cgroup of its own") rather than guessing from the process table. Two
     smaller consequences are recorded here because they are what the code does: a
-    pid the file names that is *not* in the unit's cgroup is moved into it (that
-    is the plan's "写入对应 cgroup", and it is what makes the unit's limits, its
-    stop signalling and its cleanup apply to the daemon), and the stop path
-    signals the unit's process *group* and then the pid itself - a daemon
-    inherited its group from whatever forked it, so the group signal can address
-    a group that no longer exists while the daemon is alive.
+    pid the file names that is *not* in the unit's cgroup is refused, not adopted
+    (moving an unrelated process into a unit would give it that unit's limits,
+    stop signal and cleanup), and the stop path signals the unit's process
+    *group* and then the pid itself - a daemon inherited its group from whatever
+    forked it, so the group signal can address a group that no longer exists
+    while the daemon is alive. Without a cgroup the file is accepted only when
+    the process's real/effective/saved/filesystem UIDs all match the unit's
+    `User=`.
 21. **A target only propagates `Requires=` failures; `After=` is ordering, not
     readiness.** Plan §7.2 literally says a target is ready when its `After=`
     dependencies are terminal and none failed. rinit follows systemd instead:
@@ -1080,6 +1102,23 @@ open. All are noted here so they are not mistaken for drift:
     failed `Requires=` does fail it. This is what keeps `multi-user.target`
     usable on a board with no NIC. The `a_wanted_after_failure_does_not_fail_the_target`
     regression test pins the distinction.
+22. **Boot rejects mutating control requests, but answers reads and power
+    requests.** Boot and supervision share one loop, and the control socket is
+    bound before the first level. Allowing `start`/`stop`/`reload` there would
+    let a client change the schedule the level walk is still consuming (or make
+    a level wait on a unit that was just removed). `list`, `status`, `log`,
+    `reboot` and `poweroff` remain available; a mutating request gets
+    `Conflict` with a "boot is still in progress" message. The socket is
+    otherwise fully live, which is what makes a hung boot diagnosable.
+23. **A socket watcher reports one connection per permit.** The listener is
+    level-triggered, so a queued connection the service has not accepted stays
+    readable. The watcher therefore waits for a one-byte permit from the main
+    loop before reporting, and the loop rearms it only when the unit is not
+    running, not starting, not failed, and its cooldown has elapsed. The cost is
+    one pending permit per idle socket; the benefit is no 10 ms wake-up loop
+    behind a stuck client. A failed socket unit is not retried until an explicit
+    `start`/`reset-failed`/reload, so a broken service cannot spin on the same
+    connection.
 
 ## Measurements (plan §0.1 calibration point)
 
@@ -1088,12 +1127,12 @@ byte counts as `ls -l` reports them:
 
 | target                               | binary              | size                    | in an image |
 | ------------------------------------ | ------------------- | ----------------------- | ----------- |
-| `aarch64-unknown-linux-gnu` (dynamic) | `rinit`             | 0.88 MiB (922 680 B)  | yes         |
-| `armv7-unknown-linux-gnueabihf` (dynamic) | `rinit`         | 0.94 MiB (986 468 B)  | yes         |
+| `aarch64-unknown-linux-gnu` (dynamic) | `rinit`             | 1.00 MiB (1 053 752 B) | yes        |
+| `armv7-unknown-linux-gnueabihf` (dynamic) | `rinit`         | 1.07 MiB (1 117 540 B) | yes        |
 | `x86_64-unknown-linux-musl` (static) | `rinit`             | 1.05 MiB (1 098 688 B)  | yes         |
 
-`rctl` is 332 584 B on aarch64 and 330 904 B on armv7; `processes` is 463 672 B
-and 461 984 B. All three are dynamic and are inside the initramfs; the loader, libc
+`rctl` is 332 576 B on aarch64 and 330 908 B on armv7; `processes` is 463 664 B
+and 461 988 B. All three are dynamic and are inside the initramfs; the loader, libc
 and libgcc are packaged alongside them. `make size-check` checks all three
 binaries of the selected ARCH with a 4 MiB guard. The musl figures are a manual build
 (`cargo build --release --target x86_64-unknown-linux-musl`), which is how that
@@ -1109,10 +1148,11 @@ command through the same spawn path a unit uses.
 
 The packed images (`build/out/initramfs-aarch64-unknown-linux-gnu.cpio.gz` and
 `…-demo.cpio.gz`: static busybox + dynamic rinit/rctl/processes + the unit directory + the
-`/etc`/`/var` skeleton) are 2.31 MiB (2 419 117 B) and 2.83 MiB (2 966 232 B)
-gzipped. The arm32 pair is 2.04 MiB (2 136 598 B) and 2.62 MiB (2 742 947 B).
-The `run-disk` images are ext4 files of at least 64 MiB (roughly 38-40 MiB used
-before the first boot, including the default 32 MiB swap file); they are not
+`/etc`/`/var` skeleton) are 8.16 MiB (8 557 197 B) and 8.16 MiB (8 563 070 B)
+gzipped. The arm32 pair is 8.33 MiB (8 732 403 B) and 8.34 MiB (8 738 765 B).
+The `run-disk` images are ext4 files of about 79 MiB logical size (roughly
+49-51 MiB used before the first boot, including the default 32 MiB swap file);
+they are not
 shipped in the initramfs. The difference is the
 fourteen files in `units/demo/`, which only the second initramfs carries. The packing is
 reproducible - `scripts/mkinitramfs.sh` zeroes the mtimes and inode numbers the

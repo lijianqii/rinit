@@ -4,7 +4,7 @@
 # Usage:
 #   scripts/run-qemu.sh --arch <aarch64|arm|x86_64> --kernel <Image|zImage|vmlinuz>
 #                       (--initrd <cpio.gz> | --disk <img> --root <dev>)
-#                       [--mem 256M] [--hostfwd tcp::2222-:22]
+#                       [--mem 256M] [--hostfwd tcp:127.0.0.1:2222-:22]
 #                       [--service "<cmd> [args...]"]
 #                       [--kernel-args "<tokens>"]
 #

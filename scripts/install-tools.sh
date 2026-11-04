@@ -114,7 +114,11 @@ while read -r applet cargo_bin install_path busybox_link budget_kib _source; do
     fi
 
     target_path="$install_path"
-    if [[ "$profile" == coexist && "$busybox_link" != "-" ]]; then
+    # Prefix only tools that would otherwise collide with a BusyBox applet.
+    # rlogin/rgetty live at paths BusyBox does not use (`/bin/login` is the
+    # applet), so their standard paths can be installed in coexist too - which
+    # is what keeps the shipped getty.service working without a unit variant.
+    if [[ "$profile" == coexist && "$busybox_link" != "-" && "$install_path" == "$busybox_link" ]]; then
         target_path="$(dirname "$install_path")/rinit-$applet"
     fi
     target="$rootfs$target_path"
@@ -122,6 +126,7 @@ while read -r applet cargo_bin install_path busybox_link budget_kib _source; do
     # Validate the replacement before removing anything from the rootfs.
     check_elf "$bin" "$target_path" "$budget_kib" || exit 1
 
+    link=""
     if [[ "$profile" == replace-system && "$busybox_link" != "-" ]]; then
         link="$rootfs$busybox_link"
         if [[ -L "$link" ]]; then
@@ -130,7 +135,6 @@ while read -r applet cargo_bin install_path busybox_link budget_kib _source; do
                 echo "install-tools: $busybox_link points at '$target_of_link', not busybox" >&2
                 exit 1
             }
-            rm -f "$link"
         elif [[ -e "$link" ]]; then
             # A previous replace-system install (or a deliberate operator
             # replacement) is a regular file; replacing it is idempotent.
@@ -139,7 +143,20 @@ while read -r applet cargo_bin install_path busybox_link budget_kib _source; do
     fi
 
     mkdir -p "$(dirname "$target")"
-    install -m 0755 "$bin" "$target"
+    # Write beside the target and rename over it. A failed install (ENOSPC,
+    # EACCES, interrupted build) must leave the old applet in place.
+    temporary="$target.rinit-tools.$$"
+    if ! install -m 0755 "$bin" "$temporary"; then
+        rm -f "$temporary"
+        exit 1
+    fi
+    mv -f "$temporary" "$target"
+    # Some tools (notably `rlogin`) install at a different path from the
+    # BusyBox applet they replace. Remove that old link only after the new
+    # binary is in place.
+    if [[ -n "$link" && "$link" != "$target" && -L "$link" ]]; then
+        rm -f "$link"
+    fi
     echo "install-tools: $target_path <- $bin"
     installed=$((installed + 1))
 done <"$manifest"

@@ -68,8 +68,7 @@ MIRROR           ?= https://mirrors.tuna.tsinghua.edu.cn
 KERNEL_URLS      ?= $(MIRROR)/kernel/v6.x/linux-$(KERNEL_VERSION).tar.xz \
                     https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$(KERNEL_VERSION).tar.xz
 BUSYBOX_URLS     ?= $(MIRROR)/busybox/busybox-$(BUSYBOX_VERSION).tar.bz2 \
-                    https://busybox.net/downloads/busybox-$(BUSYBOX_VERSION).tar.bz2 \
-                    https://busybox.net/downloads/busybox-$(BUSYBOX_VERSION).tar.gz
+                    https://busybox.net/downloads/busybox-$(BUSYBOX_VERSION).tar.bz2
 
 JOBS             ?= $(shell nproc 2>/dev/null || echo 2)
 # The initramfs now carries the full rinit-tools set; 128M is too small for the
@@ -81,7 +80,7 @@ QEMU_MEM         ?= 256M
 SWAP_SIZE_MB     ?= 32
 DROPBEAR_VERSION ?= 2026.94
 # Host-side SSH access to `run-disk`: ssh -p 2222 root@localhost.
-DISK_HOSTFWD     ?= tcp::2222-:22
+DISK_HOSTFWD     ?= tcp:127.0.0.1:2222-:22
 # Public key installed for root by `disk-image`; empty keeps the image keyless.
 AUTHORIZED_KEY   ?=
 # Extra MiB added to the disk image: long runs use 64 to get ~128 MB.

@@ -6,7 +6,9 @@
 # `-` means "no BusyBox link" / "no per-tool size budget yet".
 # The default profile is replace-system: the install path is a real ELF and the
 # BusyBox link at the same path is removed. The `coexist` profile is for A/B and
-# rollback and is not represented by this file.
+# rollback and is not represented by this file. It prefixes entries whose
+# install path collides with the BusyBox link; rlogin/rgetty keep their own
+# paths because BusyBox uses `login`/`getty`, not `rlogin`/`rgetty`.
 #
 # Existing binaries.
 rinit      rinit      /sbin/rinit      -               1229  crates/rinit

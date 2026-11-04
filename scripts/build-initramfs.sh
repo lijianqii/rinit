@@ -30,6 +30,10 @@
 #   --tools-profile    replace-system (default) or coexist; implies
 #                      --rinit-tools when passed.
 #
+# Environment:
+#   RUNTIME_LIB_DIR    directory holding the cross target's ld.so/libc/libgcc
+#                      (defaults to the Debian multiarch paths).
+#
 # Examples:
 #   scripts/build-initramfs.sh aarch64-unknown-linux-gnu --busybox-src build/src/busybox-1.36.1
 #   scripts/build-initramfs.sh x86_64-unknown-linux-musl         # rinit only
@@ -94,6 +98,17 @@ if [[ -n "${rootfs_out}" ]]; then
     # Absolute path: busybox's `make install` runs with -C its source tree, so
     # a relative CONFIG_PREFIX would resolve against that tree, not the repo.
     work="$(realpath -m "${rootfs_out}")"
+    # This directory is deleted wholesale. Keep the destructive default inside
+    # the build tree; an operator with a deliberate external path can opt in.
+    case "${work}" in
+        "${repo_root}/build/"*) ;;
+        *)
+            [[ "${ALLOW_ROOTFS_DELETE:-0}" == 1 ]] || {
+                echo "error: refusing to delete ${work}; set ALLOW_ROOTFS_DELETE=1 to allow an external --rootfs" >&2
+                exit 2
+            }
+            ;;
+    esac
     rm -rf "${work}"
     mkdir -p "${work}"
 else
@@ -136,7 +151,14 @@ case "${triple}" in
         runtime_libs=()
         ;;
 esac
+# A non-Debian cross toolchain keeps its sysroot elsewhere; let the caller
+# point at it instead of silently copying the host's Debian paths.
+runtime_lib_dir="${RUNTIME_LIB_DIR:-${runtime_lib_dir}}"
 if [[ -n "${runtime_lib_dir}" ]]; then
+    [[ -d "${runtime_lib_dir}" ]] || {
+        echo "error: runtime library directory ${runtime_lib_dir} does not exist" >&2
+        exit 1
+    }
     for lib in "${runtime_libs[@]}"; do
         install -m 0755 "${runtime_lib_dir}/${lib}" "${work}/lib/${lib}"
     done
@@ -155,7 +177,9 @@ install -m 0755 "${bin_dir}/rctl" "${work}/bin/rctl"
 # `processes` is available for the target images. The host-only x86_64 build
 # path may not have it, so keep that path working.
 if [[ -x "${bin_dir}/processes" ]]; then
-    install -m 0755 "${bin_dir}/processes" "${work}/usr/bin/processes"
+    # Keep the manifest path, so `install-tools.sh` overwrites the same file
+    # instead of leaving a second copy under /usr/bin.
+    install -m 0755 "${bin_dir}/processes" "${work}/bin/processes"
 fi
 
 # Plan §1.3(9)'s second wave: the mount table rinit reads after the first wave.
@@ -331,7 +355,12 @@ if [[ -n "${busybox_src}" ]]; then
     # (or switch to key-only access) before deploying. The hash is a fixed
     # SHA-512 crypt of "toor" with salt "rinit"; busybox's login supports it.
     printf 'root:x:0:0:root:/root:/bin/sh\nnobody:x:65534:65534:nobody:/nonexistent:/sbin/nologin\n' >"${work}/etc/passwd"
-    printf 'root:$6$rinit$h.sfVK5a75HqcCQ8mjFVlpyRSK5rin/8GpC7okbfq82BH16wN0lJDJUvCd.0bpt2/q/MtfkobUfMxtG72uIuj.:0:0:99999:7:::\nnobody:!:65534:0:99999:7:::\n' >"${work}/etc/shadow"
+    default_root_hash='$6$rinit$h.sfVK5a75HqcCQ8mjFVlpyRSK5rin/8GpC7okbfq82BH16wN0lJDJUvCd.0bpt2/q/MtfkobUfMxtG72uIuj.'
+    root_hash="${RINIT_ROOT_PASSWORD_HASH:-${default_root_hash}}"
+    printf 'root:%s:0:0:99999:7:::\nnobody:!:65534:0:99999:7:::\n' "${root_hash}" >"${work}/etc/shadow"
+    if [[ -n "${device_units}" && "${root_hash}" == "${default_root_hash}" ]]; then
+        echo "warning: device image uses the development root/toor password; set RINIT_ROOT_PASSWORD_HASH (use '!' to lock root) before deploying" >&2
+    fi
     chmod 0600 "${work}/etc/shadow"
     printf 'root:x:0:\nnogroup:x:65534:\n' >"${work}/etc/group"
 fi

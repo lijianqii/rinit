@@ -104,17 +104,17 @@ check() {
 
 "$repo_root/scripts/run-qemu.sh" --arch "$arch" \
     --kernel "$kernel" --disk "$image" --root /dev/vda \
-    --hostfwd "tcp::$port-:22" --kernel-args "-- --default device.target" \
+    --hostfwd "tcp:127.0.0.1:$port-:22" --kernel-args "-- --default device.target" \
     </dev/null >"$serial" 2>&1 &
 qemu_pid=$!
 
 wait_ssh || { echo "FAIL: SSH did not come up" >&2; tail -30 "$serial" >&2; exit 3; }
 
 for path in mount umount hostname ps free uptime dmesg df sysctl top reboot poweroff \
-    ls cat cp mv rm mkdir ln touch echo sleep uname mktemp sync stat rlogin \
+    processes ls cat cp mv rm mkdir ln touch echo sleep uname mktemp sync stat rlogin \
     id whoami env which dirname basename realpath readlink rgetty; do
     case "$path" in
-        mount | umount | hostname | ps | dmesg | df | ls | cat | cp | mv | rm | mkdir | ln | touch | echo | sleep | uname | mktemp | sync | stat | rlogin) full="/bin/$path" ;;
+        mount | umount | hostname | ps | dmesg | df | processes | ls | cat | cp | mv | rm | mkdir | ln | touch | echo | sleep | uname | mktemp | sync | stat | rlogin) full="/bin/$path" ;;
         free | uptime | top | id | whoami | env | which | dirname | basename | realpath | readlink) full="/usr/bin/$path" ;;
         sysctl | reboot | poweroff | rgetty) full="/sbin/$path" ;;
     esac

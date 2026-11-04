@@ -130,11 +130,13 @@ ExecStart=/usr/bin/api
   and removes it on shutdown, so a client sees a service that comes and goes
   rather than a socket that does.
 
-Two limits worth knowing: the socket is bound at boot, so a *reload* that adds or
-removes an activated unit takes effect only after a restart; and rinit does not
-create the directory policy around the socket beyond making it `0666` (systemd's
-own `SocketMode=` default) - a deployment that wants it narrower puts the socket in
-a directory with the permissions it means.
+Two limits worth knowing: rinit does not create the directory policy around the
+socket beyond making it `0666` (systemd's own `SocketMode=` default) - a
+deployment that wants it narrower puts the socket in a directory with the
+permissions it means; and a reload that adds, moves or removes `SocketActivate=`
+rebinds immediately, even when the running unit defers the rest of its new
+definition. The socket is rinit-owned state, not the service's process, so the
+directory's current path is the one a connection can wake.
 
 ### Sockets as dependencies
 
@@ -187,7 +189,7 @@ rather than leaving a service that believes it owns a terminal.
 | --- | ----- | ------- | ------- |
 | `Restart` | `no`, `always`, `on-success`, `on-failure`, `on-abnormal` | `no` | Which exits are retried. |
 | `RestartSec` | seconds, `0` allowed | `2` | Backoff base; the delay jitters upward from it. |
-| `StartLimitBurst` | count, `0` rejected | `5` | Failures allowed inside the window before the breaker trips and the unit stops being retried. |
+| `StartLimitBurst` | count, `0` rejected | `5` | Restart attempts allowed inside the window before the breaker trips. Clean exits under `Restart=always`/`on-success` count too: the breaker is a restart-rate limit, not only a crash counter. |
 | `StartLimitIntervalSec` | seconds, `0` allowed | `10` | The window. `0` disables the breaker. |
 | `TimeoutStartSec` | seconds, `0` = forever | `30` | How long a start may take (`notify`, `forking`, `oneshot`). |
 | `TimeoutStopSec` | seconds, `0` = `SIGKILL` at once | `10` | How long a stop may take before `SIGKILL`. |

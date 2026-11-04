@@ -175,7 +175,7 @@ start_qemu() {
     fi
     "$repo_root/scripts/run-qemu.sh" --arch "$arch" \
         --kernel "$kernel" --disk "$work_image" --root /dev/vda \
-        --hostfwd "tcp::$port-:22" --kernel-args "-- --default device.target" \
+        --hostfwd "tcp:127.0.0.1:$port-:22" --kernel-args "-- --default device.target" \
         </dev/null >>"$log" 2>&1 &
     qemu_pid=$!
     sleep 1

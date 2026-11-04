@@ -42,8 +42,8 @@ still boots with every unit unlimited.
   `libc.so.6` and `libgcc_s.so.1` for it.
 - `/bin/rctl` - the control client. Useless without the socket rinit binds at
   `/run/rinit/control.sock`, which is why the two ship together.
-- `/usr/bin/processes` - the `/proc` viewer. It reads `/proc` directly and does
-  not need the control socket.
+- `/bin/processes` - the `/proc` viewer. It reads `/proc` directly and does not
+  need the control socket.
 - `/etc/rinit/units/*.service|*.target` - the units. At minimum something that
   gives you a console (`getty.service`) or a shell, or a port to an appliance
   has nothing to talk to.
@@ -207,10 +207,11 @@ instead of silently losing a setting. The common ones:
   declares the path, the consumer waits for it.
 - `SocketActivate=`/`IdleTimeoutSec=` work as *activation* (plan §7.9): rinit
   binds the socket, the first connection starts the service, and the service is
-  handed the listening socket on fd 3 with `LISTEN_FDS=1`. Two differences from
-  systemd: the socket is bound at boot only (a reload that adds an activated unit
-  needs a restart), and there is no `Accept=yes` inetd-style mode - rinit always
-  passes the listening socket.
+  handed the listening socket on fd 3 with `LISTEN_FDS=1`. A reload rebinds or
+  releases the socket immediately; a running unit still defers the rest of its
+  new definition until its next start. One difference from systemd remains:
+  there is no `Accept=yes` inetd-style mode - rinit always passes the listening
+  socket.
 - `Type=idle`/`dbus`, `$MAINPID`, cgroup v1: not implemented.
 - `PermissionsStartOnly=` and the `+`/`-`/`!` prefixes: every `Exec*` runs as the
   unit's `User=`.

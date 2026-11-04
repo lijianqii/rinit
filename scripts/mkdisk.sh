@@ -66,6 +66,11 @@ elif command -v unshare >/dev/null 2>&1 && unshare -r true 2>/dev/null; then
     unshare -r --map-root-user "${mke2fs}" "${mke2fs_args[@]}" \
         -d "${root}" "${tmp}" "${blocks}"
 else
+    if [[ "${ALLOW_NONROOT_DISK:-0}" != 1 ]]; then
+        echo "mkdisk: error: no fakeroot or user namespace; the image would keep build-user ownership" >&2
+        echo "mkdisk: install fakeroot, or set ALLOW_NONROOT_DISK=1 to accept that" >&2
+        exit 1
+    fi
     echo "mkdisk: warning: no fakeroot/user namespace; image files keep build-user ownership" >&2
     "${mke2fs}" "${mke2fs_args[@]}" -d "${root}" "${tmp}" "${blocks}"
 fi

@@ -35,7 +35,7 @@ find "${root}" -exec touch -h -d @0 {} +
 # It does *not* touch mtimes (that is the `touch` above) - a build needs both, and
 # with both the same tree packs to the same bytes, which is what lets the README
 # quote a size instead of an approximation.
-( cd "${root}" && find . -print0 | cpio --null -o --format=newc --quiet --owner=0:0 --reproducible | gzip -9 ) >"${tmp}"
+( cd "${root}" && find . -print0 | sort -z | cpio --null -o --format=newc --quiet --owner=0:0 --reproducible | gzip -9 ) >"${tmp}"
 mv -f "${tmp}" "${out}"
 trap - EXIT
 echo "mkinitramfs: wrote ${out} ($(du -h "${out}" | cut -f1))"

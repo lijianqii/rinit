@@ -96,5 +96,21 @@ ln -s /bin/busybox "$root/bin/mount"
 check 'coexist installs rinit-mount' test -f "$root/bin/rinit-mount"
 check 'coexist keeps /bin/mount as BusyBox' test -L "$root/bin/mount"
 
+# 7. A tool whose install path is not the BusyBox applet does not need a
+# prefix: /bin/login stays BusyBox, /bin/rlogin is the new binary, and the
+# shipped getty.service can keep calling /sbin/rgetty.
+different="$tmp/different"
+mkdir -p "$different/root/bin" "$different/bin"
+touch "$different/root/bin/busybox"
+ln -s /bin/busybox "$different/root/bin/login"
+cp "$bin_src/rctl" "$different/bin/rlogin"
+cat >"$different.list" <<EOF
+rlogin rlogin /bin/rlogin /bin/login 1024 crates/rinit-tools/src/bin/rlogin/main.rs
+EOF
+"$installer" --rootfs "$different/root" --bin-dir "$different/bin" \
+    --manifest "$different.list" --arch aarch64 --profile coexist >/dev/null
+check 'coexist installs /bin/rlogin at its own path' test -f "$different/root/bin/rlogin"
+check 'coexist keeps /bin/login as BusyBox' test -L "$different/root/bin/login"
+
 echo "install-tools-test: $pass passed, $fail failed"
 exit $((fail > 0))

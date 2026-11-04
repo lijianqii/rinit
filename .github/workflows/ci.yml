@@ -127,7 +127,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             gcc-arm-linux-gnueabihf qemu-system-arm bc flex bison \
-            libssl-dev libelf-dev cpio
+            libssl-dev libelf-dev cpio fakeroot
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -169,6 +169,21 @@ jobs:
 
       - name: Boot and assert
         run: make ARCH=arm32 test-system
+
+      - name: Generate device test key
+        run: ssh-keygen -q -t ed25519 -N '' -f "$RUNNER_TEMP/device-key"
+
+      - name: Build the device image with that key
+        run: make ARCH=arm32 disk-image AUTHORIZED_KEY="$RUNNER_TEMP/device-key.pub"
+
+      - name: Exercise the replaced tools on armv7
+        run: >-
+          scripts/tools-test.sh
+          --arch arm
+          --image build/arm32/out/rinit-armv7-unknown-linux-gnueabihf.ext4
+          --kernel build/arm32/src/linux-6.6.158/arch/arm/boot/zImage
+          --key "$RUNNER_TEMP/device-key"
+          --tag ci-tools-arm
 
   guest:
     name: qemu system test (aarch64)

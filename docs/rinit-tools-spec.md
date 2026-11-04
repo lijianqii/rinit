@@ -64,9 +64,13 @@ network tools and every other applet not in the table above.
 ### `coexist`
 
 Keeps all BusyBox applets and installs the rinit tools under a `rinit-` prefix
-(for example `/bin/rinit-mount`). This is a development and A/B profile, and the
-rollback path if a replaced tool has a regression. It is not the release
-default.
+(for example `/bin/rinit-mount`). The exception is a tool whose install path is
+not the BusyBox applet it replaces: `rlogin` and `rgetty` already use the names
+`/bin/rlogin` and `/sbin/rgetty`, while BusyBox keeps `/bin/login` and
+`/sbin/getty`, so those two keep their standard paths and the shipped
+`getty.service` still works in this profile. This is a development and A/B
+profile, and the rollback path if a replaced tool has a regression. It is not
+the release default.
 
 ## 4. First version tool set
 
