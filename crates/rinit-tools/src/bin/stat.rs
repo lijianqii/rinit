@@ -1,7 +1,9 @@
 //! `stat` - display file status.
 
+use std::ffi::OsStr;
 use std::fs::{self, Metadata};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use rinit_tools::users;
@@ -57,7 +59,8 @@ fn group_label(gid: u32) -> String {
     users::group_name(gid).unwrap_or_else(|| "UNKNOWN".to_string())
 }
 
-fn render(format: &str, name: &str, meta: &Metadata) -> String {
+fn render(format: &str, name: impl AsRef<Path>, meta: &Metadata) -> String {
+    let name = name.as_ref().display().to_string();
     let mut out = String::new();
     let mut chars = format.chars();
     while let Some(ch) = chars.next() {
@@ -71,7 +74,7 @@ fn render(format: &str, name: &str, meta: &Metadata) -> String {
         };
         match directive {
             '%' => out.push('%'),
-            'n' => out.push_str(name),
+            'n' => out.push_str(&name),
             's' => out.push_str(&meta.size().to_string()),
             'a' => out.push_str(&format!("{:o}", meta.mode() & 0o7777)),
             'f' => out.push_str(&format!("{:x}", meta.mode())),
@@ -97,33 +100,45 @@ fn render(format: &str, name: &str, meta: &Metadata) -> String {
     out
 }
 
-fn run(args: &[String], program: &str) -> ExitCode {
+fn run<A: AsRef<OsStr>>(args: &[A], program: &str) -> ExitCode {
     let mut follow = false;
     let mut format = DEFAULT_FORMAT.to_string();
-    let mut paths: Vec<String> = Vec::new();
+    let mut paths: Vec<PathBuf> = Vec::new();
+    let marker = args.iter().position(|arg| arg.as_ref() == OsStr::new("--"));
+    let (options_args, trailing): (&[A], &[A]) = match marker {
+        Some(index) => (
+            args.get(..index).unwrap_or(&[]),
+            args.get(index + 1..).unwrap_or(&[]),
+        ),
+        None => (args, &[] as &[A]),
+    };
     let mut index = 0;
-    while let Some(arg) = args.get(index) {
-        match arg.as_str() {
-            "--help" => {
+    while let Some(arg) = options_args.get(index) {
+        match arg.as_ref().to_str() {
+            Some("--help") => {
                 println!("Usage: stat [-L] [-c FORMAT] [-t] FILE...");
                 return ExitCode::from(EXIT_OK);
             }
-            "-L" | "--dereference" => follow = true,
-            "-t" | "--terse" => format = TERSE_FORMAT.to_string(),
-            "-c" | "--format" => {
+            Some("-L" | "--dereference") => follow = true,
+            Some("-t" | "--terse") => format = TERSE_FORMAT.to_string(),
+            Some("-c" | "--format") => {
                 index += 1;
-                let Some(value) = args.get(index) else {
+                let Some(value) = options_args.get(index) else {
                     return ExitCode::from(usage_error(program, "-c needs a format"));
                 };
-                format = value.clone();
+                let Some(value) = value.as_ref().to_str() else {
+                    return ExitCode::from(usage_error(program, "-c needs a UTF-8 format"));
+                };
+                format = value.to_string();
             }
-            value if value.starts_with('-') && value != "-" => {
+            Some(value) if value.starts_with('-') && value != "-" => {
                 return ExitCode::from(usage_error(program, &format!("unknown option '{value}'")));
             }
-            value => paths.push(value.to_string()),
+            _ => paths.push(PathBuf::from(arg.as_ref())),
         }
         index += 1;
     }
+    paths.extend(trailing.iter().map(|arg| PathBuf::from(arg.as_ref())));
     if paths.is_empty() {
         return ExitCode::from(usage_error(program, "a file operand is required"));
     }
@@ -137,7 +152,7 @@ fn run(args: &[String], program: &str) -> ExitCode {
         match result {
             Ok(meta) => print!("{}", render(&format, &name, &meta)),
             Err(error) => {
-                eprintln!("{program}: {name}: {error}");
+                eprintln!("{program}: {}: {error}", name.display());
                 failed = true;
             }
         }
@@ -147,8 +162,14 @@ fn run(args: &[String], program: &str) -> ExitCode {
 
 fn main() -> ExitCode {
     rinit_tools::restore_sigpipe();
-    let program = program_name(std::env::args().next().as_deref(), "stat");
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let program = program_name(
+        std::env::args_os()
+            .next()
+            .as_deref()
+            .and_then(|arg| arg.to_str()),
+        "stat",
+    );
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     run(&args, &program)
 }
 
@@ -205,6 +226,64 @@ mod tests {
             run(&["/definitely/missing".to_string()], "stat"),
             ExitCode::from(1)
         );
-        assert_eq!(run(&[], "stat"), ExitCode::from(rinit_tools::EXIT_USAGE));
+        assert_eq!(
+            run(&[] as &[String], "stat"),
+            ExitCode::from(rinit_tools::EXIT_USAGE)
+        );
+    }
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn root(tag: &str) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("rinit-{}-{}-{tag}", "stat", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("root");
+        root
+    }
+
+    #[test]
+    fn run_formats_files_and_reports_missing_ones() {
+        let root = root("run");
+        let file = root.join("file");
+        fs::write(&file, b"x").expect("file");
+        let path = file.display().to_string();
+        assert_eq!(
+            run(std::slice::from_ref(&path), "stat"),
+            ExitCode::from(EXIT_OK)
+        );
+        assert_eq!(
+            run(&["-t".to_string(), path.clone()], "stat"),
+            ExitCode::from(EXIT_OK)
+        );
+        assert_eq!(
+            run(&["-c".to_string(), "%n".to_string(), path], "stat"),
+            ExitCode::from(EXIT_OK)
+        );
+        assert_eq!(
+            run(&[root.join("missing").display().to_string()], "stat"),
+            ExitCode::from(1)
+        );
+        assert_eq!(
+            run(&["--help".to_string()], "stat"),
+            ExitCode::from(EXIT_OK)
+        );
+        assert_eq!(
+            run(&["--bad".to_string()], "stat"),
+            ExitCode::from(rinit_tools::EXIT_USAGE)
+        );
+        assert_eq!(
+            run(&[] as &[String], "stat"),
+            ExitCode::from(rinit_tools::EXIT_USAGE)
+        );
+        assert_eq!(
+            run(&["-c".to_string()], "stat"),
+            ExitCode::from(rinit_tools::EXIT_USAGE)
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 }

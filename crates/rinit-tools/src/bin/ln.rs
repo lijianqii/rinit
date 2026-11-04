@@ -1,5 +1,6 @@
 //! `ln` - create hard and symbolic links.
 
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -43,29 +44,38 @@ fn link_one(target: &Path, link: &Path, options: Options) -> Result<(), String> 
     result.map_err(|error| format!("{} -> {}: {error}", link.display(), target.display()))
 }
 
-fn run(args: &[String], program: &str) -> ExitCode {
+fn run<A: AsRef<OsStr>>(args: &[A], program: &str) -> ExitCode {
     let mut options = Options::default();
-    let mut paths: Vec<String> = Vec::new();
-    for arg in args {
-        match arg.as_str() {
-            "--help" => {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    let marker = args.iter().position(|arg| arg.as_ref() == OsStr::new("--"));
+    let (options_args, trailing): (&[A], &[A]) = match marker {
+        Some(index) => (
+            args.get(..index).unwrap_or(&[]),
+            args.get(index + 1..).unwrap_or(&[]),
+        ),
+        None => (args, &[] as &[A]),
+    };
+    for arg in options_args {
+        match arg.as_ref().to_str() {
+            Some("--help") => {
                 println!("Usage: ln [-sfn] TARGET... LINK");
                 return ExitCode::from(EXIT_OK);
             }
-            "-s" | "--symbolic" => options.symbolic = true,
-            "-f" | "--force" => options.force = true,
-            "-n" | "--no-dereference" => options.no_dereference = true,
-            value if value.starts_with('-') && value != "-" => {
+            Some("-s" | "--symbolic") => options.symbolic = true,
+            Some("-f" | "--force") => options.force = true,
+            Some("-n" | "--no-dereference") => options.no_dereference = true,
+            Some(value) if value.starts_with('-') && value != "-" => {
                 return ExitCode::from(usage_error(program, &format!("unknown option '{value}'")));
             }
-            value => paths.push(value.to_string()),
+            _ => paths.push(PathBuf::from(arg.as_ref())),
         }
     }
+    paths.extend(trailing.iter().map(|arg| PathBuf::from(arg.as_ref())));
     let (dst, targets) = match paths.split_last() {
         Some((dst, targets)) if !targets.is_empty() => (dst, targets),
         _ => return ExitCode::from(usage_error(program, "TARGET and LINK are required")),
     };
-    let dst_path = Path::new(dst);
+    let dst_path = dst.as_path();
     if targets.len() > 1 {
         let is_dir = fs::metadata(dst_path)
             .map(|meta| meta.is_dir())
@@ -76,7 +86,7 @@ fn run(args: &[String], program: &str) -> ExitCode {
     }
     let mut failed = false;
     for target in targets {
-        let target_path = Path::new(target);
+        let target_path = target.as_path();
         match destination_for(target_path, dst_path, options)
             .and_then(|link| link_one(target_path, &link, options))
         {
@@ -92,8 +102,14 @@ fn run(args: &[String], program: &str) -> ExitCode {
 
 fn main() -> ExitCode {
     rinit_tools::restore_sigpipe();
-    let program = program_name(std::env::args().next().as_deref(), "ln");
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let program = program_name(
+        std::env::args_os()
+            .next()
+            .as_deref()
+            .and_then(|arg| arg.to_str()),
+        "ln",
+    );
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     run(&args, &program)
 }
 
@@ -175,6 +191,65 @@ mod tests {
             run(&["--bad".to_string()], "ln"),
             ExitCode::from(rinit_tools::EXIT_USAGE)
         );
-        assert_eq!(run(&[], "ln"), ExitCode::from(rinit_tools::EXIT_USAGE));
+        assert_eq!(
+            run(&[] as &[String], "ln"),
+            ExitCode::from(rinit_tools::EXIT_USAGE)
+        );
+    }
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn root(tag: &str) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("rinit-{}-{}-{tag}", "ln", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("root");
+        root
+    }
+
+    #[test]
+    fn run_links_and_reports_usage_errors() {
+        let root = root("run");
+        let target = root.join("target");
+        fs::write(&target, b"x").expect("target");
+        let link = root.join("link");
+        assert_eq!(
+            run(
+                &[
+                    "-s".to_string(),
+                    target.display().to_string(),
+                    link.display().to_string()
+                ],
+                "ln"
+            ),
+            ExitCode::from(EXIT_OK)
+        );
+        assert!(link.exists());
+        assert_eq!(
+            run(
+                &[
+                    "-s".to_string(),
+                    "-f".to_string(),
+                    target.display().to_string(),
+                    link.display().to_string()
+                ],
+                "ln"
+            ),
+            ExitCode::from(EXIT_OK)
+        );
+        assert_eq!(run(&["--help".to_string()], "ln"), ExitCode::from(EXIT_OK));
+        assert_eq!(
+            run(&["--bad".to_string()], "ln"),
+            ExitCode::from(rinit_tools::EXIT_USAGE)
+        );
+        assert_eq!(
+            run(&[] as &[String], "ln"),
+            ExitCode::from(rinit_tools::EXIT_USAGE)
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 }

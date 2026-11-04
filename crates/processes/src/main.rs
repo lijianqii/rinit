@@ -23,7 +23,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
@@ -156,7 +156,7 @@ fn main() {
     let opts = match parse_args(args.into_iter()) {
         Ok(Some(opts)) => opts,
         Ok(None) => {
-            print!("{USAGE}");
+            let _ = std::io::stdout().write_all(USAGE.as_bytes());
             return;
         }
         Err(message) => {
@@ -167,6 +167,7 @@ fn main() {
 
     match run(&opts) {
         Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {}
         Err(e) => {
             eprintln!("processes: {e}");
             std::process::exit(1);
@@ -195,11 +196,11 @@ fn run(opts: &Options) -> io::Result<()> {
     }
 
     if opts.json {
-        print_json(&processes);
+        print_json(&processes)?;
     } else if opts.tree {
-        print_tree(&processes, opts);
+        print_tree(&processes, opts)?;
     } else {
-        print_table(&processes, opts);
+        print_table(&processes, opts)?;
     }
     Ok(())
 }
@@ -210,7 +211,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<Options>,
         match arg.as_str() {
             "-h" | "--help" => return Ok(None),
             "-V" | "--version" => {
-                println!("processes {}", env!("CARGO_PKG_VERSION"));
+                let _ = writeln!(std::io::stdout(), "processes {}", env!("CARGO_PKG_VERSION"));
                 return Ok(None);
             }
             "--tree" => opts.tree = true,
@@ -535,15 +536,15 @@ fn sort_for_tree(processes: &mut [Process]) {
     processes.sort_by_key(|process| process.pid);
 }
 
-fn print_table(processes: &[Process], opts: &Options) {
+fn print_table(processes: &[Process], opts: &Options) -> io::Result<()> {
     let mut rows = Vec::new();
     for process in processes {
         rows.push(table_row(process, "", opts.long));
     }
-    print_rows(rows, opts);
+    print_rows(rows, opts)
 }
 
-fn print_tree(processes: &[Process], opts: &Options) {
+fn print_tree(processes: &[Process], opts: &Options) -> io::Result<()> {
     let by_pid: BTreeMap<u32, &Process> = processes
         .iter()
         .map(|process| (process.pid, process))
@@ -574,7 +575,7 @@ fn print_tree(processes: &[Process], opts: &Options) {
         let last = index + 1 == roots.len();
         tree.walk(*pid, "", last, true);
     }
-    print_rows(tree.rows, opts);
+    print_rows(tree.rows, opts)
 }
 
 struct TreeContext<'a> {
@@ -654,7 +655,7 @@ fn table_row(process: &Process, prefix: &str, long: bool) -> Vec<String> {
     row
 }
 
-fn print_rows(rows: Vec<Vec<String>>, opts: &Options) {
+fn print_rows(rows: Vec<Vec<String>>, opts: &Options) -> io::Result<()> {
     let mut headers: Vec<String> = ["PID", "PPID", "USER", "STAT", "VSZ", "RSS", "%CPU", "TIME+"]
         .iter()
         .map(|value| (*value).to_string())
@@ -674,14 +675,15 @@ fn print_rows(rows: Vec<Vec<String>>, opts: &Options) {
     }
 
     if !opts.no_header {
-        println!("{}", format_row(&headers, &width));
+        writeln!(std::io::stdout(), "{}", format_row(&headers, &width))?;
     }
     for row in &rows {
-        println!("{}", format_row(row, &width));
+        writeln!(std::io::stdout(), "{}", format_row(row, &width))?;
     }
+    Ok(())
 }
 
-fn print_json(processes: &[Process]) {
+fn print_json(processes: &[Process]) -> io::Result<()> {
     let rows = processes
         .iter()
         .map(|process| {
@@ -703,7 +705,7 @@ fn print_json(processes: &[Process]) {
             )
         })
         .collect::<Vec<_>>();
-    println!("[{}]", rows.join(","));
+    writeln!(std::io::stdout(), "[{}]", rows.join(","))
 }
 
 fn format_row(values: &[String], width: &[usize]) -> String {

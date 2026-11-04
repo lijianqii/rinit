@@ -26,6 +26,34 @@ pub fn dead_record(pid: i32, tty: &str) -> io::Result<()> {
     record(DEAD_PROCESS, pid, tty, "", None)
 }
 
+/// Count live `USER_PROCESS` records in a utmp file.
+///
+/// A missing or unreadable file is not fatal to `uptime`; the caller decides
+/// whether zero or an error is the better answer.
+pub fn user_count(path: &Path) -> io::Result<usize> {
+    let data = std::fs::read(path)?;
+    let size = std::mem::size_of::<libc::utmpx>();
+    let mut count = 0;
+    for chunk in data.chunks_exact(size) {
+        // Copying the bytes is alignment-safe; reading a `&utmpx` directly
+        // from the file buffer would not be.
+        let mut entry: libc::utmpx = unsafe { std::mem::zeroed() };
+        // SAFETY: `chunk` is exactly `size_of::<utmpx>()` bytes and `entry` is
+        // a valid `utmpx` destination.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                chunk.as_ptr(),
+                (&mut entry as *mut libc::utmpx).cast::<u8>(),
+                size,
+            );
+        }
+        if entry.ut_type == USER_PROCESS {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
 fn record(kind: i16, pid: i32, tty: &str, user: &str, host: Option<&str>) -> io::Result<()> {
     record_at(
         Path::new("/var/run/utmp"),
@@ -144,7 +172,7 @@ mod tests {
             &wtmp,
             USER_PROCESS,
             42,
-            "ttyAMA0",
+            "ttyAMA1",
             "root",
             Some("console"),
         )
@@ -152,6 +180,7 @@ mod tests {
         record_at(&utmp, &wtmp, DEAD_PROCESS, 42, "ttyAMA0", "", None).expect("dead record");
         assert!(std::fs::metadata(&utmp).expect("utmp").len() > 0);
         assert!(std::fs::metadata(&wtmp).expect("wtmp").len() > 0);
+        assert_eq!(user_count(&utmp).expect("count"), 1);
         let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -147,8 +147,17 @@ fn run(args: &[String], program: &str) -> ExitCode {
 
 fn main() -> ExitCode {
     rinit_tools::restore_sigpipe();
-    let program = program_name(std::env::args().next().as_deref(), "env");
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let program = program_name(
+        std::env::args_os()
+            .next()
+            .as_deref()
+            .and_then(|arg| arg.to_str()),
+        "env",
+    );
+    let Some(args) = rinit_tools::utf8_args(&program) else {
+        return ExitCode::from(rinit_tools::EXIT_USAGE);
+    };
+    let args: Vec<String> = args.into_iter().skip(1).collect();
     run(&args, &program)
 }
 
@@ -210,6 +219,53 @@ mod tests {
         assert_eq!(
             run(&["--bad".to_string()], "env"),
             ExitCode::from(rinit_tools::EXIT_USAGE)
+        );
+    }
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+
+    #[test]
+    fn run_builds_environments_and_reports_usage_errors() {
+        assert_eq!(run(&["--help".to_string()], "env"), ExitCode::from(EXIT_OK));
+        assert_eq!(run(&["-i".to_string()], "env"), ExitCode::from(EXIT_OK));
+        assert_eq!(
+            run(
+                &[
+                    "-i".to_string(),
+                    "FOO=bar".to_string(),
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "test \"$FOO\" = bar".to_string()
+                ],
+                "env"
+            ),
+            ExitCode::from(EXIT_OK)
+        );
+        assert_eq!(
+            run(
+                &[
+                    "-u".to_string(),
+                    "PATH".to_string(),
+                    "/bin/true".to_string()
+                ],
+                "env"
+            ),
+            ExitCode::from(EXIT_OK)
+        );
+        assert_eq!(
+            run(&["--bad".to_string()], "env"),
+            ExitCode::from(rinit_tools::EXIT_USAGE)
+        );
+        assert_eq!(
+            run(&["-u".to_string()], "env"),
+            ExitCode::from(rinit_tools::EXIT_USAGE)
+        );
+        assert_eq!(
+            run(&["/definitely/missing".to_string()], "env"),
+            ExitCode::from(1)
         );
     }
 }

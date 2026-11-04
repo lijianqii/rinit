@@ -1,50 +1,73 @@
 //! `realpath` - resolve path names.
 
+use std::ffi::OsStr;
 use std::io::Write;
-use std::path::Path;
+use std::os::unix::ffi::OsStrExt;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use rinit_tools::pathutil;
 use rinit_tools::{EXIT_OK, program_name, usage_error};
 
-fn run(args: &[String], program: &str) -> ExitCode {
+fn run<A: AsRef<OsStr>>(args: &[A], program: &str) -> ExitCode {
     let mut allow_missing = false;
     let mut quiet = false;
     let mut zero = false;
-    let mut paths: Vec<String> = Vec::new();
-    for arg in args {
-        match arg.as_str() {
-            "--help" => {
-                println!("Usage: realpath [-e|-m] [-q] [-z] PATH...");
+    let mut paths: Vec<PathBuf> = Vec::new();
+    let marker = args.iter().position(|arg| arg.as_ref() == OsStr::new("--"));
+    let (options_args, trailing): (&[A], &[A]) = match marker {
+        Some(index) => (
+            args.get(..index).unwrap_or(&[]),
+            args.get(index + 1..).unwrap_or(&[]),
+        ),
+        None => (args, &[] as &[A]),
+    };
+    for arg in options_args {
+        match arg.as_ref().to_str() {
+            Some("--help") => {
+                println!("Usage: realpath [-e|-m|-P] [-q] [-z] PATH...");
                 return ExitCode::from(EXIT_OK);
             }
-            "-e" | "--canonicalize-existing" => allow_missing = false,
-            "-m" | "--canonicalize-missing" => allow_missing = true,
-            "-q" | "--quiet" => quiet = true,
-            "-z" | "--zero" => zero = true,
-            "-L" | "--logical" | "-P" | "--physical" => {}
-            value if value.starts_with('-') && value != "-" => {
+            Some("-e" | "--canonicalize-existing") => allow_missing = false,
+            Some("-m" | "--canonicalize-missing") => allow_missing = true,
+            Some("-q" | "--quiet") => quiet = true,
+            Some("-z" | "--zero") => zero = true,
+            // Physical resolution is the only mode implemented; `-P` is the
+            // default and is accepted for compatibility. `-L` would silently
+            // mean something else, and the tool contract says an unsupported
+            // option must fail rather than be ignored.
+            Some("-P" | "--physical") => {}
+            Some("-L" | "--logical") => {
+                return ExitCode::from(usage_error(
+                    program,
+                    "logical resolution (-L) is not supported",
+                ));
+            }
+            Some(value) if value.starts_with('-') && value != "-" => {
                 return ExitCode::from(usage_error(program, &format!("unknown option '{value}'")));
             }
-            value => paths.push(value.to_string()),
+            _ => paths.push(PathBuf::from(arg.as_ref())),
         }
     }
+    paths.extend(trailing.iter().map(|arg| PathBuf::from(arg.as_ref())));
     if paths.is_empty() {
         return ExitCode::from(usage_error(program, "a path operand is required"));
     }
     let mut failed = false;
     let mut stdout = std::io::stdout().lock();
     for path in paths {
-        match pathutil::resolve(Path::new(&path), allow_missing) {
+        match pathutil::resolve(&path, allow_missing) {
             Ok(resolved) => {
-                let text = resolved.display().to_string();
-                let result = if zero {
-                    stdout
-                        .write_all(text.as_bytes())
-                        .and_then(|()| stdout.write_all(b"\0"))
-                } else {
-                    writeln!(stdout, "{text}")
-                };
+                // A resolved path is bytes, not text; printing it through
+                // `display()` would substitute U+FFFD for a non-UTF-8 name.
+                let bytes = resolved.as_os_str().as_bytes();
+                let result = stdout.write_all(bytes).and_then(|()| {
+                    if zero {
+                        stdout.write_all(b"\0")
+                    } else {
+                        stdout.write_all(b"\n")
+                    }
+                });
                 if let Err(error) = result {
                     if !quiet {
                         eprintln!("{program}: {error}");
@@ -54,7 +77,7 @@ fn run(args: &[String], program: &str) -> ExitCode {
             }
             Err(error) => {
                 if !quiet {
-                    eprintln!("{program}: {path}: {error}");
+                    eprintln!("{program}: {}: {error}", path.display());
                 }
                 failed = true;
             }
@@ -65,8 +88,14 @@ fn run(args: &[String], program: &str) -> ExitCode {
 
 fn main() -> ExitCode {
     rinit_tools::restore_sigpipe();
-    let program = program_name(std::env::args().next().as_deref(), "realpath");
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let program = program_name(
+        std::env::args_os()
+            .next()
+            .as_deref()
+            .and_then(|arg| arg.to_str()),
+        "realpath",
+    );
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     run(&args, &program)
 }
 
@@ -117,7 +146,16 @@ mod tests {
             ExitCode::from(rinit_tools::EXIT_USAGE)
         );
         assert_eq!(
-            run(&[], "realpath"),
+            run(&["-L".to_string(), ".".to_string()], "realpath"),
+            ExitCode::from(rinit_tools::EXIT_USAGE),
+            "an unimplemented option must be rejected, not silently ignored"
+        );
+        assert_eq!(
+            run(&["-P".to_string(), ".".to_string()], "realpath"),
+            ExitCode::from(EXIT_OK)
+        );
+        assert_eq!(
+            run(&[] as &[String], "realpath"),
             ExitCode::from(rinit_tools::EXIT_USAGE)
         );
     }

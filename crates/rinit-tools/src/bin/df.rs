@@ -99,8 +99,23 @@ fn run(args: &[String], root: &std::path::Path, program: &str) -> ExitCode {
             return ExitCode::from(1);
         }
     }
+    let mut failed = false;
     if !paths.is_empty() {
-        mounts.retain(|(_, mount)| paths.iter().any(|path| path == mount));
+        let mut selected = Vec::new();
+        for path in &paths {
+            match mount_for(&mounts, path) {
+                Some(entry) => {
+                    if !selected.contains(entry) {
+                        selected.push(entry.clone());
+                    }
+                }
+                None => {
+                    eprintln!("{program}: {path}: not found");
+                    failed = true;
+                }
+            }
+        }
+        mounts = selected;
     }
 
     println!("Filesystem     1K-blocks      Used Available Use% Mounted on");
@@ -117,16 +132,41 @@ fn run(args: &[String], root: &std::path::Path, program: &str) -> ExitCode {
                     "{device:<14} {total_s:>10} {used_s:>9} {avail_s:>9} {percent:>3}% {mount}"
                 );
             }
-            Err(e) => eprintln!("{program}: {mount}: {e}"),
+            Err(e) => {
+                eprintln!("{program}: {mount}: {e}");
+                failed = true;
+            }
         }
     }
-    ExitCode::from(EXIT_OK)
+    ExitCode::from(if failed { 1 } else { EXIT_OK })
+}
+
+/// The mount point a path belongs to: the longest mount that is a path-prefix
+/// of it, with a component boundary so `/mntx` does not match `/mnt`.
+fn mount_for<'a>(mounts: &'a [(String, String)], path: &str) -> Option<&'a (String, String)> {
+    mounts
+        .iter()
+        .filter(|(_, mount)| {
+            path == mount
+                || (path.starts_with(mount)
+                    && (mount == "/" || path.as_bytes().get(mount.len()) == Some(&b'/')))
+        })
+        .max_by_key(|(_, mount)| mount.len())
 }
 
 fn main() -> ExitCode {
     rinit_tools::restore_sigpipe();
-    let program = program_name(std::env::args().next().as_deref(), "df");
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let program = program_name(
+        std::env::args_os()
+            .next()
+            .as_deref()
+            .and_then(|arg| arg.to_str()),
+        "df",
+    );
+    let Some(args) = rinit_tools::utf8_args(&program) else {
+        return ExitCode::from(rinit_tools::EXIT_USAGE);
+    };
+    let args: Vec<String> = args.into_iter().skip(1).collect();
     run(&args, std::path::Path::new("/"), &program)
 }
 
@@ -179,8 +219,14 @@ mod root_tests {
             ExitCode::from(0)
         );
         assert_eq!(
+            run(&[format!("{}/child", mount.display())], &root, "df"),
+            ExitCode::from(0),
+            "a path inside a mount resolves to that mount"
+        );
+        assert_eq!(
             run(&["/not-mounted".to_string()], &root, "df"),
-            ExitCode::from(0)
+            ExitCode::from(1),
+            "an unknown path is a failure, not an empty success"
         );
         let _ = std::fs::remove_dir_all(root);
     }

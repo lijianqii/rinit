@@ -56,6 +56,32 @@ pub fn resolve(path: &Path, allow_missing: bool) -> io::Result<PathBuf> {
     }
 }
 
+/// Resolve `path` where every component but the last must exist.
+///
+/// This is `readlink -f`/`realpath`'s middle ground: the parent directory is
+/// canonicalized (following its symlinks), and the final component is appended
+/// without requiring it to exist. A missing intermediate directory still fails,
+/// which is what separates `-f` from `-m`.
+pub fn resolve_final(path: &Path) -> io::Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    if let Ok(resolved) = std::fs::canonicalize(&absolute) {
+        return Ok(resolved);
+    }
+    let Some(name) = absolute.file_name() else {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("cannot resolve '{}'", path.display()),
+        ));
+    };
+    let parent = absolute.parent().unwrap_or_else(|| Path::new("/"));
+    let parent = std::fs::canonicalize(parent)?;
+    Ok(parent.join(name))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

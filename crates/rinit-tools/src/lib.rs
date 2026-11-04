@@ -70,6 +70,50 @@ pub fn usage_error(program: &str, message: &str) -> u8 {
     EXIT_USAGE
 }
 
+/// Collect the process arguments, refusing one that is not valid UTF-8.
+///
+/// The tools currently express paths as `String`. Converting a byte path
+/// lossily could make `rm`/`mv`/`cp` operate on a *different* file, which is
+/// worse than refusing the command, so a non-UTF-8 argument is a usage error.
+/// `args_os` also keeps `std::env::args()`'s panic out of the process: release
+/// builds set `panic = "abort"`, and an abort is not the documented exit code 2.
+pub fn utf8_args(program: &str) -> Option<Vec<String>> {
+    strings_from_args(program, std::env::args_os())
+}
+
+fn strings_from_args(
+    program: &str,
+    args: impl IntoIterator<Item = std::ffi::OsString>,
+) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    for (index, arg) in args.into_iter().enumerate() {
+        match arg.into_string() {
+            Ok(text) => out.push(text),
+            Err(_) => {
+                eprintln!("{program}: argument {index} is not valid UTF-8");
+                return None;
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Split arguments at the first `--`.
+///
+/// Everything after the marker is an operand even if it starts with `-`, which
+/// is what lets `rm -- -file` and `cp -- a b` work. The marker itself is
+/// dropped. Without one, the second slice is empty and the first is `args`.
+pub fn split_double_dash(args: &[String]) -> (&[String], &[String]) {
+    match args.iter().position(|arg| arg == "--") {
+        Some(index) => {
+            let options = args.get(..index).unwrap_or(&[]);
+            let operands = args.get(index + 1..).unwrap_or(&[]);
+            (options, operands)
+        }
+        None => (args, &[]),
+    }
+}
+
 /// Restore the default `SIGPIPE` disposition at the start of a CLI tool.
 ///
 /// Rust ignores `SIGPIPE`, so `ps | head` would otherwise panic on the first
@@ -114,6 +158,43 @@ mod tests {
         assert_eq!(parse_u64("42", "tail"), Ok(42));
         let error = parse_u64("-1", "tail").expect_err("negative is not unsigned");
         assert!(error.contains("tail"), "{error}");
+    }
+
+    #[test]
+    fn a_non_utf8_argument_is_refused_instead_of_panicking() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let good = strings_from_args("tool", [OsString::from("tool"), OsString::from("file")])
+            .expect("UTF-8 arguments");
+        assert_eq!(good, ["tool", "file"]);
+
+        let bad = strings_from_args(
+            "tool",
+            [
+                OsString::from("tool"),
+                OsString::from_vec(vec![b'f', 0xff, b'x']),
+            ],
+        );
+        assert!(bad.is_none(), "a byte path must be a usage error");
+    }
+
+    #[test]
+    fn double_dash_ends_option_parsing() {
+        let args = vec![
+            "-r".to_string(),
+            "--".to_string(),
+            "-file".to_string(),
+            "x".to_string(),
+        ];
+        let (options, operands) = split_double_dash(&args);
+        assert_eq!(options, ["-r"]);
+        assert_eq!(operands, ["-file", "x"]);
+
+        let plain = vec!["a".to_string(), "b".to_string()];
+        let (options, operands) = split_double_dash(&plain);
+        assert_eq!(options, ["a", "b"]);
+        assert!(operands.is_empty());
     }
 
     #[test]

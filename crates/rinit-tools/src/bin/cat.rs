@@ -1,7 +1,9 @@
 //! `cat` - concatenate files and standard input.
 
+use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use rinit_tools::{EXIT_OK, program_name, usage_error};
@@ -60,9 +62,9 @@ fn copy_stream<R: BufRead, W: Write>(
     Ok(())
 }
 
-fn cat_path(path: &str, options: Options, state: &mut State) -> io::Result<()> {
+fn cat_path(path: &Path, options: Options, state: &mut State) -> io::Result<()> {
     let mut stdout = io::stdout().lock();
-    if path == "-" {
+    if path == Path::new("-") {
         let stdin = io::stdin();
         let mut reader = stdin.lock();
         return copy_stream(&mut reader, &mut stdout, options, state);
@@ -72,33 +74,42 @@ fn cat_path(path: &str, options: Options, state: &mut State) -> io::Result<()> {
     copy_stream(&mut reader, &mut stdout, options, state)
 }
 
-fn run(args: &[String], program: &str) -> ExitCode {
+fn run<A: AsRef<OsStr>>(args: &[A], program: &str) -> ExitCode {
     let mut options = Options::default();
-    let mut files: Vec<String> = Vec::new();
-    for arg in args {
-        match arg.as_str() {
-            "--help" => {
+    let mut files: Vec<PathBuf> = Vec::new();
+    let marker = args.iter().position(|arg| arg.as_ref() == OsStr::new("--"));
+    let (options_args, trailing): (&[A], &[A]) = match marker {
+        Some(index) => (
+            args.get(..index).unwrap_or(&[]),
+            args.get(index + 1..).unwrap_or(&[]),
+        ),
+        None => (args, &[] as &[A]),
+    };
+    for arg in options_args {
+        match arg.as_ref().to_str() {
+            Some("--help") => {
                 println!("Usage: cat [-bnsu] [FILE...]");
                 return ExitCode::from(EXIT_OK);
             }
-            "-n" | "--number" => options.number = true,
-            "-b" | "--number-nonblank" => options.number_nonblank = true,
-            "-s" | "--squeeze-blank" => options.squeeze = true,
-            "-u" => {}
-            value if value.starts_with('-') && value != "-" => {
+            Some("-n" | "--number") => options.number = true,
+            Some("-b" | "--number-nonblank") => options.number_nonblank = true,
+            Some("-s" | "--squeeze-blank") => options.squeeze = true,
+            Some("-u") => {}
+            Some(value) if value.starts_with('-') && value != "-" => {
                 return ExitCode::from(usage_error(program, &format!("unknown option '{value}'")));
             }
-            value => files.push(value.to_string()),
+            _ => files.push(PathBuf::from(arg.as_ref())),
         }
     }
+    files.extend(trailing.iter().map(|arg| PathBuf::from(arg.as_ref())));
     if files.is_empty() {
-        files.push("-".to_string());
+        files.push(PathBuf::from("-"));
     }
     let mut state = State::default();
     let mut failed = false;
     for path in files {
         if let Err(error) = cat_path(&path, options, &mut state) {
-            eprintln!("{program}: {path}: {error}");
+            eprintln!("{program}: {}: {error}", path.display());
             failed = true;
         }
     }
@@ -107,8 +118,14 @@ fn run(args: &[String], program: &str) -> ExitCode {
 
 fn main() -> ExitCode {
     rinit_tools::restore_sigpipe();
-    let program = program_name(std::env::args().next().as_deref(), "cat");
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let program = program_name(
+        std::env::args_os()
+            .next()
+            .as_deref()
+            .and_then(|arg| arg.to_str()),
+        "cat",
+    );
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     run(&args, &program)
 }
 

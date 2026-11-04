@@ -1,5 +1,6 @@
 //! `cp` - copy files and directory trees.
 
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -26,6 +27,25 @@ fn target_for(src: &Path, dst: &Path, dst_is_dir: bool) -> Result<PathBuf, Strin
     }
 }
 
+fn canonical_destination(dst: &Path) -> Result<PathBuf, String> {
+    match fs::canonicalize(dst) {
+        Ok(path) => Ok(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let parent = dst
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            let name = dst
+                .file_name()
+                .ok_or_else(|| format!("cannot determine the name of '{}'", dst.display()))?;
+            let parent = fs::canonicalize(parent)
+                .map_err(|error| format!("{}: {error}", parent.display()))?;
+            Ok(parent.join(name))
+        }
+        Err(error) => Err(format!("{}: {error}", dst.display())),
+    }
+}
+
 fn copy_one(src: &Path, dst: &Path, options: Options) -> Result<(), String> {
     if options.no_clobber && fs::symlink_metadata(dst).is_ok() {
         return Ok(());
@@ -33,6 +53,18 @@ fn copy_one(src: &Path, dst: &Path, options: Options) -> Result<(), String> {
     let meta = fs::symlink_metadata(src).map_err(|error| format!("{}: {error}", src.display()))?;
     if meta.is_dir() && !options.recursive {
         return Err(format!("{}: omitting directory", src.display()));
+    }
+    if meta.is_dir() {
+        let source =
+            fs::canonicalize(src).map_err(|error| format!("{}: {error}", src.display()))?;
+        let destination = canonical_destination(dst)?;
+        if destination.starts_with(&source) {
+            return Err(format!(
+                "{}: cannot copy a directory into itself ({})",
+                src.display(),
+                dst.display()
+            ));
+        }
     }
     if options.force && !meta.is_dir() {
         match fs::symlink_metadata(dst) {
@@ -46,34 +78,43 @@ fn copy_one(src: &Path, dst: &Path, options: Options) -> Result<(), String> {
         .map_err(|error| format!("{} -> {}: {error}", src.display(), dst.display()))
 }
 
-fn run(args: &[String], program: &str) -> ExitCode {
+fn run<A: AsRef<OsStr>>(args: &[A], program: &str) -> ExitCode {
     let mut options = Options::default();
-    let mut paths: Vec<String> = Vec::new();
-    for arg in args {
-        match arg.as_str() {
-            "--help" => {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    let marker = args.iter().position(|arg| arg.as_ref() == OsStr::new("--"));
+    let (options_args, trailing): (&[A], &[A]) = match marker {
+        Some(index) => (
+            args.get(..index).unwrap_or(&[]),
+            args.get(index + 1..).unwrap_or(&[]),
+        ),
+        None => (args, &[] as &[A]),
+    };
+    for arg in options_args {
+        match arg.as_ref().to_str() {
+            Some("--help") => {
                 println!("Usage: cp [-rRafpn] SOURCE... DEST");
                 return ExitCode::from(EXIT_OK);
             }
-            "-r" | "-R" | "--recursive" => options.recursive = true,
-            "-a" | "--archive" => {
+            Some("-r" | "-R" | "--recursive") => options.recursive = true,
+            Some("-a" | "--archive") => {
                 options.recursive = true;
                 options.preserve = true;
             }
-            "-p" | "--preserve" => options.preserve = true,
-            "-f" | "--force" => options.force = true,
-            "-n" | "--no-clobber" => options.no_clobber = true,
-            value if value.starts_with('-') && value != "-" => {
+            Some("-p" | "--preserve") => options.preserve = true,
+            Some("-f" | "--force") => options.force = true,
+            Some("-n" | "--no-clobber") => options.no_clobber = true,
+            Some(value) if value.starts_with('-') && value != "-" => {
                 return ExitCode::from(usage_error(program, &format!("unknown option '{value}'")));
             }
-            value => paths.push(value.to_string()),
+            _ => paths.push(PathBuf::from(arg.as_ref())),
         }
     }
+    paths.extend(trailing.iter().map(|arg| PathBuf::from(arg.as_ref())));
     let (dst, sources) = match paths.split_last() {
         Some((dst, sources)) if !sources.is_empty() => (dst, sources),
         _ => return ExitCode::from(usage_error(program, "SOURCE and DEST are required")),
     };
-    let dst_path = Path::new(dst);
+    let dst_path = dst.as_path();
     let dst_is_dir = fs::metadata(dst_path)
         .map(|meta| meta.is_dir())
         .unwrap_or(false);
@@ -82,7 +123,7 @@ fn run(args: &[String], program: &str) -> ExitCode {
     }
     let mut failed = false;
     for source in sources {
-        let src = Path::new(source);
+        let src = source.as_path();
         match target_for(src, dst_path, dst_is_dir)
             .and_then(|target| copy_one(src, &target, options))
         {
@@ -98,8 +139,14 @@ fn run(args: &[String], program: &str) -> ExitCode {
 
 fn main() -> ExitCode {
     rinit_tools::restore_sigpipe();
-    let program = program_name(std::env::args().next().as_deref(), "cp");
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let program = program_name(
+        std::env::args_os()
+            .next()
+            .as_deref()
+            .and_then(|arg| arg.to_str()),
+        "cp",
+    );
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     run(&args, &program)
 }
 
@@ -168,6 +215,49 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    /// Copying a directory into its own subtree must fail before the first
+    /// mkdir, or the directory walk sees the new child and recurses forever.
+    #[test]
+    fn copying_a_directory_into_itself_is_refused() {
+        let root = temp_root("self");
+        let src = root.join("tree");
+        fs::create_dir_all(&src).expect("tree");
+        fs::write(src.join("file"), b"x").expect("file");
+        let options = Options {
+            recursive: true,
+            ..Options::default()
+        };
+
+        for target in [src.join("sub"), src.join("sub/deeper")] {
+            assert!(
+                copy_one(&src, &target, options).is_err(),
+                "{} must be refused",
+                target.display()
+            );
+            assert!(!target.exists(), "the refused target must not be created");
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// `cp` must copy a source whose name is not valid UTF-8.
+    #[test]
+    fn a_non_utf8_source_copies() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = temp_root("nonutf8");
+        let name = OsString::from_vec(vec![b's', 0xff, b'r', b'c']);
+        let src = root.join(&name);
+        let dst = root.join("copy");
+        fs::write(&src, b"bytes").expect("source");
+        assert_eq!(
+            run(&[src.clone(), dst.clone()], "cp"),
+            ExitCode::from(EXIT_OK)
+        );
+        assert_eq!(fs::read(&dst).expect("copy"), b"bytes");
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn run_reports_usage_and_missing_sources() {
         let root = temp_root("run");
@@ -176,7 +266,10 @@ mod tests {
             run(&["--bad".to_string()], "cp"),
             ExitCode::from(rinit_tools::EXIT_USAGE)
         );
-        assert_eq!(run(&[], "cp"), ExitCode::from(rinit_tools::EXIT_USAGE));
+        assert_eq!(
+            run(&[] as &[String], "cp"),
+            ExitCode::from(rinit_tools::EXIT_USAGE)
+        );
         let missing = root.join("missing").display().to_string();
         let dst = root.join("dst").display().to_string();
         assert_eq!(run(&[missing, dst], "cp"), ExitCode::from(1));

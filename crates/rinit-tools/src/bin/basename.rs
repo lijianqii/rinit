@@ -54,8 +54,17 @@ fn run(args: &[String], program: &str) -> ExitCode {
 
 fn main() -> ExitCode {
     rinit_tools::restore_sigpipe();
-    let program = program_name(std::env::args().next().as_deref(), "basename");
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let program = program_name(
+        std::env::args_os()
+            .next()
+            .as_deref()
+            .and_then(|arg| arg.to_str()),
+        "basename",
+    );
+    let Some(args) = rinit_tools::utf8_args(&program) else {
+        return ExitCode::from(rinit_tools::EXIT_USAGE);
+    };
+    let args: Vec<String> = args.into_iter().skip(1).collect();
     run(&args, &program)
 }
 

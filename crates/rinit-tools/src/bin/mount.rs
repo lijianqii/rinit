@@ -118,6 +118,11 @@ fn mount_fstab(root: &std::path::Path) -> Result<(), String> {
             fail += 1;
             continue;
         }
+        // `swap` is an fstab entry, but switch activation belongs to
+        // `swapon -a`; passing it to `mount(2)` against `none` always fails.
+        if fields[2] == "swap" {
+            continue;
+        }
         let options = parse_options(fields[3]);
         if fields[3].split(',').any(|option| option == "noauto") {
             continue;
@@ -218,8 +223,17 @@ fn run(args: &[String], root: &std::path::Path, program: &str) -> ExitCode {
 
 fn main() -> ExitCode {
     rinit_tools::restore_sigpipe();
-    let program = program_name(std::env::args().next().as_deref(), "mount");
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let program = program_name(
+        std::env::args_os()
+            .next()
+            .as_deref()
+            .and_then(|arg| arg.to_str()),
+        "mount",
+    );
+    let Some(args) = rinit_tools::utf8_args(&program) else {
+        return ExitCode::from(rinit_tools::EXIT_USAGE);
+    };
+    let args: Vec<String> = args.into_iter().skip(1).collect();
     run(&args, std::path::Path::new("/"), &program)
 }
 
@@ -295,7 +309,7 @@ mod root_tests {
         let root = test_root("fstab");
         std::fs::write(
             root.join("etc/fstab"),
-            "tmpfs /tmp tmpfs rw,noauto 0 0\n# comment\n",
+            "tmpfs /tmp tmpfs rw,noauto 0 0\n/swapfile none swap sw 0 0\n# comment\n",
         )
         .expect("fstab");
         assert_eq!(run(&["-a".to_string()], &root, "mount"), ExitCode::from(0));

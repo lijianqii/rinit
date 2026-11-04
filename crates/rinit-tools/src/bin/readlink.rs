@@ -1,41 +1,58 @@
 //! `readlink` - print symbolic link targets or resolved paths.
 
+use std::ffi::OsStr;
 use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::os::unix::ffi::OsStrExt;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use rinit_tools::pathutil;
 use rinit_tools::{EXIT_OK, program_name, usage_error};
 
 enum Mode {
+    /// Print the link target itself.
     Target,
-    Resolve(bool),
+    /// Every component must exist (`-e`).
+    Existing,
+    /// All but the final component must exist (`-f`).
+    Final,
+    /// Missing components are appended lexically (`-m`).
+    Missing,
 }
 
-fn run(args: &[String], program: &str) -> ExitCode {
+fn run<A: AsRef<OsStr>>(args: &[A], program: &str) -> ExitCode {
     let mut mode = Mode::Target;
     let mut newline = true;
     let mut quiet = false;
-    let mut paths: Vec<String> = Vec::new();
-    for arg in args {
-        match arg.as_str() {
-            "--help" => {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    let marker = args.iter().position(|arg| arg.as_ref() == OsStr::new("--"));
+    let (options_args, trailing): (&[A], &[A]) = match marker {
+        Some(index) => (
+            args.get(..index).unwrap_or(&[]),
+            args.get(index + 1..).unwrap_or(&[]),
+        ),
+        None => (args, &[] as &[A]),
+    };
+    for arg in options_args {
+        match arg.as_ref().to_str() {
+            Some("--help") => {
                 println!("Usage: readlink [-fenmq] PATH...");
                 return ExitCode::from(EXIT_OK);
             }
-            "-f" | "--canonicalize" => mode = Mode::Resolve(true),
-            "-e" | "--canonicalize-existing" => mode = Mode::Resolve(false),
-            "-m" | "--canonicalize-missing" => mode = Mode::Resolve(true),
-            "-n" | "--no-newline" => newline = false,
-            "-q" | "--quiet" => quiet = true,
-            "-s" | "--silent" => quiet = true,
-            value if value.starts_with('-') && value != "-" => {
+            Some("-f" | "--canonicalize") => mode = Mode::Final,
+            Some("-e" | "--canonicalize-existing") => mode = Mode::Existing,
+            Some("-m" | "--canonicalize-missing") => mode = Mode::Missing,
+            Some("-n" | "--no-newline") => newline = false,
+            Some("-q" | "--quiet") => quiet = true,
+            Some("-s" | "--silent") => quiet = true,
+            Some(value) if value.starts_with('-') && value != "-" => {
                 return ExitCode::from(usage_error(program, &format!("unknown option '{value}'")));
             }
-            value => paths.push(value.to_string()),
+            _ => paths.push(PathBuf::from(arg.as_ref())),
         }
     }
+    paths.extend(trailing.iter().map(|arg| PathBuf::from(arg.as_ref())));
     if paths.is_empty() {
         return ExitCode::from(usage_error(program, "a path operand is required"));
     }
@@ -43,17 +60,24 @@ fn run(args: &[String], program: &str) -> ExitCode {
     let mut stdout = std::io::stdout().lock();
     for path in paths {
         let result = match mode {
-            Mode::Target => fs::read_link(Path::new(&path)),
-            Mode::Resolve(allow_missing) => pathutil::resolve(Path::new(&path), allow_missing),
+            Mode::Target => fs::read_link(&path),
+            Mode::Existing => pathutil::resolve(&path, false),
+            Mode::Final => pathutil::resolve_final(&path),
+            Mode::Missing => pathutil::resolve(&path, true),
         };
         match result {
             Ok(target) => {
-                let text = target.display().to_string();
-                let write = if newline {
-                    writeln!(stdout, "{text}")
-                } else {
-                    stdout.write_all(text.as_bytes())
-                };
+                // Print the raw bytes: a link target is not required to be
+                // UTF-8, and `display()` would replace those bytes with U+FFFD
+                // and print a path that does not exist.
+                let bytes = target.as_os_str().as_bytes();
+                let write = stdout.write_all(bytes).and_then(|()| {
+                    if newline {
+                        stdout.write_all(b"\n")
+                    } else {
+                        Ok(())
+                    }
+                });
                 if let Err(error) = write {
                     if !quiet {
                         eprintln!("{program}: {error}");
@@ -63,7 +87,7 @@ fn run(args: &[String], program: &str) -> ExitCode {
             }
             Err(error) => {
                 if !quiet {
-                    eprintln!("{program}: {path}: {error}");
+                    eprintln!("{program}: {}: {error}", path.display());
                 }
                 failed = true;
             }
@@ -74,8 +98,14 @@ fn run(args: &[String], program: &str) -> ExitCode {
 
 fn main() -> ExitCode {
     rinit_tools::restore_sigpipe();
-    let program = program_name(std::env::args().next().as_deref(), "readlink");
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let program = program_name(
+        std::env::args_os()
+            .next()
+            .as_deref()
+            .and_then(|arg| arg.to_str()),
+        "readlink",
+    );
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     run(&args, &program)
 }
 
@@ -114,6 +144,34 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    /// `-f` requires all but the last component to exist; `-m` does not. They
+    /// used to be the same mode, so a script checking for a missing file got a
+    /// success it should not have.
+    #[test]
+    fn canonicalize_modes_differ_on_missing_components() {
+        let root = temp_root("modes");
+        let missing = root.join("missing");
+        let deep = root.join("missing/child");
+        assert_eq!(
+            run(
+                &["-f".to_string(), missing.display().to_string()],
+                "readlink"
+            ),
+            ExitCode::from(EXIT_OK),
+            "the final component may be missing"
+        );
+        assert_eq!(
+            run(&["-f".to_string(), deep.display().to_string()], "readlink"),
+            ExitCode::from(1),
+            "an intermediate component may not be missing"
+        );
+        assert_eq!(
+            run(&["-m".to_string(), deep.display().to_string()], "readlink"),
+            ExitCode::from(EXIT_OK)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn run_handles_help_and_bad_options() {
         assert_eq!(
@@ -125,7 +183,7 @@ mod tests {
             ExitCode::from(rinit_tools::EXIT_USAGE)
         );
         assert_eq!(
-            run(&[], "readlink"),
+            run(&[] as &[String], "readlink"),
             ExitCode::from(rinit_tools::EXIT_USAGE)
         );
     }

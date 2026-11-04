@@ -28,6 +28,7 @@ mod client;
 mod parse;
 
 use std::ffi::OsString;
+use std::io::Write;
 use std::process::ExitCode;
 
 use rinit_core::Status;
@@ -78,6 +79,19 @@ fn collect_args(args: impl Iterator<Item = OsString>) -> Result<Vec<String>, OsS
     args.map(OsString::into_string).collect()
 }
 
+/// Write a reply, treating a closed pipe as success and any other write error
+/// as a real failure. Ignoring every error would also hide a full disk.
+fn emit(text: &str) -> bool {
+    match std::io::stdout().write_all(text.as_bytes()) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => true,
+        Err(error) => {
+            eprintln!("rctl: cannot write output: {error}");
+            false
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let args = match collect_args(std::env::args_os().skip(1)) {
         Ok(args) => args,
@@ -92,12 +106,11 @@ fn main() -> ExitCode {
 
     let request = match parse::command_line(&args) {
         Ok(parse::Parsed::Help) => {
-            print!("{USAGE}");
-            return ExitCode::from(0);
+            return ExitCode::from(if emit(USAGE) { 0 } else { 1 });
         }
         Ok(parse::Parsed::Version) => {
-            println!("rctl {}", env!("CARGO_PKG_VERSION"));
-            return ExitCode::from(0);
+            let text = format!("rctl {}\n", env!("CARGO_PKG_VERSION"));
+            return ExitCode::from(if emit(&text) { 0 } else { 1 });
         }
         Ok(parse::Parsed::Request(request)) => request,
         Err(message) => {
@@ -108,8 +121,8 @@ fn main() -> ExitCode {
 
     match client::send(&request) {
         Ok((Status::Ok, text)) => {
-            if !text.is_empty() {
-                println!("{text}");
+            if !text.is_empty() && !emit(&format!("{text}\n")) {
+                return ExitCode::from(1);
             }
             ExitCode::from(Status::Ok.exit_code())
         }

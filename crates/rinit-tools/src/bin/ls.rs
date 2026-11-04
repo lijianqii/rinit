@@ -1,10 +1,10 @@
 //! `ls` - list directory contents.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use rinit_tools::{EXIT_OK, program_name, usage_error};
@@ -132,9 +132,9 @@ fn format_dir(path: &Path, options: Options) -> io::Result<String> {
     let mut entries: Vec<(OsString, fs::Metadata)> = Vec::new();
     if options.all {
         entries.push((".".into(), fs::symlink_metadata(path)?));
-        if let Some(parent) = path.parent() {
-            entries.push(("..".into(), fs::symlink_metadata(parent)?));
-        }
+        // `Path::parent(".")` and `parent("foo")` are both `Some("")`; joining
+        // `..` works for both and avoids statting the empty path.
+        entries.push(("..".into(), fs::symlink_metadata(path.join(".."))?));
     }
     for entry in fs::read_dir(path)? {
         let entry = entry?;
@@ -171,38 +171,47 @@ fn list_path(path: &Path, display: &str, options: Options) -> io::Result<String>
     }
 }
 
-fn run(args: &[String], program: &str) -> ExitCode {
+fn run<A: AsRef<OsStr>>(args: &[A], program: &str) -> ExitCode {
     let mut options = Options::default();
-    let mut paths: Vec<String> = Vec::new();
-    for arg in args {
-        match arg.as_str() {
-            "--help" => {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    let marker = args.iter().position(|arg| arg.as_ref() == OsStr::new("--"));
+    let (options_args, trailing): (&[A], &[A]) = match marker {
+        Some(index) => (
+            args.get(..index).unwrap_or(&[]),
+            args.get(index + 1..).unwrap_or(&[]),
+        ),
+        None => (args, &[] as &[A]),
+    };
+    for arg in options_args {
+        match arg.as_ref().to_str() {
+            Some("--help") => {
                 println!("Usage: ls [-aAldh] [FILE...]");
                 return ExitCode::from(EXIT_OK);
             }
-            "-a" | "--all" => options.all = true,
-            "-A" | "--almost-all" => options.almost_all = true,
-            "-l" => options.long = true,
-            "-h" | "--human-readable" => options.human = true,
-            "-d" | "--directory" => options.directory = true,
-            "-1" => {}
-            value if value.starts_with('-') && value != "-" => {
+            Some("-a" | "--all") => options.all = true,
+            Some("-A" | "--almost-all") => options.almost_all = true,
+            Some("-l") => options.long = true,
+            Some("-h" | "--human-readable") => options.human = true,
+            Some("-d" | "--directory") => options.directory = true,
+            Some("-1") => {}
+            Some(value) if value.starts_with('-') && value != "-" => {
                 return ExitCode::from(usage_error(program, &format!("unknown option '{value}'")));
             }
-            value => paths.push(value.to_string()),
+            _ => paths.push(PathBuf::from(arg.as_ref())),
         }
     }
+    paths.extend(trailing.iter().map(|arg| PathBuf::from(arg.as_ref())));
     if paths.is_empty() {
-        paths.push(".".to_string());
+        paths.push(PathBuf::from("."));
     }
     let multiple = paths.len() > 1;
     let mut failed = false;
-    for (index, display) in paths.iter().enumerate() {
-        let path = Path::new(display);
+    for (index, path) in paths.iter().enumerate() {
+        let display = path.display().to_string();
         if multiple && index > 0 {
             println!();
         }
-        match list_path(path, display, options) {
+        match list_path(path, &display, options) {
             Ok(text) => {
                 if multiple {
                     println!("{display}:");
@@ -220,8 +229,14 @@ fn run(args: &[String], program: &str) -> ExitCode {
 
 fn main() -> ExitCode {
     rinit_tools::restore_sigpipe();
-    let program = program_name(std::env::args().next().as_deref(), "ls");
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let program = program_name(
+        std::env::args_os()
+            .next()
+            .as_deref()
+            .and_then(|arg| arg.to_str()),
+        "ls",
+    );
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     run(&args, &program)
 }
 
@@ -279,6 +294,21 @@ mod tests {
         .expect("all");
         assert!(all.contains(".hidden"));
         assert!(all.contains("..\n"));
+    }
+
+    /// `ls -a` without a path uses `"."`, whose `Path::parent()` is the empty
+    /// path; the `..` row must still resolve.
+    #[test]
+    fn the_default_directory_lists_dot_dot() {
+        let text = format_dir(
+            Path::new("."),
+            Options {
+                all: true,
+                ..Options::default()
+            },
+        )
+        .expect("the default directory must be listable");
+        assert!(text.contains(".."), "{text}");
     }
 
     #[test]

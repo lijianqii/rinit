@@ -95,6 +95,13 @@ fn make_name(template: &str, options: &Options) -> Result<String, String> {
     Err("could not create a unique temporary name".to_string())
 }
 
+fn default_temp_dir() -> String {
+    std::env::var("TMPDIR")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "/tmp".to_string())
+}
+
 fn apply_prefix(template: String, options: &Options) -> String {
     let Some(prefix) = &options.prefix else {
         return template;
@@ -108,6 +115,7 @@ fn apply_prefix(template: String, options: &Options) -> String {
 fn run(args: &[String], program: &str) -> ExitCode {
     let mut options = Options::default();
     let mut template: Option<String> = None;
+    let (args, trailing) = rinit_tools::split_double_dash(args);
     let mut index = 0;
     while let Some(arg) = args.get(index) {
         match arg.as_str() {
@@ -141,10 +149,24 @@ fn run(args: &[String], program: &str) -> ExitCode {
         }
         index += 1;
     }
-    let template = apply_prefix(
-        template.unwrap_or_else(|| "tmp.XXXXXXXXXX".to_string()),
-        &options,
-    );
+    for value in trailing {
+        if template.is_some() {
+            return ExitCode::from(usage_error(program, "too many templates"));
+        }
+        template = Some(value.clone());
+    }
+    // GNU/BusyBox `mktemp` with no template uses `$TMPDIR` (or `/tmp`), while
+    // an explicit relative template is created in the current directory.
+    let template = match template {
+        Some(template) => template,
+        None => {
+            if options.prefix.is_none() {
+                options.prefix = Some(default_temp_dir());
+            }
+            "tmp.XXXXXXXXXX".to_string()
+        }
+    };
+    let template = apply_prefix(template, &options);
     match make_name(&template, &options) {
         Ok(path) => {
             println!("{path}");
@@ -161,8 +183,17 @@ fn run(args: &[String], program: &str) -> ExitCode {
 
 fn main() -> ExitCode {
     rinit_tools::restore_sigpipe();
-    let program = program_name(std::env::args().next().as_deref(), "mktemp");
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let program = program_name(
+        std::env::args_os()
+            .next()
+            .as_deref()
+            .and_then(|arg| arg.to_str()),
+        "mktemp",
+    );
+    let Some(args) = rinit_tools::utf8_args(&program) else {
+        return ExitCode::from(rinit_tools::EXIT_USAGE);
+    };
+    let args: Vec<String> = args.into_iter().skip(1).collect();
     run(&args, &program)
 }
 
@@ -177,6 +208,19 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).expect("root");
         root
+    }
+
+    #[test]
+    fn a_bare_template_uses_the_temporary_directory() {
+        let options = Options {
+            prefix: Some("/tmp".to_string()),
+            ..Options::default()
+        };
+        assert_eq!(
+            apply_prefix("tmp.XXXXXX".to_string(), &options),
+            "/tmp/tmp.XXXXXX"
+        );
+        assert!(Path::new(&default_temp_dir()).is_absolute());
     }
 
     #[test]
@@ -228,5 +272,50 @@ mod tests {
             run(&["--bad".to_string()], "mktemp"),
             ExitCode::from(rinit_tools::EXIT_USAGE)
         );
+    }
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn root(tag: &str) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("rinit-{}-{}-{tag}", "mktemp", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("root");
+        root
+    }
+
+    #[test]
+    fn run_parses_options_and_reports_usage_errors() {
+        let root = root("run");
+        let template = root.join("x.XXXXXX").display().to_string();
+        assert_eq!(
+            run(&["-u".to_string(), template.clone()], "mktemp"),
+            ExitCode::from(EXIT_OK)
+        );
+        assert_eq!(
+            run(&["-d".to_string(), template], "mktemp"),
+            ExitCode::from(EXIT_OK)
+        );
+        assert_eq!(
+            run(&["--help".to_string()], "mktemp"),
+            ExitCode::from(EXIT_OK)
+        );
+        assert_eq!(
+            run(&["--bad".to_string()], "mktemp"),
+            ExitCode::from(rinit_tools::EXIT_USAGE)
+        );
+        assert_eq!(
+            run(&["-p".to_string()], "mktemp"),
+            ExitCode::from(rinit_tools::EXIT_USAGE)
+        );
+        assert_eq!(
+            run(&["a".to_string(), "b".to_string()], "mktemp"),
+            ExitCode::from(rinit_tools::EXIT_USAGE)
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 }

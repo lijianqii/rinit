@@ -18,7 +18,7 @@ use rinit_core::{
 /// socket timeout. Without it, a server that stops sending would leave `rctl`
 /// blocked in `read` forever, and a CI job hanging looks like the machine, not
 /// like the bug.
-const REPLY_TIMEOUT: Duration = Duration::from_secs(65);
+const REPLY_TIMEOUT: Duration = Duration::from_secs(605);
 
 /// Send `request` to rinit and return its status and payload.
 ///

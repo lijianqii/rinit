@@ -1,8 +1,9 @@
 //! `mkdir` - create directories.
 
+use std::ffi::OsStr;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use rinit_tools::{EXIT_OK, program_name, usage_error};
@@ -39,40 +40,52 @@ fn make_directory(path: &Path, options: Options) -> Result<(), String> {
     Ok(())
 }
 
-fn run(args: &[String], program: &str) -> ExitCode {
+fn run<A: AsRef<OsStr>>(args: &[A], program: &str) -> ExitCode {
     let mut options = Options::default();
-    let mut paths: Vec<String> = Vec::new();
+    let mut paths: Vec<PathBuf> = Vec::new();
+    let marker = args.iter().position(|arg| arg.as_ref() == OsStr::new("--"));
+    let (options_args, trailing): (&[A], &[A]) = match marker {
+        Some(index) => (
+            args.get(..index).unwrap_or(&[]),
+            args.get(index + 1..).unwrap_or(&[]),
+        ),
+        None => (args, &[] as &[A]),
+    };
     let mut index = 0;
-    while let Some(arg) = args.get(index) {
-        match arg.as_str() {
-            "--help" => {
+    while let Some(arg) = options_args.get(index) {
+        match arg.as_ref().to_str() {
+            Some("--help") => {
                 println!("Usage: mkdir [-p] [-m MODE] DIRECTORY...");
                 return ExitCode::from(EXIT_OK);
             }
-            "-p" | "--parents" => options.parents = true,
-            "-m" | "--mode" => {
+            Some("-p" | "--parents") => options.parents = true,
+            Some("-m" | "--mode") => {
                 index += 1;
-                let Some(value) = args.get(index) else {
+                let Some(value) = options_args.get(index) else {
                     return ExitCode::from(usage_error(program, "-m needs a mode"));
+                };
+                let Some(value) = value.as_ref().to_str() else {
+                    return ExitCode::from(usage_error(program, "-m needs a UTF-8 mode"));
                 };
                 match parse_mode(value) {
                     Ok(mode) => options.mode = Some(mode),
                     Err(error) => return ExitCode::from(usage_error(program, &error)),
                 }
             }
-            value if value.starts_with('-') && value != "-" => {
+            Some(value) if value.starts_with('-') && value != "-" => {
                 return ExitCode::from(usage_error(program, &format!("unknown option '{value}'")));
             }
-            value => paths.push(value.to_string()),
+            _ => paths.push(PathBuf::from(arg.as_ref())),
         }
         index += 1;
     }
+    paths.extend(trailing.iter().map(|arg| PathBuf::from(arg.as_ref())));
     if paths.is_empty() {
         return ExitCode::from(usage_error(program, "a directory operand is required"));
     }
     let mut failed = false;
     for display in paths {
-        if let Err(error) = make_directory(Path::new(&display), options) {
+        if let Err(error) = make_directory(&display, options) {
             eprintln!("{program}: {error}");
             failed = true;
         }
@@ -82,8 +95,14 @@ fn run(args: &[String], program: &str) -> ExitCode {
 
 fn main() -> ExitCode {
     rinit_tools::restore_sigpipe();
-    let program = program_name(std::env::args().next().as_deref(), "mkdir");
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let program = program_name(
+        std::env::args_os()
+            .next()
+            .as_deref()
+            .and_then(|arg| arg.to_str()),
+        "mkdir",
+    );
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     run(&args, &program)
 }
 
@@ -158,7 +177,10 @@ mod tests {
             run(&["--bad".to_string()], "mkdir"),
             ExitCode::from(rinit_tools::EXIT_USAGE)
         );
-        assert_eq!(run(&[], "mkdir"), ExitCode::from(rinit_tools::EXIT_USAGE));
+        assert_eq!(
+            run(&[] as &[String], "mkdir"),
+            ExitCode::from(rinit_tools::EXIT_USAGE)
+        );
         let _ = fs::remove_dir_all(root);
     }
 }

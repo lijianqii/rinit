@@ -132,8 +132,17 @@ fn run(args: &[String], program: &str) -> ExitCode {
 
 fn main() -> ExitCode {
     rinit_tools::restore_sigpipe();
-    let program = program_name(std::env::args().next().as_deref(), "uname");
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let program = program_name(
+        std::env::args_os()
+            .next()
+            .as_deref()
+            .and_then(|arg| arg.to_str()),
+        "uname",
+    );
+    let Some(args) = rinit_tools::utf8_args(&program) else {
+        return ExitCode::from(rinit_tools::EXIT_USAGE);
+    };
+    let args: Vec<String> = args.into_iter().skip(1).collect();
     run(&args, &program)
 }
 
@@ -177,6 +186,28 @@ mod tests {
             ExitCode::from(EXIT_OK)
         );
         assert_eq!(run(&["-s".to_string()], "uname"), ExitCode::from(EXIT_OK));
+        assert_eq!(
+            run(&["--bad".to_string()], "uname"),
+            ExitCode::from(rinit_tools::EXIT_USAGE)
+        );
+    }
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+
+    #[test]
+    fn run_renders_every_selector() {
+        for flag in [
+            "-a", "-s", "-n", "-r", "-v", "-m", "-p", "-i", "-o", "--help",
+        ] {
+            assert_eq!(
+                run(&[flag.to_string()], "uname"),
+                ExitCode::from(EXIT_OK),
+                "{flag}"
+            );
+        }
         assert_eq!(
             run(&["--bad".to_string()], "uname"),
             ExitCode::from(rinit_tools::EXIT_USAGE)

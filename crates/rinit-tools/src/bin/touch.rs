@@ -1,9 +1,10 @@
 //! `touch` - create files and update timestamps.
 
+use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
 use std::io;
 use std::os::unix::fs::MetadataExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use rinit_tools::fsutil;
@@ -182,42 +183,54 @@ fn touch_path(path: &Path, options: Options) -> Result<(), String> {
         .map_err(|error| format!("{}: {error}", path.display()))
 }
 
-fn run(args: &[String], program: &str) -> ExitCode {
+fn run<A: AsRef<OsStr>>(args: &[A], program: &str) -> ExitCode {
     let mut options = Options::default();
-    let mut paths: Vec<String> = Vec::new();
+    let mut paths: Vec<PathBuf> = Vec::new();
+    let marker = args.iter().position(|arg| arg.as_ref() == OsStr::new("--"));
+    let (options_args, trailing): (&[A], &[A]) = match marker {
+        Some(index) => (
+            args.get(..index).unwrap_or(&[]),
+            args.get(index + 1..).unwrap_or(&[]),
+        ),
+        None => (args, &[] as &[A]),
+    };
     let mut index = 0;
-    while let Some(arg) = args.get(index) {
-        match arg.as_str() {
-            "--help" => {
+    while let Some(arg) = options_args.get(index) {
+        match arg.as_ref().to_str() {
+            Some("--help") => {
                 println!("Usage: touch [-amc] [-t STAMP] FILE...");
                 return ExitCode::from(EXIT_OK);
             }
-            "-a" => options.atime = true,
-            "-m" => options.mtime = true,
-            "-c" | "--no-create" => options.no_create = true,
-            "-t" => {
+            Some("-a") => options.atime = true,
+            Some("-m") => options.mtime = true,
+            Some("-c" | "--no-create") => options.no_create = true,
+            Some("-t") => {
                 index += 1;
-                let Some(value) = args.get(index) else {
+                let Some(value) = options_args.get(index) else {
                     return ExitCode::from(usage_error(program, "-t needs a timestamp"));
+                };
+                let Some(value) = value.as_ref().to_str() else {
+                    return ExitCode::from(usage_error(program, "-t needs a UTF-8 timestamp"));
                 };
                 match parse_stamp(value) {
                     Ok(stamp) => options.stamp = Some(stamp),
                     Err(error) => return ExitCode::from(usage_error(program, &error)),
                 }
             }
-            value if value.starts_with('-') && value != "-" => {
+            Some(value) if value.starts_with('-') && value != "-" => {
                 return ExitCode::from(usage_error(program, &format!("unknown option '{value}'")));
             }
-            value => paths.push(value.to_string()),
+            _ => paths.push(PathBuf::from(arg.as_ref())),
         }
         index += 1;
     }
+    paths.extend(trailing.iter().map(|arg| PathBuf::from(arg.as_ref())));
     if paths.is_empty() {
         return ExitCode::from(usage_error(program, "a file operand is required"));
     }
     let mut failed = false;
     for display in paths {
-        if let Err(error) = touch_path(Path::new(&display), options) {
+        if let Err(error) = touch_path(&display, options) {
             eprintln!("{program}: {error}");
             failed = true;
         }
@@ -227,8 +240,14 @@ fn run(args: &[String], program: &str) -> ExitCode {
 
 fn main() -> ExitCode {
     rinit_tools::restore_sigpipe();
-    let program = program_name(std::env::args().next().as_deref(), "touch");
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let program = program_name(
+        std::env::args_os()
+            .next()
+            .as_deref()
+            .and_then(|arg| arg.to_str()),
+        "touch",
+    );
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     run(&args, &program)
 }
 
@@ -323,7 +342,10 @@ mod tests {
             run(&["--bad".to_string()], "touch"),
             ExitCode::from(rinit_tools::EXIT_USAGE)
         );
-        assert_eq!(run(&[], "touch"), ExitCode::from(rinit_tools::EXIT_USAGE));
+        assert_eq!(
+            run(&[] as &[String], "touch"),
+            ExitCode::from(rinit_tools::EXIT_USAGE)
+        );
         let _ = fs::remove_dir_all(root);
     }
 }

@@ -1,7 +1,8 @@
 //! `rm` - remove files and directory trees.
 
+use std::ffi::OsStr;
 use std::fs;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 
 use rinit_tools::fsutil;
@@ -14,8 +15,10 @@ struct Options {
     dir: bool,
 }
 
-fn protected(path: &str) -> bool {
-    let trimmed = path.trim_end_matches('/');
+fn protected(path: impl AsRef<Path>) -> bool {
+    let path = path.as_ref();
+    let trimmed = path.as_os_str().to_string_lossy();
+    let trimmed = trimmed.trim_end_matches('/');
     if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
         return true;
     }
@@ -56,35 +59,44 @@ fn remove_path(path: &Path, options: Options) -> Result<(), String> {
     }
 }
 
-fn run(args: &[String], program: &str) -> ExitCode {
+fn run<A: AsRef<OsStr>>(args: &[A], program: &str) -> ExitCode {
     let mut options = Options::default();
-    let mut paths: Vec<String> = Vec::new();
-    for arg in args {
-        match arg.as_str() {
-            "--help" => {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    let marker = args.iter().position(|arg| arg.as_ref() == OsStr::new("--"));
+    let (options_args, trailing): (&[A], &[A]) = match marker {
+        Some(index) => (
+            args.get(..index).unwrap_or(&[]),
+            args.get(index + 1..).unwrap_or(&[]),
+        ),
+        None => (args, &[] as &[A]),
+    };
+    for arg in options_args {
+        match arg.as_ref().to_str() {
+            Some("--help") => {
                 println!("Usage: rm [-rRfd] FILE...");
                 return ExitCode::from(EXIT_OK);
             }
-            "-r" | "-R" | "--recursive" => options.recursive = true,
-            "-f" | "--force" => options.force = true,
-            "-d" | "--dir" => options.dir = true,
-            value if value.starts_with('-') && value != "-" => {
+            Some("-r" | "-R" | "--recursive") => options.recursive = true,
+            Some("-f" | "--force") => options.force = true,
+            Some("-d" | "--dir") => options.dir = true,
+            Some(value) if value.starts_with('-') && value != "-" => {
                 return ExitCode::from(usage_error(program, &format!("unknown option '{value}'")));
             }
-            value => paths.push(value.to_string()),
+            _ => paths.push(PathBuf::from(arg.as_ref())),
         }
     }
+    paths.extend(trailing.iter().map(|arg| PathBuf::from(arg.as_ref())));
     if paths.is_empty() {
         return ExitCode::from(usage_error(program, "a file operand is required"));
     }
     let mut failed = false;
-    for display in paths {
-        if protected(&display) {
-            eprintln!("{program}: refusing to remove '{display}'");
+    for path in paths {
+        if protected(&path) {
+            eprintln!("{program}: refusing to remove '{}'", path.display());
             failed = true;
             continue;
         }
-        if let Err(error) = remove_path(Path::new(&display), options) {
+        if let Err(error) = remove_path(&path, options) {
             eprintln!("{program}: {error}");
             failed = true;
         }
@@ -94,8 +106,14 @@ fn run(args: &[String], program: &str) -> ExitCode {
 
 fn main() -> ExitCode {
     rinit_tools::restore_sigpipe();
-    let program = program_name(std::env::args().next().as_deref(), "rm");
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let program = program_name(
+        std::env::args_os()
+            .next()
+            .as_deref()
+            .and_then(|arg| arg.to_str()),
+        "rm",
+    );
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     run(&args, &program)
 }
 
@@ -187,6 +205,38 @@ mod tests {
     }
 
     #[test]
+    fn a_double_dash_allows_a_file_named_like_an_option() {
+        let root = temp_root("dashdash");
+        let file = root.join("-file");
+        fs::write(&file, b"x").expect("file");
+        assert_eq!(
+            run(&["--".to_string(), file.display().to_string()], "rm"),
+            ExitCode::from(EXIT_OK)
+        );
+        assert!(!file.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A path is bytes on Linux. The generic argument parser must treat a
+    /// non-UTF-8 operand as a path instead of rejecting or mangling it.
+    #[test]
+    fn a_non_utf8_path_is_removed() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = temp_root("nonutf8");
+        let name = OsString::from_vec(vec![b'f', 0xff, b'x']);
+        let path = root.join(&name);
+        fs::write(&path, b"x").expect("file");
+        assert_eq!(
+            run(std::slice::from_ref(&path), "rm"),
+            ExitCode::from(EXIT_OK)
+        );
+        assert!(!path.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn run_refuses_protected_paths_and_bad_options() {
         assert_eq!(run(&["/".to_string()], "rm"), ExitCode::from(1));
         assert_eq!(run(&["..".to_string()], "rm"), ExitCode::from(1));
@@ -197,6 +247,9 @@ mod tests {
             run(&["--bad".to_string()], "rm"),
             ExitCode::from(rinit_tools::EXIT_USAGE)
         );
-        assert_eq!(run(&[], "rm"), ExitCode::from(rinit_tools::EXIT_USAGE));
+        assert_eq!(
+            run(&[] as &[String], "rm"),
+            ExitCode::from(rinit_tools::EXIT_USAGE)
+        );
     }
 }

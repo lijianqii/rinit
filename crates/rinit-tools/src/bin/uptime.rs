@@ -85,10 +85,12 @@ fn run(args: &[String], root: &Path, program: &str) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    let users = rinit_tools::utmp::user_count(&root.join("var/run/utmp")).unwrap_or(0);
     println!(
-        " {} up {}, 0 users, load average: {}",
+        " {} up {}, {} users, load average: {}",
         wall_clock(),
         clock(seconds),
+        users,
         loads
     );
     ExitCode::from(EXIT_OK)
@@ -96,8 +98,17 @@ fn run(args: &[String], root: &Path, program: &str) -> ExitCode {
 
 fn main() -> ExitCode {
     rinit_tools::restore_sigpipe();
-    let program = program_name(std::env::args().next().as_deref(), "uptime");
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let program = program_name(
+        std::env::args_os()
+            .next()
+            .as_deref()
+            .and_then(|arg| arg.to_str()),
+        "uptime",
+    );
+    let Some(args) = rinit_tools::utf8_args(&program) else {
+        return ExitCode::from(rinit_tools::EXIT_USAGE);
+    };
+    let args: Vec<String> = args.into_iter().skip(1).collect();
     run(&args, Path::new("/"), &program)
 }
 

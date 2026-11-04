@@ -136,8 +136,17 @@ fn run(args: &[String], _program: &str) -> ExitCode {
 
 fn main() -> ExitCode {
     rinit_tools::restore_sigpipe();
-    let program = program_name(std::env::args().next().as_deref(), "echo");
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let program = program_name(
+        std::env::args_os()
+            .next()
+            .as_deref()
+            .and_then(|arg| arg.to_str()),
+        "echo",
+    );
+    let Some(args) = rinit_tools::utf8_args(&program) else {
+        return ExitCode::from(rinit_tools::EXIT_USAGE);
+    };
+    let args: Vec<String> = args.into_iter().skip(1).collect();
     run(&args, &program)
 }
 
@@ -173,6 +182,35 @@ mod tests {
         );
         assert_eq!(
             run(&["-e".to_string(), "x".to_string()], "echo"),
+            ExitCode::from(EXIT_OK)
+        );
+    }
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+
+    #[test]
+    fn run_parses_flags_and_escapes() {
+        assert_eq!(
+            run(&["--help".to_string()], "echo"),
+            ExitCode::from(EXIT_OK)
+        );
+        assert_eq!(
+            run(&["-n".to_string(), "x".to_string()], "echo"),
+            ExitCode::from(EXIT_OK)
+        );
+        assert_eq!(
+            run(&["-e".to_string(), "a\nb".to_string()], "echo"),
+            ExitCode::from(EXIT_OK)
+        );
+        assert_eq!(
+            run(&["-E".to_string(), "a\nb".to_string()], "echo"),
+            ExitCode::from(EXIT_OK)
+        );
+        assert_eq!(
+            run(&["-ne".to_string(), "x".to_string()], "echo"),
             ExitCode::from(EXIT_OK)
         );
     }

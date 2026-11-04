@@ -55,17 +55,71 @@ fn parse_passwd(text: &str, name: &str) -> Option<User> {
 }
 
 fn parse_shadow_hash(text: &str, name: &str) -> Option<String> {
+    shadow_fields(text, name)?
+        .get(1)
+        .map(|hash| (*hash).to_string())
+}
+
+fn shadow_fields<'a>(text: &'a str, name: &str) -> Option<Vec<&'a str>> {
     for line in text.lines() {
-        let mut fields = line.split(':');
-        let Some(field_name) = fields.next() else {
-            continue;
-        };
-        if field_name != name {
-            continue;
+        let fields: Vec<&str> = line.split(':').collect();
+        if fields.first().copied() == Some(name) {
+            return Some(fields);
         }
-        return fields.next().map(str::to_string);
     }
     None
+}
+
+/// Days since the Unix epoch, the unit `/etc/shadow` uses for its date fields.
+fn today_in_days() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() / 86_400)
+        .unwrap_or(0)
+}
+
+/// Whether the shadow record forbids this login regardless of the password.
+///
+/// `rlogin` cannot run `passwd` to force a change, so an expired password or an
+/// expired account is refused instead of being allowed through. A malformed
+/// date is also refused: the record exists, so it cannot be read as "never
+/// expires".
+fn shadow_login_denied(text: &str, name: &str, today: u64) -> bool {
+    let Some(fields) = shadow_fields(text, name) else {
+        return false;
+    };
+    // [2] last change, [4] maximum age, [7] account expiration. All are days
+    // since the epoch; empty means "not set". A value that exists but does not
+    // parse is refused: the record is there, so it cannot be read as "never
+    // expires".
+    fn number(field: Option<&&str>) -> Result<Option<u64>, ()> {
+        match field {
+            None | Some(&"") => Ok(None),
+            Some(value) => value.parse::<u64>().map(Some).map_err(|_| ()),
+        }
+    }
+    let last_change = match number(fields.get(2)) {
+        Ok(value) => value,
+        Err(()) => return true,
+    };
+    let max_age = match number(fields.get(4)) {
+        Ok(value) => value,
+        Err(()) => return true,
+    };
+    if let (Some(last_change), Some(max_age)) = (last_change, max_age)
+        && max_age > 0
+        && today >= last_change.saturating_add(max_age)
+    {
+        return true;
+    }
+
+    match fields.get(7) {
+        None | Some(&"") => false,
+        Some(value) => match value.parse::<u64>() {
+            Ok(expire) => today >= expire,
+            Err(_) => true,
+        },
+    }
 }
 
 fn password_hash_from(field: &str, shadow: Option<&str>, name: &str) -> Option<String> {
@@ -77,6 +131,11 @@ fn password_hash_from(field: &str, shadow: Option<&str>, name: &str) -> Option<S
 
 fn password_hash(user: &User) -> Option<String> {
     let shadow = fs::read_to_string("/etc/shadow").ok();
+    if let Some(text) = shadow.as_deref()
+        && shadow_login_denied(text, &user.name, today_in_days())
+    {
+        return None;
+    }
     password_hash_from(&user.password, shadow.as_deref(), &user.name)
 }
 
@@ -498,8 +557,17 @@ fn run(args: &[String], program: &str) -> ExitCode {
 
 fn main() -> ExitCode {
     rinit_tools::restore_sigpipe();
-    let program = program_name(std::env::args().next().as_deref(), "rlogin");
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let program = program_name(
+        std::env::args_os()
+            .next()
+            .as_deref()
+            .and_then(|arg| arg.to_str()),
+        "rlogin",
+    );
+    let Some(args) = rinit_tools::utf8_args(&program) else {
+        return ExitCode::from(rinit_tools::EXIT_USAGE);
+    };
+    let args: Vec<String> = args.into_iter().skip(1).collect();
     run(&args, &program)
 }
 
@@ -522,6 +590,33 @@ mod tests {
             Some("$6$salt$hash")
         );
         assert_eq!(parse_shadow_hash(shadow, "missing"), None);
+    }
+
+    /// Expiry is a login decision, not just a hash lookup: a valid password on
+    /// an expired account or after its maximum age must still be refused, and a
+    /// malformed date must fail closed.
+    #[test]
+    fn shadow_expiry_and_aging_deny_the_login() {
+        let today = 20_000;
+        // last change, max age, warning, inactive, account expiry.
+        let live = "root:$6$h:19000:0:99999:7:::";
+        assert!(!shadow_login_denied(live, "root", today));
+
+        let account_expired = "root:$6$h:19000:0:99999:7::19999:";
+        assert!(shadow_login_denied(account_expired, "root", today));
+
+        let password_expired = "root:$6$h:19000:0:30:7:::";
+        assert!(shadow_login_denied(password_expired, "root", today));
+
+        let no_aging = "root:$6$h:19000:0::::";
+        assert!(!shadow_login_denied(no_aging, "root", today));
+
+        let malformed = "root:$6$h:19000:0:99999:7::soon:";
+        assert!(
+            shadow_login_denied(malformed, "root", today),
+            "an unreadable expiry date must not be treated as no expiry"
+        );
+        assert!(!shadow_login_denied(live, "missing", today));
     }
 
     fn user(uid: u32) -> User {
