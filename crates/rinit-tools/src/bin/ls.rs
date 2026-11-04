@@ -2,7 +2,8 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::io;
+use std::io::{self, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -100,9 +101,9 @@ fn format_time(seconds: i64) -> String {
     )
 }
 
-fn format_entry(path: &Path, name: &str, meta: &fs::Metadata, options: Options) -> String {
+fn format_entry(path: &Path, name: &OsStr, meta: &fs::Metadata, options: Options) -> Vec<u8> {
     if !options.long {
-        return name.to_string();
+        return name.as_bytes().to_vec();
     }
     let size = if options.human {
         human_size(meta.size())
@@ -110,25 +111,26 @@ fn format_entry(path: &Path, name: &str, meta: &fs::Metadata, options: Options) 
         meta.size().to_string()
     };
     let mut line = format!(
-        "{} {:>2} {:>5} {:>5} {:>8} {} {}",
+        "{} {:>2} {:>5} {:>5} {:>8} {} ",
         mode_string(meta),
         meta.nlink(),
         meta.uid(),
         meta.gid(),
         size,
         format_time(meta.mtime()),
-        name
-    );
+    )
+    .into_bytes();
+    line.extend_from_slice(name.as_bytes());
     if meta.file_type().is_symlink()
         && let Ok(target) = fs::read_link(path)
     {
-        line.push_str(" -> ");
-        line.push_str(&target.to_string_lossy());
+        line.extend_from_slice(b" -> ");
+        line.extend_from_slice(target.as_os_str().as_bytes());
     }
     line
 }
 
-fn format_dir(path: &Path, options: Options) -> io::Result<String> {
+fn format_dir(path: &Path, options: Options) -> io::Result<Vec<u8>> {
     let mut entries: Vec<(OsString, fs::Metadata)> = Vec::new();
     if options.all {
         entries.push((".".into(), fs::symlink_metadata(path)?));
@@ -139,7 +141,7 @@ fn format_dir(path: &Path, options: Options) -> io::Result<String> {
     for entry in fs::read_dir(path)? {
         let entry = entry?;
         let name = entry.file_name();
-        let hidden = name.to_string_lossy().starts_with('.');
+        let hidden = name.as_bytes().first() == Some(&b'.');
         if hidden && !options.all && !options.almost_all {
             continue;
         }
@@ -147,16 +149,15 @@ fn format_dir(path: &Path, options: Options) -> io::Result<String> {
         entries.push((name, meta));
     }
     entries.sort_by(|left, right| left.0.cmp(&right.0));
-    let mut out = String::new();
+    let mut out = Vec::new();
     for (name, meta) in entries {
-        let display = name.to_string_lossy();
-        out.push_str(&format_entry(&path.join(&name), &display, &meta, options));
-        out.push('\n');
+        out.extend(format_entry(&path.join(&name), &name, &meta, options));
+        out.push(b'\n');
     }
     Ok(out)
 }
 
-fn list_path(path: &Path, display: &str, options: Options) -> io::Result<String> {
+fn list_path(path: &Path, display: &OsStr, options: Options) -> io::Result<Vec<u8>> {
     let meta = fs::symlink_metadata(path)?;
     let follows_to_directory = !options.directory
         && fs::metadata(path)
@@ -166,8 +167,21 @@ fn list_path(path: &Path, display: &str, options: Options) -> io::Result<String>
         format_dir(path, options)
     } else {
         let mut out = format_entry(path, display, &meta, options);
-        out.push('\n');
+        out.push(b'\n');
         Ok(out)
+    }
+}
+
+/// Write raw listing bytes. A closed pipe ends the command successfully; any
+/// other write error is a real failure.
+fn emit(bytes: &[u8]) -> bool {
+    match std::io::stdout().write_all(bytes) {
+        Ok(()) => true,
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => false,
+        Err(error) => {
+            eprintln!("ls: cannot write output: {error}");
+            false
+        }
     }
 }
 
@@ -207,19 +221,21 @@ fn run<A: AsRef<OsStr>>(args: &[A], program: &str) -> ExitCode {
     let multiple = paths.len() > 1;
     let mut failed = false;
     for (index, path) in paths.iter().enumerate() {
-        let display = path.display().to_string();
-        if multiple && index > 0 {
-            println!();
+        let display = path.as_os_str();
+        if multiple && index > 0 && !emit(b"\n") {
+            return ExitCode::from(EXIT_OK);
         }
-        match list_path(path, &display, options) {
+        match list_path(path, display, options) {
             Ok(text) => {
-                if multiple {
-                    println!("{display}:");
+                if multiple && (!emit(display.as_bytes()) || !emit(b":\n")) {
+                    return ExitCode::from(EXIT_OK);
                 }
-                print!("{text}");
+                if !emit(&text) {
+                    return ExitCode::from(EXIT_OK);
+                }
             }
             Err(error) => {
-                eprintln!("{program}: {display}: {error}");
+                eprintln!("{program}: {}: {error}", path.display());
                 failed = true;
             }
         }
@@ -244,6 +260,10 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    fn text(bytes: Vec<u8>) -> String {
+        String::from_utf8(bytes).expect("the test fixture is ASCII")
+    }
 
     fn temp_root(tag: &str) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!("rinit-ls-{tag}-{}", std::process::id()));
@@ -281,17 +301,19 @@ mod tests {
         let root = temp_root("listing");
         fs::write(root.join("visible"), b"x").expect("visible");
         fs::write(root.join(".hidden"), b"x").expect("hidden");
-        let plain = format_dir(&root, Options::default()).expect("plain");
+        let plain = text(format_dir(&root, Options::default()).expect("plain"));
         assert!(plain.contains("visible"));
         assert!(!plain.contains(".hidden"));
-        let all = format_dir(
-            &root,
-            Options {
-                all: true,
-                ..Options::default()
-            },
-        )
-        .expect("all");
+        let all = text(
+            format_dir(
+                &root,
+                Options {
+                    all: true,
+                    ..Options::default()
+                },
+            )
+            .expect("all"),
+        );
         assert!(all.contains(".hidden"));
         assert!(all.contains("..\n"));
     }
@@ -300,15 +322,17 @@ mod tests {
     /// path; the `..` row must still resolve.
     #[test]
     fn the_default_directory_lists_dot_dot() {
-        let text = format_dir(
-            Path::new("."),
-            Options {
-                all: true,
-                ..Options::default()
-            },
-        )
-        .expect("the default directory must be listable");
-        assert!(text.contains(".."), "{text}");
+        let listing = text(
+            format_dir(
+                Path::new("."),
+                Options {
+                    all: true,
+                    ..Options::default()
+                },
+            )
+            .expect("the default directory must be listable"),
+        );
+        assert!(listing.contains(".."), "{listing}");
     }
 
     #[test]
@@ -317,17 +341,36 @@ mod tests {
         let file = root.join("file");
         fs::write(&file, b"abc").expect("file");
         fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).expect("file mode");
-        let text = format_dir(
-            &root,
-            Options {
-                long: true,
-                human: true,
-                ..Options::default()
-            },
-        )
-        .expect("long");
-        assert!(text.contains("-rw-r--r--"));
-        assert!(text.contains("file"));
+        let listing = text(
+            format_dir(
+                &root,
+                Options {
+                    long: true,
+                    human: true,
+                    ..Options::default()
+                },
+            )
+            .expect("long"),
+        );
+        assert!(listing.contains("-rw-r--r--"));
+        assert!(listing.contains("file"));
+    }
+
+    /// A directory entry is bytes; it must appear unchanged in the raw listing.
+    #[test]
+    fn non_utf8_names_are_emitted_as_bytes() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = temp_root("nonutf8");
+        let name = OsString::from_vec(vec![b'f', 0xff, b'x']);
+        fs::write(root.join(&name), b"x").expect("file");
+        let listing = format_dir(&root, Options::default()).expect("listing");
+        assert!(
+            listing.windows(3).any(|window| window == b"f\xffx"),
+            "the raw name must survive: {listing:?}"
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -338,17 +381,19 @@ mod tests {
         fs::write(dir.join("inside"), b"x").expect("inside");
         let link = root.join("link");
         std::os::unix::fs::symlink(&dir, &link).expect("link");
-        let listed = list_path(&link, "link", Options::default()).expect("list");
+        let listed = text(list_path(&link, OsStr::new("link"), Options::default()).expect("list"));
         assert!(listed.contains("inside"));
-        let as_entry = list_path(
-            &link,
-            "link",
-            Options {
-                directory: true,
-                ..Options::default()
-            },
-        )
-        .expect("entry");
+        let as_entry = text(
+            list_path(
+                &link,
+                OsStr::new("link"),
+                Options {
+                    directory: true,
+                    ..Options::default()
+                },
+            )
+            .expect("entry"),
+        );
         assert!(as_entry.contains("link"));
     }
 

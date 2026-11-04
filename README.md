@@ -323,12 +323,12 @@ make test           # check + test-system
 make gates          # acceptance gates: binary size + coverage thresholds
 ```
 
-`cargo test --offline --workspace` (what `make check` runs last) executes **950
+`cargo test --offline --workspace` (what `make check` runs last) executes **951
 tests** across 51 cargo test targets. The five shapes, and why each is not
 redundant:
 
 - **unit tests** next to the code (core 334, rinit 213, rinit-runtime 114,
-  rinit-tools 172, rctl 16, processes 5), including `proptest` properties over
+  rinit-tools 173, rctl 16, processes 5), including `proptest` properties over
   the parser;
 - **integration tests** in `crates/*/tests/`: the syscall layer against the real
   kernel (`rinit-runtime` 26: run unprivileged, they assert that each drop is
@@ -422,10 +422,10 @@ they are measured on the tree as it stands rather than copied from one run:
 | `rinit-core`     | **97.83%**    | 582/592   |
 | `rinit-runtime`  | 83.11%        | 309/361   |
 | `rinit`          | 87.25%        | 767/865   |
-| `rinit-tools`    | 80.78%        | 511/683   |
+| `rinit-tools`    | 80.79%        | 515/687   |
 | `rctl`           | 93.06%        | 42/50     |
 | `processes`      | 25.04%        | 22/80     |
-| **total**        | **85.50%**    | 2233/2631 |
+| **total**        | **85.50%**    | 2237/2635 |
 
 The plan's checklist asks for ≥80% overall and ≥90% in the core, so these are the
 numbers that answer it rather than a shape:
@@ -470,9 +470,9 @@ cargo llvm-cov --offline --workspace --html                  # target/llvm-cov/h
 - **Path-bearing tools accept byte paths; only their textual output is
   lossy.** `rm`, `cp`, `mv`, `cat`, `ls`, `stat`, `mkdir`, `ln`, `touch`,
   `readlink`, `realpath`, `basename`, `dirname`, `df`, `mktemp`, `mount` and
-  `umount` treat a non-UTF-8 operand as a path. Option values such as `-o`/`-t`
-  remain UTF-8, and `ls` renders non-UTF-8 directory entries with replacement
-  characters.
+  `umount` treat a non-UTF-8 operand as a path, and `ls` emits directory names
+  and symlink targets as raw bytes. Option values such as `-o`/`-t` remain
+  UTF-8.
 - **Spawn confirmation is off the main loop for every service path.** The main
   start waits for the report in a blocking task; `ExecStartPre=`,
   `ExecStartPost=`, health probes and `ExecStop=` fork and return immediately.
@@ -1149,8 +1149,8 @@ command through the same spawn path a unit uses.
 
 The packed images (`build/out/initramfs-aarch64-unknown-linux-gnu.cpio.gz` and
 `…-demo.cpio.gz`: static busybox + dynamic rinit/rctl/processes + the unit directory + the
-`/etc`/`/var` skeleton) are 8.16 MiB (8 557 053 B) and 8.16 MiB (8 563 778 B)
-gzipped. The arm32 pair is 8.33 MiB (8 732 363 B) and 8.34 MiB (8 738 173 B).
+`/etc`/`/var` skeleton) are 8.16 MiB (8 557 492 B) and 8.16 MiB (8 563 077 B)
+gzipped. The arm32 pair is 8.33 MiB (8 732 887 B) and 8.34 MiB (8 737 995 B).
 The `run-disk` images are ext4 files of about 79 MiB logical size (roughly
 49-51 MiB used before the first boot, including the default 32 MiB swap file);
 they are not
