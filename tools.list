@@ -15,6 +15,9 @@ rinit      rinit      /sbin/rinit      -               1229  crates/rinit
 rctl       rctl       /bin/rctl        -                600  crates/rctl
 processes  processes  /bin/processes   -                600  crates/processes
 
+# Tools with no BusyBox counterpart keep their rinit- name in both profiles.
+rinit-check rinit-check /bin/rinit-check -                600  crates/rinit-tools/src/bin/rinit-check.rs
+
 # First replace-system set. These binaries are added in
 # crates/rinit-tools/src/bin/ as the implementation lands.
 mount      mount      /bin/mount       /bin/mount      1024  crates/rinit-tools/src/bin/mount.rs

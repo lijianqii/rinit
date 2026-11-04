@@ -12,3 +12,4 @@ path = "src/lib.rs"
 [dependencies]
 libc.workspace = true
 rinit-core.workspace = true
+rinit-runtime.workspace = true

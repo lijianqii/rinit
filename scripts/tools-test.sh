@@ -111,10 +111,10 @@ qemu_pid=$!
 wait_ssh || { echo "FAIL: SSH did not come up" >&2; tail -30 "$serial" >&2; exit 3; }
 
 for path in mount umount swapon swapoff hostname ps free uptime dmesg df sysctl top reboot poweroff \
-    processes ls cat cp mv rm mkdir ln touch echo sleep uname mktemp sync stat rlogin \
+    processes rinit-check ls cat cp mv rm mkdir ln touch echo sleep uname mktemp sync stat rlogin \
     id whoami env which dirname basename realpath readlink rgetty; do
     case "$path" in
-        mount | umount | hostname | ps | dmesg | df | processes | ls | cat | cp | mv | rm | mkdir | ln | touch | echo | sleep | uname | mktemp | sync | stat | rlogin) full="/bin/$path" ;;
+        mount | umount | hostname | ps | dmesg | df | processes | rinit-check | ls | cat | cp | mv | rm | mkdir | ln | touch | echo | sleep | uname | mktemp | sync | stat | rlogin) full="/bin/$path" ;;
         free | uptime | top | id | whoami | env | which | dirname | basename | realpath | readlink) full="/usr/bin/$path" ;;
         sysctl | reboot | poweroff | rgetty | swapon | swapoff) full="/sbin/$path" ;;
     esac
@@ -132,6 +132,10 @@ check 'df prints a filesystem' "ssh_guest 'df' | grep -q '/dev/root'"
 check 'dmesg reads the ring' "ssh_guest 'dmesg' | grep -q 'Booting Linux'"
 check 'sysctl reads a key' "ssh_guest 'sysctl kernel.hostname' | grep -q 'kernel.hostname ='"
 check 'sysctl -w writes a key' "ssh_guest 'sysctl -w kernel.hostname=tools-sysctl >/dev/null; test \"\$(hostname)\" = tools-sysctl; sysctl -w kernel.hostname=rinit >/dev/null'"
+check 'rinit-check validates the shipped units' "ssh_guest 'rinit-check'"
+check 'rinit-check validates the device target' "ssh_guest 'rinit-check --default device.target'"
+check 'rinit-check rejects a bad target' "! ssh_guest 'rinit-check --default no-such.target' >/dev/null 2>&1"
+check 'rinit-check rejects a missing directory' "! ssh_guest 'rinit-check --units /no/such/units' >/dev/null 2>&1"
 check 'top batch snapshot' "ssh_guest 'top -b -n 1' | grep -q 'Tasks:'"
 check 'mount/umount tmpfs' "ssh_guest 'mkdir -p /tmp/toolmnt; mount -t tmpfs tmpfs /tmp/toolmnt; grep -q \" /tmp/toolmnt \" /proc/mounts; umount /tmp/toolmnt; ! grep -q \" /tmp/toolmnt \" /proc/mounts'"
 check 'devpts is mounted from fstab' "ssh_guest 'grep -q \" /dev/pts \" /proc/mounts'"

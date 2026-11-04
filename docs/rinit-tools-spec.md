@@ -82,6 +82,9 @@ The three existing binaries keep their names and paths:
 | `rctl` | `/bin/rctl` |
 | `processes` | `/bin/processes` |
 
+`rinit-check` (`/bin/rinit-check`) is the first tool with no BusyBox
+counterpart; its contract is in section 6.
+
 The first `replace-system` set is:
 
 | BusyBox applet | install path | source binary | risk |
@@ -162,8 +165,8 @@ Still out of scope:
 - `ip`, `ifconfig`, `udhcpc`, `ntpd`, `wget`;
 - filesystem creation/repair tools.
 
-Tools with no BusyBox conflict, such as `rinit-logs`, `rinit-notify` and
-`rinit-watchdog`, can be added later under a `rinit-` prefix.
+Tools with no BusyBox conflict keep a `rinit-` prefix. `rinit-check` is the
+first of these; `rinit-logs`, `rinit-notify` and `rinit-watchdog` can follow.
 
 ## 5. Prerequisite: a real poweroff path
 
@@ -255,6 +258,23 @@ corresponding kernel flags. `swapon -s` prints `/proc/swaps` unchanged. UUID
 and LABEL resolution, `mkswap`, and swap-file creation or resizing are out of
 scope.
 
+### `/bin/rinit-check`
+
+```text
+rinit-check [--units DIR] [--default TARGET]
+```
+
+`rinit-check` loads, parses and resolves a unit directory through the same
+`rinit-runtime` plan PID 1 uses at boot. It is an offline deployment check, not
+a second implementation of the parser.
+
+Non-fatal warnings (for example a missing `Wants=` target) are printed but
+exit 0. A parse error, a dependency cycle, a missing hard dependency or a
+missing default target exits 1. Usage errors exit 2. The check validates the
+static graph only: it does not start units, probe kernel features, resolve
+`User=`/`Group=`, check `ExecStart=` paths or touch cgroups, watchdogs and
+sockets.
+
 ### `/sbin/reboot` and `/sbin/poweroff`
 
 Both must go through the rinit control path. They must not call the reboot
@@ -308,6 +328,7 @@ crates/
       umount.rs
       swapon.rs
       swapoff.rs
+      rinit-check.rs
       hostname.rs
       reboot.rs
       poweroff.rs
@@ -342,6 +363,7 @@ and size budgets:
 
 ```text
 # applet   cargo-bin   install-path    busybox-link    max-kib  source
+rinit-check rinit-check /bin/rinit-check -               600     crates/rinit-tools/src/bin/rinit-check.rs
 mount      mount       /bin/mount      /bin/mount      1024     crates/rinit-tools/src/bin/mount.rs
 umount     umount      /bin/umount     /bin/umount     1024     crates/rinit-tools/src/bin/umount.rs
 swapon     swapon      /sbin/swapon    /sbin/swapon     600     crates/rinit-tools/src/bin/swapon.rs
@@ -433,7 +455,7 @@ Provisional first-version budgets, to be replaced by measured values:
 | profile | tools | total budget |
 | --- | --- | --- |
 | minimal | `rinit` only | 1.2 MB |
-| `replace-system` (first three waves + console + swap) | 41 including existing | 20 MB |
+| `replace-system` (first three waves + console + swap + check) | 42 including existing | 20 MB |
 | full toolbox (later) | 50+ | 24 MB |
 
 Each tool also has its own budget in `tools.list`. CI fails on either a per-tool
@@ -448,6 +470,7 @@ shared `librinit-tools.so` for non-init tools; do not add it pre-emptively.
 - stable output fields compared with BusyBox for the supported subset;
 - mount/umount against real tmpfs/devpts entries, not only `--help`;
 - swap fstab filtering, `pri=`/`discard=` flags and the `-a` idempotency rules;
+- `rinit-check` against valid, warning-only, cyclic and missing-target trees;
 - hostname `-F`;
 - file operations: recursive copy, no-clobber, symlink preservation, directory
   removal guards, hard/symbolic links and `touch -t`;
@@ -469,6 +492,7 @@ shared `librinit-tools.so` for non-init tools; do not add it pre-emptively.
 
 - the existing 105 `make test-system` assertions on the `replace-system` image;
 - a swap round trip: `swapon`, `swapon -s`, `swapoff` and `swapon -a`;
+- `rinit-check` on the shipped directory and a rejected bad target;
 - T3 reboot/poweroff persistence tests;
 - 24 h and 7 day soaks for `rinit`, with the tools not affecting the PID 1
   memory curve;
