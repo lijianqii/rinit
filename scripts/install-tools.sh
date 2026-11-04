@@ -97,6 +97,25 @@ check_elf() {
     done < <(readelf -d "$bin" 2>/dev/null | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p')
 }
 
+total_budget_kib="${TOOLS_TOTAL_BUDGET_KIB:-20480}"
+[[ "$total_budget_kib" =~ ^[0-9]+$ ]] || die "TOOLS_TOTAL_BUDGET_KIB must be a non-negative integer"
+preflight_bytes=0
+while read -r applet cargo_bin install_path busybox_link budget_kib _source; do
+    [[ -z "${applet:-}" || "$applet" == \#* ]] && continue
+    [[ "$applet" == "applet" ]] && continue
+    [[ -n "${budget_kib:-}" ]] || die "malformed manifest line for $applet"
+    bin="$bin_dir/$cargo_bin"
+    if [[ ! -x "$bin" ]]; then
+        ((allow_missing)) || die "missing binary for $applet: $bin"
+        continue
+    fi
+    size=$(stat -c %s "$bin")
+    preflight_bytes=$((preflight_bytes + size))
+done < "$manifest"
+if ((preflight_bytes > total_budget_kib * 1024)); then
+    die "installed tools total $preflight_bytes bytes exceeds ${total_budget_kib}KiB"
+fi
+
 installed=0
 while read -r applet cargo_bin install_path busybox_link budget_kib _source; do
     [[ -z "${applet:-}" || "$applet" == \#* ]] && continue

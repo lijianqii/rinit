@@ -1,6 +1,8 @@
 //! `df` - filesystem space from `/proc/mounts` and `statvfs`.
 
+use std::ffi::OsStr;
 use std::io;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use rinit_tools::{EXIT_OK, program_name, read_trimmed, usage_error};
@@ -66,22 +68,22 @@ fn statvfs(path: &str) -> io::Result<(u64, u64, u64)> {
     ))
 }
 
-fn run(args: &[String], root: &std::path::Path, program: &str) -> ExitCode {
+fn run<A: AsRef<OsStr>>(args: &[A], root: &std::path::Path, program: &str) -> ExitCode {
     let mut human_flag = false;
-    let mut paths = Vec::new();
+    let mut paths: Vec<PathBuf> = Vec::new();
     for arg in args {
-        match arg.as_str() {
-            "-h" => human_flag = true,
-            "-k" => human_flag = false,
-            "-P" => {}
-            "--help" => {
+        match arg.as_ref().to_str() {
+            Some("-h") => human_flag = true,
+            Some("-k") => human_flag = false,
+            Some("-P") => {}
+            Some("--help") => {
                 println!("Usage: df [-h] [-k] [-P] [PATH...]");
                 return ExitCode::from(EXIT_OK);
             }
-            value if value.starts_with('-') => {
+            Some(value) if value.starts_with('-') => {
                 return ExitCode::from(usage_error(program, &format!("unknown option '{value}'")));
             }
-            value => paths.push(value.to_string()),
+            _ => paths.push(PathBuf::from(arg.as_ref())),
         }
     }
 
@@ -110,7 +112,7 @@ fn run(args: &[String], root: &std::path::Path, program: &str) -> ExitCode {
                     }
                 }
                 None => {
-                    eprintln!("{program}: {path}: not found");
+                    eprintln!("{program}: {}: not found", path.display());
                     failed = true;
                 }
             }
@@ -143,14 +145,10 @@ fn run(args: &[String], root: &std::path::Path, program: &str) -> ExitCode {
 
 /// The mount point a path belongs to: the longest mount that is a path-prefix
 /// of it, with a component boundary so `/mntx` does not match `/mnt`.
-fn mount_for<'a>(mounts: &'a [(String, String)], path: &str) -> Option<&'a (String, String)> {
+fn mount_for<'a>(mounts: &'a [(String, String)], path: &Path) -> Option<&'a (String, String)> {
     mounts
         .iter()
-        .filter(|(_, mount)| {
-            path == mount
-                || (path.starts_with(mount)
-                    && (mount == "/" || path.as_bytes().get(mount.len()) == Some(&b'/')))
-        })
+        .filter(|(_, mount)| path.starts_with(Path::new(mount)))
         .max_by_key(|(_, mount)| mount.len())
 }
 
@@ -208,7 +206,7 @@ mod root_tests {
         let mount = root.join("mnt");
         let line = format!("tmpfs {} tmpfs rw 0 0\n", mount.display());
         std::fs::write(root.join("proc/mounts"), line).expect("mounts");
-        assert_eq!(run(&[], &root, "df"), ExitCode::from(0));
+        assert_eq!(run(&[] as &[String], &root, "df"), ExitCode::from(0));
         assert_eq!(run(&["-h".to_string()], &root, "df"), ExitCode::from(0));
         assert_eq!(
             run(&["-k".to_string(), "-P".to_string()], &root, "df"),
@@ -235,7 +233,7 @@ mod root_tests {
     fn run_rejects_bad_options_and_missing_proc() {
         let root = test_root("missing");
         std::fs::remove_file(root.join("proc/mounts")).ok();
-        assert_eq!(run(&[], &root, "df"), ExitCode::from(1));
+        assert_eq!(run(&[] as &[String], &root, "df"), ExitCode::from(1));
         assert_eq!(run(&["--help".to_string()], &root, "df"), ExitCode::from(0));
         assert_eq!(run(&["--bad".to_string()], &root, "df"), ExitCode::from(2));
         let _ = std::fs::remove_dir_all(root);

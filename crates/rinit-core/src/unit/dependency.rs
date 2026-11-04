@@ -369,20 +369,6 @@ impl DependencyGraph {
         }
     }
 
-    /// The units that are waiting on `unit`.
-    pub fn dependents_of(&self, unit: &UnitName) -> Vec<UnitName> {
-        let Some(me) = self.units.iter().position(|u| u == unit) else {
-            return Vec::new();
-        };
-        self.dependencies
-            .iter()
-            .enumerate()
-            .filter(|(_, deps)| deps.contains(&me))
-            .filter_map(|(i, _)| self.units.get(i))
-            .cloned()
-            .collect()
-    }
-
     /// Assign every unit a startup level.
     ///
     /// Level 0 has no dependencies; every other unit sits one level below its

@@ -8,7 +8,6 @@
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-use std::sync::atomic::AtomicBool;
 
 use rinit_core::unit::sandbox::Sandbox;
 use rinit_runtime::RuntimeError;
@@ -149,11 +148,13 @@ pub fn begin_spawn_service_in_group(
     }
 }
 
-/// Start a service and wait for the exec report.
+/// Start a service and return immediately after the fork.
 ///
-/// This is the synchronous wrapper for tests, probes, `ExecStop=` and auxiliary
-/// commands. The main service start uses [`begin_spawn_service_in_group`].
-pub fn spawn_service_in_group(
+/// Used by auxiliary commands, health probes and `ExecStop=`, whose caller only
+/// consumes the exit status. A setup failure before `execve` appears as exit
+/// 127; the normal reaper still observes it. The main service start keeps the
+/// report so it can name the failing step.
+pub fn spawn_service_in_group_detached(
     argv: &[String],
     env: &[String],
     working_directory: Option<&str>,
@@ -161,10 +162,9 @@ pub fn spawn_service_in_group(
     sandbox: &Sandbox,
     place: ChildPlacement<'_>,
 ) -> Result<libc::pid_t, RuntimeError> {
-    let cancel = AtomicBool::new(false);
     match begin_spawn_service_in_group(argv, env, working_directory, output, sandbox, place)? {
         SpawnBegin::Ready(pid) => Ok(pid),
-        SpawnBegin::Pending(pending) => pending.wait_blocking(&cancel).map_err(RuntimeError::from),
+        SpawnBegin::Pending(pending) => Ok(pending.detach()),
     }
 }
 

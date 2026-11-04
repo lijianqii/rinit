@@ -32,7 +32,7 @@ use crate::logs::ServiceLogs;
 use crate::manager;
 use crate::notify::NotifyHub;
 use crate::readiness;
-use crate::service::{ServiceSet, reap_and_log, shutdown, spawn_service_in_group};
+use crate::service::{ServiceSet, reap_and_log, shutdown, spawn_service_in_group_detached};
 use crate::unit_manager::{
     Outcome, ResourceUsage, RestartPlan, SpawnBeginUnit, UnitListEntry, UnitManager, UnitRuntime,
     UnitSpawn, build_service_env, reap_into_manager,
@@ -1627,7 +1627,7 @@ fn plan_aux_command(
 fn spawn_aux_command(unit: &UnitName, plan: &AuxCommandPlan) -> Result<libc::pid_t, String> {
     // As before the state machine: preparation is not the service. It runs
     // outside the unit's cgroup and without its `TTYPath=`.
-    spawn_service_in_group(
+    spawn_service_in_group_detached(
         &plan.argv,
         &plan.env,
         Some(&plan.cwd),
@@ -1865,6 +1865,12 @@ struct ControlStart {
     waiting: Option<UnitName>,
     reply: Option<oneshot::Sender<(Status, String)>>,
     target_was_active: bool,
+    /// Absolute bound for the whole dependency chain.
+    ///
+    /// Each unit's `TimeoutStartSec=` is a budget for that unit; the control
+    /// job must not wait past their sum or a client sees a failure while the
+    /// service is still starting.
+    deadline: Instant,
     /// Reload starts are background work; do not narrate each one as a control
     /// request.
     quiet: bool,
@@ -1878,6 +1884,23 @@ impl ControlStart {
         let target_was_active = manager
             .get(unit)
             .is_some_and(|rt| matches!(rt.state, UnitState::Active | UnitState::ActiveExited));
+        let unlimited = order.iter().any(|name| {
+            manager
+                .get(name)
+                .is_none_or(|rt| rt.config.timeout_start_sec == 0)
+        });
+        let seconds = order
+            .iter()
+            .filter_map(|name| manager.get(name).map(|rt| rt.config.timeout_start_sec))
+            .fold(0u64, u64::saturating_add);
+        let deadline = if unlimited {
+            start_deadline(0)
+        } else {
+            // Give the per-unit flow a moment to publish its own named failure
+            // (for example `NeedsSocket=... did not appear`) instead of
+            // replacing it with the generic control-job timeout.
+            crate::deadline::after_secs(seconds.saturating_add(5).max(1))
+        };
         Ok(ControlStart {
             target: unit.clone(),
             order,
@@ -1886,6 +1909,7 @@ impl ControlStart {
             waiting: None,
             reply: None,
             target_was_active,
+            deadline,
             quiet: false,
         })
     }
@@ -1899,6 +1923,15 @@ impl ControlStart {
         aux: &mut BTreeMap<libc::pid_t, ExitOutcome>,
     ) -> Option<(Status, String)> {
         loop {
+            if Instant::now() >= self.deadline {
+                return Some((
+                    Status::Error,
+                    format!(
+                        "{}: start did not finish within its timeout budget",
+                        self.target
+                    ),
+                ));
+            }
             if let Some(waiting) = self.waiting.clone() {
                 if flows.contains_key(&waiting) {
                     return None;

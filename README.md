@@ -323,12 +323,12 @@ make test           # check + test-system
 make gates          # acceptance gates: binary size + coverage thresholds
 ```
 
-`cargo test --offline --workspace` (what `make check` runs last) executes **948
+`cargo test --offline --workspace` (what `make check` runs last) executes **950
 tests** across 51 cargo test targets. The five shapes, and why each is not
 redundant:
 
 - **unit tests** next to the code (core 334, rinit 213, rinit-runtime 114,
-  rinit-tools 170, rctl 16, processes 5), including `proptest` properties over
+  rinit-tools 172, rctl 16, processes 5), including `proptest` properties over
   the parser;
 - **integration tests** in `crates/*/tests/`: the syscall layer against the real
   kernel (`rinit-runtime` 26: run unprivileged, they assert that each drop is
@@ -419,13 +419,13 @@ they are measured on the tree as it stands rather than copied from one run:
 
 | crate            | line coverage | functions |
 | ---------------- | ------------- | --------- |
-| `rinit-core`     | **97.74%**    | 587/598   |
-| `rinit-runtime`  | 83.37%        | 309/359   |
-| `rinit`          | 87.44%        | 764/863   |
-| `rinit-tools`    | 80.81%        | 502/675   |
+| `rinit-core`     | **97.83%**    | 582/592   |
+| `rinit-runtime`  | 83.11%        | 309/361   |
+| `rinit`          | 87.25%        | 767/865   |
+| `rinit-tools`    | 80.78%        | 511/683   |
 | `rctl`           | 93.06%        | 42/50     |
 | `processes`      | 25.04%        | 22/80     |
-| **total**        | **85.61%**    | 2226/2625 |
+| **total**        | **85.50%**    | 2233/2631 |
 
 The plan's checklist asks for ≥80% overall and ≥90% in the core, so these are the
 numbers that answer it rather than a shape:
@@ -467,16 +467,17 @@ cargo llvm-cov --offline --workspace --html                  # target/llvm-cov/h
   the file, and no syslog protocol. `rctl log` reads the ring, so a line is only
   in the file for as long as the file is; whether that outlives a reboot is the
   filesystem's business (tmpfs does not, a disk does).
-- **Byte paths are supported by the core file tools, not every tool.** `rm`,
-  `cp`, `mv`, `cat`, `ls`, `stat`, `mkdir`, `ln`, `touch`, `readlink` and
-  `realpath` treat a non-UTF-8 argument as a path. `mktemp` templates and
-  `mount`/`umount` arguments are still UTF-8, and `ls` renders non-UTF-8
-  directory entries with replacement characters.
-- **The main service spawn now confirms exec off the main loop.** The `fork`
-  still happens on the main thread, then a blocking task reads the report and
-  the start flow polls it, so a stuck `chdir`/`execve` no longer blocks PID 1 for
-  five seconds. `ExecStartPre=`, health probes and `ExecStop=` still use the
-  synchronous wrapper.
+- **Path-bearing tools accept byte paths; only their textual output is
+  lossy.** `rm`, `cp`, `mv`, `cat`, `ls`, `stat`, `mkdir`, `ln`, `touch`,
+  `readlink`, `realpath`, `basename`, `dirname`, `df`, `mktemp`, `mount` and
+  `umount` treat a non-UTF-8 operand as a path. Option values such as `-o`/`-t`
+  remain UTF-8, and `ls` renders non-UTF-8 directory entries with replacement
+  characters.
+- **Spawn confirmation is off the main loop for every service path.** The main
+  start waits for the report in a blocking task; `ExecStartPre=`,
+  `ExecStartPost=`, health probes and `ExecStop=` fork and return immediately.
+  For those auxiliary paths a pre-exec setup failure is observed as exit 127
+  rather than a named step.
 - **A `oneshot` cannot set `Restart=`.** A oneshot's exit is its start-up
   result, so the manager never restarts it; the parser now rejects any
   non-`no` `Restart=` instead of accepting a directive that would do nothing.
@@ -556,7 +557,7 @@ repository or a measurement in this README:
 | 72 h soak with stable RSS | **Passed on the host.** Segment 9 on `8b373d8` completed **4,320/4,320 samples** and **8,640/8,640 control commands**. RSS peak per half fell from 5,168 kB to 4,300 kB, descriptor minima were 11 and 11 (peak 22), the maximum zombie streak was 1 transient sample, and the final quiescent sweep found 0 zombies. |
 | 24 h soak in the target guest | **Passed.** `7a5df04`, aarch64 `run-disk`, guest-side sampler: **1,440/1,440 samples** and **2,880/2,880 control commands** over 86,343 s. RSS stayed within 2,364–2,528 kB (half peaks 2,520/2,528), descriptors within 19–20, no zombie was ever observed, and the final sweep returned `quiescent=0 health_fail=0`. `eth0`, the default route, `udhcpc`, dropbear, `network.service` and `sshd.service` were healthy in every sample; the serial log shows one boot and no panic/OOM. Sampling runs inside the guest (`scripts/soak-qemu.sh` + `scripts/soak-guest.sh`), so a host SSH outage cannot end the run silently. |
 | binaries ≤2 MB dynamic / ≤4 MB static | [Measurements](#measurements-plan-01-calibration-point): 1.00 MiB dynamic arm64 / 1.07 MiB armv7, checked by `make size-check` |
-| unit test coverage ≥80% overall, ≥90% in the core | **85.61%** and **97.74%** (`make coverage-check`, [above](#testing)) |
+| unit test coverage ≥80% overall, ≥90% in the core | **85.50%** and **97.83%** (`make coverage-check`, [above](#testing)) |
 | documentation: architecture, unit format, `rctl`, porting | this README (architecture, status, measurements), [`docs/units.md`](docs/units.md) (every directive, its value syntax and its default), [`docs/porting.md`](docs/porting.md) (kernel, userspace, build, differences from systemd), and `rinit-开发计划.md` |
 
 One number the checklist does not ask for, but plan §0.1's design goals do: rinit's
@@ -1148,8 +1149,8 @@ command through the same spawn path a unit uses.
 
 The packed images (`build/out/initramfs-aarch64-unknown-linux-gnu.cpio.gz` and
 `…-demo.cpio.gz`: static busybox + dynamic rinit/rctl/processes + the unit directory + the
-`/etc`/`/var` skeleton) are 8.16 MiB (8 557 197 B) and 8.16 MiB (8 563 070 B)
-gzipped. The arm32 pair is 8.33 MiB (8 732 403 B) and 8.34 MiB (8 738 765 B).
+`/etc`/`/var` skeleton) are 8.16 MiB (8 557 053 B) and 8.16 MiB (8 563 778 B)
+gzipped. The arm32 pair is 8.33 MiB (8 732 363 B) and 8.34 MiB (8 738 173 B).
 The `run-disk` images are ext4 files of about 79 MiB logical size (roughly
 49-51 MiB used before the first boot, including the default 32 MiB swap file);
 they are not

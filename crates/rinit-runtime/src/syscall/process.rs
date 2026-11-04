@@ -394,6 +394,28 @@ impl PendingSpawn {
         self.pid
     }
 
+    /// Release the child without reading its report.
+    ///
+    /// The child keeps running; a setup failure is observed as exit 127 by the
+    /// normal reaper. Used for auxiliary commands whose exit status is already
+    /// the only thing the caller consumes.
+    pub fn detach(mut self) -> libc::pid_t {
+        self.completed = true;
+        self.pid
+    }
+
+    /// Kill the child and stop tracking it without waiting for the report.
+    ///
+    /// Used when the parent discovers that the unit disappeared between fork
+    /// and registration. The child is left as a zombie for the global reaper;
+    /// blocking here for up to five seconds would defeat the asynchronous
+    /// spawn path.
+    pub fn abandon(mut self) {
+        // SAFETY: `pid` is our unreaped child and SIGKILL takes no pointer.
+        unsafe { libc::kill(self.pid, libc::SIGKILL) };
+        self.completed = true;
+    }
+
     /// Wait for the report, killing and reaping the child if it never execs.
     ///
     /// `cancel` is checked between short poll slices; a flow that is cancelled

@@ -28,7 +28,7 @@ use rinit_runtime::syscall::{process, wait};
 
 use crate::cgroup::Cgroup;
 use crate::log::rlog;
-use crate::service::{begin_spawn_service_in_group, spawn_service_in_group};
+use crate::service::{begin_spawn_service_in_group, spawn_service_in_group_detached};
 
 /// What registering a unit definition did (plan §7.6).
 ///
@@ -1341,8 +1341,16 @@ impl UnitManager {
         let now = self.now_millis();
         let Some(rt) = self.units.get_mut(unit) else {
             let _ = process::kill(pid, libc::SIGKILL);
-            pending.map(|pending| pending.wait_blocking(&AtomicBool::new(false)));
-            return Ok(SpawnBeginUnit::AlreadyRunning);
+            if let Some(pending) = pending {
+                pending.abandon();
+            }
+            return Err(RuntimeError::Io {
+                op: "spawn unit",
+                source: std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("{unit} disappeared during spawn"),
+                ),
+            });
         };
         rt.pid = Some(pid);
         rt.group = process::getpgid(pid).ok().filter(|group| *group == pid);
@@ -1389,7 +1397,7 @@ impl UnitManager {
         let Some(pending) = spawn.take_pending() else {
             return Ok(());
         };
-        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let cancel = AtomicBool::new(false);
         if let Err(error) = pending.wait_blocking(&cancel) {
             // State was registered before the wait; make the failure terminal
             // and clear the pid rather than leaving a dead child as Active.
@@ -1686,7 +1694,7 @@ impl UnitManager {
             // (`probe_pid`), and having it join would keep the unit's cgroup
             // populated across the probe - which is exactly the state plan §7.3
             // reads as "still running, do not remove this directory".
-            match spawn_service_in_group(
+            match spawn_service_in_group_detached(
                 &argv,
                 &env,
                 Some(&cwd),
@@ -1918,7 +1926,7 @@ impl UnitManager {
                 // probe: a stop command joining the unit's cgroup would make the
                 // directory look populated for as long as it runs, and plan
                 // §7.3 reads a populated directory as a reason to keep it.
-                Ok(sandbox) => spawn_service_in_group(
+                Ok(sandbox) => spawn_service_in_group_detached(
                     &stop_cmd,
                     &env,
                     Some(&cwd),
@@ -1983,10 +1991,23 @@ impl UnitManager {
         }
         // So is an `ExecStop=` command: its exit is not the service exiting.
         if let Some(unit) = self.exec_stop_owner(pid) {
+            let main = self.units.get(&unit).and_then(|rt| rt.pid);
             if let Some(rt) = self.units.get_mut(&unit) {
                 rt.exec_stop_pid = None;
             }
-            rlog!("{unit}: ExecStop finished");
+            if matches!(outcome, ExitOutcome::Success) {
+                rlog!("{unit}: ExecStop finished");
+            } else {
+                // A detached ExecStop only reports its result through its exit
+                // status. If it could not exec or failed, fall back to the
+                // ordinary stop signal instead of waiting out the deadline
+                // with the service untouched.
+                rlog!("warning: {unit}: ExecStop failed ({outcome:?}); sending SIGTERM");
+                self.cgroup.signal_members(&unit, libc::SIGTERM);
+                if let Some(pid) = main {
+                    let _ = signal_process(pid, libc::SIGTERM);
+                }
+            }
             return None;
         }
 

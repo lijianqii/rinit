@@ -149,12 +149,6 @@ impl LogBuffer {
     pub fn accounted_bytes(&self) -> usize {
         self.bytes
     }
-
-    /// Forget everything (used when a unit is removed).
-    pub fn clear(&mut self) {
-        self.lines.clear();
-        self.bytes = 0;
-    }
 }
 
 impl Default for LogBuffer {

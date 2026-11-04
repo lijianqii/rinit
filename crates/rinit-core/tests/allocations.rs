@@ -116,7 +116,6 @@ fn workload() {
     let _ = graph.levels().expect("levels");
     let _ = graph.topological_order().expect("order");
     let _ = graph.dependencies_of(&target);
-    let _ = graph.dependents_of(&target);
     let _ = graph.closure_of(&target);
 
     // Job queue: submission, merge and reconciliation.

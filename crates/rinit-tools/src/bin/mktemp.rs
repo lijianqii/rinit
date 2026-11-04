@@ -1,9 +1,11 @@
 //! `mktemp` - create a temporary file or directory.
 
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-use std::path::Path;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use rinit_tools::{EXIT_OK, program_name, usage_error};
@@ -15,7 +17,7 @@ struct Options {
     directory: bool,
     dry_run: bool,
     quiet: bool,
-    prefix: Option<String>,
+    prefix: Option<PathBuf>,
 }
 
 fn random_bytes(length: usize) -> Vec<u8> {
@@ -39,7 +41,7 @@ fn random_bytes(length: usize) -> Vec<u8> {
     buffer
 }
 
-fn split_template(template: &str) -> Result<(&str, usize, &str), String> {
+fn split_template(template: &OsStr) -> Result<(&[u8], usize, &[u8]), String> {
     let bytes = template.as_bytes();
     let Some(last) = bytes.iter().rposition(|byte| *byte == b'X') else {
         return Err("template must contain at least 3 consecutive X's".to_string());
@@ -53,26 +55,26 @@ fn split_template(template: &str) -> Result<(&str, usize, &str), String> {
         return Err("template must contain at least 3 consecutive X's".to_string());
     }
     Ok((
-        &template[..start],
+        bytes.get(..start).unwrap_or_default(),
         count,
-        template.get(last + 1..).unwrap_or_default(),
+        bytes.get(last + 1..).unwrap_or_default(),
     ))
 }
 
-fn make_name(template: &str, options: &Options) -> Result<String, String> {
-    let (prefix, count, suffix) = split_template(template)?;
+fn make_name(template: impl AsRef<OsStr>, options: &Options) -> Result<PathBuf, String> {
+    let (prefix, count, suffix) = split_template(template.as_ref())?;
     for _ in 0..100 {
         let random = random_bytes(count);
-        let replacement: String = random
-            .iter()
-            .map(|byte| {
-                ALPHABET
-                    .get(*byte as usize % ALPHABET.len())
-                    .copied()
-                    .unwrap_or(b'a') as char
-            })
-            .collect();
-        let path = format!("{prefix}{replacement}{suffix}");
+        let mut name = Vec::with_capacity(prefix.len() + count + suffix.len());
+        name.extend_from_slice(prefix);
+        name.extend(random.iter().map(|byte| {
+            ALPHABET
+                .get(*byte as usize % ALPHABET.len())
+                .copied()
+                .unwrap_or(b'a')
+        }));
+        name.extend_from_slice(suffix);
+        let path = PathBuf::from(OsString::from_vec(name));
         if options.dry_run {
             return Ok(path);
         }
@@ -89,62 +91,67 @@ fn make_name(template: &str, options: &Options) -> Result<String, String> {
         match result {
             Ok(()) => return Ok(path),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(format!("{path}: {error}")),
+            Err(error) => return Err(format!("{}: {error}", path.display())),
         }
     }
     Err("could not create a unique temporary name".to_string())
 }
 
-fn default_temp_dir() -> String {
-    std::env::var("TMPDIR")
-        .ok()
+fn default_temp_dir() -> OsString {
+    std::env::var_os("TMPDIR")
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "/tmp".to_string())
+        .unwrap_or_else(|| OsString::from("/tmp"))
 }
 
-fn apply_prefix(template: String, options: &Options) -> String {
+fn apply_prefix(template: OsString, options: &Options) -> OsString {
     let Some(prefix) = &options.prefix else {
         return template;
     };
-    if template.contains('/') {
+    if template.as_bytes().contains(&b'/') {
         return template;
     }
-    Path::new(prefix).join(template).display().to_string()
+    prefix.join(template).into_os_string()
 }
 
-fn run(args: &[String], program: &str) -> ExitCode {
+fn run<A: AsRef<OsStr>>(args: &[A], program: &str) -> ExitCode {
     let mut options = Options::default();
-    let mut template: Option<String> = None;
-    let (args, trailing) = rinit_tools::split_double_dash(args);
+    let mut template: Option<OsString> = None;
+    let marker = args.iter().position(|arg| arg.as_ref() == OsStr::new("--"));
+    let (options_args, trailing): (&[A], &[A]) = match marker {
+        Some(index) => (
+            args.get(..index).unwrap_or(&[]),
+            args.get(index + 1..).unwrap_or(&[]),
+        ),
+        None => (args, &[] as &[A]),
+    };
     let mut index = 0;
-    while let Some(arg) = args.get(index) {
-        match arg.as_str() {
-            "--help" => {
+    while let Some(arg) = options_args.get(index) {
+        match arg.as_ref().to_str() {
+            Some("--help") => {
                 println!("Usage: mktemp [-dqu] [-p DIR] [TEMPLATE]");
                 return ExitCode::from(EXIT_OK);
             }
-            "-d" | "--directory" => options.directory = true,
-            "-u" | "--dry-run" => options.dry_run = true,
-            "-q" | "--quiet" => options.quiet = true,
-            "-t" => {
-                options.prefix =
-                    Some(std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string()));
+            Some("-d" | "--directory") => options.directory = true,
+            Some("-u" | "--dry-run") => options.dry_run = true,
+            Some("-q" | "--quiet") => options.quiet = true,
+            Some("-t") => {
+                options.prefix = Some(PathBuf::from(default_temp_dir()));
             }
-            "-p" | "--tmpdir" => {
+            Some("-p" | "--tmpdir") => {
                 index += 1;
-                let Some(directory) = args.get(index) else {
+                let Some(directory) = options_args.get(index) else {
                     return ExitCode::from(usage_error(program, "-p needs a directory"));
                 };
-                options.prefix = Some(directory.clone());
+                options.prefix = Some(PathBuf::from(directory.as_ref()));
             }
-            value if value.starts_with('-') && value != "-" => {
+            Some(value) if value.starts_with('-') && value != "-" => {
                 return ExitCode::from(usage_error(program, &format!("unknown option '{value}'")));
             }
-            value => {
+            _ => {
                 if template.is_some() {
                     return ExitCode::from(usage_error(program, "too many templates"));
                 }
-                template = Some(value.to_string());
+                template = Some(OsString::from(arg.as_ref()));
             }
         }
         index += 1;
@@ -153,23 +160,23 @@ fn run(args: &[String], program: &str) -> ExitCode {
         if template.is_some() {
             return ExitCode::from(usage_error(program, "too many templates"));
         }
-        template = Some(value.clone());
+        template = Some(OsString::from(value.as_ref()));
     }
     // GNU/BusyBox `mktemp` with no template uses `$TMPDIR` (or `/tmp`), while
     // an explicit relative template is created in the current directory.
-    let template = match template {
+    let template: OsString = match template {
         Some(template) => template,
         None => {
             if options.prefix.is_none() {
-                options.prefix = Some(default_temp_dir());
+                options.prefix = Some(PathBuf::from(default_temp_dir()));
             }
-            "tmp.XXXXXXXXXX".to_string()
+            OsString::from("tmp.XXXXXXXXXX")
         }
     };
     let template = apply_prefix(template, &options);
     match make_name(&template, &options) {
         Ok(path) => {
-            println!("{path}");
+            println!("{}", path.display());
             ExitCode::from(EXIT_OK)
         }
         Err(error) => {
@@ -190,10 +197,7 @@ fn main() -> ExitCode {
             .and_then(|arg| arg.to_str()),
         "mktemp",
     );
-    let Some(args) = rinit_tools::utf8_args(&program) else {
-        return ExitCode::from(rinit_tools::EXIT_USAGE);
-    };
-    let args: Vec<String> = args.into_iter().skip(1).collect();
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     run(&args, &program)
 }
 
@@ -201,6 +205,7 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
     use std::path::PathBuf;
 
     fn temp_root(tag: &str) -> PathBuf {
@@ -213,11 +218,11 @@ mod tests {
     #[test]
     fn a_bare_template_uses_the_temporary_directory() {
         let options = Options {
-            prefix: Some("/tmp".to_string()),
+            prefix: Some(PathBuf::from("/tmp")),
             ..Options::default()
         };
         assert_eq!(
-            apply_prefix("tmp.XXXXXX".to_string(), &options),
+            apply_prefix(OsString::from("tmp.XXXXXX"), &options),
             "/tmp/tmp.XXXXXX"
         );
         assert!(Path::new(&default_temp_dir()).is_absolute());

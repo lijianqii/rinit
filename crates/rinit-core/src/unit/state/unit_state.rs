@@ -69,14 +69,6 @@ impl UnitState {
         )
     }
 
-    /// Whether a stop can be skipped because there is nothing to stop.
-    ///
-    /// `Active(Exited)` has no process, so `Deactivating` would spin with
-    /// nothing to do; plan §1.3(3) requires the direct jump to `Inactive`.
-    pub fn has_nothing_to_stop(&self) -> bool {
-        matches!(self, UnitState::Inactive | UnitState::ActiveExited)
-    }
-
     /// The short form `rctl status` shows.
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -184,14 +176,13 @@ mod tests {
 
     /// `Active(Exited)` is the case that makes `oneshot` work at all.
     #[test]
-    fn active_exited_is_satisfied_but_has_nothing_to_stop() {
+    fn active_exited_is_satisfied_and_not_live() {
         let state = UnitState::ActiveExited;
         assert!(
             state.is_satisfied(),
             "dependents must be allowed to proceed"
         );
         assert!(!state.is_live(), "no process is running");
-        assert!(state.has_nothing_to_stop());
     }
 
     #[test]
@@ -199,7 +190,6 @@ mod tests {
         let state = UnitState::Inactive;
         assert!(!state.is_satisfied());
         assert!(!state.is_live());
-        assert!(state.has_nothing_to_stop());
     }
 
     #[test]

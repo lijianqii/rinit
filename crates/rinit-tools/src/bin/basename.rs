@@ -1,46 +1,66 @@
 //! `basename` - strip directory and suffix from a path.
 
+use std::ffi::{OsStr, OsString};
+use std::io::Write;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::process::ExitCode;
 
 use rinit_tools::{EXIT_OK, program_name, usage_error};
 
-fn basename(path: &str, suffix: Option<&str>) -> String {
-    if path.is_empty() {
-        return String::new();
+fn basename_os(path: &OsStr, suffix: Option<&OsStr>) -> OsString {
+    let bytes = path.as_bytes();
+    if bytes.is_empty() {
+        return OsString::new();
     }
-    let trimmed = path.trim_end_matches('/');
-    let name = if trimmed.is_empty() {
-        "/"
+    let mut end = bytes.len();
+    while end > 1 && bytes.get(end - 1) == Some(&b'/') {
+        end -= 1;
+    }
+    let trimmed = bytes.get(..end).unwrap_or(bytes);
+    let mut name = if trimmed == b"/" {
+        trimmed
     } else {
-        trimmed.rsplit('/').next().unwrap_or(trimmed)
+        match trimmed.iter().rposition(|byte| *byte == b'/') {
+            Some(position) => trimmed.get(position + 1..).unwrap_or(trimmed),
+            None => trimmed,
+        }
     };
-    if let Some(suffix) = suffix
-        && !suffix.is_empty()
-        && name != suffix
-        && let Some(stripped) = name.strip_suffix(suffix)
-    {
-        return stripped.to_string();
+    if let Some(suffix) = suffix {
+        let suffix = suffix.as_bytes();
+        if !suffix.is_empty()
+            && name != suffix
+            && let Some(stripped) = name.strip_suffix(suffix)
+        {
+            name = stripped;
+        }
     }
-    name.to_string()
+    OsString::from_vec(name.to_vec())
 }
 
-fn run(args: &[String], program: &str) -> ExitCode {
-    let mut operands: Vec<String> = Vec::new();
+#[cfg(test)]
+fn basename(path: &str, suffix: Option<&str>) -> String {
+    basename_os(OsStr::new(path), suffix.map(OsStr::new))
+        .into_string()
+        .unwrap_or_default()
+}
+
+fn run<A: AsRef<OsStr>>(args: &[A], program: &str) -> ExitCode {
+    let mut operands: Vec<OsString> = Vec::new();
     for arg in args {
-        match arg.as_str() {
-            "--help" => {
+        match arg.as_ref().to_str() {
+            Some("--help") => {
                 println!("Usage: basename NAME [SUFFIX]");
                 return ExitCode::from(EXIT_OK);
             }
-            value if value.starts_with('-') && value != "-" => {
+            Some(value) if value.starts_with('-') && value != "-" => {
                 return ExitCode::from(usage_error(program, &format!("unknown option '{value}'")));
             }
-            value => operands.push(value.to_string()),
+            _ => operands.push(OsString::from(arg.as_ref())),
         }
     }
     let (name, suffix) = match operands.as_slice() {
-        [name] => (name.as_str(), None),
-        [name, suffix] => (name.as_str(), Some(suffix.as_str())),
+        [name] => (name.as_os_str(), None),
+        [name, suffix] => (name.as_os_str(), Some(suffix.as_os_str())),
         _ => {
             return ExitCode::from(usage_error(
                 program,
@@ -48,8 +68,19 @@ fn run(args: &[String], program: &str) -> ExitCode {
             ));
         }
     };
-    println!("{}", basename(name, suffix));
-    ExitCode::from(EXIT_OK)
+    let result = basename_os(name, suffix);
+    let mut out = std::io::stdout().lock();
+    let write = out
+        .write_all(result.as_bytes())
+        .and_then(|()| out.write_all(b"\n"));
+    match write {
+        Ok(()) => ExitCode::from(EXIT_OK),
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => ExitCode::from(EXIT_OK),
+        Err(error) => {
+            eprintln!("{program}: {error}");
+            ExitCode::from(1)
+        }
+    }
 }
 
 fn main() -> ExitCode {
@@ -61,10 +92,7 @@ fn main() -> ExitCode {
             .and_then(|arg| arg.to_str()),
         "basename",
     );
-    let Some(args) = rinit_tools::utf8_args(&program) else {
-        return ExitCode::from(rinit_tools::EXIT_USAGE);
-    };
-    let args: Vec<String> = args.into_iter().skip(1).collect();
+    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     run(&args, &program)
 }
 
@@ -86,6 +114,13 @@ mod tests {
     }
 
     #[test]
+    fn a_non_utf8_component_is_preserved() {
+        use std::os::unix::ffi::OsStrExt;
+        let name = OsStr::from_bytes(b"dir/\xff");
+        assert_eq!(basename_os(name, None).as_bytes(), b"\xff");
+    }
+
+    #[test]
     fn run_handles_help_and_operands() {
         assert_eq!(
             run(&["--help".to_string()], "basename"),
@@ -100,7 +135,7 @@ mod tests {
             ExitCode::from(EXIT_OK)
         );
         assert_eq!(
-            run(&[], "basename"),
+            run(&[] as &[String], "basename"),
             ExitCode::from(rinit_tools::EXIT_USAGE)
         );
     }

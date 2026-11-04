@@ -1,54 +1,76 @@
 //! `dirname` - strip the last component from a path.
 
+use std::ffi::{OsStr, OsString};
+use std::io::Write;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::process::ExitCode;
 
 use rinit_tools::{EXIT_OK, program_name, usage_error};
 
-fn dirname(path: &str) -> String {
-    if path.is_empty() {
-        return ".".to_string();
+fn dirname_os(path: &OsStr) -> OsString {
+    let bytes = path.as_bytes();
+    if bytes.is_empty() {
+        return OsString::from(".");
     }
-    let mut end = path.len();
-    while end > 1 && path.as_bytes().get(end - 1) == Some(&b'/') {
+    let mut end = bytes.len();
+    while end > 1 && bytes.get(end - 1) == Some(&b'/') {
         end -= 1;
     }
-    let trimmed = &path[..end];
-    match trimmed.rfind('/') {
-        None => ".".to_string(),
-        Some(0) => "/".to_string(),
+    let trimmed = bytes.get(..end).unwrap_or(bytes);
+    match trimmed.iter().rposition(|byte| *byte == b'/') {
+        None => OsString::from("."),
+        Some(0) => OsString::from("/"),
         Some(position) => {
-            let mut directory = &trimmed[..position];
-            while directory.len() > 1 && directory.ends_with('/') {
-                directory = &directory[..directory.len() - 1];
+            let mut directory = trimmed.get(..position).unwrap_or_default();
+            while directory.len() > 1 && directory.last() == Some(&b'/') {
+                directory = directory.get(..directory.len() - 1).unwrap_or_default();
             }
             if directory.is_empty() {
-                "/".to_string()
+                OsString::from("/")
             } else {
-                directory.to_string()
+                OsString::from_vec(directory.to_vec())
             }
         }
     }
 }
 
-fn run(args: &[String], program: &str) -> ExitCode {
-    let mut paths: Vec<String> = Vec::new();
+#[cfg(test)]
+fn dirname(path: &str) -> String {
+    dirname_os(OsStr::new(path))
+        .into_string()
+        .unwrap_or_default()
+}
+
+fn run<A: AsRef<OsStr>>(args: &[A], program: &str) -> ExitCode {
+    let mut paths: Vec<OsString> = Vec::new();
     for arg in args {
-        match arg.as_str() {
-            "--help" => {
+        match arg.as_ref().to_str() {
+            Some("--help") => {
                 println!("Usage: dirname PATH...");
                 return ExitCode::from(EXIT_OK);
             }
-            value if value.starts_with('-') && value != "-" => {
+            Some(value) if value.starts_with('-') && value != "-" => {
                 return ExitCode::from(usage_error(program, &format!("unknown option '{value}'")));
             }
-            value => paths.push(value.to_string()),
+            _ => paths.push(OsString::from(arg.as_ref())),
         }
     }
     if paths.is_empty() {
         return ExitCode::from(usage_error(program, "a path operand is required"));
     }
+    let mut out = std::io::stdout().lock();
     for path in paths {
-        println!("{}", dirname(&path));
+        let result = dirname_os(&path);
+        if let Err(error) = out
+            .write_all(result.as_bytes())
+            .and_then(|()| out.write_all(b"\n"))
+        {
+            if error.kind() == std::io::ErrorKind::BrokenPipe {
+                return ExitCode::from(EXIT_OK);
+            }
+            eprintln!("{program}: {error}");
+            return ExitCode::from(1);
+        }
     }
     ExitCode::from(EXIT_OK)
 }
@@ -62,10 +84,7 @@ fn main() -> ExitCode {
             .and_then(|arg| arg.to_str()),
         "dirname",
     );
-    let Some(args) = rinit_tools::utf8_args(&program) else {
-        return ExitCode::from(rinit_tools::EXIT_USAGE);
-    };
-    let args: Vec<String> = args.into_iter().skip(1).collect();
+    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     run(&args, &program)
 }
 
@@ -86,6 +105,13 @@ mod tests {
     }
 
     #[test]
+    fn a_non_utf8_path_is_preserved() {
+        use std::os::unix::ffi::OsStrExt;
+        let path = OsStr::from_bytes(b"/tmp/\xff/file");
+        assert_eq!(dirname_os(path).as_bytes(), b"/tmp/\xff");
+    }
+
+    #[test]
     fn run_handles_help_and_missing_operands() {
         assert_eq!(
             run(&["--help".to_string()], "dirname"),
@@ -95,6 +121,9 @@ mod tests {
             run(&["/a/b".to_string()], "dirname"),
             ExitCode::from(EXIT_OK)
         );
-        assert_eq!(run(&[], "dirname"), ExitCode::from(rinit_tools::EXIT_USAGE));
+        assert_eq!(
+            run(&[] as &[String], "dirname"),
+            ExitCode::from(rinit_tools::EXIT_USAGE)
+        );
     }
 }

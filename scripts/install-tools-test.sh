@@ -88,6 +88,15 @@ rc=$?
 check 'size budget is enforced' test "$rc" -ne 0
 check 'failed size check leaves the BusyBox link' test -L "$root/bin/mount"
 
+# 5b. The whole manifest has a total budget, checked before any install.
+new_case total
+ln -s /bin/busybox "$root/bin/mount"
+TOOLS_TOTAL_BUDGET_KIB=1 "$installer" --rootfs "$root" --bin-dir "$bin" \
+    --manifest "$tmp/total.list" --arch aarch64 >/dev/null 2>&1
+rc=$?
+check 'total size budget is enforced' test "$rc" -ne 0
+check 'total size failure leaves the BusyBox link' test -L "$root/bin/mount"
+
 # 6. coexist keeps BusyBox and uses an rinit- prefix.
 new_case coexist
 ln -s /bin/busybox "$root/bin/mount"

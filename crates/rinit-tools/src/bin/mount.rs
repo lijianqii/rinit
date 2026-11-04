@@ -1,6 +1,7 @@
 //! `mount` - the small, explicit subset the device image needs.
 
-use std::ffi::CString;
+use std::ffi::{CString, OsStr, OsString};
+use std::os::unix::ffi::OsStrExt;
 use std::process::ExitCode;
 
 use rinit_tools::{EXIT_OK, program_name, read_trimmed, usage_error};
@@ -42,13 +43,13 @@ fn parse_options(spec: &str) -> ParsedOptions {
     parsed
 }
 
-fn cstring(value: &str, what: &str) -> Result<CString, String> {
-    CString::new(value).map_err(|_| format!("{what} contains NUL"))
+fn cstring(value: &OsStr, what: &str) -> Result<CString, String> {
+    CString::new(value.as_bytes()).map_err(|_| format!("{what} contains NUL"))
 }
 
 fn mount_one(
-    source: &str,
-    target: &str,
+    source: &OsStr,
+    target: &OsStr,
     fstype: Option<&str>,
     options: &ParsedOptions,
 ) -> Result<(), String> {
@@ -56,7 +57,7 @@ fn mount_one(
     let target_c = cstring(target, "target")?;
     let fstype_c = match fstype {
         Some(value) if !value.is_empty() && value != "none" => {
-            Some(cstring(value, "filesystem type")?)
+            Some(cstring(OsStr::new(value), "filesystem type")?)
         }
         _ => None,
     };
@@ -64,7 +65,7 @@ fn mount_one(
     let data_c = if data.is_empty() {
         None
     } else {
-        Some(cstring(&data, "mount options")?)
+        Some(cstring(OsStr::new(&data), "mount options")?)
     };
     // SAFETY: every pointer is borrowed from a NUL-terminated CString for the
     // duration of the call; an absent type/data is a null pointer.
@@ -127,7 +128,12 @@ fn mount_fstab(root: &std::path::Path) -> Result<(), String> {
         if fields[3].split(',').any(|option| option == "noauto") {
             continue;
         }
-        if let Err(e) = mount_one(fields[0], fields[1], Some(fields[2]), &options) {
+        if let Err(e) = mount_one(
+            OsStr::new(fields[0]),
+            OsStr::new(fields[1]),
+            Some(fields[2]),
+            &options,
+        ) {
             eprintln!("mount: {}: {e}", fields[1]);
             fail += 1;
         }
@@ -139,7 +145,7 @@ fn mount_fstab(root: &std::path::Path) -> Result<(), String> {
     }
 }
 
-fn run(args: &[String], root: &std::path::Path, program: &str) -> ExitCode {
+fn run<A: AsRef<OsStr>>(args: &[A], root: &std::path::Path, program: &str) -> ExitCode {
     if args.is_empty() {
         return match list_mounts(root) {
             Ok(()) => ExitCode::from(EXIT_OK),
@@ -153,38 +159,44 @@ fn run(args: &[String], root: &std::path::Path, program: &str) -> ExitCode {
     let mut fstype: Option<String> = None;
     let mut options = ParsedOptions::default();
     let mut all = false;
-    let mut positional = Vec::new();
+    let mut positional: Vec<OsString> = Vec::new();
     let mut index = 0;
     while let Some(arg) = args.get(index) {
-        match arg.as_str() {
-            "-h" | "--help" => {
+        match arg.as_ref().to_str() {
+            Some("-h" | "--help") => {
                 println!("Usage: mount [-a] [-t TYPE] [-o OPTIONS] [DEVICE] DIR");
                 return ExitCode::from(EXIT_OK);
             }
-            "-a" | "--all" => all = true,
-            "-n" => {}
-            "-r" => options.flags |= libc::MS_RDONLY,
-            "-w" => options.flags &= !libc::MS_RDONLY,
-            "-t" => {
+            Some("-a" | "--all") => all = true,
+            Some("-n") => {}
+            Some("-r") => options.flags |= libc::MS_RDONLY,
+            Some("-w") => options.flags &= !libc::MS_RDONLY,
+            Some("-t") => {
                 index += 1;
                 let Some(value) = args.get(index) else {
                     return ExitCode::from(usage_error(program, "-t needs a type"));
                 };
-                fstype = Some(value.clone());
+                let Some(value) = value.as_ref().to_str() else {
+                    return ExitCode::from(usage_error(program, "-t needs a UTF-8 type"));
+                };
+                fstype = Some(value.to_string());
             }
-            "-o" => {
+            Some("-o") => {
                 index += 1;
                 let Some(value) = args.get(index) else {
                     return ExitCode::from(usage_error(program, "-o needs options"));
+                };
+                let Some(value) = value.as_ref().to_str() else {
+                    return ExitCode::from(usage_error(program, "-o needs UTF-8 options"));
                 };
                 let extra = parse_options(value);
                 options.flags |= extra.flags;
                 options.data.extend(extra.data);
             }
-            value if value.starts_with('-') => {
+            Some(value) if value.starts_with('-') => {
                 return ExitCode::from(usage_error(program, &format!("unknown option '{value}'")));
             }
-            value => positional.push(value.to_string()),
+            _ => positional.push(OsString::from(arg.as_ref())),
         }
         index += 1;
     }
@@ -208,14 +220,14 @@ fn run(args: &[String], root: &std::path::Path, program: &str) -> ExitCode {
                 }
             };
         }
-        [source, target] => (source.as_str(), target.as_str()),
-        [target] => ("", target.as_str()),
+        [source, target] => (source.as_os_str(), target.as_os_str()),
+        [target] => (OsStr::new(""), target.as_os_str()),
         _ => return ExitCode::from(usage_error(program, "too many arguments")),
     };
     match mount_one(source, target, fstype.as_deref(), &options) {
         Ok(()) => ExitCode::from(EXIT_OK),
         Err(e) => {
-            eprintln!("{program}: {target}: {e}");
+            eprintln!("{program}: {}: {e}", target.to_string_lossy());
             ExitCode::from(1)
         }
     }
@@ -230,10 +242,7 @@ fn main() -> ExitCode {
             .and_then(|arg| arg.to_str()),
         "mount",
     );
-    let Some(args) = rinit_tools::utf8_args(&program) else {
-        return ExitCode::from(rinit_tools::EXIT_USAGE);
-    };
-    let args: Vec<String> = args.into_iter().skip(1).collect();
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     run(&args, std::path::Path::new("/"), &program)
 }
 
@@ -257,8 +266,8 @@ mod tests {
 
     #[test]
     fn nul_paths_are_rejected() {
-        assert!(cstring("a\0b", "path").is_err());
-        assert!(cstring("ok", "path").is_ok());
+        assert!(cstring(OsStr::new("a\0b"), "path").is_err());
+        assert!(cstring(OsStr::new("ok"), "path").is_ok());
     }
 }
 
@@ -282,7 +291,7 @@ mod root_tests {
             "/dev/vda / ext4 rw 0 0\ntmpfs /run tmpfs rw 0 0\n",
         )
         .expect("mounts");
-        assert_eq!(run(&[], &root, "mount"), ExitCode::from(0));
+        assert_eq!(run(&[] as &[String], &root, "mount"), ExitCode::from(0));
         assert_eq!(
             run(&["--help".to_string()], &root, "mount"),
             ExitCode::from(0)
@@ -323,7 +332,7 @@ mod root_tests {
     #[test]
     fn missing_mounts_and_missing_target_are_errors() {
         let root = test_root("missing");
-        assert_eq!(run(&[], &root, "mount"), ExitCode::from(1));
+        assert_eq!(run(&[] as &[String], &root, "mount"), ExitCode::from(1));
         assert_eq!(
             run(
                 &["tmpfs".to_string(), "/no/such/target".to_string()],
