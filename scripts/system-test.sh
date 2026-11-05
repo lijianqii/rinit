@@ -544,12 +544,12 @@ expect "and the kernel has devpts on /dev/pts" "fstab-devpts /dev/pts devpts"
 expect "rinit reported the boot timing" "rinit: boot timing: first service at"
 timing="$(grep -oE 'first service at [0-9]+ms' "${log_file}" | tail -1 | grep -oE '[0-9]+')"
 rinit_ms="$(grep -oE "rinit's own boot: [0-9]+ms" "${log_file}" | tail -1 | grep -oE '[0-9]+')"
-# A sanity check on the measurement, not a performance gate: plan §0.1 does name
-# a <1 s target, but a guest under whatever load the host is carrying is not a
-# stable benchmark, and the recorded number is still being calibrated. What this
-# catches is a clock that is not the kernel's - the first service cannot have
-# started before rinit itself did - and a number several orders of magnitude out.
-# The recorded gap is called out in the README's measurements section.
+# A regression bound, not the plan §0.1 <1 s target: a guest under whatever
+# load the host is carrying is not a stable benchmark, and the first-service
+# time is dominated by kernel/initramfs boot. What this catches is a clock that
+# is not the kernel's - the first service cannot have started before rinit
+# itself did - and a number several orders of magnitude out. The accepted
+# deviation is recorded in the README's measurements section.
 if [[ -n "${timing}" && -n "${rinit_ms}" && "${timing}" -ge "${rinit_ms}" && "${timing}" -lt 30000 ]]; then
     pass "the boot timing is the kernel's own clock (first service at ${timing}ms, ${rinit_ms}ms of it rinit's)"
 else

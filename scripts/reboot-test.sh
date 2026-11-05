@@ -208,7 +208,7 @@ reboot_guest() {
     timeout 5 ssh -p "$port" -i "$key" -o BatchMode=yes \
         -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
         -o LogLevel=ERROR -o ConnectTimeout=5 \
-        root@127.0.0.1 'reboot' >/dev/null 2>&1 || true
+        root@127.0.0.1 'kill -TERM 1' >/dev/null 2>&1 || true
     if ! wait_log_count 'rinit 0.1.0 starting (pid 1)' "$want" 180; then
         echo "reboot-test: boot $want did not start" >&2
         tail -40 "$log" >&2
