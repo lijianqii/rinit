@@ -913,7 +913,16 @@ enum ChildReport {
 /// process, which is not worth the cost for an init that already owns the
 /// status of its children.
 fn read_report(fd: libc::c_int, cancel: &AtomicBool) -> Result<ChildReport, SyscallError> {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    read_report_with_deadline(fd, cancel, Instant::now() + Duration::from_secs(5))
+}
+
+/// The deadline is explicit so tests can exercise the timeout path without
+/// waiting for the production five-second budget.
+fn read_report_with_deadline(
+    fd: libc::c_int,
+    cancel: &AtomicBool,
+    deadline: Instant,
+) -> Result<ChildReport, SyscallError> {
     let mut first = [0u8; 1];
     if read_until(fd, &mut first, deadline, "child report", cancel)? == 0 {
         return Ok(ChildReport::DiedBeforeExec);
@@ -1431,5 +1440,34 @@ mod report_tests {
             read_report(read_end.as_raw_fd(), &AtomicBool::new(false)).expect("read"),
             ChildReport::DiedBeforeExec
         );
+    }
+
+    /// Cancellation must be observed between poll slices, not only at the
+    /// five-second deadline: a stop that arrives while a child is stuck before
+    /// `execve` has to release the flow promptly.
+    #[test]
+    fn a_cancelled_report_stops_without_waiting_for_the_deadline() {
+        let read_end = pipe_with(&[]);
+        let error = read_report_with_deadline(
+            read_end.as_raw_fd(),
+            &AtomicBool::new(true),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .expect_err("a cancelled read must not succeed");
+        assert_eq!(error.errno(), libc::ECANCELED);
+    }
+
+    /// A report that never arrives is a timeout, not a quiet success or a
+    /// process that stays stuck forever.
+    #[test]
+    fn a_report_without_data_times_out_at_its_deadline() {
+        let (read_end, _write_end) = fs::pipe().expect("pipe");
+        let error = read_report_with_deadline(
+            read_end.as_raw_fd(),
+            &AtomicBool::new(false),
+            Instant::now() + Duration::from_millis(10),
+        )
+        .expect_err("an empty report must time out");
+        assert_eq!(error.errno(), libc::ETIMEDOUT);
     }
 }

@@ -305,6 +305,7 @@ fn status_of(error: &ProtocolError) -> Status {
 }
 
 /// What went wrong reading a frame.
+#[derive(Debug)]
 enum FrameError {
     /// The socket itself failed (including a clean EOF).
     Io(std::io::Error),
@@ -314,8 +315,17 @@ enum FrameError {
 
 /// Read one length-prefixed frame, bounded by [`IO_TIMEOUT`].
 async fn read_frame(stream: &mut UnixStream) -> Result<Vec<u8>, FrameError> {
+    read_frame_with_timeout(stream, IO_TIMEOUT).await
+}
+
+/// The timeout is a parameter so tests can exercise the failure without
+/// waiting for the production ten-second budget.
+async fn read_frame_with_timeout(
+    stream: &mut UnixStream,
+    timeout: Duration,
+) -> Result<Vec<u8>, FrameError> {
     let mut prefix = [0u8; LENGTH_PREFIX_BYTES];
-    tokio::time::timeout(IO_TIMEOUT, stream.read_exact(&mut prefix))
+    tokio::time::timeout(timeout, stream.read_exact(&mut prefix))
         .await
         .map_err(|_| {
             FrameError::Io(std::io::Error::new(
@@ -327,7 +337,7 @@ async fn read_frame(stream: &mut UnixStream) -> Result<Vec<u8>, FrameError> {
 
     let len = frame_len(prefix).map_err(FrameError::Protocol)?;
     let mut body = vec![0u8; len];
-    tokio::time::timeout(IO_TIMEOUT, stream.read_exact(&mut body))
+    tokio::time::timeout(timeout, stream.read_exact(&mut body))
         .await
         .map_err(|_| {
             FrameError::Io(std::io::Error::new(
@@ -415,5 +425,102 @@ mod tests {
         let (status, text) = await_reply(rx, Duration::from_secs(1)).await;
         assert_eq!(status, Status::Ok);
         assert_eq!(text, "fine");
+    }
+
+    async fn read_response(stream: &mut UnixStream) -> (Status, String) {
+        let mut prefix = [0u8; LENGTH_PREFIX_BYTES];
+        stream
+            .read_exact(&mut prefix)
+            .await
+            .expect("response prefix");
+        let len = frame_len(prefix).expect("response length");
+        let mut body = vec![0u8; len];
+        stream.read_exact(&mut body).await.expect("response body");
+        rinit_core::decode_response(&body).expect("response decode")
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_complete_frame_is_read_without_the_production_timeout() {
+        let (mut client, mut server) = UnixStream::pair().expect("socket pair");
+        client
+            .write_all(&frame(b"request"))
+            .await
+            .expect("write frame");
+        assert_eq!(
+            read_frame_with_timeout(&mut server, Duration::from_secs(1))
+                .await
+                .expect("frame"),
+            b"request"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_oversized_length_prefix_is_rejected_before_the_body() {
+        let (mut client, mut server) = UnixStream::pair().expect("socket pair");
+        let declared = rinit_core::MAX_FRAME_BYTES + 1;
+        client
+            .write_all(&(declared as u32).to_le_bytes())
+            .await
+            .expect("write prefix");
+        match read_frame_with_timeout(&mut server, Duration::from_secs(1)).await {
+            Err(FrameError::Protocol(ProtocolError::TooLong { declared: found })) => {
+                assert_eq!(found, declared);
+            }
+            other => panic!("expected TooLong, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_silent_prefix_times_out() {
+        let (_client, mut server) = UnixStream::pair().expect("socket pair");
+        match read_frame_with_timeout(&mut server, Duration::from_millis(10)).await {
+            Err(FrameError::Io(error)) => assert_eq!(error.kind(), std::io::ErrorKind::TimedOut),
+            other => panic!("expected a timeout, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_silent_body_times_out_after_the_prefix() {
+        let (mut client, mut server) = UnixStream::pair().expect("socket pair");
+        client
+            .write_all(&5u32.to_le_bytes())
+            .await
+            .expect("write prefix");
+        match read_frame_with_timeout(&mut server, Duration::from_millis(10)).await {
+            Err(FrameError::Io(error)) => assert_eq!(error.kind(), std::io::ErrorKind::TimedOut),
+            other => panic!("expected a timeout, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_foreign_version_is_answered_with_the_wire_status() {
+        let (mut client, server) = UnixStream::pair().expect("socket pair");
+        let foreign = rinit_core::PROTOCOL_VERSION.wrapping_add(1);
+        let mut body = rinit_core::encode_request(&Request::List);
+        body[..2].copy_from_slice(&foreign.to_le_bytes());
+        client
+            .write_all(&frame(&body))
+            .await
+            .expect("write request");
+        let (sender, _receiver) = mpsc::channel(1);
+        serve(server, sender, true).await.expect("serve");
+        let (status, text) = read_response(&mut client).await;
+        assert_eq!(status, Status::VersionMismatch);
+        assert!(text.contains("protocol version"), "{text}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_oversized_frame_is_answered_as_a_bad_request() {
+        let (mut client, server) = UnixStream::pair().expect("socket pair");
+        let declared = rinit_core::MAX_FRAME_BYTES + 1;
+        client
+            .write_all(&(declared as u32).to_le_bytes())
+            .await
+            .expect("write prefix");
+        let (sender, _receiver) = mpsc::channel(1);
+        serve(server, sender, true).await.expect("serve");
+        let (status, text) = read_response(&mut client).await;
+        assert_eq!(status, Status::BadRequest);
+        assert!(text.contains("exceeds"), "{text}");
     }
 }

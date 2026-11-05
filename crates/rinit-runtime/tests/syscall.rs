@@ -74,6 +74,73 @@ fn reap_signaled_child() {
     assert!(killed, "expected child {pid} to be reported as signaled");
 }
 
+/// Start a `/bin/sleep` through the controlled fork path without waiting for
+/// the exec report, so the pending handle can be detached or abandoned.
+fn pending_sleep() -> process::PendingSpawn {
+    let path = cs("/bin/sleep");
+    let argv = [cs("sleep"), cs("30")];
+    let envp: [CString; 0] = [];
+    process::spawn_sandboxed_begin(
+        path.as_c_str(),
+        &argv,
+        &envp,
+        process::SpawnOptions::default(),
+        None,
+        &Sandbox::default(),
+        process::ChildPaths::default(),
+    )
+    .expect("pending spawn")
+}
+
+/// `detach` hands the child to the global reaper without waiting. The child
+/// must still be alive until the test kills it.
+#[test]
+fn a_detached_spawn_is_left_for_the_global_reaper() {
+    let _guard = REAP_LOCK.lock().unwrap();
+    let pending = pending_sleep();
+    let pid = pending.detach();
+    assert!(pid > 0);
+    process::kill(pid, libc::SIGKILL).expect("kill detached child");
+
+    let mut reaped = false;
+    for _ in 0..100 {
+        for event in wait::reap_children() {
+            if matches!(event, ChildExit::Signaled { pid: p, signal: libc::SIGKILL } if p == pid) {
+                reaped = true;
+            }
+        }
+        if reaped {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(reaped, "the detached child must remain reapable by pid");
+}
+
+/// `abandon` kills an unconfirmed child and leaves it to the reaper; a flow
+/// that disappeared before registration must not leave a live service behind.
+#[test]
+fn an_abandoned_spawn_is_killed_and_reaped_by_the_global_reaper() {
+    let _guard = REAP_LOCK.lock().unwrap();
+    let pending = pending_sleep();
+    let pid = pending.pid();
+    pending.abandon();
+
+    let mut killed = false;
+    for _ in 0..100 {
+        for event in wait::reap_children() {
+            if matches!(event, ChildExit::Signaled { pid: p, signal: libc::SIGKILL } if p == pid) {
+                killed = true;
+            }
+        }
+        if killed {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(killed, "abandon must kill the unconfirmed child");
+}
+
 /// `kill` on a non-existent PID reports `ESRCH` without panicking.
 #[test]
 fn kill_missing_pid_reports_esrch() {

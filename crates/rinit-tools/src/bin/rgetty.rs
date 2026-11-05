@@ -123,6 +123,30 @@ fn tty_path(path: &str) -> String {
     }
 }
 
+/// Resolve a tty operand and require it to stay under `/dev`.
+///
+/// `tty_path` alone is lexical: `/dev/../etc/shadow` still starts with
+/// `/dev`, and an absolute operand could name any file. Resolving the path
+/// before opening also makes the ownership/mode changes below apply only to a
+/// real device path, never to an operator's mistyped regular file.
+fn resolve_tty_path(path: &str) -> Result<String, String> {
+    let candidate = tty_path(path);
+    let resolved =
+        std::fs::canonicalize(&candidate).map_err(|error| format!("{candidate}: {error}"))?;
+    if !resolved.starts_with("/dev") {
+        return Err(format!("{candidate} resolves outside /dev"));
+    }
+    resolved
+        .into_os_string()
+        .into_string()
+        .map_err(|_| format!("{candidate} is not valid UTF-8"))
+}
+
+fn is_terminal(fd: libc::c_int) -> bool {
+    // SAFETY: `isatty` only inspects the descriptor.
+    unsafe { libc::isatty(fd) == 1 }
+}
+
 fn configure_termios(term: &mut libc::termios, local: bool, baud: u32) {
     term.c_cflag &= !(libc::PARENB | libc::CSTOPB | libc::CSIZE);
     term.c_cflag |= libc::CS8 | libc::CREAD;
@@ -175,13 +199,17 @@ fn default_job_control_signals() {
 }
 
 fn open_tty(path: &str, local: bool, baud: u32) -> Result<(), String> {
-    let path = tty_path(path);
+    let path = resolve_tty_path(path)?;
     let tty = CString::new(path.as_str()).map_err(|_| "tty path contains NUL".to_string())?;
     let pid = unsafe { libc::getpid() };
     // SAFETY: `tty` is a valid C string; the descriptor is checked below.
     let fd = unsafe { libc::open(tty.as_ptr(), libc::O_RDWR | libc::O_NOCTTY) };
     if fd < 0 {
         return Err(format!("{path}: {}", io::Error::last_os_error()));
+    }
+    if !is_terminal(fd) {
+        unsafe { libc::close(fd) };
+        return Err(format!("{path}: not a terminal"));
     }
     // SAFETY: a fresh session may fail only when this process is already the
     // session leader. In that case, drop any inherited controlling tty first:
@@ -232,14 +260,6 @@ fn open_tty(path: &str, local: bool, baud: u32) -> Result<(), String> {
     if unsafe { libc::tcsetpgrp(0, pid) } != 0 {
         return Err(format!("tcsetpgrp: {}", io::Error::last_os_error()));
     }
-    // Reclaim the device from the previous session before anyone can log in.
-    if unsafe { libc::fchown(0, 0, 0) } != 0 {
-        return Err(format!("fchown tty: {}", io::Error::last_os_error()));
-    }
-    if unsafe { libc::fchmod(0, 0o600) } != 0 {
-        return Err(format!("fchmod tty: {}", io::Error::last_os_error()));
-    }
-
     let mut term = unsafe { std::mem::zeroed::<libc::termios>() };
     // SAFETY: fd 0 is the tty opened above.
     if unsafe { libc::tcgetattr(0, &mut term) } != 0 {
@@ -249,6 +269,15 @@ fn open_tty(path: &str, local: bool, baud: u32) -> Result<(), String> {
     // SAFETY: the settings were read from the same terminal.
     if unsafe { libc::tcsetattr(0, libc::TCSANOW, &term) } != 0 {
         return Err(format!("tcsetattr: {}", io::Error::last_os_error()));
+    }
+    // Reclaim the device from the previous session only after it has been
+    // proven to be a terminal and configured, so a mistyped regular file is
+    // never chowned or chmod'ed.
+    if unsafe { libc::fchown(0, 0, 0) } != 0 {
+        return Err(format!("fchown tty: {}", io::Error::last_os_error()));
+    }
+    if unsafe { libc::fchmod(0, 0o600) } != 0 {
+        return Err(format!("fchmod tty: {}", io::Error::last_os_error()));
     }
     // Drop typeahead typed before the prompt, including input from the
     // previous session.
@@ -529,6 +558,44 @@ mod tests {
     fn tty_paths_are_anchored_under_dev() {
         assert_eq!(tty_path("ttyAMA0"), "/dev/ttyAMA0");
         assert_eq!(tty_path("/dev/ttyS0"), "/dev/ttyS0");
+    }
+
+    /// A path that resolves outside `/dev` must be rejected before `open_tty`
+    /// can chown/chmod anything. `/dev/null` resolves correctly but is still
+    /// rejected later by the terminal check.
+    #[test]
+    fn a_non_terminal_descriptor_is_recognised() {
+        use std::os::fd::AsRawFd;
+
+        let file = std::fs::File::open("/dev/null").expect("/dev/null");
+        assert!(!is_terminal(file.as_raw_fd()));
+    }
+
+    #[test]
+    fn tty_paths_must_resolve_under_dev() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let file = std::env::temp_dir().join(format!("rgetty-not-a-tty-{}", std::process::id()));
+        std::fs::write(&file, b"not a tty").expect("file");
+        let before = std::fs::metadata(&file)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        let error = resolve_tty_path(file.to_str().expect("UTF-8 path"))
+            .expect_err("a regular file must not be a tty path");
+        assert!(
+            error.contains("outside /dev") || error.contains("No such file"),
+            "{error}"
+        );
+        let after = std::fs::metadata(&file)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(before, after, "validation must not touch the file");
+        let _ = std::fs::remove_file(file);
+
+        assert!(resolve_tty_path("/dev/null").is_ok());
+        assert!(resolve_tty_path("/dev/../etc/passwd").is_err());
     }
 
     #[test]
