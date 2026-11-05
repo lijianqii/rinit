@@ -323,11 +323,11 @@ make test           # check + test-system
 make gates          # acceptance gates: binary size + coverage thresholds
 ```
 
-`cargo test --offline --workspace` (what `make check` runs last) executes **1027
+`cargo test --offline --workspace` (what `make check` runs last) executes **1032
 tests** across 58 cargo test targets. The five shapes, and why each is not
 redundant:
 
-- **unit tests** next to the code (core 334, rinit 213, rinit-runtime 134,
+- **unit tests** next to the code (core 335, rinit 216, rinit-runtime 135,
   rinit-tools 223, rctl 16, processes 5), including `proptest` properties over
   the parser;
 - **integration tests** in `crates/*/tests/`: the syscall layer against the real
@@ -419,13 +419,13 @@ they are measured on the tree as it stands rather than copied from one run:
 
 | crate            | line coverage | functions |
 | ---------------- | ------------- | --------- |
-| `rinit-core`     | **97.97%**    | 582/591   |
-| `rinit-runtime`  | 85.68%        | 361/408   |
-| `rinit`          | 87.50%        | 772/867   |
-| `rinit-tools`    | 81.42%        | 652/850   |
+| `rinit-core`     | **97.87%**    | 581/591   |
+| `rinit-runtime`  | 85.73%        | 362/410   |
+| `rinit`          | 87.61%        | 776/868   |
+| `rinit-tools`    | 81.47%        | 652/850   |
 | `rctl`           | 93.06%        | 42/50     |
 | `processes`      | 83.93%        | 60/80     |
-| **total**        | **87.07%**    | 2469/2846 |
+| **total**        | **87.11%**    | 2473/2849 |
 
 The plan's checklist asks for ≥80% overall and ≥90% in the core, so these are the
 numbers that answer it rather than a shape:
@@ -557,21 +557,21 @@ repository or a measurement in this README:
 | 72 h soak with stable RSS | **Passed on the host.** Segment 9 on `8b373d8` completed **4,320/4,320 samples** and **8,640/8,640 control commands**. RSS peak per half fell from 5,168 kB to 4,300 kB, descriptor minima were 11 and 11 (peak 22), the maximum zombie streak was 1 transient sample, and the final quiescent sweep found 0 zombies. |
 | 24 h soak in the target guest | **Passed.** `7a5df04`, aarch64 `run-disk`, guest-side sampler: **1,440/1,440 samples** and **2,880/2,880 control commands** over 86,343 s. RSS stayed within 2,364–2,528 kB (half peaks 2,520/2,528), descriptors within 19–20, no zombie was ever observed, and the final sweep returned `quiescent=0 health_fail=0`. `eth0`, the default route, `udhcpc`, dropbear, `network.service` and `sshd.service` were healthy in every sample; the serial log shows one boot and no panic/OOM. Sampling runs inside the guest (`scripts/soak-qemu.sh` + `scripts/soak-guest.sh`), so a host SSH outage cannot end the run silently. |
 | binaries ≤2 MB dynamic / ≤4 MB static | [Measurements](#measurements-plan-01-calibration-point): 1.00 MiB dynamic arm64 / 1.07 MiB armv7, checked by `make size-check` |
-| unit test coverage ≥80% overall, ≥90% in the core | **87.07%** and **97.97%** (`make coverage-check`, [above](#testing)) |
+| unit test coverage ≥80% overall, ≥90% in the core | **87.11%** and **97.87%** (`make coverage-check`, [above](#testing)) |
 | documentation: architecture, unit format, `rctl`, porting | this README (architecture, status, measurements), [`docs/units.md`](docs/units.md) (every directive, its value syntax and its default), [`docs/porting.md`](docs/porting.md) (kernel, userspace, build, differences from systemd), and `rinit-开发计划.md` |
 
 One number the checklist does not ask for, but plan §0.1's design goals do: rinit's
 RSS, measured *in the guest* out of `/proc/1/status` rather than on the host -
-**2 744 kB idle** and **3 248 kB with 20 services running**, with a 3 MB boot
+**2 704 kB idle** and **3 216 kB with 20 services running**, with a 3 MB boot
 limit and 6 MB load limit. The growth is the interesting part: twenty more units
 cost under 600 kB, because a unit is a config, a state and a few timers rather
 than a thread.
 
 Plan §0.1's original goals are stricter than those gates: **≤2 MB idle** and
 **<1 s from kernel to the first service**, with a **≤100 ms** cold start for
-rinit. The current guest run reads **2 744 kB**, **2 810 ms** and **331 ms**.
+rinit. The current guest run reads **2 704 kB**, **3 520 ms** and **395 ms**.
 The remaining first-service time is dominated by kernel/initramfs boot; rinit's
-own startup is 331 ms. Reaching 2 MB idle would require structural changes to
+own startup is 395 ms. Reaching 2 MB idle would require structural changes to
 the runtime or libraries, not a small local fix, and no safe optimisation was
 found that closes either gap. The 3 MB / 6 MB / 30 s gates are therefore kept as
 regression bounds, and the plan-target deviation is accepted and recorded here
@@ -1153,8 +1153,8 @@ command through the same spawn path a unit uses.
 The packed images (`build/out/initramfs-aarch64-unknown-linux-gnu.cpio.gz` and
 `…-demo.cpio.gz`: static busybox + dynamic rinit/rctl/processes + the installed
 tools + the unit directory + the `/etc`/`/var` skeleton) are 9.09 MiB
-(9 534 818 B) and 9.09 MiB (9 539 356 B) gzipped. The arm32 pair is 9.31 MiB
-(9 774 269 B) and 9.32 MiB (9 780 304 B).
+(9 536 798 B) and 9.09 MiB (9 543 769 B) gzipped. The arm32 pair is 9.32 MiB
+(9 774 882 B) and 9.33 MiB (9 780 071 B).
 The `run-disk` images are ext4 files of about 80-81 MiB logical size (roughly
 51-52 MiB used before the first boot, including the default 32 MiB swap file);
 they are not
@@ -1170,7 +1170,7 @@ All three Rust binaries are inside the plan §0.1 budget: each is below the 4 MB
 guard, and the image carries the dynamic loader and runtime libraries separately.
 
 Plan §0.1's memory column is measured in the guest, out of `/proc/1/status`, by
-`make test-system`: **2 744 kB at boot** and **3 248 kB with 20 services**, on the
+`make test-system`: **2 704 kB at boot** and **3 216 kB with 20 services**, on the
 128M machine, asserted at ≤3 MB and ≤6 MB. The host process the soak watches
 reads higher - about 5 MB - because it is an unoptimised `--dev` build of the
 same code.
@@ -1194,6 +1194,6 @@ What is left is not a feature: both the 72 h host soak and the 24 h target-guest
 soak are closed. CI covers the coverage/size gates, the 60 s host soak, the
 initramfs system test, the device-image boot and now the reboot/power-loss
 recovery test. The plan's §0.1 boot and idle-memory targets remain above the
-recorded measurements (`2 810 ms` to first service, `331 ms` of it rinit;
-`2 744 kB` idle); the deviation is accepted above because it is dominated by
+recorded measurements (`3 520 ms` to first service, `395 ms` of it rinit;
+`2 704 kB` idle); the deviation is accepted above because it is dominated by
 kernel/runtime structure and no safe local optimisation closes it.

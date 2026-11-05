@@ -121,13 +121,16 @@ impl LogBuffer {
 
     /// The most recent `count` lines from `unit`, oldest first.
     pub fn tail_for(&self, unit: &UnitName, count: usize) -> Vec<LogLine> {
-        let matching: Vec<&LogLine> = self
+        let mut out: Vec<LogLine> = self
             .lines
             .iter()
             .filter(|line| &line.unit == unit)
+            .rev()
+            .take(count)
+            .cloned()
             .collect();
-        let skip = matching.len().saturating_sub(count);
-        matching.into_iter().skip(skip).cloned().collect()
+        out.reverse();
+        out
     }
 
     /// How many lines are buffered.

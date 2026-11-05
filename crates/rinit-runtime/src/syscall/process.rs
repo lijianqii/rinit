@@ -163,16 +163,12 @@ pub fn posix_spawn_full(
     options: SpawnOptions,
     working_directory: Option<&CStr>,
 ) -> Result<libc::pid_t, SyscallError> {
-    let mut argv_ptrs: Vec<*mut libc::c_char> = argv
-        .iter()
-        .map(|a| a.as_ptr() as *mut libc::c_char)
-        .collect();
+    let mut argv_ptrs: Vec<*mut libc::c_char> = Vec::with_capacity(argv.len() + 1);
+    argv_ptrs.extend(argv.iter().map(|a| a.as_ptr() as *mut libc::c_char));
     argv_ptrs.push(std::ptr::null_mut());
 
-    let mut env_ptrs: Vec<*mut libc::c_char> = envp
-        .iter()
-        .map(|e| e.as_ptr() as *mut libc::c_char)
-        .collect();
+    let mut env_ptrs: Vec<*mut libc::c_char> = Vec::with_capacity(envp.len() + 1);
+    env_ptrs.extend(envp.iter().map(|e| e.as_ptr() as *mut libc::c_char));
     env_ptrs.push(std::ptr::null_mut());
 
     if options.listen_fd.is_some() {
@@ -475,14 +471,16 @@ pub fn spawn_sandboxed_begin(
     // before exec. No allocation happens between fork and exec.
     let mut listen_pid_buf = [0u8; 32];
     let provides_listen_pid = options.listen_fd.is_some();
-    let mut env_ptrs: Vec<*const libc::c_char> = envp
-        .iter()
-        // Only replace `LISTEN_PID` when this child is actually being handed a
-        // socket. A service that sets the variable for its own reasons must
-        // keep it on the ordinary path.
-        .filter(|entry| !provides_listen_pid || !entry.to_bytes().starts_with(b"LISTEN_PID="))
-        .map(|entry| entry.as_ptr())
-        .collect();
+    let mut env_ptrs: Vec<*const libc::c_char> =
+        Vec::with_capacity(envp.len() + 1 + usize::from(provides_listen_pid));
+    env_ptrs.extend(
+        envp.iter()
+            // Only replace `LISTEN_PID` when this child is actually being handed a
+            // socket. A service that sets the variable for its own reasons must
+            // keep it on the ordinary path.
+            .filter(|entry| !provides_listen_pid || !entry.to_bytes().starts_with(b"LISTEN_PID="))
+            .map(|entry| entry.as_ptr()),
+    );
     let listen_pid = if provides_listen_pid {
         let pointer = listen_pid_buf.as_mut_ptr().cast::<libc::c_char>();
         env_ptrs.push(pointer);
@@ -1078,7 +1076,8 @@ fn reap_failed_spawn(pid: libc::pid_t) {
 /// allocates nothing, so every pointer it uses must already be in the address
 /// space it inherited.
 fn null_terminated(strings: &[CString]) -> Vec<*const libc::c_char> {
-    let mut pointers: Vec<*const libc::c_char> = strings.iter().map(|s| s.as_ptr()).collect();
+    let mut pointers: Vec<*const libc::c_char> = Vec::with_capacity(strings.len() + 1);
+    pointers.extend(strings.iter().map(|s| s.as_ptr()));
     pointers.push(std::ptr::null());
     pointers
 }
@@ -1279,6 +1278,16 @@ pub fn group_alive(pgid: libc::pid_t) -> bool {
 /// read after the last `)`.
 pub fn group_has_other_members(pgid: libc::pid_t, except: libc::pid_t) -> bool {
     if pgid <= 1 {
+        return false;
+    }
+    // A group with no members is the common case after the leader exits.
+    // `kill(-pgid, 0)` answers that with one syscall; only ESRCH proves the
+    // whole group is gone, so EPERM and other errors still take the /proc
+    // scan below.
+    // SAFETY: a negative pid with signal 0 only probes the process group.
+    if unsafe { libc::kill(-pgid, 0) } != 0
+        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    {
         return false;
     }
     let Ok(entries) = std::fs::read_dir("/proc") else {

@@ -201,11 +201,35 @@ pub fn unmount_order(proc_mounts: &str) -> Vec<String> {
 /// Decode the octal escapes `/proc/mounts` uses for space, tab, newline and
 /// backslash in a path.
 pub(crate) fn unescape_mount_field(field: &str) -> String {
-    field
-        .replace("\\040", " ")
-        .replace("\\011", "\t")
-        .replace("\\012", "\n")
-        .replace("\\134", "\\")
+    let bytes = field.as_bytes();
+    if !bytes.contains(&b'\\') {
+        return field.to_owned();
+    }
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while let Some(byte) = bytes.get(index).copied() {
+        if byte == b'\\'
+            && let (Some(a), Some(b), Some(c)) = (
+                bytes.get(index + 1).copied(),
+                bytes.get(index + 2).copied(),
+                bytes.get(index + 3).copied(),
+            )
+            && let Some(decoded) = match (a, b, c) {
+                (b'0', b'4', b'0') => Some(b' '),
+                (b'0', b'1', b'1') => Some(b'\t'),
+                (b'0', b'1', b'2') => Some(b'\n'),
+                (b'1', b'3', b'4') => Some(b'\\'),
+                _ => None,
+            }
+        {
+            out.push(decoded);
+            index += 4;
+        } else {
+            out.push(byte);
+            index += 1;
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| field.to_owned())
 }
 
 /// Unmount everything but the root, best effort (plan §1.3(8)).
@@ -539,6 +563,17 @@ tmpfs /run tmpfs rw 0 0
             ["/data", "/run", "/proc"],
             "the root is kept and the rest are unmounted newest-first"
         );
+    }
+
+    #[test]
+    fn octal_escape_decoding_is_single_pass_and_matches_the_public_rules() {
+        assert_eq!(unescape_mount_field(r"/mnt/a\040b"), "/mnt/a b");
+        assert_eq!(unescape_mount_field(r"a\011b\012c"), "a\tb\nc");
+        assert_eq!(unescape_mount_field(r"a\134b"), r"a\b");
+        assert_eq!(unescape_mount_field(r"\134040"), r"\040");
+        assert_eq!(unescape_mount_field(r"\999"), r"\999");
+        assert_eq!(unescape_mount_field("/mnt/plain"), "/mnt/plain");
+        assert_eq!(unescape_mount_field("/mnt/é"), "/mnt/é");
     }
 
     /// `/proc/mounts` escapes spaces in paths; a mount point with one must be

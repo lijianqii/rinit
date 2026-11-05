@@ -56,7 +56,7 @@ pub fn plan_boot(unit_dir: &Path, default_target: &str) -> Result<BootPlan, Runt
 
     let mut configs: Vec<UnitConfig> = Vec::with_capacity(files.len());
     let mut templates: BTreeMap<String, String> = BTreeMap::new();
-    for file in &files {
+    for file in files {
         if file.name.is_template() {
             // Parsed here and thrown away, so a template with a typo fails the
             // boot it belongs to rather than the first start that uses it. The
@@ -64,7 +64,7 @@ pub fn plan_boot(unit_dir: &Path, default_target: &str) -> Result<BootPlan, Runt
             // specifiers already expanded.
             rinit_core::unit::parser::parse(&file.name, &file.contents)
                 .map_err(|e| annotate(e, &file.path))?;
-            templates.insert(file.name.canonical().to_string(), file.contents.clone());
+            templates.insert(file.name.canonical().to_string(), file.contents);
             continue;
         }
         let cfg = rinit_core::unit::parser::parse(&file.name, &file.contents)
@@ -82,9 +82,8 @@ pub fn plan_boot(unit_dir: &Path, default_target: &str) -> Result<BootPlan, Runt
 
     let target = UnitName::parse(default_target).map_err(RuntimeError::Core)?;
 
-    let by_ref: Vec<&UnitConfig> = configs.iter().collect();
-    let graph = DependencyGraph::build(by_ref).map_err(|e| RuntimeError::Core(e.into()))?;
-    warnings.extend(graph.warnings.iter().cloned());
+    let mut graph = DependencyGraph::build(&configs).map_err(|e| RuntimeError::Core(e.into()))?;
+    warnings.append(&mut graph.warnings);
 
     if !graph.units().contains(&target) {
         return Err(RuntimeError::Core(
@@ -102,7 +101,7 @@ pub fn plan_boot(unit_dir: &Path, default_target: &str) -> Result<BootPlan, Runt
         .map(|level| {
             level
                 .into_iter()
-                .filter(|unit| wanted.contains(unit))
+                .filter(|unit| wanted.binary_search(unit).is_ok())
                 .collect::<Vec<_>>()
         })
         .filter(|level| !level.is_empty())

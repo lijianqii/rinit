@@ -803,12 +803,10 @@ async fn supervise(
                     break;
                 }
             }
-            _ = tokio::time::sleep(wait) => {}
-            // The idle half of the orphan reaping rule: even with no signal and
-            // no deadline due, wake often enough to drain a child that was
-            // reparented to PID 1 without a fresh SIGCHLD. The actual drain is
-            // at the top of the loop, so this arm has no body.
-            _ = tokio::time::sleep(HOUSEKEEPING_POLL) => {}
+            // The housekeeping poll is also the upper bound on the ordinary
+            // wait: even with no deadline due, wake often enough to drain a
+            // child reparented to PID 1 without a fresh SIGCHLD.
+            _ = tokio::time::sleep(wait.min(HOUSEKEEPING_POLL)) => {}
             Some(unit) = activation.recv() => {
                 woke_socket = Some(unit);
             }
@@ -1713,25 +1711,25 @@ impl StartCoordinator {
         logs: &ServiceLogs,
     ) -> Vec<UnitName> {
         let mut spawned = Vec::new();
-        let units: Vec<UnitName> = self.flows.keys().cloned().collect();
-        for unit in units {
-            let (done, newly_spawned) = match self.flows.get_mut(&unit) {
-                Some(flow) => {
-                    let was_spawned = flow.spawned;
-                    let done = flow.advance(manager, notify, logs, &mut self.aux_exits);
-                    (done, flow.spawned && !was_spawned)
-                }
-                None => (None, false),
-            };
-            if newly_spawned {
+        let mut finished = Vec::new();
+        let StartCoordinator {
+            flows, aux_exits, ..
+        } = self;
+        for (unit, flow) in flows.iter_mut() {
+            let was_spawned = flow.spawned;
+            let done = flow.advance(manager, notify, logs, aux_exits);
+            if flow.spawned && !was_spawned {
                 spawned.push(unit.clone());
             }
             if done.is_some() {
                 // An `ExecStartPre=` that was running when the flow failed or
                 // was cancelled is not owned by the unit manager; dropping the
                 // flow without this would leave it running.
-                self.remove_flow(&unit);
+                finished.push(unit.clone());
             }
+        }
+        for unit in finished {
+            self.remove_flow(&unit);
         }
 
         let mut index = 0;
@@ -2919,17 +2917,7 @@ fn log_outcome(outcome: &Outcome) {
 
 /// How long to block before checking the timers again.
 fn next_deadline(manager: &UnitManager) -> std::time::Duration {
-    let soonest = [
-        manager.next_restart_in(),
-        manager.next_start_timeout_in(),
-        manager.next_kill_in(),
-        manager.next_health_in(),
-        manager.next_probe_timeout_in(),
-        manager.next_idle_in(),
-    ]
-    .into_iter()
-    .flatten()
-    .min();
+    let soonest = manager.next_deadline_in();
     // No pending timer: sleep for a long time and let a signal wake us.
     soonest.map_or(std::time::Duration::from_secs(3600), |d| {
         d.max(std::time::Duration::from_millis(1))

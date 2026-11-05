@@ -147,33 +147,30 @@ impl JobQueue {
     /// target at `Started`. Callers care about authority, not change, because
     /// authority is what a later `ShutdownStop` has to override.
     pub fn submit(&mut self, job: Job) -> bool {
-        match self.merged.iter_mut().find(|(u, _)| *u == job.unit) {
+        let Job {
+            unit,
+            target,
+            source,
+            at,
+        } = job;
+        match self
+            .merged
+            .iter_mut()
+            .find(|(candidate, _)| *candidate == unit)
+        {
             Some((_, current)) => {
-                // Compare against the request that currently holds the target,
-                // not against the target itself: two `Started` jobs from
-                // different sources still have to pick a winner so that a
-                // later `ShutdownStop` knows what it is overriding.
-                let holder = Job::new(job.unit.clone(), current.target, current.source, current.at);
-                if job.supersedes(&holder) {
-                    *current = MergedTarget {
-                        target: job.target,
-                        source: job.source,
-                        at: job.at,
-                    };
+                // The same ordering as `Job::supersedes`, without allocating a
+                // throwaway holder job: source first, then timestamp.
+                if source > current.source || (source == current.source && at > current.at) {
+                    *current = MergedTarget { target, source, at };
                     true
                 } else {
                     false
                 }
             }
             None => {
-                self.merged.push((
-                    job.unit.clone(),
-                    MergedTarget {
-                        target: job.target,
-                        source: job.source,
-                        at: job.at,
-                    },
-                ));
+                self.merged
+                    .push((unit, MergedTarget { target, source, at }));
                 true
             }
         }

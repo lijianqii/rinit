@@ -143,7 +143,12 @@ impl Sandbox {
 
     /// Whether the child runs exactly as rinit does, so no `fork` is needed.
     pub fn is_inherited(&self) -> bool {
-        self.steps().is_empty()
+        !self.no_new_privileges
+            && self.ambient.is_none()
+            && self.bounding_set.is_none()
+            && self.gid == 0
+            && self.groups.is_none()
+            && self.uid == 0
     }
 
     /// Whether the child ends up as a different user or group than rinit.
@@ -166,6 +171,42 @@ mod tests {
         assert_eq!(sandbox.steps(), Vec::new());
         assert!(sandbox.is_inherited());
         assert!(!sandbox.drops_privileges());
+    }
+
+    /// `is_inherited` is a fast path for `steps().is_empty()`; the two must
+    /// agree for every field a unit can set.
+    #[test]
+    fn is_inherited_agrees_with_an_empty_step_list() {
+        let variants = [
+            Sandbox::inherit(),
+            Sandbox {
+                no_new_privileges: true,
+                ..Sandbox::inherit()
+            },
+            Sandbox {
+                ambient: Some(vec![10]),
+                ..Sandbox::inherit()
+            },
+            Sandbox {
+                bounding_set: Some(vec![10]),
+                ..Sandbox::inherit()
+            },
+            Sandbox {
+                gid: 1000,
+                ..Sandbox::inherit()
+            },
+            Sandbox {
+                groups: Some(Vec::new()),
+                ..Sandbox::inherit()
+            },
+            Sandbox {
+                uid: 1000,
+                ..Sandbox::inherit()
+            },
+        ];
+        for sandbox in variants {
+            assert_eq!(sandbox.is_inherited(), sandbox.steps().is_empty());
+        }
     }
 
     /// The whole point of the module: `setuid` is last, and `no_new_privs` is

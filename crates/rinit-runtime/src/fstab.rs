@@ -145,10 +145,10 @@ pub fn parse(text: &str) -> (Vec<Entry>, Vec<String>) {
             continue;
         }
         entries.push(Entry {
-            device: device.to_string(),
+            device,
             mountpoint: PathBuf::from(mountpoint),
-            fstype: fstype.to_string(),
-            options: options.to_string(),
+            fstype,
+            options,
         });
     }
     (entries, warnings)

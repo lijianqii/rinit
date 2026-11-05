@@ -316,7 +316,8 @@ impl Parser {
             message: format!("expected 'Key=Value', found {text:?}"),
         })?;
 
-        if !REPEATABLE.contains(&key)
+        let repeatable = REPEATABLE.contains(&key);
+        if !repeatable
             && self
                 .seen
                 .iter()
@@ -327,7 +328,9 @@ impl Parser {
                 key: key.to_string(),
             });
         }
-        self.seen.push((section.as_str(), key.to_string()));
+        if !repeatable {
+            self.seen.push((section.as_str(), key.to_string()));
+        }
 
         let tokens = tokenize(value, line)?;
         let joined = || join_tokens(&tokens);

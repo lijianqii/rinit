@@ -249,7 +249,7 @@ impl DependencyGraph {
         for cfg in &configs {
             // Plan §1.1: two definitions of the same unit is an error, never a
             // silent merge.
-            if units.contains(&cfg.name) {
+            if units.last() == Some(&cfg.name) {
                 return Err(DependencyError::DuplicateUnit {
                     unit: cfg.name.clone(),
                 });
@@ -258,7 +258,7 @@ impl DependencyGraph {
         }
         units.sort();
 
-        let index_of = |name: &UnitName| units.iter().position(|u| u == name);
+        let index_of = |name: &UnitName| units.binary_search(name).ok();
         let mut dependencies: Vec<Vec<usize>> = vec![Vec::new(); units.len()];
         let mut activations: Vec<Vec<usize>> = vec![Vec::new(); units.len()];
         let mut warnings = Vec::new();

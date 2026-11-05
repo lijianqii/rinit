@@ -1283,16 +1283,6 @@ impl UnitManager {
             .count()
     }
 
-    /// Time until the next restart is due, if any.
-    pub fn next_restart_in(&self) -> Option<Duration> {
-        let now = Instant::now();
-        self.units
-            .values()
-            .filter_map(|rt| rt.restart_at)
-            .map(|at| at.saturating_duration_since(now))
-            .min()
-    }
-
     /// Prepare a start and fork the child without waiting for exec.
     ///
     /// The `posix_spawn` fast path returns ready immediately; the controlled
@@ -1712,28 +1702,7 @@ impl UnitManager {
         due
     }
 
-    /// Time until the next `TimeoutStartSec` deadline, if any.
-    pub fn next_start_timeout_in(&self) -> Option<Duration> {
-        let now = Instant::now();
-        self.units
-            .values()
-            .filter(|rt| rt.state == UnitState::Starting)
-            .filter_map(|rt| rt.start_deadline)
-            .map(|at| at.saturating_duration_since(now))
-            .min()
-    }
-
     /// Time until the next post-timeout `SIGKILL` is due, if any.
-    /// Time until the next idle deadline, if any (plan §7.9).
-    pub fn next_idle_in(&self) -> Option<Duration> {
-        let now = Instant::now();
-        self.units
-            .values()
-            .filter_map(|rt| rt.idle_at)
-            .map(|at| at.saturating_duration_since(now))
-            .min()
-    }
-
     pub fn next_kill_in(&self) -> Option<Duration> {
         let now = Instant::now();
         self.units
@@ -1832,24 +1801,38 @@ impl UnitManager {
         timed_out
     }
 
-    /// Time until the next health probe is due, if any.
-    pub fn next_health_in(&self) -> Option<Duration> {
+    /// Time until the earliest of every per-unit deadline.
+    ///
+    /// The supervisor asks this once per loop. Gathering all six kinds in one
+    /// pass avoids six full unit-map scans; `next_kill_in` remains for the
+    /// stop/reap path.
+    pub fn next_deadline_in(&self) -> Option<Duration> {
         let now = Instant::now();
-        self.units
-            .values()
-            .filter_map(|rt| rt.health_at)
-            .map(|at| at.saturating_duration_since(now))
-            .min()
-    }
-
-    /// Time until the next probe timeout, if any.
-    pub fn next_probe_timeout_in(&self) -> Option<Duration> {
-        let now = Instant::now();
-        self.units
-            .values()
-            .filter_map(|rt| rt.probe_deadline)
-            .map(|at| at.saturating_duration_since(now))
-            .min()
+        let mut soonest: Option<Duration> = None;
+        let mut consider = |at: Instant| {
+            let wait = at.saturating_duration_since(now);
+            soonest = Some(soonest.map_or(wait, |current| current.min(wait)));
+        };
+        for rt in self.units.values() {
+            for at in [
+                rt.restart_at,
+                rt.kill_at,
+                rt.health_at,
+                rt.probe_deadline,
+                rt.idle_at,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                consider(at);
+            }
+            if rt.state == UnitState::Starting
+                && let Some(at) = rt.start_deadline
+            {
+                consider(at);
+            }
+        }
+        soonest
     }
 
     /// The unit whose health probe `pid` belongs to, if any.
@@ -4372,6 +4355,63 @@ mod tests {
             "the failed start's process group must be gone"
         );
         cleanup(&mut m, &unit);
+    }
+
+    /// The supervisor asks for one deadline per loop; it must still consider
+    /// every timer kind the old per-kind scans covered.
+    #[test]
+    fn next_deadline_in_considers_every_timer_kind() {
+        fn clear(rt: &mut UnitRuntime) {
+            rt.restart_at = None;
+            rt.kill_at = None;
+            rt.health_at = None;
+            rt.probe_deadline = None;
+            rt.idle_at = None;
+            rt.start_deadline = None;
+        }
+
+        let mut m = manager_with("a.service", RestartPolicy::No);
+        let unit = UnitName::parse("a.service").unwrap();
+        let past = Instant::now() - Duration::from_secs(1);
+        let setters: [fn(&mut UnitRuntime, Instant); 5] = [
+            |rt, at| rt.restart_at = Some(at),
+            |rt, at| rt.kill_at = Some(at),
+            |rt, at| rt.health_at = Some(at),
+            |rt, at| rt.probe_deadline = Some(at),
+            |rt, at| rt.idle_at = Some(at),
+        ];
+        for set in setters {
+            clear(m.units.get_mut(&unit).unwrap());
+            set(m.units.get_mut(&unit).unwrap(), past);
+            assert_eq!(
+                m.next_deadline_in(),
+                Some(Duration::ZERO),
+                "an elapsed deadline must keep the loop awake"
+            );
+        }
+    }
+
+    /// `TimeoutStartSec` only applies while the unit is starting, matching the
+    /// `next_start_timeout_in` scan this method replaced.
+    #[test]
+    fn next_deadline_in_ignores_a_start_deadline_after_starting() {
+        let mut m = manager_with("a.service", RestartPolicy::No);
+        let unit = UnitName::parse("a.service").unwrap();
+        m.units.get_mut(&unit).unwrap().start_deadline =
+            Some(Instant::now() - Duration::from_secs(1));
+        assert_eq!(m.next_deadline_in(), None);
+
+        let rt = m.units.get_mut(&unit).unwrap();
+        rt.state = UnitState::Starting;
+        // A fresh `Starting` state normally has its deadline set by
+        // `begin_start`; the value above is enough for the scan.
+        assert_eq!(m.next_deadline_in(), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn next_deadline_in_is_none_without_timers() {
+        let m = manager_with("a.service", RestartPolicy::No);
+        assert_eq!(m.next_deadline_in(), None);
     }
 
     /// `reset-failed` clears the failure without starting the unit.
