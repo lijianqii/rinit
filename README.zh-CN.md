@@ -295,9 +295,9 @@ make gates          # acceptance gates: binary size + coverage thresholds
 ```
 
 `cargo test --offline --workspace`（`make check` 最后一步跑的就是它）在 58 个
-cargo 测试目标里执行 **1032 个测试**。五种形态，以及为什么每种都不是多余的：
+cargo 测试目标里执行 **1033 个测试**。五种形态，以及为什么每种都不是多余的：
 
-- **单元测试**紧挨着代码（core 335、rinit 216、rinit-runtime 135、rinit-tools 223、rctl 16、processes 5），
+- **单元测试**紧挨着代码（core 335、rinit 216、rinit-runtime 135、rinit-tools 224、rctl 16、processes 5），
   包括解析器上的 `proptest` 属性测试；
 - **集成测试**在 `crates/*/tests/`：系统调用层面对真实内核（`rinit-runtime` 26 个：
   以非特权身份运行，断言每次降权都*被拒绝*而不是被静默跳过——`setuid(0)`、
@@ -364,11 +364,11 @@ qemu 的 `i6300esb` 设备和带该驱动编译的内核是测试装置的一部
 | ---------------- | ------------- | --------- |
 | `rinit-core`     | **97.87%**    | 581/591   |
 | `rinit-runtime`  | 85.73%        | 362/410   |
-| `rinit`          | 87.61%        | 776/868   |
-| `rinit-tools`    | 81.47%        | 652/850   |
+| `rinit`          | 87.58%        | 776/868   |
+| `rinit-tools`    | 81.50%        | 653/851   |
 | `rctl`           | 93.06%        | 42/50     |
-| `processes`      | 83.93%        | 60/80     |
-| **总计**         | **87.11%**    | 2473/2849 |
+| `processes`      | 83.98%        | 60/80     |
+| **总计**         | **87.11%**    | 2474/2850 |
 
 计划清单要求总体 ≥80%、核心 ≥90%，所以回答它的是这些数字，而不是某种形状：
 
@@ -476,7 +476,8 @@ cargo llvm-cov --offline --workspace --html                  # target/llvm-cov/h
 
 计划 §0.1 的原始目标比这些阈值更严格：空闲 **≤2 MB**、内核到首个服务
 **<1 s**、rinit 自身冷启动 **≤100 ms**。客户机实测是 **2 704 kB**、
-**3 520 ms** 和 **395 ms**。首个服务剩余时间主要花在内核/initramfs 启动上，
+**3 520 ms** 和 **395 ms**；启动时间会随宿主机负载波动，内存数字相对稳定。
+首个服务剩余时间主要花在内核/initramfs 启动上，
 rinit 自身是 395 ms。把空闲降到 2 MB 需要改运行时或库的结构，不是局部小修；没有
 找到能安全关闭这两个差距的手段，因此保留 3 MB / 6 MB / 30 s 作为回归阈值，并把
 计划目标偏离明确记录在这里。
@@ -964,8 +965,8 @@ M0 的 bring-up 辅助程序 `rinit-testservice` 已经删除：没有东西再�
 
 打包后的镜像（`build/out/initramfs-aarch64-unknown-linux-gnu.cpio.gz` 和
 `…-demo.cpio.gz`：静态 busybox + 动态 rinit/rctl/processes + 已安装的工具 + 单元目录 + `/etc`/`/var` 骨架）
-gzip 后分别是 9.09 MiB（9 536 798 B）和 9.10 MiB（9 543 769 B）；arm32 的两个镜像
-分别是 9.32 MiB（9 774 882 B）和 9.33 MiB（9 780 071 B）。`run-disk` 的镜像是
+gzip 后分别是 9.10 MiB（9 543 525 B）和 9.11 MiB（9 549 347 B）；arm32 的两个镜像
+分别是 9.33 MiB（9 780 718 B）和 9.33 MiB（9 787 526 B）。`run-disk` 的镜像是
 约 80-81 MiB 的 ext4（首次启动前实际使用约 51-52 MiB，其中默认 swap 文件占
 32 MiB），不放进 initramfs。差值就是 `units/demo/`
 里的十四个文件，只有第二个镜像带它们。打包是可复现的——`scripts/mkinitramfs.sh` 把归档

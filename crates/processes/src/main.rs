@@ -23,7 +23,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, BufWriter, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
@@ -674,13 +674,15 @@ fn print_rows(rows: Vec<Vec<String>>, opts: &Options) -> io::Result<()> {
         }
     }
 
+    let stdout = io::stdout();
+    let mut out = BufWriter::new(stdout.lock());
     if !opts.no_header {
-        writeln!(std::io::stdout(), "{}", format_row(&headers, &width))?;
+        writeln!(out, "{}", format_row(&headers, &width))?;
     }
     for row in &rows {
-        writeln!(std::io::stdout(), "{}", format_row(row, &width))?;
+        writeln!(out, "{}", format_row(row, &width))?;
     }
-    Ok(())
+    out.flush()
 }
 
 fn print_json(processes: &[Process]) -> io::Result<()> {

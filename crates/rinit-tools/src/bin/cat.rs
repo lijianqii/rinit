@@ -30,6 +30,9 @@ fn copy_stream<R: BufRead, W: Write>(
     options: Options,
     state: &mut State,
 ) -> io::Result<()> {
+    if !options.number && !options.number_nonblank && !options.squeeze {
+        return io::copy(reader, writer).map(|_| ());
+    }
     let mut line = Vec::new();
     let mut blank_run = 0_u32;
     loop {
@@ -37,7 +40,7 @@ fn copy_stream<R: BufRead, W: Write>(
         if reader.read_until(b'\n', &mut line)? == 0 {
             break;
         }
-        let blank = is_blank(&line);
+        let blank = (options.squeeze || options.number_nonblank) && is_blank(&line);
         if options.squeeze {
             if blank {
                 blank_run += 1;

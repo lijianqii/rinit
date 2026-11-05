@@ -323,12 +323,12 @@ make test           # check + test-system
 make gates          # acceptance gates: binary size + coverage thresholds
 ```
 
-`cargo test --offline --workspace` (what `make check` runs last) executes **1032
+`cargo test --offline --workspace` (what `make check` runs last) executes **1033
 tests** across 58 cargo test targets. The five shapes, and why each is not
 redundant:
 
 - **unit tests** next to the code (core 335, rinit 216, rinit-runtime 135,
-  rinit-tools 223, rctl 16, processes 5), including `proptest` properties over
+  rinit-tools 224, rctl 16, processes 5), including `proptest` properties over
   the parser;
 - **integration tests** in `crates/*/tests/`: the syscall layer against the real
   kernel (`rinit-runtime` 26: run unprivileged, they assert that each drop is
@@ -421,11 +421,11 @@ they are measured on the tree as it stands rather than copied from one run:
 | ---------------- | ------------- | --------- |
 | `rinit-core`     | **97.87%**    | 581/591   |
 | `rinit-runtime`  | 85.73%        | 362/410   |
-| `rinit`          | 87.61%        | 776/868   |
-| `rinit-tools`    | 81.47%        | 652/850   |
+| `rinit`          | 87.58%        | 776/868   |
+| `rinit-tools`    | 81.50%        | 653/851   |
 | `rctl`           | 93.06%        | 42/50     |
-| `processes`      | 83.93%        | 60/80     |
-| **total**        | **87.11%**    | 2473/2849 |
+| `processes`      | 83.98%        | 60/80     |
+| **total**        | **87.11%**    | 2474/2850 |
 
 The plan's checklist asks for ≥80% overall and ≥90% in the core, so these are the
 numbers that answer it rather than a shape:
@@ -569,7 +569,8 @@ than a thread.
 
 Plan §0.1's original goals are stricter than those gates: **≤2 MB idle** and
 **<1 s from kernel to the first service**, with a **≤100 ms** cold start for
-rinit. The current guest run reads **2 704 kB**, **3 520 ms** and **395 ms**.
+rinit. The current guest run reads **2 704 kB**, **3 520 ms** and **395 ms**;
+boot timings move with host load, while the memory figures stay put.
 The remaining first-service time is dominated by kernel/initramfs boot; rinit's
 own startup is 395 ms. Reaching 2 MB idle would require structural changes to
 the runtime or libraries, not a small local fix, and no safe optimisation was
@@ -1152,9 +1153,9 @@ command through the same spawn path a unit uses.
 
 The packed images (`build/out/initramfs-aarch64-unknown-linux-gnu.cpio.gz` and
 `…-demo.cpio.gz`: static busybox + dynamic rinit/rctl/processes + the installed
-tools + the unit directory + the `/etc`/`/var` skeleton) are 9.09 MiB
-(9 536 798 B) and 9.09 MiB (9 543 769 B) gzipped. The arm32 pair is 9.32 MiB
-(9 774 882 B) and 9.33 MiB (9 780 071 B).
+tools + the unit directory + the `/etc`/`/var` skeleton) are 9.10 MiB
+(9 543 525 B) and 9.11 MiB (9 549 347 B) gzipped. The arm32 pair is 9.33 MiB
+(9 780 718 B) and 9.33 MiB (9 787 526 B).
 The `run-disk` images are ext4 files of about 80-81 MiB logical size (roughly
 51-52 MiB used before the first boot, including the default 32 MiB swap file);
 they are not

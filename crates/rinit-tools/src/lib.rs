@@ -61,8 +61,10 @@ pub fn parse_u64(value: &str, what: &str) -> Result<u64, String> {
 /// `/proc` files are line-oriented and may end with a newline; keeping that
 /// detail out of each tool makes the call sites easier to audit.
 pub fn read_trimmed(path: &Path) -> io::Result<String> {
-    let text = std::fs::read_to_string(path)?;
-    Ok(text.trim_end_matches(['\n', '\r']).to_string())
+    let mut text = std::fs::read_to_string(path)?;
+    let end = text.trim_end_matches(['\n', '\r']).len();
+    text.truncate(end);
+    Ok(text)
 }
 
 /// Print a usage error and return the documented exit code.
@@ -152,6 +154,17 @@ mod tests {
         assert_eq!(program_name(Some("mount"), "mount"), "mount");
         assert_eq!(program_name(None, "free"), "free");
         assert_eq!(program_name(Some("/"), "df"), "df");
+    }
+
+    #[test]
+    fn read_trimmed_strips_only_trailing_line_endings() {
+        let path =
+            std::env::temp_dir().join(format!("rinit-tools-read-trimmed-{}", std::process::id()));
+        std::fs::write(&path, b"value\r\n\n").expect("write scratch file");
+        assert_eq!(read_trimmed(&path).expect("read"), "value");
+        std::fs::write(&path, b"value\ninside").expect("write scratch file");
+        assert_eq!(read_trimmed(&path).expect("read"), "value\ninside");
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
