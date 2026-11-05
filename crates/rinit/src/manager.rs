@@ -14,10 +14,23 @@ use crate::log::rlog;
 
 /// Load and log a plan, reporting the level structure on the console.
 ///
+/// Reading every unit file is blocking filesystem I/O, so the load itself runs
+/// on the blocking pool and only the logging stays on the async thread.
+///
 /// # Errors
 /// As [`plan_boot`].
-pub fn announce_plan(unit_dir: &Path, default_target: &str) -> Result<BootPlan, RuntimeError> {
-    let plan = plan_boot(unit_dir, default_target)?;
+pub async fn announce_plan(
+    unit_dir: &Path,
+    default_target: &str,
+) -> Result<BootPlan, RuntimeError> {
+    let unit_dir = unit_dir.to_path_buf();
+    let default_target = default_target.to_string();
+    let plan = tokio::task::spawn_blocking(move || plan_boot(&unit_dir, &default_target))
+        .await
+        .map_err(|error| RuntimeError::Join {
+            op: "unit plan",
+            detail: error.to_string(),
+        })??;
     for warning in &plan.warnings {
         rlog!("warning: {warning}");
     }

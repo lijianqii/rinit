@@ -29,7 +29,7 @@
 // any of this runs (see `build`), so the graph is always well formed.
 #![allow(clippy::indexing_slicing)]
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::string::String;
 use alloc::vec;
@@ -509,27 +509,24 @@ impl DependencyGraph {
     /// are ordering-only, and a `Conflicts=` is an exclusion, so neither pulls
     /// a unit in. The result is sorted for determinism.
     pub fn closure_of(&self, target: &UnitName) -> Vec<UnitName> {
-        let mut out: Vec<UnitName> = Vec::new();
-        let mut stack = vec![target.clone()];
-        while let Some(unit) = stack.pop() {
-            if out.contains(&unit) {
+        // `units` is sorted, so the index lookup is logarithmic and the
+        // visited set stops diamonds from repeatedly expanding the same node.
+        let Ok(start) = self.units.binary_search(target) else {
+            return Vec::new();
+        };
+        let mut seen = BTreeSet::new();
+        let mut stack = vec![start];
+        while let Some(index) = stack.pop() {
+            if !seen.insert(index) {
                 continue;
             }
-            let activated: Vec<UnitName> = match self.units.iter().position(|u| u == &unit) {
-                Some(i) => self.activations[i]
-                    .iter()
-                    .filter_map(|&d| self.units.get(d))
-                    .cloned()
-                    .collect(),
-                None => Vec::new(),
-            };
-            out.push(unit.clone());
-            for dep in activated {
-                stack.push(dep);
+            if let Some(activated) = self.activations.get(index) {
+                stack.extend(activated.iter().copied());
             }
         }
-        out.sort();
-        out
+        seen.into_iter()
+            .filter_map(|index| self.units.get(index).cloned())
+            .collect()
     }
 }
 

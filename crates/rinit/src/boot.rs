@@ -129,7 +129,7 @@ pub async fn run(cfg: Config) -> Result<(), RuntimeError> {
         // the first service's output is captured like every other line.
         let logs = ServiceLogs::new();
         if let Some(path) = &cfg.log_file {
-            logs.persist_to(path);
+            logs.persist_to(path).await;
         }
         // Plan §7.9: the sockets rinit holds for units that asked to be started
         // by a connection rather than at boot.
@@ -137,7 +137,7 @@ pub async fn run(cfg: Config) -> Result<(), RuntimeError> {
         // Resolve the schedule and bind its sockets before the loop starts, so
         // the first level is ready to queue and a bind failure is already a
         // failed unit rather than a surprise during the boot.
-        let plan = manager::announce_plan(&cfg.unit_dir, &cfg.default_target)?;
+        let plan = manager::announce_plan(&cfg.unit_dir, &cfg.default_target).await?;
         let mut manager = prepare_units(&plan, cgroup, &mut activation);
         let boot = Boot::new(plan, started);
         // The control socket is bound after the mounts, so `/run` exists
@@ -2968,16 +2968,17 @@ async fn report_fstab(cfg: &Config) -> Result<(), RuntimeError> {
         rlog!("second-wave mounts: disabled");
         return Ok(());
     };
-    let cmdline = cmdline();
-    if !rinit_runtime::fstab::enabled(&cmdline) {
-        rlog!("second-wave mounts: 'nofstab' on the kernel command line");
-        return Ok(());
-    }
 
     let path = path.clone();
     let report = tokio::task::spawn_blocking(move || {
+        // Both `/proc/cmdline` and the fstab file are blocking reads. Keeping
+        // them in the same blocking task leaves the async thread free.
+        let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
+        if !rinit_runtime::fstab::enabled(&cmdline) {
+            return Ok(None);
+        }
         let mut ops = rinit_runtime::RealMounts;
-        rinit_runtime::fstab::run_with(&mut ops, &path)
+        rinit_runtime::fstab::run_with(&mut ops, &path).map(Some)
     })
     .await
     .map_err(|e| RuntimeError::Join {
@@ -2985,6 +2986,10 @@ async fn report_fstab(cfg: &Config) -> Result<(), RuntimeError> {
         detail: e.to_string(),
     })??;
 
+    let Some(report) = report else {
+        rlog!("second-wave mounts: 'nofstab' on the kernel command line");
+        return Ok(());
+    };
     for point in &report.mounted {
         rlog!("mounted {point} (fstab)");
     }
@@ -2992,15 +2997,6 @@ async fn report_fstab(cfg: &Config) -> Result<(), RuntimeError> {
         rlog!("warning: {warning}");
     }
     Ok(())
-}
-
-/// The kernel command line, or an empty string when it cannot be read.
-///
-/// The second wave's veto (`nofstab`) lives there, and a system where
-/// `/proc/cmdline` cannot be read is one where the answer is the default rather
-/// than a failed boot.
-fn cmdline() -> String {
-    std::fs::read_to_string("/proc/cmdline").unwrap_or_default()
 }
 
 /// True when this process is PID 1.

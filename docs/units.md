@@ -76,7 +76,7 @@ of that). `After` alone orders without pulling in, exactly as in systemd.
 | `ExecStartPre` | command | none | Run before `ExecStart`; a non-zero exit fails the unit. Repeatable. |
 | `ExecStartPost` | command | none | Run after the main command is under way (after exit, for `oneshot`). Repeatable. |
 | `ExecStop` | command | empty | The stop action. **Empty means `SIGTERM`** to the process group and to every process in the unit's cgroup. |
-| `PIDFile` | absolute path | none | Where a `Type=forking` daemon writes its pid (plan §7.10). |
+| `PIDFile` | absolute path | none | Where a `Type=forking` daemon writes its pid (plan §7.10). Only a regular file is accepted, at most 4 KiB; an unreadable, non-regular or oversized file fails the start. |
 | `SocketActivate` | absolute path | none | A socket rinit binds and starts the unit from (plan §7.9): the unit is *not* started at boot, the first connection is. The service is handed the listening socket on fd 3, with `LISTEN_FDS=1`. |
 | `IdleTimeoutSec` | seconds, `0` = never stop | `0` | How long a socket-activated unit may stay up with no *new* connection before rinit stops it. |
 | `Sockets` | absolute path (repeatable) | none | A socket path this unit creates (plan §7.8). rinit creates nothing - this is the declaration that lets another unit's `NeedsSocket=` resolve to *this* unit. |
@@ -85,7 +85,16 @@ of that). `After` alone orders without pulling in, exactly as in systemd.
 | `TTYReset` | `true`/`false` | `true` | Hang the terminal up when taking it over, so a respawned console service starts on a clean one rather than on the last session's leftovers. Best effort: a device that does not implement it is still used. |
 | `WorkingDirectory` | absolute path | `/` | The child's working directory. Empty keeps the default. |
 | `Environment` | `KEY=VALUE` (one or more) | empty | Environment for every `Exec*` of the unit. Repeatable. |
-| `EnvironmentFile` | absolute path | none | Read further `KEY=VALUE` lines from this file. One that cannot be read is a warning, not a failure - a board without the file still boots. |
+| `EnvironmentFile` | absolute path | none | Read further `KEY=VALUE` lines from this file. Only a regular file is accepted, at most 1 MiB; an unreadable, non-regular or oversized file is a warning, not a failure - a board without the file still boots. |
+
+`EnvironmentFile=` and `PIDFile=` are read through one bounded helper. It
+accepts regular files only and caps `EnvironmentFile=` at 1 MiB and `PIDFile=`
+at 4 KiB. FIFOs, sockets, devices, directories and oversized files are rejected
+before reading; content that is not valid UTF-8 is rejected after the bounded
+read. For `EnvironmentFile=` that is a warning; for `PIDFile=` it fails the
+start. The read is synchronous, so a regular file on a filesystem that never
+completes a read can still stall PID 1 - there is no hard wall-clock timeout on
+this path.
 
 `Type=` decides what "started" means (plan §1.3(3)):
 

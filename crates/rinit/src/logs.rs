@@ -247,15 +247,26 @@ impl ServiceLogs {
     /// Best effort by design: a board whose rootfs is read-only, or whose
     /// `/var/log` cannot be created, boots with the ring and a warning - the same
     /// degradation every other optional facility here has.
-    pub fn persist_to(&self, path: &Path) {
-        match LogFile::open(path, LOG_FILE_MAX_BYTES) {
-            Ok(file) => {
+    pub async fn persist_to(&self, path: &Path) {
+        let path = path.to_path_buf();
+        let open_path = path.clone();
+        let opened =
+            tokio::task::spawn_blocking(move || LogFile::open(&open_path, LOG_FILE_MAX_BYTES))
+                .await;
+        match opened {
+            Ok(Ok(file)) => {
                 *lock(&self.file) = Some(Arc::new(FileQueue::new(file)));
                 rlog!("logging to {}", path.display());
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 rlog!(
                     "warning: cannot persist logs to {}: {e}; keeping them in memory only",
+                    path.display()
+                );
+            }
+            Err(e) => {
+                rlog!(
+                    "warning: cannot open the log file task for {}: {e}; keeping them in memory only",
                     path.display()
                 );
             }
@@ -498,14 +509,14 @@ mod tests {
     /// Plan §1.3(7): with a file configured, a captured line reaches the ring
     /// *and* the file - including the directory the plan's path implies, which
     /// rinit has to create itself.
-    #[test]
-    fn a_configured_file_gets_the_same_lines_as_the_ring() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_configured_file_gets_the_same_lines_as_the_ring() {
         let dir = std::env::temp_dir().join(format!("rinit-logs-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("nested/rinit.log");
 
         let logs = ServiceLogs::new();
-        logs.persist_to(&path);
+        logs.persist_to(&path).await;
         let app = unit("app.service");
         logs.push(&app, "first");
         logs.push(&app, "second");

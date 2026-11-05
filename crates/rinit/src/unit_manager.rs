@@ -17,7 +17,10 @@ use rinit_core::unit::dependency::{DependencyGraph, spawns_process};
 use rinit_core::unit::restart::BackoffState;
 use rinit_core::{Effect, Event, ExitOutcome, FailedReason, NotifyMessage, UnitState, transition};
 use rinit_core::{Job, JobQueue, JobTarget, RequestSource, UnitConfig, UnitName};
+use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
@@ -361,6 +364,57 @@ fn upsert(env: &mut Vec<(String, String)>, key: &str, value: &str) {
     }
 }
 
+/// Largest `EnvironmentFile=` rinit will read.
+const MAX_ENVIRONMENT_FILE_BYTES: u64 = 1024 * 1024;
+
+/// Largest `PIDFile=` rinit will read. A pid is digits and a newline; this is
+/// deliberately generous enough for comments without letting a bad path
+/// consume PID 1's memory.
+const MAX_PID_FILE_BYTES: u64 = 4096;
+
+/// Read a file supplied by a unit, with a hard size cap and a regular-file
+/// requirement.
+///
+/// Unit files are root-controlled, but their paths can still point at a FIFO,
+/// a terminal or a huge file. `O_NONBLOCK` keeps the `open` from waiting for a
+/// FIFO writer, and the file-type check rejects every non-regular target before
+/// any read. `O_NONBLOCK` has no effect on regular files, so the size cap is
+/// what bounds those. A regular file on a wedged filesystem can still block in
+/// `read(2)`; a synchronous PID 1 cannot interrupt that, and claiming a hard
+/// timeout would require the async staging this helper deliberately avoids.
+fn read_unit_file(path: &str, limit: u64) -> Result<String, String> {
+    // Inspect before opening: opening a device can have side effects even when
+    // the file type is rejected immediately afterwards. The second check after
+    // `open` covers a path that changed between the two calls.
+    let before = std::fs::metadata(path).map_err(|error| format!("stat failed: {error}"))?;
+    if !before.file_type().is_file() {
+        return Err("not a regular file".to_string());
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(path)
+        .map_err(|error| format!("open failed: {error}"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("stat failed: {error}"))?;
+    if !metadata.file_type().is_file() {
+        return Err("not a regular file".to_string());
+    }
+    let declared = metadata.len();
+    if declared > limit {
+        return Err(format!("file is {declared} bytes; the limit is {limit}"));
+    }
+    let mut bytes = Vec::new();
+    file.take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("read failed: {error}"))?;
+    if bytes.len() as u64 > limit {
+        return Err(format!("file exceeds the {limit}-byte limit"));
+    }
+    String::from_utf8(bytes).map_err(|_| "file is not valid UTF-8".to_string())
+}
+
 /// Assemble the environment a service runs with (plan §1.1).
 ///
 /// Precedence, lowest to highest: the fixed [`SERVICE_ENV`](crate::service::SERVICE_ENV)
@@ -379,7 +433,7 @@ pub(crate) fn build_service_env(config: &UnitConfig, extra_env: &[String]) -> Ve
         }
     }
     if !config.environment_file.is_empty() {
-        match std::fs::read_to_string(&config.environment_file) {
+        match read_unit_file(&config.environment_file, MAX_ENVIRONMENT_FILE_BYTES) {
             Ok(body) => {
                 for (key, value) in rinit_core::parse_environment_file(&body) {
                     upsert(&mut merged, &key, &value);
@@ -451,6 +505,13 @@ pub struct UnitManager {
     /// `Restart=` belongs to a running service, and a retry armed here would
     /// outlive the level that already failed it.
     boot_in_progress: bool,
+    /// A cache of the dependency graph used by `rctl start`.
+    ///
+    /// `start_order` is called for every explicit start and used to rebuild
+    /// the whole graph each time. The revision is bumped by every definition
+    /// change, so the cache can never outlive a reload or a template instance.
+    graph_cache: RefCell<Option<(u64, DependencyGraph)>>,
+    graph_revision: u64,
 }
 
 impl UnitManager {
@@ -466,7 +527,14 @@ impl UnitManager {
             listen_fds: BTreeMap::new(),
             templates: BTreeMap::new(),
             boot_in_progress: false,
+            graph_cache: RefCell::new(None),
+            graph_revision: 0,
         }
+    }
+
+    /// Invalidate the cached graph after a definition change.
+    fn invalidate_graph(&mut self) {
+        self.graph_revision = self.graph_revision.wrapping_add(1);
     }
 
     /// Mark the boot schedule as running.
@@ -535,6 +603,7 @@ impl UnitManager {
         let config = rinit_core::unit::parser::parse(unit, &expanded)
             .map_err(|e| format!("{}: {e}", template.canonical()))?;
         self.units.insert(unit.clone(), UnitRuntime::new(config));
+        self.invalidate_graph();
         Ok(())
     }
 
@@ -572,6 +641,7 @@ impl UnitManager {
         let name = config.name.clone();
         let Some(rt) = self.units.get_mut(&name) else {
             self.units.insert(name, UnitRuntime::new(config));
+            self.invalidate_graph();
             return ConfigChange::Added;
         };
         // The file is back (or never left): the unit is a unit again.
@@ -589,6 +659,7 @@ impl UnitManager {
         } else {
             rt.config = config;
             rt.pending_config = None;
+            self.invalidate_graph();
             ConfigChange::Applied
         }
     }
@@ -609,6 +680,7 @@ impl UnitManager {
     pub fn retire(&mut self, unit: &UnitName) {
         if let Some(rt) = self.units.get_mut(unit) {
             rt.retired = true;
+            self.invalidate_graph();
         }
     }
 
@@ -620,7 +692,11 @@ impl UnitManager {
     pub fn prune_retired(&mut self) -> usize {
         let before = self.units.len();
         self.units.retain(|_, rt| !rt.retired || rt.is_up());
-        before - self.units.len()
+        let removed = before - self.units.len();
+        if removed > 0 {
+            self.invalidate_graph();
+        }
+        removed
     }
 
     /// Every known unit, retired ones included, in name order.
@@ -645,8 +721,22 @@ impl UnitManager {
     /// target looks active while the units it aggregates are still inactive.
     /// Ordering-only edges are not pulled in; the closure is.
     pub fn start_order(&self, unit: &UnitName) -> Result<Vec<UnitName>, String> {
-        let configs: Vec<&UnitConfig> = self.units.values().map(|rt| &rt.config).collect();
-        let graph = DependencyGraph::build(configs).map_err(|e| e.to_string())?;
+        let revision = self.graph_revision;
+        if self
+            .graph_cache
+            .borrow()
+            .as_ref()
+            .is_none_or(|(cached, _)| *cached != revision)
+        {
+            let configs: Vec<&UnitConfig> = self.units.values().map(|rt| &rt.config).collect();
+            let graph = DependencyGraph::build(configs).map_err(|e| e.to_string())?;
+            *self.graph_cache.borrow_mut() = Some((revision, graph));
+        }
+        let cache = self.graph_cache.borrow();
+        let graph = cache
+            .as_ref()
+            .map(|(_, graph)| graph)
+            .ok_or_else(|| "dependency graph cache is empty".to_string())?;
         let closure = graph.closure_of(unit);
         let levels = graph.levels().map_err(|e| e.to_string())?;
         let mut order = Vec::new();
@@ -665,6 +755,8 @@ impl UnitManager {
     /// `Wants=` failures are tolerated; a required unit that fails takes the
     /// dependent start with it, exactly like the boot path.
     pub fn required_closure(&self, unit: &UnitName) -> Vec<UnitName> {
+        let mut seen = std::collections::BTreeSet::new();
+        seen.insert(unit.clone());
         let mut out: Vec<UnitName> = Vec::new();
         let mut stack = vec![unit.clone()];
         while let Some(current) = stack.pop() {
@@ -672,11 +764,10 @@ impl UnitManager {
                 continue;
             };
             for required in &rt.config.deps.requires {
-                if out.contains(required) {
-                    continue;
+                if seen.insert(required.clone()) {
+                    out.push(required.clone());
+                    stack.push(required.clone());
                 }
-                out.push(required.clone());
-                stack.push(required.clone());
             }
         }
         out
@@ -690,6 +781,7 @@ impl UnitManager {
     pub fn adopt_pending_config(&mut self, unit: &UnitName) {
         if let Some(rt) = self.units.get_mut(unit) {
             rt.adopt_pending_config();
+            self.invalidate_graph();
         }
     }
 
@@ -2445,7 +2537,7 @@ fn find_daemon(
 ) -> Result<libc::pid_t, String> {
     let pid = match &config.pid_file {
         Some(path) => {
-            let text = std::fs::read_to_string(path)
+            let text = read_unit_file(path, MAX_PID_FILE_BYTES)
                 .map_err(|e| format!("cannot read PIDFile {path}: {e}"))?;
             let text = text.trim();
             text.parse::<libc::pid_t>()
@@ -2811,6 +2903,190 @@ mod tests {
         let why = find_daemon(&cfg, &fake.cgroup(), &unit).expect_err("a dead pid is not a daemon");
 
         assert!(why.contains("not running"), "unexpected reason: {why}");
+    }
+
+    /// Unit-supplied files are capped before they can consume PID 1's memory.
+    #[test]
+    fn unit_file_reads_are_size_bounded() {
+        let path =
+            std::env::temp_dir().join(format!("rinit-unit-read-limit-{}", std::process::id()));
+        std::fs::write(&path, b"1234").expect("file");
+        assert_eq!(
+            read_unit_file(path.to_str().expect("UTF-8 temp path"), 4).expect("fits"),
+            "1234"
+        );
+        let error =
+            read_unit_file(path.to_str().expect("UTF-8 temp path"), 3).expect_err("over limit");
+        assert!(error.contains("limit"), "unexpected error: {error}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A FIFO or a directory must be rejected before `read`, not block the
+    /// supervisor; `O_NONBLOCK` is what makes the FIFO case safe.
+    #[test]
+    fn unit_file_reads_require_a_regular_file() {
+        let root =
+            std::env::temp_dir().join(format!("rinit-unit-read-kind-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("root");
+
+        let directory = root.join("directory");
+        std::fs::create_dir(&directory).expect("directory");
+        let error = read_unit_file(directory.to_str().expect("UTF-8 path"), 64)
+            .expect_err("a directory is not a unit file");
+        assert!(error.contains("regular file"), "unexpected error: {error}");
+
+        let fifo = root.join("fifo");
+        let fifo_c =
+            std::ffi::CString::new(fifo.to_str().expect("UTF-8 path")).expect("path has no NUL");
+        // SAFETY: `fifo_c` is a valid NUL-terminated path and the mode is a
+        // scalar; the FIFO is used only by this test process.
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        let error = read_unit_file(fifo.to_str().expect("UTF-8 path"), 64)
+            .expect_err("a FIFO is not a unit file");
+        assert!(error.contains("regular file"), "unexpected error: {error}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unit_file_reads_require_utf8() {
+        let path =
+            std::env::temp_dir().join(format!("rinit-unit-read-utf8-{}", std::process::id()));
+        std::fs::write(&path, b"\xff").expect("file");
+        let error =
+            read_unit_file(path.to_str().expect("UTF-8 temp path"), 64).expect_err("invalid UTF-8");
+        assert!(error.contains("UTF-8"), "unexpected error: {error}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The configured limits are inclusive: exactly the maximum is readable,
+    /// one byte more is not.
+    #[test]
+    fn unit_file_limits_are_inclusive() {
+        let env_path = std::env::temp_dir().join(format!("rinit-env-exact-{}", std::process::id()));
+        let file = std::fs::File::create(&env_path).expect("env file");
+        file.set_len(MAX_ENVIRONMENT_FILE_BYTES).expect("env size");
+        assert!(
+            read_unit_file(
+                env_path.to_str().expect("UTF-8 temp path"),
+                MAX_ENVIRONMENT_FILE_BYTES
+            )
+            .is_ok(),
+            "exactly the environment limit is allowed"
+        );
+        let _ = std::fs::remove_file(env_path);
+
+        let pid_path = std::env::temp_dir().join(format!("rinit-pid-exact-{}", std::process::id()));
+        let file = std::fs::File::create(&pid_path).expect("pid file");
+        file.set_len(MAX_PID_FILE_BYTES).expect("pid size");
+        assert!(
+            read_unit_file(
+                pid_path.to_str().expect("UTF-8 temp path"),
+                MAX_PID_FILE_BYTES
+            )
+            .is_ok(),
+            "exactly the PIDFile limit is allowed"
+        );
+        let _ = std::fs::remove_file(pid_path);
+    }
+
+    /// Symlinks follow to regular files but a symlink to a FIFO must be
+    /// rejected before opening, just like the FIFO itself.
+    #[test]
+    fn unit_file_symlinks_are_checked_by_target() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!("rinit-unit-symlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("root");
+
+        let target = root.join("target");
+        std::fs::write(&target, b"KEY=value\n").expect("target");
+        let link = root.join("link");
+        symlink(&target, &link).expect("symlink");
+        assert_eq!(
+            read_unit_file(link.to_str().expect("UTF-8 path"), 64).expect("regular symlink"),
+            "KEY=value\n"
+        );
+
+        let fifo = root.join("fifo");
+        let fifo_c =
+            std::ffi::CString::new(fifo.to_str().expect("UTF-8 path")).expect("path has no NUL");
+        // SAFETY: valid NUL-terminated path and scalar mode.
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        let fifo_link = root.join("fifo-link");
+        symlink(&fifo, &fifo_link).expect("fifo symlink");
+        let error = read_unit_file(fifo_link.to_str().expect("UTF-8 path"), 64)
+            .expect_err("a symlink to a FIFO is not regular");
+        assert!(error.contains("regular file"), "unexpected error: {error}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A permission failure is reported, not treated as an empty file. Root
+    /// bypasses the mode bits, so the check is only meaningful unprivileged.
+    #[test]
+    fn unit_file_permission_errors_are_explicit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let path = std::env::temp_dir().join(format!("rinit-unit-denied-{}", std::process::id()));
+        std::fs::write(&path, b"KEY=value\n").expect("file");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).expect("mode");
+        let error = read_unit_file(path.to_str().expect("UTF-8 temp path"), 64)
+            .expect_err("unreadable file");
+        assert!(
+            error.contains("Permission denied") || error.contains("open failed"),
+            "unexpected error: {error}"
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("restore mode");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// An unreadable or oversized EnvironmentFile is a warning and leaves the
+    /// base environment intact, exactly like a missing file.
+    #[test]
+    fn an_oversized_environment_file_is_ignored() {
+        let path = std::env::temp_dir().join(format!("rinit-env-too-big-{}", std::process::id()));
+        let file = std::fs::File::create(&path).expect("env file");
+        file.set_len(MAX_ENVIRONMENT_FILE_BYTES + 1).expect("size");
+        let mut cfg = config("app.service", RestartPolicy::No);
+        cfg.environment_file = path.to_str().expect("UTF-8 temp path").to_string();
+        let env = build_service_env(&cfg, &[]);
+        assert!(
+            env.iter().any(|entry| entry.starts_with("PATH=")),
+            "{env:?}"
+        );
+        assert!(
+            !env.iter().any(|entry| entry.starts_with("LEAK=")),
+            "{env:?}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// PIDFile is read only after the leader exits, but its path is still
+    /// unit-controlled: an oversized or non-regular target must be a named
+    /// start failure rather than an unbounded read.
+    #[test]
+    fn a_pid_file_must_be_a_bounded_regular_file() {
+        let fake = FakeCgroup::new("pid-kind");
+        let unit = UnitName::parse("app.service").unwrap();
+        let mut cfg = config("app.service", RestartPolicy::No);
+
+        let oversized = fake.root.join("oversized.pid");
+        let file = std::fs::File::create(&oversized).expect("pid file");
+        file.set_len(MAX_PID_FILE_BYTES + 1).expect("size");
+        cfg.pid_file = Some(oversized.display().to_string());
+        let why = find_daemon(&cfg, &fake.cgroup(), &unit).expect_err("over limit");
+        assert!(why.contains("limit"), "unexpected reason: {why}");
+
+        let directory = fake.root.join("directory.pid");
+        std::fs::create_dir(&directory).expect("directory");
+        cfg.pid_file = Some(directory.display().to_string());
+        let why = find_daemon(&cfg, &fake.cgroup(), &unit).expect_err("not a file");
+        assert!(why.contains("regular file"), "unexpected reason: {why}");
     }
 
     /// Without a `PIDFile=`, the cgroup is all there is - and it has to name
@@ -3499,6 +3775,35 @@ mod tests {
     // --- Job queue interaction (plan §1.3(13)) --------------------------
 
     /// A start request against a unit that is down asks for a process.
+    #[test]
+    fn start_order_cache_is_invalidated_by_a_definition_change() {
+        let a = UnitName::parse("a.service").unwrap();
+        let b = UnitName::parse("b.service").unwrap();
+        let target = UnitName::parse("all.target").unwrap();
+
+        let mut m = UnitManager::new();
+        let _ = m.add(config("a.service", RestartPolicy::No));
+        let mut first_target = config("all.target", RestartPolicy::No);
+        first_target.kind = rinit_core::UnitType::Target;
+        first_target.deps.requires = vec![a.clone()];
+        let _ = m.add(first_target);
+        assert_eq!(
+            m.start_order(&target).expect("first order"),
+            vec![a.clone()]
+        );
+
+        let _ = m.add(config("b.service", RestartPolicy::No));
+        let mut second_target = config("all.target", RestartPolicy::No);
+        second_target.kind = rinit_core::UnitType::Target;
+        second_target.deps.requires = vec![a, b.clone()];
+        let _ = m.add(second_target);
+        let order = m.start_order(&target).expect("second order");
+        assert!(
+            order.contains(&b),
+            "the cache must see the new edge: {order:?}"
+        );
+    }
+
     #[test]
     fn a_start_request_spawns_an_inactive_unit() {
         let _guard = crate::test_support::children_lock();
