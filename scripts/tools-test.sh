@@ -112,10 +112,10 @@ wait_ssh || { echo "FAIL: SSH did not come up" >&2; tail -30 "$serial" >&2; exit
 
 for path in mount umount swapon swapoff hostname ps free uptime dmesg df sysctl top reboot poweroff \
     processes rinit-check ls cat cp mv rm mkdir ln touch echo sleep uname mktemp sync stat rlogin \
-    id whoami env which dirname basename realpath readlink rgetty; do
+    id whoami env which dirname basename realpath readlink cut head tail rgetty; do
     case "$path" in
         mount | umount | hostname | ps | dmesg | df | processes | rinit-check | ls | cat | cp | mv | rm | mkdir | ln | touch | echo | sleep | uname | mktemp | sync | stat | rlogin) full="/bin/$path" ;;
-        free | uptime | top | id | whoami | env | which | dirname | basename | realpath | readlink) full="/usr/bin/$path" ;;
+        free | uptime | top | id | whoami | env | which | dirname | basename | realpath | readlink | cut | head | tail) full="/usr/bin/$path" ;;
         sysctl | reboot | poweroff | rgetty | swapon | swapoff) full="/sbin/$path" ;;
     esac
     check "$full is a real executable" "ssh_guest 'test -x $full && ! test -L $full'"
@@ -173,6 +173,11 @@ check 'readlink prints a symlink target' "ssh_guest 'ln -s /etc/hostname /tmp/to
 check 'mktemp creates a file' "ssh_guest 'p=\$(mktemp /tmp/tool-tmp.XXXXXX) && test -f \"\$p\" && rm -f \"\$p\"'"
 check 'sync succeeds' "ssh_guest 'sync'"
 check 'stat prints a file name and size' "ssh_guest 'stat -c \"%n %s\" /etc/hostname' | grep -q hostname"
+check 'cut selects a field' "ssh_guest 'printf \"a:b:c\\n\" | cut -d: -f2' | grep -qx b"
+check 'cut selects byte ranges' "ssh_guest 'printf \"abcdef\\n\" | cut -b2-4' | grep -qx bcd"
+check 'head prints the first line' "ssh_guest 'printf \"one\\ntwo\\n\" | head -n1' | grep -qx one"
+check 'tail prints the last line' "ssh_guest 'printf \"one\\ntwo\\n\" | tail -n1' | grep -qx two"
+check 'tail -c prints trailing bytes' "ssh_guest 'printf abcdef | tail -c3' | grep -qx def"
 check 'rlogin --help' "ssh_guest '/bin/rlogin --help' | grep -q Usage"
 check 'rgetty --help' "ssh_guest '/sbin/rgetty --help' | grep -q Usage"
 check 'old login/getty links are gone' "ssh_guest '! test -e /bin/login && ! test -e /sbin/getty'"

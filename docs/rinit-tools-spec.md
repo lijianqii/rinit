@@ -139,6 +139,14 @@ stat [-L] [-c FORMAT] [-t] FILE...
 `-m` allows missing components. `which` searches `PATH`, not the shell's
 command table.
 
+The text-filter additions are:
+
+| BusyBox applet | install path | source binary | risk |
+| --- | --- | --- | --- |
+| `cut` | `/usr/bin/cut` | `cut.rs` | medium: range lists and field delimiters |
+| `head` | `/usr/bin/head` | `head.rs` | low |
+| `tail` | `/usr/bin/tail` | `tail.rs` | medium: no follow mode |
+
 The console login pair uses the r-prefixed names. `replace-system` removes the
 old BusyBox links:
 
@@ -155,8 +163,9 @@ libcrypt), writes a `USER_PROCESS` record, drops privileges and execs the
 user's shell; `rgetty` writes `DEAD_PROCESS` when the session ends. Root login
 honours `/etc/securetty` when that file is present and non-empty. It supports
 `-p`, `-h HOST` and root-only `-f USER`; `rgetty` supports `-L`, `-l LOGIN`,
-`-h HOST`, `-n`, `-t SEC` and `-I STRING`. PAM and yescrypt/bcrypt hashes are
-not implemented.
+`-h HOST`, `-n`, `-t SEC` and `-I STRING`. `rgetty` resolves the tty operand and
+requires it to remain under `/dev`; a non-terminal is rejected before any
+ownership or mode change. PAM and yescrypt/bcrypt hashes are not implemented.
 
 Still out of scope:
 
@@ -275,6 +284,30 @@ static graph only: it does not start units, probe kernel features, resolve
 `User=`/`Group=`, check `ExecStart=` paths or touch cgroups, watchdogs and
 sockets.
 
+### `/usr/bin/cut`, `/usr/bin/head` and `/usr/bin/tail`
+
+```text
+cut (-b LIST|-c LIST|-f LIST) [-d DELIM] [-s] [FILE...]
+head [-n N|-c N] [-q|-v] [FILE...]
+tail [-n N|-c N] [-q|-v] [FILE...]
+```
+
+`LIST` is a comma-separated set of 1-based positions and inclusive ranges:
+`3`, `2-5`, `7-` and `-4` are accepted. Ranges are merged before use, and
+fields are emitted in input order. `cut` reads bytes for both `-b` and `-c`;
+`-c` is not locale-aware. `-d` takes exactly one byte and defaults to tab.
+With `-f`, a line without the delimiter is copied unchanged unless `-s` is
+given; `-s` and `-d` require `-f`.
+
+`head` and `tail` accept non-negative decimal counts up to the platform's
+usable size and default to 10 lines. `-c` counts bytes. Multiple files get
+`==> FILE <==` headers (`==> standard input <==` for `-`), suppressed by `-q`
+and forced by `-v`; `-` is standard input. `tail -c` seeks and streams regular
+files without allocating the full count; non-seekable input is buffered only up
+to 16 MiB and rejects larger counts with a clear error. `tail -f`, `-F`,
+follow-mode `-s` and the `+N` tail form are rejected rather than approximated.
+Live service logs belong to `rctl log`.
+
 ### `/sbin/reboot` and `/sbin/poweroff`
 
 Both must go through the rinit control path. They must not call the reboot
@@ -329,6 +362,9 @@ crates/
       swapon.rs
       swapoff.rs
       rinit-check.rs
+      cut.rs
+      head.rs
+      tail.rs
       hostname.rs
       reboot.rs
       poweroff.rs
@@ -364,6 +400,9 @@ and size budgets:
 ```text
 # applet   cargo-bin   install-path    busybox-link    max-kib  source
 rinit-check rinit-check /bin/rinit-check -               600     crates/rinit-tools/src/bin/rinit-check.rs
+cut        cut         /usr/bin/cut     /usr/bin/cut     600     crates/rinit-tools/src/bin/cut.rs
+head       head        /usr/bin/head    /usr/bin/head    600     crates/rinit-tools/src/bin/head.rs
+tail       tail        /usr/bin/tail    /usr/bin/tail    600     crates/rinit-tools/src/bin/tail.rs
 mount      mount       /bin/mount      /bin/mount      1024     crates/rinit-tools/src/bin/mount.rs
 umount     umount      /bin/umount     /bin/umount     1024     crates/rinit-tools/src/bin/umount.rs
 swapon     swapon      /sbin/swapon    /sbin/swapon     600     crates/rinit-tools/src/bin/swapon.rs
@@ -455,7 +494,7 @@ Provisional first-version budgets, to be replaced by measured values:
 | profile | tools | total budget |
 | --- | --- | --- |
 | minimal | `rinit` only | 1.2 MB |
-| `replace-system` (first three waves + console + swap + check) | 42 including existing | 20 MB |
+| `replace-system` (first three waves + console + swap + check + filters) | 45 including existing | 20 MB |
 | full toolbox (later) | 50+ | 24 MB |
 
 Each tool also has its own budget in `tools.list`. CI fails on either a per-tool
@@ -471,6 +510,8 @@ shared `librinit-tools.so` for non-init tools; do not add it pre-emptively.
 - mount/umount against real tmpfs/devpts entries, not only `--help`;
 - swap fstab filtering, `pri=`/`discard=` flags and the `-a` idempotency rules;
 - `rinit-check` against valid, warning-only, cyclic and missing-target trees;
+- `cut` range merging, empty fields and missing delimiters; `head`/`tail`
+  boundaries, byte counts and multi-file headers;
 - hostname `-F`;
 - file operations: recursive copy, no-clobber, symlink preservation, directory
   removal guards, hard/symbolic links and `touch -t`;
@@ -493,6 +534,7 @@ shared `librinit-tools.so` for non-init tools; do not add it pre-emptively.
 - the existing 105 `make test-system` assertions on the `replace-system` image;
 - a swap round trip: `swapon`, `swapon -s`, `swapoff` and `swapon -a`;
 - `rinit-check` on the shipped directory and a rejected bad target;
+- `cut`, `head` and `tail` with representative fields, byte ranges and files;
 - T3 reboot/poweroff persistence tests;
 - 24 h and 7 day soaks for `rinit`, with the tools not affecting the PID 1
   memory curve;

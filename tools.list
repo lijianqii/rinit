@@ -61,6 +61,11 @@ mktemp     mktemp     /bin/mktemp      /bin/mktemp      600  crates/rinit-tools/
 sync       sync       /bin/sync        /bin/sync        600  crates/rinit-tools/src/bin/sync.rs
 stat       stat       /bin/stat        /bin/stat        800  crates/rinit-tools/src/bin/stat.rs
 
+# Text filters: byte-oriented subsets of the BusyBox applets.
+cut        cut        /usr/bin/cut     /usr/bin/cut     600  crates/rinit-tools/src/bin/cut.rs
+head       head       /usr/bin/head    /usr/bin/head    600  crates/rinit-tools/src/bin/head.rs
+tail       tail       /usr/bin/tail    /usr/bin/tail    600  crates/rinit-tools/src/bin/tail.rs
+
 # Console login: independent replacements for BusyBox login/getty. The old
 # BusyBox links are removed; the tools use the r-prefixed names.
 rlogin     rlogin     /bin/rlogin      /bin/login       800  crates/rinit-tools/src/bin/rlogin/main.rs
