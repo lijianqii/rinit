@@ -5,6 +5,9 @@
 
 use rinit_core::{ListFormat, Request, StatusFormat, UnitName};
 
+/// How many recent log lines the default systemd status view includes.
+const DEFAULT_STATUS_TAIL: u32 = 10;
+
 /// What a command line asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Parsed {
@@ -141,17 +144,17 @@ fn parse_list_format(value: &str) -> Result<ListFormat, String> {
 /// `--format=json`, and `--plain` is the escape hatch for existing scripts.
 fn parse_status(rest: &[String]) -> Result<(Option<UnitName>, u32, StatusFormat), String> {
     let mut unit: Option<UnitName> = None;
-    let mut tail: u32 = 0;
+    let mut tail: Option<u32> = None;
     let mut format = StatusFormat::Systemd;
     let mut index = 0;
     while let Some(arg) = rest.get(index) {
         if let Some(value) = arg.strip_prefix("--tail=") {
-            tail = parse_tail(value)?;
+            tail = Some(parse_tail(value)?);
         } else if arg == "--tail" {
             let value = rest
                 .get(index + 1)
                 .ok_or_else(|| "--tail needs a line count".to_string())?;
-            tail = parse_tail(value)?;
+            tail = Some(parse_tail(value)?);
             index += 1;
         } else if let Some(value) = arg.strip_prefix("--format=") {
             format = parse_status_format(value)?;
@@ -178,6 +181,16 @@ fn parse_status(rest: &[String]) -> Result<(Option<UnitName>, u32, StatusFormat)
         }
         index += 1;
     }
+    // The default human view carries a small tail; machine-oriented formats
+    // stay stable unless the caller asks for logs explicitly. `--tail 0` is
+    // the escape hatch for the systemd view itself.
+    let tail = tail.unwrap_or_else(|| {
+        if unit.is_some() && format == StatusFormat::Systemd {
+            DEFAULT_STATUS_TAIL
+        } else {
+            0
+        }
+    });
     Ok((unit, tail, format))
 }
 
@@ -321,7 +334,7 @@ mod tests {
             parse(&["status", "app"]),
             Ok(Parsed::Request(Request::StatusFormatted {
                 unit: Some(unit("app.service")),
-                tail: 0,
+                tail: DEFAULT_STATUS_TAIL,
                 format: StatusFormat::Systemd
             }))
         );
@@ -330,6 +343,45 @@ mod tests {
             Ok(Parsed::Request(Request::Log {
                 unit: Some(unit("app.service")),
                 tail: 0
+            }))
+        );
+    }
+
+    /// The default systemd status view includes a small tail; explicit
+    /// formats and `--tail 0` do not.
+    #[test]
+    fn status_defaults_to_a_small_log_tail_only_in_the_systemd_view() {
+        for args in [
+            ["status", "app", "--plain"].as_slice(),
+            ["status", "app", "--short"].as_slice(),
+            ["status", "app", "--json"].as_slice(),
+            ["status", "app", "--card"].as_slice(),
+        ] {
+            let Ok(Parsed::Request(Request::StatusFormatted {
+                unit: parsed_unit,
+                tail,
+                ..
+            })) = parse(args)
+            else {
+                panic!("{args:?} did not parse as a formatted status request");
+            };
+            assert_eq!(parsed_unit, Some(unit("app.service")), "{args:?}");
+            assert_eq!(tail, 0, "{args:?}");
+        }
+        assert_eq!(
+            parse(&["status", "app", "--tail", "0"]),
+            Ok(Parsed::Request(Request::StatusFormatted {
+                unit: Some(unit("app.service")),
+                tail: 0,
+                format: StatusFormat::Systemd
+            }))
+        );
+        assert_eq!(
+            parse(&["status", "app", "--format=systemd"]),
+            Ok(Parsed::Request(Request::StatusFormatted {
+                unit: Some(unit("app.service")),
+                tail: DEFAULT_STATUS_TAIL,
+                format: StatusFormat::Systemd
             }))
         );
     }

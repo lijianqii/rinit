@@ -295,9 +295,9 @@ make gates          # acceptance gates: binary size + coverage thresholds
 ```
 
 `cargo test --offline --workspace`（`make check` 最后一步跑的就是它）在 58 个
-cargo 测试目标里执行 **1035 个测试**。五种形态，以及为什么每种都不是多余的：
+cargo 测试目标里执行 **1039 个测试**。五种形态，以及为什么每种都不是多余的：
 
-- **单元测试**紧挨着代码（core 335、rinit 218、rinit-runtime 135、rinit-tools 224、rctl 16、processes 5），
+- **单元测试**紧挨着代码（core 335、rinit 221、rinit-runtime 135、rinit-tools 224、rctl 17、processes 5），
   包括解析器上的 `proptest` 属性测试；
 - **集成测试**在 `crates/*/tests/`：系统调用层面对真实内核（`rinit-runtime` 26 个：
   以非特权身份运行，断言每次降权都*被拒绝*而不是被静默跳过——`setuid(0)`、
@@ -364,11 +364,11 @@ qemu 的 `i6300esb` 设备和带该驱动编译的内核是测试装置的一部
 | ---------------- | ------------- | --------- |
 | `rinit-core`     | **97.87%**    | 581/591   |
 | `rinit-runtime`  | 85.73%        | 362/410   |
-| `rinit`          | 87.55%        | 789/882   |
+| `rinit`          | 87.81%        | 794/887   |
 | `rinit-tools`    | 81.50%        | 653/851   |
-| `rctl`           | 93.06%        | 42/50     |
+| `rctl`           | 93.38%        | 44/52     |
 | `processes`      | 83.98%        | 60/80     |
-| **总计**         | **87.10%**    | 2487/2864 |
+| **总计**         | **87.20%**    | 2494/2871 |
 
 计划清单要求总体 ≥80%、核心 ≥90%，所以回答它的是这些数字，而不是某种形状：
 
@@ -468,7 +468,7 @@ cargo llvm-cov --offline --workspace --html                  # target/llvm-cov/h
 | 72 小时 soak，RSS 稳定 | **宿主上已通过。** 第九段在 `8b373d8` 上完成 **4,320/4,320 个样本**和 **8,640/8,640 条 control 命令**。前半段与后半段的 RSS 峰值分别为 5,168 kB 和 4,300 kB，描述符最低值均为 11（峰值 22），最大 zombie 连续出现 1 个瞬时采样，最终静默扫描为 0。 |
 | 24 小时目标客户机 soak | **已通过。** `7a5df04`，aarch64 `run-disk`，guest 内采样：86,343 秒内完成 **1,440/1,440 个样本**和 **2,880/2,880 条 control 命令**。RSS 保持在 2,364–2,528 kB（前后半段峰值 2,520/2,528），描述符 19–20，全程未观察到 zombie，最终检查为 `quiescent=0 health_fail=0`。每个样本里 `eth0`、默认路由、`udhcpc`、dropbear、`network.service` 和 `sshd.service` 都正常；串口日志只有一次启动，无 panic/OOM。采样在 guest 内运行（`scripts/soak-qemu.sh` + `scripts/soak-guest.sh`），宿主 SSH 断开不会让测试静默失效。 |
 | 二进制 ≤2 MB 动态 / ≤4 MB 静态 | [测量](#测量计划-01-校准点)：aarch64 动态 1.00 MiB、armv7 动态 1.07 MiB，由 `make size-check` 检查 |
-| 单元测试覆盖率总体 ≥80%、核心 ≥90% | **87.10%** 和 **97.87%**（`make coverage-check`，见[上文](#测试)） |
+| 单元测试覆盖率总体 ≥80%、核心 ≥90% | **87.20%** 和 **97.87%**（`make coverage-check`，见[上文](#测试)） |
 | 文档：架构、单元格式、`rctl`、移植 | 本 README（架构、状态、测量）、[`docs/units.md`](docs/units.md)（每条指令、取值语法和默认值）、[`docs/porting.md`](docs/porting.md)（内核、用户空间、构建、与 systemd 的差异），以及 `rinit-开发计划.md` |
 
 还有一个清单没要求、但计划 §0.1 的设计目标要求的数字：rinit 的 RSS，在*客户机里*从
@@ -740,12 +740,12 @@ rctl <COMMAND> [ARGS]
 
   list [--format FMT]     List all known units (default: table)
   status [UNIT] [--tail N] [--format FMT]
-                          Show unit status (default: systemd)
+                          Show unit status (default: systemd, latest 10 logs)
   start <UNIT>            Start a unit
   stop <UNIT>             Stop a unit
   restart <UNIT>          Restart a unit
   reset-failed <UNIT>     Clear a unit's failed/start-limit state
-  log [UNIT] [--tail N]   Show buffered log
+  log [UNIT] [--tail N]   Show buffered log (default: all lines)
   reload                  Re-read the unit directory and apply the difference
 
 Exit codes: 0 success  1 error  2 usage  3 no such unit  4 operation conflict
@@ -783,11 +783,18 @@ rinit 对**自己的**控制台输出限流，按调用点：每 5 秒 40 行，
 或者如果洪峰先停了，就在关闭路径上报告。崩溃循环的服务每秒重启几百次，反复打印同样
 几条只有 pid 不同的消息，所以限流器按调用点而不是按文本做键；最大的合法突发（一个
 启动层启动它的 20 个单元，同一个调用点）远在预算之内。服务输出不受影响——日志环和
-落盘镜像已经按单元、按大小给它设了界。
+落盘镜像都按字节给它设了界。
 
-`--tail N` 返回日志环里最后 N 行，`0` 表示缓冲区里全部。日志环为每个单元保留有界的
-字节数（`LINE_OVERHEAD` 也计入这份账，这样单元名不会让预算说谎），协议帧有 64 KiB
-上限（`MAX_FRAME_BYTES`），正是它阻止任一侧的长度前缀变成无界分配。
+`rctl log UNIT` 打印该单元当前缓冲区里的全部日志；`--tail N` 限制为最近 N 行，
+`--tail 0`（`log` 的默认值）表示整个缓冲区。默认 systemd 视图下，
+`rctl status UNIT` 会附带最近 10 行日志；`--tail N` 改变数量，`--tail 0` 关闭。
+`--plain`、`--short`、`--json`、`--card` 等其他格式只有在显式传入
+`--tail` 时才附带日志。
+
+日志环是所有单元共享的一个有界字节缓冲，所以刷屏的单元可能挤掉其他单元最旧的行；
+`LINE_OVERHEAD` 也计入这份账，这样单元名不会让预算说谎。回复帧上限为 512 KiB
+（`MAX_FRAME_BYTES`），足以容纳整个 256 KiB 日志环，同时仍限制任一侧可被要求
+缓冲的数据量。
 
 `reload`（计划 §7.6）是唯一一个针对目录而不是单个单元的命令，所以它不接受参数，
 回复是一份报告：注册了什么、什么立即采用了新定义、什么在等下次重启、什么被停止并
@@ -971,8 +978,8 @@ M0 的 bring-up 辅助程序 `rinit-testservice` 已经删除：没有东西再�
 
 打包后的镜像（`build/out/initramfs-aarch64-unknown-linux-gnu.cpio.gz` 和
 `…-demo.cpio.gz`：静态 busybox + 动态 rinit/rctl/processes + 已安装的工具 + 单元目录 + `/etc`/`/var` 骨架）
-gzip 后分别是 9.10 MiB（9 544 980 B）和 9.11 MiB（9 551 106 B）；arm32 的两个镜像
-分别是 9.33 MiB（9 784 752 B）和 9.34 MiB（9 790 664 B）。`run-disk` 的镜像是
+gzip 后分别是 9.10 MiB（9 544 702 B）和 9.11 MiB（9 550 948 B）；arm32 的两个镜像
+分别是 9.33 MiB（9 784 988 B）和 9.34 MiB（9 790 851 B）。`run-disk` 的镜像是
 约 80-81 MiB 的 ext4（首次启动前实际使用约 51-52 MiB，其中默认 swap 文件占
 32 MiB），不放进 initramfs。差值就是 `units/demo/`
 里的十四个文件，只有第二个镜像带它们。打包是可复现的——`scripts/mkinitramfs.sh` 把归档

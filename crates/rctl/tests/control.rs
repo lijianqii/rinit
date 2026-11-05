@@ -89,7 +89,7 @@ fn a_successful_command_prints_the_reply_and_exits_zero() {
         server.join().expect("server"),
         Request::StatusFormatted {
             unit: Some(rinit_core::UnitName::parse("app.service").unwrap()),
-            tail: 0,
+            tail: 10,
             format: rinit_core::StatusFormat::Systemd
         }
     );

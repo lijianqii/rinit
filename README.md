@@ -323,12 +323,12 @@ make test           # check + test-system
 make gates          # acceptance gates: binary size + coverage thresholds
 ```
 
-`cargo test --offline --workspace` (what `make check` runs last) executes **1035
+`cargo test --offline --workspace` (what `make check` runs last) executes **1039
 tests** across 58 cargo test targets. The five shapes, and why each is not
 redundant:
 
-- **unit tests** next to the code (core 335, rinit 218, rinit-runtime 135,
-  rinit-tools 224, rctl 16, processes 5), including `proptest` properties over
+- **unit tests** next to the code (core 335, rinit 221, rinit-runtime 135,
+  rinit-tools 224, rctl 17, processes 5), including `proptest` properties over
   the parser;
 - **integration tests** in `crates/*/tests/`: the syscall layer against the real
   kernel (`rinit-runtime` 26: run unprivileged, they assert that each drop is
@@ -421,11 +421,11 @@ they are measured on the tree as it stands rather than copied from one run:
 | ---------------- | ------------- | --------- |
 | `rinit-core`     | **97.87%**    | 581/591   |
 | `rinit-runtime`  | 85.73%        | 362/410   |
-| `rinit`          | 87.55%        | 789/882   |
+| `rinit`          | 87.81%        | 794/887   |
 | `rinit-tools`    | 81.50%        | 653/851   |
-| `rctl`           | 93.06%        | 42/50     |
+| `rctl`           | 93.38%        | 44/52     |
 | `processes`      | 83.98%        | 60/80     |
-| **total**        | **87.10%**    | 2487/2864 |
+| **total**        | **87.20%**    | 2494/2871 |
 
 The plan's checklist asks for ≥80% overall and ≥90% in the core, so these are the
 numbers that answer it rather than a shape:
@@ -560,7 +560,7 @@ repository or a measurement in this README:
 | 72 h soak with stable RSS | **Passed on the host.** Segment 9 on `8b373d8` completed **4,320/4,320 samples** and **8,640/8,640 control commands**. RSS peak per half fell from 5,168 kB to 4,300 kB, descriptor minima were 11 and 11 (peak 22), the maximum zombie streak was 1 transient sample, and the final quiescent sweep found 0 zombies. |
 | 24 h soak in the target guest | **Passed.** `7a5df04`, aarch64 `run-disk`, guest-side sampler: **1,440/1,440 samples** and **2,880/2,880 control commands** over 86,343 s. RSS stayed within 2,364–2,528 kB (half peaks 2,520/2,528), descriptors within 19–20, no zombie was ever observed, and the final sweep returned `quiescent=0 health_fail=0`. `eth0`, the default route, `udhcpc`, dropbear, `network.service` and `sshd.service` were healthy in every sample; the serial log shows one boot and no panic/OOM. Sampling runs inside the guest (`scripts/soak-qemu.sh` + `scripts/soak-guest.sh`), so a host SSH outage cannot end the run silently. |
 | binaries ≤2 MB dynamic / ≤4 MB static | [Measurements](#measurements-plan-01-calibration-point): 1.00 MiB dynamic arm64 / 1.07 MiB armv7, checked by `make size-check` |
-| unit test coverage ≥80% overall, ≥90% in the core | **87.10%** and **97.87%** (`make coverage-check`, [above](#testing)) |
+| unit test coverage ≥80% overall, ≥90% in the core | **87.20%** and **97.87%** (`make coverage-check`, [above](#testing)) |
 | documentation: architecture, unit format, `rctl`, porting | this README (architecture, status, measurements), [`docs/units.md`](docs/units.md) (every directive, its value syntax and its default), [`docs/porting.md`](docs/porting.md) (kernel, userspace, build, differences from systemd), and `rinit-开发计划.md` |
 
 One number the checklist does not ask for, but plan §0.1's design goals do: rinit's
@@ -872,12 +872,12 @@ rctl <COMMAND> [ARGS]
 
   list [--format FMT]     List all known units (default: table)
   status [UNIT] [--tail N] [--format FMT]
-                          Show unit status (default: systemd)
+                          Show unit status (default: systemd, latest 10 logs)
   start <UNIT>            Start a unit
   stop <UNIT>             Stop a unit
   restart <UNIT>          Restart a unit
   reset-failed <UNIT>     Clear a unit's failed/start-limit state
-  log [UNIT] [--tail N]   Show buffered log
+  log [UNIT] [--tail N]   Show buffered log (default: all lines)
   reload                  Re-read the unit directory and apply the difference
 
 Exit codes: 0 success  1 error  2 usage  3 no such unit  4 operation conflict
@@ -918,14 +918,20 @@ the flood stops first. A service that crash-loops restarts hundreds of times a
 second and prints the same messages with different pids in them, so the limiter
 is keyed by call site rather than by text; the largest legitimate burst (a boot
 level starting its 20 units, one call site) is well inside the budget. Service
-output is unaffected - the ring and the file mirror already bound that, per unit
-and by size.
+output is unaffected - the ring and the file mirror bound it by bytes.
 
-`--tail N` returns the last N lines from the ring, with `0` meaning everything
-buffered. The ring keeps a bounded number of bytes per unit (`LINE_OVERHEAD` is
-part of that accounting, so a unit name cannot make the budget lie), and the
-protocol is framed with a 64 KiB limit (`MAX_FRAME_BYTES`), which is what stops
-a length prefix - on either side - from becoming an unbounded allocation.
+`rctl log UNIT` prints every line currently buffered for that unit; `--tail N`
+limits it to the newest N, and `--tail 0` (the default for `log`) means the whole
+buffer. `rctl status UNIT` in the default systemd view appends the newest 10
+lines; `--tail N` changes that and `--tail 0` disables it. The other formats
+(`--plain`, `--short`, `--json`, `--card`) only include logs when `--tail` is
+given explicitly.
+
+The ring is one global byte-bounded buffer shared by all units, so a noisy unit
+can evict another unit's oldest lines; `LINE_OVERHEAD` is part of the accounting,
+so a unit name cannot make the budget lie. A reply is framed with a 512 KiB limit
+(`MAX_FRAME_BYTES`), large enough for the whole 256 KiB ring while still bounding
+what either side can be made to buffer.
 
 `reload` (plan §7.6) is the one command that is about the directory rather than a
 unit, so it takes no arguments, and its reply is a report: what was registered,
@@ -1161,8 +1167,8 @@ command through the same spawn path a unit uses.
 The packed images (`build/out/initramfs-aarch64-unknown-linux-gnu.cpio.gz` and
 `…-demo.cpio.gz`: static busybox + dynamic rinit/rctl/processes + the installed
 tools + the unit directory + the `/etc`/`/var` skeleton) are 9.10 MiB
-(9 544 980 B) and 9.11 MiB (9 551 106 B) gzipped. The arm32 pair is 9.33 MiB
-(9 784 752 B) and 9.34 MiB (9 790 664 B).
+(9 544 702 B) and 9.11 MiB (9 550 948 B) gzipped. The arm32 pair is 9.33 MiB
+(9 784 988 B) and 9.34 MiB (9 790 851 B).
 The `run-disk` images are ext4 files of about 80-81 MiB logical size (roughly
 51-52 MiB used before the first boot, including the default 32 MiB swap file);
 they are not

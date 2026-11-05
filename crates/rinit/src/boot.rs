@@ -2390,7 +2390,22 @@ fn render_logs(logs: &ServiceLogs, unit: Option<&UnitName>, tail: u32) -> String
     // Leave room for the status prefix, the JSON field wrapper and the frame
     // header. The newest lines are kept: a truncated log that drops the newest
     // output is useless for the failure that just happened.
-    let budget = MAX_FRAME_BYTES.saturating_sub(4096).saturating_sub(1);
+    render_logs_with_budget(
+        logs,
+        unit,
+        tail,
+        MAX_FRAME_BYTES.saturating_sub(4096).saturating_sub(1),
+    )
+}
+
+/// The selection half of [`render_logs`], with the frame budget explicit so
+/// tests can exercise the omission path without a half-megabyte fixture.
+fn render_logs_with_budget(
+    logs: &ServiceLogs,
+    unit: Option<&UnitName>,
+    tail: u32,
+    budget: usize,
+) -> String {
     let lines = logs.tail(unit, tail as usize);
     let mut selected = Vec::new();
     let mut used = 0usize;
@@ -3505,10 +3520,58 @@ mod tests {
         );
     }
 
-    /// `rctl log` defaults to the whole ring, which is larger than the control
-    /// frame limit. The reply must stay decodable and keep the newest lines.
+    /// `rctl status UNIT` includes the unit's recent log lines when the
+    /// request asks for a tail (the client asks for ten in the default view).
+    #[tokio::test(flavor = "current_thread")]
+    async fn status_formatted_with_a_tail_appends_the_unit_log() {
+        let _guard = crate::test_support::children_lock_async().await;
+        let mut manager = manager_with("app.service");
+        let mut notify = test_hub("statuslog");
+        let logs = ServiceLogs::new();
+        let app = unit("app.service");
+        let other = unit("other.service");
+        logs.push(&app, "app-ready");
+        logs.push(&other, "other-noise");
+
+        let (status, text) = control(
+            &mut manager,
+            &mut notify,
+            &logs,
+            &Request::StatusFormatted {
+                unit: Some(app.clone()),
+                tail: 10,
+                format: StatusFormat::Systemd,
+            },
+        )
+        .await;
+        assert_eq!(status, Status::Ok);
+        assert!(text.contains("log:\napp.service: app-ready"), "{text}");
+        assert!(!text.contains("other-noise"), "{text}");
+    }
+
+    /// `rctl log UNIT` without `--tail` asks for every buffered line of that
+    /// unit, not a default window.
     #[test]
-    fn render_logs_keeps_the_newest_lines_within_the_frame_limit() {
+    fn render_logs_without_a_tail_returns_the_whole_unit_buffer() {
+        let logs = ServiceLogs::new();
+        let app = unit("app.service");
+        let other = unit("other.service");
+        logs.push(&app, "one");
+        logs.push(&app, "two");
+        logs.push(&other, "someone else");
+        logs.push(&app, "three");
+
+        let text = render_logs(&logs, Some(&app), 0);
+        assert_eq!(
+            text,
+            "app.service: one\napp.service: two\napp.service: three"
+        );
+    }
+
+    /// A log reply that fits the frame contains the whole ring, including a
+    /// buffer much larger than the old 64 KiB limit.
+    #[test]
+    fn render_logs_returns_the_whole_ring_when_it_fits() {
         let logs = ServiceLogs::new();
         let app = unit("app.service");
         for i in 0..3000 {
@@ -3516,12 +3579,34 @@ mod tests {
         }
         logs.push(&app, "newest line");
 
-        let text = render_logs(&logs, None, 0);
+        let text = render_logs(&logs, Some(&app), 0);
         assert!(
             text.len() < MAX_FRAME_BYTES,
             "reply is {} bytes",
             text.len()
         );
+        assert!(
+            !text.contains("[older log lines omitted"),
+            "the frame is large enough for the whole ring"
+        );
+        assert!(
+            text.ends_with("newest line"),
+            "the newest line must survive"
+        );
+    }
+
+    /// The omission marker still protects a caller with a smaller budget.
+    #[test]
+    fn render_logs_keeps_the_newest_lines_within_a_small_budget() {
+        let logs = ServiceLogs::new();
+        let app = unit("app.service");
+        for i in 0..3000 {
+            logs.push(&app, &format!("line {i} {}", "x".repeat(80)));
+        }
+        logs.push(&app, "newest line");
+
+        let text = render_logs_with_budget(&logs, None, 0, 1024);
+        assert!(text.len() <= 1024, "reply is {} bytes", text.len());
         assert!(text.contains("[older log lines omitted"), "{}", &text[..80]);
         assert!(
             text.ends_with("newest line"),

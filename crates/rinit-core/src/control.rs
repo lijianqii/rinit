@@ -24,9 +24,10 @@ pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Largest frame body accepted, in bytes.
 ///
-/// A control reply is a few lines of text; 64 KiB is generous while still
-/// bounding what a client can make rinit buffer.
-pub const MAX_FRAME_BYTES: usize = 64 * 1024;
+/// Most control replies are a few lines of text, but `rctl log` can return the
+/// whole 256 KiB log ring. 512 KiB leaves room for the per-line unit prefix
+/// and still bounds what either side can be made to buffer.
+pub const MAX_FRAME_BYTES: usize = 512 * 1024;
 
 /// Bytes of the little-endian length prefix that frames every message.
 pub const LENGTH_PREFIX_BYTES: usize = 4;

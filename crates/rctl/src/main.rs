@@ -41,12 +41,12 @@ Control the rinit PID 1 service manager.
 Commands:
   list [--format FMT]     List all known units (default: table)
   status [UNIT] [--tail N] [--format FMT]
-                            Show unit status (default format: systemd)
+                            Show unit status (default: systemd, latest 10 logs)
   start <UNIT>            Start a unit
   stop <UNIT>             Stop a unit
   restart <UNIT>          Restart a unit
   reset-failed <UNIT>     Clear a unit's failed/start-limit state
-  log [UNIT] [--tail N]   Show buffered log
+  log [UNIT] [--tail N]   Show buffered log (default: all lines)
   reload                  Re-read the unit directory and apply the difference
   reboot                  Stop services and reboot
   poweroff                Stop services and power off
@@ -61,7 +61,8 @@ Options:
   --short                 alias for --format=short
   --card                  status alias for --format=card
   --table                 list alias for --format=table
-  --tail N                include N recent log lines with status
+  --tail N                limit status/log to N recent lines
+                          (status defaults to 10; 0 disables status logs)
 
 Exit codes:
   0 success   1 error   2 usage   3 no such unit   4 operation conflict
