@@ -64,6 +64,11 @@ pub struct Config {
     /// is a *mirror* of the ring, not a replacement, so `rctl log` does not
     /// depend on it.
     pub log_file: Option<PathBuf>,
+    /// Maximum size of the persisted log file (`--log-max-bytes`).
+    pub log_max_bytes: u64,
+    /// Number of rotated log files to keep; zero truncates in place
+    /// (`--log-keep`).
+    pub log_keep: usize,
     /// Where the second-wave mount table lives (plan §1.3(9)), or `None` to skip
     /// the second wave.
     ///
@@ -135,6 +140,8 @@ fn parse_with_default<I: IntoIterator<Item = OsString>>(
         watchdog_device: None,
         watchdog_timeout_sec: rinit_runtime::syscall::watchdog::DEFAULT_TIMEOUT_SEC,
         log_file: Some(PathBuf::from(DEFAULT_LOG_FILE)),
+        log_max_bytes: crate::logs::DEFAULT_LOG_FILE_MAX_BYTES,
+        log_keep: crate::logs::DEFAULT_LOG_KEEP,
         fstab: Some(PathBuf::from(DEFAULT_FSTAB)),
     };
 
@@ -182,6 +189,18 @@ fn parse_with_default<I: IntoIterator<Item = OsString>>(
                     .ok_or_else(|| "--log-file requires a path".to_string())?;
                 cfg.log_file = log_file_path(&value.to_string_lossy());
             }
+            "--log-max-bytes" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--log-max-bytes requires a byte count".to_string())?;
+                cfg.log_max_bytes = parse_log_max_bytes(&value.to_string_lossy())?;
+            }
+            "--log-keep" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--log-keep requires a file count".to_string())?;
+                cfg.log_keep = parse_log_keep(&value.to_string_lossy())?;
+            }
             "--watchdog-timeout" => {
                 let value = iter
                     .next()
@@ -220,6 +239,10 @@ fn parse_with_default<I: IntoIterator<Item = OsString>>(
                     cfg.fstab = log_file_path(value);
                 } else if let Some(value) = other.strip_prefix("--log-file=") {
                     cfg.log_file = log_file_path(value);
+                } else if let Some(value) = other.strip_prefix("--log-max-bytes=") {
+                    cfg.log_max_bytes = parse_log_max_bytes(value)?;
+                } else if let Some(value) = other.strip_prefix("--log-keep=") {
+                    cfg.log_keep = parse_log_keep(value)?;
                 } else if let Some(value) = other.strip_prefix("--watchdog=") {
                     cfg.watchdog_device = Some(PathBuf::from(value));
                 } else if let Some(value) = other.strip_prefix("--watchdog-timeout=") {
@@ -263,6 +286,43 @@ fn parse_with_default<I: IntoIterator<Item = OsString>>(
             return None;
         }
         Some(PathBuf::from(value))
+    }
+
+    /// A log-file bound in bytes.
+    ///
+    /// The minimum keeps a pathological value such as `1` from turning every
+    /// write into a rotation, while still allowing a small deployment.
+    fn parse_log_max_bytes(value: &str) -> Result<u64, String> {
+        if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(format!(
+                "--log-max-bytes: '{value}' is not a whole number of bytes"
+            ));
+        }
+        match value.parse::<u64>() {
+            Ok(bytes) if bytes >= crate::logs::MIN_LOG_FILE_MAX_BYTES => Ok(bytes),
+            Ok(_) => Err(format!(
+                "--log-max-bytes: at least {} bytes are required",
+                crate::logs::MIN_LOG_FILE_MAX_BYTES
+            )),
+            Err(_) => Err(format!("--log-max-bytes: '{value}' is out of range")),
+        }
+    }
+
+    /// A count of rotated files, bounded so one write cannot walk a huge chain.
+    fn parse_log_keep(value: &str) -> Result<usize, String> {
+        if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(format!(
+                "--log-keep: '{value}' is not a whole number of files"
+            ));
+        }
+        match value.parse::<usize>() {
+            Ok(keep) if keep <= crate::logs::MAX_LOG_KEEP => Ok(keep),
+            Ok(_) => Err(format!(
+                "--log-keep: at most {} rotated files are supported",
+                crate::logs::MAX_LOG_KEEP
+            )),
+            Err(_) => Err(format!("--log-keep: '{value}' is out of range")),
+        }
     }
 
     /// A whole number of seconds, for `--watchdog-timeout`.
@@ -326,6 +386,10 @@ Options:
                              (default: 30)
       --log-file <PATH>      Mirror captured service output to this file
                              (default: /var/log/rinit/log; 'none' disables)
+      --log-max-bytes <N>    Log file size limit in bytes (min 4096;
+                             default: 1048576)
+      --log-keep <N>         Keep N rotated log files; 0 truncates in place
+                             (default: 0; max: 64)
       --fstab <PATH>         Second-wave mount table (plan §1.3(9))
                              (default: /etc/fstab; 'none' disables)
       --test-service <CMD>   Launch this instead of the unit directory
@@ -726,6 +790,37 @@ mod tests {
         }
         let missing = parse_args(&["--log-file"]).expect_err("must fail");
         assert!(missing.contains("--log-file"), "got: {missing}");
+    }
+
+    #[test]
+    fn log_size_and_rotation_are_parsed_and_bounded() {
+        let cfg = parse_args(&[]).unwrap();
+        assert_eq!(cfg.log_max_bytes, crate::logs::DEFAULT_LOG_FILE_MAX_BYTES);
+        assert_eq!(cfg.log_keep, crate::logs::DEFAULT_LOG_KEEP);
+
+        let cfg = parse_args(&["--log-max-bytes", "8192", "--log-keep", "3"]).unwrap();
+        assert_eq!(cfg.log_max_bytes, 8192);
+        assert_eq!(cfg.log_keep, 3);
+        let cfg = parse_args(&["--log-max-bytes=16384", "--log-keep=2"]).unwrap();
+        assert_eq!(cfg.log_max_bytes, 16384);
+        assert_eq!(cfg.log_keep, 2);
+
+        for bad in ["0", "4095", "-1", "8192k", ""] {
+            assert!(
+                parse_args(&["--log-max-bytes", bad]).is_err(),
+                "'{bad}' must not be accepted as a size"
+            );
+        }
+        for bad in ["65", "-1", "x", ""] {
+            assert!(
+                parse_args(&["--log-keep", bad]).is_err(),
+                "'{bad}' must not be accepted as a keep count"
+            );
+        }
+        let missing = parse_args(&["--log-max-bytes"]).expect_err("must fail");
+        assert!(missing.contains("--log-max-bytes"), "got: {missing}");
+        let missing = parse_args(&["--log-keep"]).expect_err("must fail");
+        assert!(missing.contains("--log-keep"), "got: {missing}");
     }
 
     // --- the watchdog (plan §7.5) -------------------------------------

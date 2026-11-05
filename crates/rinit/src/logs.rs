@@ -10,7 +10,7 @@
 //! block, not lose output or get an error it does not expect.
 
 use std::collections::VecDeque;
-use std::io::Write;
+use std::io::{self, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -31,14 +31,25 @@ const READ_CHUNK: usize = 4096;
 /// memory.
 const MAX_PENDING_LINE: usize = 64 * 1024;
 
-/// How large the persisted log file may grow before it is truncated
-/// (plan §1.3(7)).
+/// Default bound for the persisted log file (plan §1.3(7)).
 ///
 /// The plan asks for persistence without asking for a format or a size; a
-/// megabyte is the same order as the ring's own bound, and the policy is the
-/// same one the ring uses - past the bound, the *oldest* lines are the ones that
-/// go.
-const LOG_FILE_MAX_BYTES: u64 = 1024 * 1024;
+/// megabyte is the same order as the ring's own bound. `--log-max-bytes`
+/// overrides it, and `--log-keep` chooses rotation instead of truncation.
+pub(crate) const DEFAULT_LOG_FILE_MAX_BYTES: u64 = 1024 * 1024;
+
+/// The smallest log-file bound accepted from the command line.
+pub(crate) const MIN_LOG_FILE_MAX_BYTES: u64 = 4096;
+
+/// How many rotated files `--log-keep` may retain.
+///
+/// A bound is necessary because rotation walks the whole chain: accepting an
+/// arbitrarily large count would turn one write into an unbounded series of
+/// renames.
+pub(crate) const MAX_LOG_KEEP: usize = 64;
+
+/// Default number of rotated logs: zero keeps the historical truncate policy.
+pub(crate) const DEFAULT_LOG_KEEP: usize = 0;
 
 /// How many lines may wait for the persisted log to catch up.
 ///
@@ -71,6 +82,8 @@ pub struct ServiceLogs {
 struct FileQueue {
     state: Mutex<QueueState>,
     writer: Mutex<LogFile>,
+    /// Largest batch worth assembling for the configured file bound.
+    max_batch: usize,
 }
 
 #[derive(Default)]
@@ -83,9 +96,11 @@ struct QueueState {
 
 impl FileQueue {
     fn new(file: LogFile) -> Self {
+        let max_batch = file.max_bytes.min(LOG_DRAIN_MAX_BYTES as u64).max(1) as usize;
         FileQueue {
             state: Mutex::new(QueueState::default()),
             writer: Mutex::new(file),
+            max_batch,
         }
     }
 
@@ -112,7 +127,7 @@ impl FileQueue {
                 let Some(next) = state.lines.front() else {
                     break;
                 };
-                if !batch.is_empty() && bytes + next.len() > LOG_DRAIN_MAX_BYTES {
+                if !batch.is_empty() && bytes + next.len() > self.max_batch {
                     break;
                 }
                 let Some(line) = state.lines.pop_front() else {
@@ -152,12 +167,16 @@ impl FileQueue {
 /// sitting in a `BufWriter` when the machine goes down is a line nobody has. The
 /// ring is the fast path; this is the durable one.
 struct LogFile {
-    file: std::fs::File,
+    /// `None` after a failed reopen, so the next append retries instead of
+    /// writing through a descriptor that no longer names `path`.
+    file: Option<std::fs::File>,
     path: PathBuf,
-    /// Bytes written so far, so the bound costs no `stat` per line.
+    /// Bytes written to the current file, so the bound costs no `stat` per line.
     written: u64,
-    /// The bound; `LOG_FILE_MAX_BYTES` in production, smaller in tests.
+    /// The bound; `DEFAULT_LOG_FILE_MAX_BYTES` in production, smaller in tests.
     max_bytes: u64,
+    /// Rotated files to keep; zero means truncate, the historical policy.
+    keep: usize,
     /// Set once, so a filesystem that fails on every write warns once.
     warned: bool,
 }
@@ -169,7 +188,7 @@ impl LogFile {
     /// Whatever the directory creation or the open returns - a read-only rootfs,
     /// a path with no parent rinit may create. The caller degrades: no file, and
     /// the ring still works.
-    fn open(path: &Path, max_bytes: u64) -> std::io::Result<Self> {
+    fn open(path: &Path, max_bytes: u64, keep: usize) -> std::io::Result<Self> {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -184,51 +203,160 @@ impl LogFile {
             .open(path)?;
         let written = file.metadata().map(|meta| meta.len()).unwrap_or(0);
         Ok(LogFile {
-            file,
+            file: Some(file),
             path: path.to_path_buf(),
             written,
             max_bytes: max_bytes.max(1),
+            keep,
             warned: false,
         })
     }
 
-    /// Append one already-formatted record, truncating first if that would pass
-    /// the bound.
+    /// Append one already-formatted record, rotating or truncating first when
+    /// the write would pass the bound.
     fn append_text(&mut self, text: &str) {
-        if self.written >= self.max_bytes {
-            self.truncate();
+        if text.is_empty() {
+            return;
         }
-        match self.file.write_all(text.as_bytes()) {
+        if self.file.is_none() && !self.reopen() {
+            return;
+        }
+        if self.written.saturating_add(text.len() as u64) > self.max_bytes && !self.rotate() {
+            return;
+        }
+        let Some(file) = self.file.as_mut() else {
+            return;
+        };
+        match file.write_all(text.as_bytes()) {
             Ok(()) => {
-                self.written += text.len() as u64;
+                self.written = self.written.saturating_add(text.len() as u64);
                 self.warned = false;
             }
             // A log is diagnostic: a full disk must not take the system with it,
             // and it must not fill the console either - hence once.
-            Err(e) => {
-                if !self.warned {
-                    rlog!(
-                        "warning: cannot write the log file {}: {e}",
-                        self.path.display()
-                    );
-                    self.warned = true;
-                }
+            Err(e) => self.warn(&e),
+        }
+    }
+
+    /// Make room for the next write.
+    ///
+    /// With `keep == 0` this is the original policy: drop the file's contents
+    /// and leave a marker. With `keep > 0` the current file becomes `path.1`,
+    /// older files shift up, and the oldest is removed; the total on-disk bound
+    /// is therefore roughly `(keep + 1) * max_bytes`.
+    fn rotate(&mut self) -> bool {
+        if self.keep == 0 {
+            return self.truncate();
+        }
+
+        let oldest = self.rotated_path(self.keep);
+        if let Err(e) = std::fs::remove_file(&oldest)
+            && e.kind() != io::ErrorKind::NotFound
+        {
+            self.warn(&e);
+        }
+        for index in (1..self.keep).rev() {
+            let from = self.rotated_path(index);
+            let to = self.rotated_path(index + 1);
+            match std::fs::rename(&from, &to) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => self.warn(&e),
             }
         }
+        match std::fs::rename(&self.path, self.rotated_path(1)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => {
+                self.warn(&e);
+                // Rotation did not happen, but the current file is still the
+                // one we own: fall back to the bounded truncate policy.
+                return self.truncate();
+            }
+        }
+        // The old descriptor still names the renamed file; close it before
+        // creating the new current file.
+        self.file = None;
+        if !self.reopen() {
+            return false;
+        }
+        self.written = 0;
+        true
     }
 
     /// Drop what is there and start again.
     ///
-    /// Truncate rather than rotate to a second file: the ring drops its oldest
-    /// lines past its bound, and a file that behaves the same way is one fewer
-    /// thing to watch on a rootfs. `O_APPEND` is what makes this safe without
-    /// seeking - every write goes to the end of the file as it is *now*.
-    fn truncate(&mut self) {
-        if self.file.set_len(0).is_ok() {
-            self.written = 0;
-            let _ = self
-                .file
-                .write_all(b"log truncated: the previous contents were dropped\n");
+    /// The marker bytes count against the bound, so a file that is truncated at
+    /// `max_bytes` does not silently exceed it just because it says so.
+    fn truncate(&mut self) -> bool {
+        if self.file.is_none() && !self.reopen() {
+            return false;
+        }
+        let marker = b"log truncated: the previous contents were dropped\n";
+        let marker_len = marker.len() as u64;
+        let max_bytes = self.max_bytes;
+        let outcome = {
+            let Some(file) = self.file.as_mut() else {
+                return false;
+            };
+            file.set_len(0).and_then(|()| {
+                if marker_len <= max_bytes {
+                    file.write_all(marker)
+                } else {
+                    Ok(())
+                }
+            })
+        };
+        match outcome {
+            Ok(()) => {
+                self.written = if marker_len <= max_bytes {
+                    marker_len
+                } else {
+                    0
+                };
+                self.warned = false;
+                true
+            }
+            Err(e) => {
+                self.warn(&e);
+                false
+            }
+        }
+    }
+
+    /// Reopen the current path after rotation (or after an earlier failure).
+    fn reopen(&mut self) -> bool {
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+        {
+            Ok(file) => {
+                self.written = file.metadata().map(|meta| meta.len()).unwrap_or(0);
+                self.file = Some(file);
+                true
+            }
+            Err(e) => {
+                self.warn(&e);
+                false
+            }
+        }
+    }
+
+    /// `path.N` for a rotated file.
+    fn rotated_path(&self, index: usize) -> PathBuf {
+        let mut name = self.path.as_os_str().to_os_string();
+        name.push(format!(".{index}"));
+        PathBuf::from(name)
+    }
+
+    fn warn(&mut self, error: &std::io::Error) {
+        if !self.warned {
+            rlog!(
+                "warning: cannot maintain the log file {}: {error}",
+                self.path.display()
+            );
+            self.warned = true;
         }
     }
 }
@@ -247,12 +375,11 @@ impl ServiceLogs {
     /// Best effort by design: a board whose rootfs is read-only, or whose
     /// `/var/log` cannot be created, boots with the ring and a warning - the same
     /// degradation every other optional facility here has.
-    pub async fn persist_to(&self, path: &Path) {
+    pub async fn persist_to(&self, path: &Path, max_bytes: u64, keep: usize) {
         let path = path.to_path_buf();
         let open_path = path.clone();
         let opened =
-            tokio::task::spawn_blocking(move || LogFile::open(&open_path, LOG_FILE_MAX_BYTES))
-                .await;
+            tokio::task::spawn_blocking(move || LogFile::open(&open_path, max_bytes, keep)).await;
         match opened {
             Ok(Ok(file)) => {
                 *lock(&self.file) = Some(Arc::new(FileQueue::new(file)));
@@ -421,15 +548,14 @@ async fn pump(
             Ok(Ok(n)) => {
                 // Lossy: a service writing invalid UTF-8 must not lose its log.
                 pending.push_str(&String::from_utf8_lossy(buf.get(..n).unwrap_or(&[])));
-                let mut lines: Vec<String> = Vec::new();
-                while let Some(newline) = pending.find('\n') {
-                    let line: String = pending.drain(..=newline).collect();
-                    lines.push(trim_line(&line));
+                if let Some(last) = pending.rfind('\n') {
+                    let complete = last + 1;
+                    for line in pending[..complete].split_inclusive('\n') {
+                        push_captured(&buffer, &file, &unit, trim_line(line));
+                    }
+                    pending.drain(..complete);
                 }
                 cap_pending(&mut pending);
-                for line in lines {
-                    push_captured(&buffer, &file, &unit, &line);
-                }
             }
             // A real read error (not "would block", which `try_io` turns into
             // the outer `Err`).
@@ -444,8 +570,7 @@ async fn pump(
 
     // A final partial line with no trailing newline still belongs in the log.
     if !pending.is_empty() {
-        let line = trim_line(&pending);
-        push_captured(&buffer, &file, &unit, &line);
+        push_captured(&buffer, &file, &unit, trim_line(&pending));
     }
 }
 
@@ -463,8 +588,8 @@ fn cap_pending(pending: &mut String) {
 }
 
 /// Strip the line terminator from a captured line.
-fn trim_line(line: &str) -> String {
-    line.trim_end_matches(['\n', '\r']).to_string()
+fn trim_line(line: &str) -> &str {
+    line.trim_end_matches(['\n', '\r'])
 }
 
 #[cfg(test)]
@@ -516,7 +641,7 @@ mod tests {
         let path = dir.join("nested/rinit.log");
 
         let logs = ServiceLogs::new();
-        logs.persist_to(&path).await;
+        logs.persist_to(&path, DEFAULT_LOG_FILE_MAX_BYTES, 0).await;
         let app = unit("app.service");
         logs.push(&app, "first");
         logs.push(&app, "second");
@@ -535,7 +660,7 @@ mod tests {
     fn the_log_file_truncates_at_its_bound() {
         let path = std::env::temp_dir().join(format!("rinit-logs-cap-{}", std::process::id()));
         let _ = std::fs::remove_file(&path);
-        let mut file = LogFile::open(&path, 64).expect("open");
+        let mut file = LogFile::open(&path, 64, 0).expect("open");
         let app = unit("app.service");
         for _ in 0..20 {
             file.append_text(&format!("{app}: 0123456789\n"));
@@ -555,6 +680,39 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// `--log-keep` keeps the newest files instead of dropping every old line.
+    #[test]
+    fn the_log_file_rotates_and_keeps_the_requested_history() {
+        let dir = std::env::temp_dir().join(format!("rinit-logs-rotate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("rinit.log");
+        let mut file = LogFile::open(&path, 64, 2).expect("open");
+        for line in 0..12 {
+            file.append_text(&format!("app.service: line {line:02}\n"));
+        }
+
+        assert!(path.exists(), "the current file must exist");
+        assert!(file.rotated_path(1).exists(), "the newest rotation");
+        assert!(file.rotated_path(2).exists(), "the oldest kept file");
+        assert!(
+            !file.rotated_path(3).exists(),
+            "only --log-keep files are kept"
+        );
+
+        let current = std::fs::read_to_string(&path).expect("current file");
+        assert!(current.contains("line 11"), "newest line: {current}");
+        let oldest_kept = std::fs::read_to_string(file.rotated_path(2)).expect("second file");
+        assert!(
+            !oldest_kept.contains("line 00"),
+            "the file beyond the keep count is gone: {oldest_kept}"
+        );
+        for kept in [&path, &file.rotated_path(1), &file.rotated_path(2)] {
+            let len = std::fs::metadata(kept).expect("metadata").len();
+            assert!(len <= 64 + 32, "bounded file {kept:?}: {len} bytes");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The persisted queue is bounded: a service logging faster than the disk
     /// costs memory in the queue, not in PID 1's address space. The oldest line
     /// goes and the file says how many.
@@ -562,7 +720,7 @@ mod tests {
     fn a_full_file_queue_drops_the_oldest_and_reports_it() {
         let path = std::env::temp_dir().join(format!("rinit-logs-queue-{}", std::process::id()));
         let _ = std::fs::remove_file(&path);
-        let queue = FileQueue::new(LogFile::open(&path, 1 << 20).expect("open"));
+        let queue = FileQueue::new(LogFile::open(&path, 1 << 20, 0).expect("open"));
         let total = LOG_QUEUE_MAX_LINES + 10;
         for line in 0..total {
             queue.enqueue(format!("app.service: line {line}\n"));

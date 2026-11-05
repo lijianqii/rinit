@@ -129,7 +129,7 @@ pub async fn run(cfg: Config) -> Result<(), RuntimeError> {
         // the first service's output is captured like every other line.
         let logs = ServiceLogs::new();
         if let Some(path) = &cfg.log_file {
-            logs.persist_to(path).await;
+            logs.persist_to(path, cfg.log_max_bytes, cfg.log_keep).await;
         }
         // Plan §7.9: the sockets rinit holds for units that asked to be started
         // by a connection rather than at boot.

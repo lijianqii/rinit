@@ -295,9 +295,9 @@ make gates          # acceptance gates: binary size + coverage thresholds
 ```
 
 `cargo test --offline --workspace`（`make check` 最后一步跑的就是它）在 58 个
-cargo 测试目标里执行 **1033 个测试**。五种形态，以及为什么每种都不是多余的：
+cargo 测试目标里执行 **1035 个测试**。五种形态，以及为什么每种都不是多余的：
 
-- **单元测试**紧挨着代码（core 335、rinit 216、rinit-runtime 135、rinit-tools 224、rctl 16、processes 5），
+- **单元测试**紧挨着代码（core 335、rinit 218、rinit-runtime 135、rinit-tools 224、rctl 16、processes 5），
   包括解析器上的 `proptest` 属性测试；
 - **集成测试**在 `crates/*/tests/`：系统调用层面对真实内核（`rinit-runtime` 26 个：
   以非特权身份运行，断言每次降权都*被拒绝*而不是被静默跳过——`setuid(0)`、
@@ -364,11 +364,11 @@ qemu 的 `i6300esb` 设备和带该驱动编译的内核是测试装置的一部
 | ---------------- | ------------- | --------- |
 | `rinit-core`     | **97.87%**    | 581/591   |
 | `rinit-runtime`  | 85.73%        | 362/410   |
-| `rinit`          | 87.58%        | 776/868   |
+| `rinit`          | 87.55%        | 789/882   |
 | `rinit-tools`    | 81.50%        | 653/851   |
 | `rctl`           | 93.06%        | 42/50     |
 | `processes`      | 83.98%        | 60/80     |
-| **总计**         | **87.11%**    | 2474/2850 |
+| **总计**         | **87.10%**    | 2487/2864 |
 
 计划清单要求总体 ≥80%、核心 ≥90%，所以回答它的是这些数字，而不是某种形状：
 
@@ -396,7 +396,9 @@ cargo llvm-cov --offline --workspace --html                  # target/llvm-cov/h
 **已知缺口**，记录在案而不是藏起来：
 
 - **日志*文件*是镜像，不是日志库。** 计划 §1.3(7) 的可选持久化已实现
-  （`--log-file`，默认 `/var/log/rinit/log`，超过 1 MiB 截断）。捕获的行先进入
+  （`--log-file`，默认 `/var/log/rinit/log`，默认上限 1 MiB）。可用
+  `--log-max-bytes` 调整上限，用 `--log-keep` 保留轮转文件而不是原地截断；压缩
+  刻意留给外部 logrotate，文件保持纯文本。捕获的行先进入
   有界队列，由主循环分批写入；为保持 `fork()` 单线程约束，故意不使用写线程。磁盘
   慢于队列时丢弃最旧的行并在文件中说明。没有按单元分文件，不能对文件做
   `journalctl` 式查询，也没有 syslog 协议。`rctl log` 读的是日志环，所以一行只在
@@ -466,7 +468,7 @@ cargo llvm-cov --offline --workspace --html                  # target/llvm-cov/h
 | 72 小时 soak，RSS 稳定 | **宿主上已通过。** 第九段在 `8b373d8` 上完成 **4,320/4,320 个样本**和 **8,640/8,640 条 control 命令**。前半段与后半段的 RSS 峰值分别为 5,168 kB 和 4,300 kB，描述符最低值均为 11（峰值 22），最大 zombie 连续出现 1 个瞬时采样，最终静默扫描为 0。 |
 | 24 小时目标客户机 soak | **已通过。** `7a5df04`，aarch64 `run-disk`，guest 内采样：86,343 秒内完成 **1,440/1,440 个样本**和 **2,880/2,880 条 control 命令**。RSS 保持在 2,364–2,528 kB（前后半段峰值 2,520/2,528），描述符 19–20，全程未观察到 zombie，最终检查为 `quiescent=0 health_fail=0`。每个样本里 `eth0`、默认路由、`udhcpc`、dropbear、`network.service` 和 `sshd.service` 都正常；串口日志只有一次启动，无 panic/OOM。采样在 guest 内运行（`scripts/soak-qemu.sh` + `scripts/soak-guest.sh`），宿主 SSH 断开不会让测试静默失效。 |
 | 二进制 ≤2 MB 动态 / ≤4 MB 静态 | [测量](#测量计划-01-校准点)：aarch64 动态 1.00 MiB、armv7 动态 1.07 MiB，由 `make size-check` 检查 |
-| 单元测试覆盖率总体 ≥80%、核心 ≥90% | **87.11%** 和 **97.87%**（`make coverage-check`，见[上文](#测试)） |
+| 单元测试覆盖率总体 ≥80%、核心 ≥90% | **87.10%** 和 **97.87%**（`make coverage-check`，见[上文](#测试)） |
 | 文档：架构、单元格式、`rctl`、移植 | 本 README（架构、状态、测量）、[`docs/units.md`](docs/units.md)（每条指令、取值语法和默认值）、[`docs/porting.md`](docs/porting.md)（内核、用户空间、构建、与 systemd 的差异），以及 `rinit-开发计划.md` |
 
 还有一个清单没要求、但计划 §0.1 的设计目标要求的数字：rinit 的 RSS，在*客户机里*从
@@ -706,6 +708,10 @@ rinit [OPTIONS] [-- <SERVICE> [ARGS...]]
                              (default: 30)
       --log-file <PATH>      Mirror captured service output to this file
                              (default: /var/log/rinit/log; 'none' disables)
+      --log-max-bytes <N>    Log file size limit in bytes (min 4096;
+                             default: 1048576)
+      --log-keep <N>         Keep N rotated log files; 0 truncates in place
+                             (default: 0; max: 64)
       --fstab <PATH>         Second-wave mount table (plan §1.3(9))
                              (default: /etc/fstab; 'none' disables)
       --test-service <CMD>   Launch this instead of the unit directory
@@ -965,8 +971,8 @@ M0 的 bring-up 辅助程序 `rinit-testservice` 已经删除：没有东西再�
 
 打包后的镜像（`build/out/initramfs-aarch64-unknown-linux-gnu.cpio.gz` 和
 `…-demo.cpio.gz`：静态 busybox + 动态 rinit/rctl/processes + 已安装的工具 + 单元目录 + `/etc`/`/var` 骨架）
-gzip 后分别是 9.10 MiB（9 543 525 B）和 9.11 MiB（9 549 347 B）；arm32 的两个镜像
-分别是 9.33 MiB（9 780 718 B）和 9.33 MiB（9 787 526 B）。`run-disk` 的镜像是
+gzip 后分别是 9.10 MiB（9 544 980 B）和 9.11 MiB（9 551 106 B）；arm32 的两个镜像
+分别是 9.33 MiB（9 784 752 B）和 9.34 MiB（9 790 664 B）。`run-disk` 的镜像是
 约 80-81 MiB 的 ext4（首次启动前实际使用约 51-52 MiB，其中默认 swap 文件占
 32 MiB），不放进 initramfs。差值就是 `units/demo/`
 里的十四个文件，只有第二个镜像带它们。打包是可复现的——`scripts/mkinitramfs.sh` 把归档

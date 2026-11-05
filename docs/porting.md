@@ -137,6 +137,8 @@ rinit [OPTIONS]
   --watchdog-timeout <S> hardware timeout; fed every half (default 30)
   --log-file <PATH>      mirror service output to a file
                          (default /var/log/rinit/log; 'none' disables)
+  --log-max-bytes <N>    log file size limit (default 1048576; min 4096)
+  --log-keep <N>         keep N rotated files; 0 truncates (default 0; max 64)
   --fstab <PATH>         second-wave mount table
                          (default /etc/fstab; 'none' disables)
 ```
@@ -224,9 +226,10 @@ instead of silently losing a setting. The common ones:
   mid-start: `rctl reload` is atomic (the whole directory resolves or nothing
   changes).
 - No journal: `rctl log` reads a bounded in-memory ring. `--log-file` mirrors it
-  to a file (the plan's `/var/log/rinit/log` by default, truncated at 1 MiB), but
-  that is a file rather than a service - shipping, rotation beyond the one
-  truncation and per-unit retention are the target's job.
+  to a file (the plan's `/var/log/rinit/log` by default, limited to 1 MiB).
+  `--log-keep` can retain rotated files instead of truncating in place, but
+  compression, shipping and per-unit retention are the target's job; the file is
+  deliberately plain text so an external logrotate can handle it.
 - `rctl reload` is the only live reconfiguration: there is no per-unit
   `daemon-reload` to call while a unit is being edited, and a running unit keeps
   the definition it was started with until its next start (by design).
