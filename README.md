@@ -202,7 +202,7 @@ And the fail-closed boundary, on a unit written at runtime:
 
 ```
 ~ # rctl start badfork.service
-rinit: error: badfork.service: cannot locate the daemon: cannot read PIDFile /run/not-written.pid: No such file or directory (os error 2)
+rinit: error: badfork.service: cannot locate the daemon: cannot read PIDFile /run/not-written.pid: stat failed: No such file or directory (os error 2)
 rinit: badfork.service exited: failed
 ```
 
@@ -323,12 +323,12 @@ make test           # check + test-system
 make gates          # acceptance gates: binary size + coverage thresholds
 ```
 
-`cargo test --offline --workspace` (what `make check` runs last) executes **976
-tests** across 54 cargo test targets. The five shapes, and why each is not
+`cargo test --offline --workspace` (what `make check` runs last) executes **1021
+tests** across 58 cargo test targets. The five shapes, and why each is not
 redundant:
 
-- **unit tests** next to the code (core 334, rinit 198, rinit-runtime 129,
-  rinit-tools 198, rctl 16, processes 5), including `proptest` properties over
+- **unit tests** next to the code (core 334, rinit 213, rinit-runtime 131,
+  rinit-tools 220, rctl 16, processes 5), including `proptest` properties over
   the parser;
 - **integration tests** in `crates/*/tests/`: the syscall layer against the real
   kernel (`rinit-runtime` 26: run unprivileged, they assert that each drop is
@@ -419,13 +419,13 @@ they are measured on the tree as it stands rather than copied from one run:
 
 | crate            | line coverage | functions |
 | ---------------- | ------------- | --------- |
-| `rinit-core`     | **97.83%**    | 582/592   |
-| `rinit-runtime`  | 84.40%        | 345/400   |
-| `rinit`          | 86.88%        | 731/826   |
-| `rinit-tools`    | 81.54%        | 578/758   |
+| `rinit-core`     | **97.97%**    | 582/591   |
+| `rinit-runtime`  | 84.82%        | 350/403   |
+| `rinit`          | 87.50%        | 772/867   |
+| `rinit-tools`    | 81.32%        | 645/841   |
 | `rctl`           | 93.06%        | 42/50     |
-| `processes`      | 25.04%        | 22/80     |
-| **total**        | **85.61%**    | 2300/2706 |
+| `processes`      | 83.93%        | 60/80     |
+| **total**        | **86.94%**    | 2451/2832 |
 
 The plan's checklist asks for ≥80% overall and ≥90% in the core, so these are the
 numbers that answer it rather than a shape:
@@ -557,7 +557,7 @@ repository or a measurement in this README:
 | 72 h soak with stable RSS | **Passed on the host.** Segment 9 on `8b373d8` completed **4,320/4,320 samples** and **8,640/8,640 control commands**. RSS peak per half fell from 5,168 kB to 4,300 kB, descriptor minima were 11 and 11 (peak 22), the maximum zombie streak was 1 transient sample, and the final quiescent sweep found 0 zombies. |
 | 24 h soak in the target guest | **Passed.** `7a5df04`, aarch64 `run-disk`, guest-side sampler: **1,440/1,440 samples** and **2,880/2,880 control commands** over 86,343 s. RSS stayed within 2,364–2,528 kB (half peaks 2,520/2,528), descriptors within 19–20, no zombie was ever observed, and the final sweep returned `quiescent=0 health_fail=0`. `eth0`, the default route, `udhcpc`, dropbear, `network.service` and `sshd.service` were healthy in every sample; the serial log shows one boot and no panic/OOM. Sampling runs inside the guest (`scripts/soak-qemu.sh` + `scripts/soak-guest.sh`), so a host SSH outage cannot end the run silently. |
 | binaries ≤2 MB dynamic / ≤4 MB static | [Measurements](#measurements-plan-01-calibration-point): 1.00 MiB dynamic arm64 / 1.07 MiB armv7, checked by `make size-check` |
-| unit test coverage ≥80% overall, ≥90% in the core | **85.61%** and **97.83%** (`make coverage-check`, [above](#testing)) |
+| unit test coverage ≥80% overall, ≥90% in the core | **86.94%** and **97.97%** (`make coverage-check`, [above](#testing)) |
 | documentation: architecture, unit format, `rctl`, porting | this README (architecture, status, measurements), [`docs/units.md`](docs/units.md) (every directive, its value syntax and its default), [`docs/porting.md`](docs/porting.md) (kernel, userspace, build, differences from systemd), and `rinit-开发计划.md` |
 
 One number the checklist does not ask for, but plan §0.1's design goals do: rinit's
@@ -1149,11 +1149,11 @@ command through the same spawn path a unit uses.
 
 The packed images (`build/out/initramfs-aarch64-unknown-linux-gnu.cpio.gz` and
 `…-demo.cpio.gz`: static busybox + dynamic rinit/rctl/processes + the installed
-tools + the unit directory + the `/etc`/`/var` skeleton) are 8.64 MiB
-(9 064 289 B) and 8.65 MiB (9 070 750 B) gzipped. The arm32 pair is 8.84 MiB
-(9 269 445 B) and 8.85 MiB (9 275 370 B).
-The `run-disk` images are ext4 files of about 79-80 MiB logical size (roughly
-50-52 MiB used before the first boot, including the default 32 MiB swap file);
+tools + the unit directory + the `/etc`/`/var` skeleton) are 9.09 MiB
+(9 532 738 B) and 9.09 MiB (9 538 824 B) gzipped. The arm32 pair is 9.31 MiB
+(9 772 661 B) and 9.32 MiB (9 779 062 B).
+The `run-disk` images are ext4 files of about 80-81 MiB logical size (roughly
+51-52 MiB used before the first boot, including the default 32 MiB swap file);
 they are not
 shipped in the initramfs. The difference is the
 fourteen files in `units/demo/`, which only the second initramfs carries. The packing is
