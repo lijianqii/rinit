@@ -125,3 +125,28 @@ pub fn mount_cgroup2(target: &Path) -> Result<(), SyscallError> {
         None,
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Argument conversion must reject interior NULs before the syscall. This is
+    /// testable unprivileged because the error is created before `mount(2)`.
+    #[test]
+    fn nul_arguments_are_rejected_before_the_syscall() {
+        let error = mount("src\0", Path::new("/tmp"), "tmpfs", 0, None)
+            .expect_err("NUL source must be rejected");
+        assert_eq!(error.errno(), libc::EINVAL);
+
+        let error = mount("src", Path::new("/tmp"), "tmpfs\0", 0, None)
+            .expect_err("NUL filesystem type must be rejected");
+        assert_eq!(error.errno(), libc::EINVAL);
+
+        let error = mount("src", Path::new("/tmp"), "tmpfs", 0, Some("data\0"))
+            .expect_err("NUL mount data must be rejected");
+        assert_eq!(error.errno(), libc::EINVAL);
+
+        let error = umount2(Path::new("/tmp/\0"), 0).expect_err("NUL target must be rejected");
+        assert_eq!(error.errno(), libc::EINVAL);
+    }
+}

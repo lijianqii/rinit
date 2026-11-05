@@ -270,7 +270,7 @@ scope.
 ### `/bin/rinit-check`
 
 ```text
-rinit-check [--units DIR] [--default TARGET]
+rinit-check [--units DIR] [--default TARGET] [--strict] [--json|--plan]
 ```
 
 `rinit-check` loads, parses and resolves a unit directory through the same
@@ -278,11 +278,13 @@ rinit-check [--units DIR] [--default TARGET]
 a second implementation of the parser.
 
 Non-fatal warnings (for example a missing `Wants=` target) are printed but
-exit 0. A parse error, a dependency cycle, a missing hard dependency or a
-missing default target exits 1. Usage errors exit 2. The check validates the
-static graph only: it does not start units, probe kernel features, resolve
-`User=`/`Group=`, check `ExecStart=` paths or touch cgroups, watchdogs and
-sockets.
+exit 0; `--strict` makes them exit 1. A parse error, a dependency cycle, a
+missing hard dependency or a missing default target exits 1. Usage errors exit
+2. `--json` emits the target, unit/level/template counts, levels and warnings
+as one JSON object; `--plan` prints the resolved level lines instead of the
+summary. The check validates the static graph only: it does not start units,
+probe kernel features, resolve `User=`/`Group=`, check `ExecStart=` paths or
+touch cgroups, watchdogs and sockets.
 
 ### `/usr/bin/cut`, `/usr/bin/head` and `/usr/bin/tail`
 
