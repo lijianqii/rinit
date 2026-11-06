@@ -2,7 +2,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::PathBuf;
@@ -176,7 +176,10 @@ fn run<A: AsRef<OsStr>>(args: &[A], program: &str) -> ExitCode {
     let template = apply_prefix(template, &options);
     match make_name(&template, &options) {
         Ok(path) => {
-            println!("{}", path.display());
+            let mut stdout = std::io::stdout().lock();
+            let mut bytes = path.as_os_str().as_bytes().to_vec();
+            bytes.push(b'\n');
+            let _ = stdout.write_all(&bytes);
             ExitCode::from(EXIT_OK)
         }
         Err(error) => {

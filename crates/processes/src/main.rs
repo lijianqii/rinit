@@ -154,9 +154,13 @@ fn main() {
     };
 
     let opts = match parse_args(args.into_iter()) {
-        Ok(Some(opts)) => opts,
-        Ok(None) => {
+        Ok(ParsedArgs::Run(opts)) => opts,
+        Ok(ParsedArgs::Help) => {
             let _ = std::io::stdout().write_all(USAGE.as_bytes());
+            return;
+        }
+        Ok(ParsedArgs::Version) => {
+            let _ = writeln!(std::io::stdout(), "processes {}", env!("CARGO_PKG_VERSION"));
             return;
         }
         Err(message) => {
@@ -205,15 +209,18 @@ fn run(opts: &Options) -> io::Result<()> {
     Ok(())
 }
 
-fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<Options>, String> {
+enum ParsedArgs {
+    Run(Options),
+    Help,
+    Version,
+}
+
+fn parse_args(mut args: impl Iterator<Item = String>) -> Result<ParsedArgs, String> {
     let mut opts = Options::default();
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "-h" | "--help" => return Ok(None),
-            "-V" | "--version" => {
-                let _ = writeln!(std::io::stdout(), "processes {}", env!("CARGO_PKG_VERSION"));
-                return Ok(None);
-            }
+            "-h" | "--help" => return Ok(ParsedArgs::Help),
+            "-V" | "--version" => return Ok(ParsedArgs::Version),
             "--tree" => opts.tree = true,
             "--long" => opts.long = true,
             "--json" => opts.json = true,
@@ -235,6 +242,9 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<Options>,
             }
             "--user" => {
                 let value = args.next().ok_or("--user needs a value")?;
+                if value.is_empty() || value.starts_with('-') {
+                    return Err("--user needs a user name or uid".to_string());
+                }
                 opts.user = Some(value);
             }
             "--proc-root" => {
@@ -249,6 +259,9 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<Options>,
                 } else if let Some(value) = other.strip_prefix("--pid=") {
                     opts.pids = Some(parse_pids(value)?);
                 } else if let Some(value) = other.strip_prefix("--user=") {
+                    if value.is_empty() || value.starts_with('-') {
+                        return Err("--user needs a user name or uid".to_string());
+                    }
                     opts.user = Some(value.to_string());
                 } else if let Some(value) = other.strip_prefix("--proc-root=") {
                     opts.proc_root = PathBuf::from(value);
@@ -258,7 +271,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<Options>,
             }
         }
     }
-    Ok(Some(opts))
+    Ok(ParsedArgs::Run(opts))
 }
 
 fn parse_sort(value: &str) -> Result<SortKey, String> {
@@ -316,6 +329,14 @@ fn read_processes(
     Ok(processes)
 }
 
+/// `/proc` text fields are not required to be UTF-8. Keep the process visible
+/// instead of dropping it for a non-UTF-8 comm or command name.
+fn read_lossy(path: &Path) -> Option<String> {
+    fs::read(path)
+        .ok()
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+}
+
 fn read_process(
     proc_root: &Path,
     pid: u32,
@@ -324,15 +345,13 @@ fn read_process(
     long: bool,
 ) -> Option<Process> {
     let dir = proc_root.join(pid.to_string());
-    let stat_text = fs::read_to_string(dir.join("stat")).ok()?;
+    let stat_text = read_lossy(&dir.join("stat"))?;
     let stat = parse_stat(&stat_text)?;
-    let status = fs::read_to_string(dir.join("status"))
-        .ok()
+    let status = read_lossy(&dir.join("status"))
         .map(|text| parse_status(&text))
         .unwrap_or_default();
     let smaps = if long {
-        fs::read_to_string(dir.join("smaps_rollup"))
-            .ok()
+        read_lossy(&dir.join("smaps_rollup"))
             .map(|text| parse_smaps(&text))
             .unwrap_or_default()
     } else {
@@ -639,7 +658,7 @@ fn table_row(process: &Process, prefix: &str, long: bool) -> Vec<String> {
         process.state.to_string(),
         format_bytes(process.vsz),
         format_bytes(process.rss),
-        format!("{:.1}", process.cpu_percent),
+        format!("{:.1}", finite_percent(process.cpu_percent)),
         format_time(process.cpu_usec),
     ];
     if long {
@@ -668,6 +687,11 @@ fn print_rows(rows: Vec<Vec<String>>, opts: &Options) -> io::Result<()> {
     let mut width = headers.iter().map(|value| value.len()).collect::<Vec<_>>();
     for row in &rows {
         for (index, value) in row.iter().enumerate() {
+            // The last column is COMMAND and is intentionally not padded: one
+            // very long argv must not pad every other row to its width.
+            if index + 1 == row.len() {
+                break;
+            }
             if let Some(slot) = width.get_mut(index) {
                 *slot = (*slot).max(value.chars().count());
             }
@@ -701,7 +725,7 @@ fn print_json(processes: &[Process]) -> io::Result<()> {
                 json_num(process.uss),
                 json_num(process.swap),
                 process.cpu_usec,
-                process.cpu_percent,
+                finite_percent(process.cpu_percent),
                 json_num(process.threads),
                 json_string(&process.command)
             )
@@ -711,12 +735,19 @@ fn print_json(processes: &[Process]) -> io::Result<()> {
 }
 
 fn format_row(values: &[String], width: &[usize]) -> String {
-    values
-        .iter()
-        .zip(width.iter())
-        .map(|(value, width)| format!("{value:<width$}", width = *width))
-        .collect::<Vec<_>>()
-        .join("  ")
+    let mut out = String::new();
+    for (index, value) in values.iter().enumerate() {
+        if index > 0 {
+            out.push_str("  ");
+        }
+        match width.get(index) {
+            Some(width) if index + 1 < values.len() => {
+                out.push_str(&format!("{value:<width$}", width = *width));
+            }
+            _ => out.push_str(value),
+        }
+    }
+    out
 }
 
 fn format_optional_bytes(bytes: Option<u64>) -> String {
@@ -733,6 +764,10 @@ fn format_bytes(bytes: u64) -> String {
     } else {
         format!("{:.1}G", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
     }
+}
+
+fn finite_percent(value: f64) -> f64 {
+    if value.is_finite() { value } else { 0.0 }
 }
 
 fn format_time(usec: u64) -> String {
@@ -819,6 +854,18 @@ mod tests {
     }
 
     #[test]
+    fn help_and_version_are_distinct_outcomes() {
+        assert!(matches!(
+            parse_args(["--help".to_string()].into_iter()),
+            Ok(ParsedArgs::Help)
+        ));
+        assert!(matches!(
+            parse_args(["--version".to_string()].into_iter()),
+            Ok(ParsedArgs::Version)
+        ));
+    }
+
+    #[test]
     fn optional_and_json_formatters_are_stable() {
         assert_eq!(format_optional_bytes(None), "-");
         assert_eq!(format_optional_bytes(Some(2048)), "2.0K");
@@ -830,7 +877,7 @@ mod tests {
         );
         assert_eq!(
             format_row(&["a".to_string(), "bb".to_string()], &[2, 3]),
-            "a   bb "
+            "a   bb"
         );
     }
 
@@ -852,7 +899,10 @@ mod tests {
         ]
         .into_iter()
         .map(String::from);
-        let opts = parse_args(args).expect("parse").expect("not help");
+        let opts = match parse_args(args).expect("parse") {
+            ParsedArgs::Run(opts) => opts,
+            _ => panic!("options must parse as Run"),
+        };
         assert!(matches!(opts.sort, SortKey::Rss));
         assert_eq!(opts.limit, Some(5));
         assert_eq!(opts.pids.as_ref().map(BTreeSet::len), Some(2));
@@ -870,6 +920,8 @@ mod tests {
             ["--pid"].as_slice(),
             ["--pid=,"].as_slice(),
             ["--user"].as_slice(),
+            ["--user="].as_slice(),
+            ["--user", "--json"].as_slice(),
             ["--proc-root"].as_slice(),
             ["--unknown"].as_slice(),
         ] {

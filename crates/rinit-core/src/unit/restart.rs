@@ -112,6 +112,19 @@ impl BackoffState {
         }
     }
 
+    /// Apply a reloaded restart policy without discarding the failure history.
+    ///
+    /// The window is trimmed to the new burst; subsequent decisions use the
+    /// new base and interval.
+    pub fn reconfigure(&mut self, base: Duration, burst: u32, interval: Duration) {
+        self.base = base;
+        self.burst = burst.max(1);
+        self.interval = interval;
+        while self.window.len() > self.burst as usize {
+            self.window.pop_front();
+        }
+    }
+
     /// Record that the unit reached `Active` at `now`.
     ///
     /// Only the timestamp is recorded. The reset decision happens in
@@ -198,10 +211,10 @@ impl BackoffState {
         let exponent = self.consecutive.saturating_sub(1).min(BACKOFF_EXPONENT_CAP);
         // Widen before multiplying so a large base saturates instead of
         // overflowing and wrapping to a *small* delay.
+        let factor = 1u64.checked_shl(exponent).unwrap_or(u64::MAX);
         let scaled = base_ms
-            .checked_shl(exponent)
-            .unwrap_or(u64::MAX)
-            .min(base_ms.saturating_mul(1 << BACKOFF_EXPONENT_CAP));
+            .saturating_mul(factor)
+            .min(base_ms.saturating_mul(1u64 << BACKOFF_EXPONENT_CAP));
         // Jitter is added, never subtracted (plan §1.3(4)).
         let jitter_max = base_ms / 4;
         let jitter = self.jitter.next_below(jitter_max);
@@ -309,6 +322,19 @@ mod tests {
             .map(|_| b.on_failure(0).unwrap().as_millis() as u64)
             .collect();
         assert_ne!(da, db, "identical seeds would restart in lockstep");
+    }
+
+    #[test]
+    fn reconfigure_applies_a_new_burst_and_base() {
+        let mut backoff = BackoffState::new(Duration::from_secs(1), 5, Duration::from_secs(10), 1);
+        for _ in 0..4 {
+            assert!(backoff.on_failure(0).is_some());
+        }
+        backoff.reconfigure(Duration::from_millis(50), 2, Duration::from_secs(10));
+        assert!(
+            backoff.on_failure(0).is_none(),
+            "the new burst of two must count the failures already in the window"
+        );
     }
 
     /// The breaker trips once `burst` failures land inside one window.

@@ -194,6 +194,24 @@ mod tests {
     }
 
     #[test]
+    fn a_symlink_inside_a_tree_is_unlinked_not_followed() {
+        let root = temp_root("nested-symlink");
+        let target = root.join("target");
+        fs::write(&target, b"x").expect("target");
+        let tree = root.join("tree");
+        fs::create_dir(&tree).expect("tree");
+        std::os::unix::fs::symlink(&target, tree.join("link")).expect("link");
+        let options = Options {
+            recursive: true,
+            ..Options::default()
+        };
+        remove_path(&tree, options).expect("remove tree");
+        assert!(!tree.exists());
+        assert!(target.exists(), "the symlink target must survive");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn protects_parent_and_current_directory_components() {
         for path in [
             "/", "/.", "//.", "/usr/..", "/tmp/..", "foo/..", "foo/.", "..", ".", "",

@@ -17,6 +17,7 @@
 //! sequence are all testable through [`MountOps`], and the guest test mounts a
 //! real `tmpfs` to prove the sequence reaches `mount(2)`.
 
+use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::error::SyscallError;
@@ -119,8 +120,8 @@ pub fn parse(text: &str) -> (Vec<Entry>, Vec<String>) {
     let mut entries = Vec::new();
     let mut warnings = Vec::new();
     for (index, line) in text.lines().enumerate() {
-        let line = line.split('#').next().unwrap_or("").trim();
-        if line.is_empty() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
             continue;
         }
         let Some((device, mountpoint, fstype, options)) = read_entry(line) else {
@@ -227,9 +228,30 @@ pub fn mount_with(ops: &mut impl MountOps, text: &str) -> FstabReport {
 /// [`SyscallError`] only for a file that exists and cannot be *read*: a missing
 /// `/etc/fstab` is the plan's "optional" case, not a failure.
 pub fn run_with(ops: &mut impl MountOps, path: &Path) -> Result<FstabReport, SyscallError> {
+    const MAX_FSTAB_BYTES: u64 = 1024 * 1024;
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(FstabReport::default()),
+        Err(e) => return Err(SyscallError::from_io("stat(/etc/fstab)", &e)),
+    };
+    if !metadata.file_type().is_file() {
+        return Err(SyscallError::new(
+            "read(/etc/fstab)",
+            io::Error::from(io::ErrorKind::InvalidInput)
+                .raw_os_error()
+                .unwrap_or(libc::EINVAL),
+        ));
+    }
+    if metadata.len() > MAX_FSTAB_BYTES {
+        return Err(SyscallError::new(
+            "read(/etc/fstab)",
+            io::Error::from(io::ErrorKind::InvalidInput)
+                .raw_os_error()
+                .unwrap_or(libc::EINVAL),
+        ));
+    }
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(FstabReport::default()),
         Err(e) => return Err(SyscallError::from_io("read(/etc/fstab)", &e)),
     };
     Ok(mount_with(ops, &text))
@@ -293,6 +315,14 @@ mod tests {
             // test that sees this happen has found the two paths mixed up.
             Err(SyscallError::new("umount2", libc::EINVAL))
         }
+    }
+
+    #[test]
+    fn a_hash_inside_a_field_is_not_a_comment() {
+        let (entries, warnings) = parse("tmpfs /mnt/a#b tmpfs defaults 0 0\n");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].mountpoint, PathBuf::from("/mnt/a#b"));
     }
 
     /// The six fields, in order, with comments and `noauto` skipped.

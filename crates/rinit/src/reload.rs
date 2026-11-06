@@ -36,6 +36,7 @@ use crate::args::Config;
 use crate::boot::{StartCoordinator, apply_effect};
 use crate::log::rlog;
 use crate::manager;
+use crate::notify::NotifyHub;
 use crate::unit_manager::{ConfigChange, UnitManager};
 
 /// What one reload did.
@@ -125,6 +126,7 @@ pub async fn reload(
     cfg: &Config,
     manager: &mut UnitManager,
     activation: &mut Activated,
+    notify: &mut NotifyHub,
     starts: &mut StartCoordinator,
 ) -> Result<Report, RuntimeError> {
     // The one fallible step, and it is fallible *before* anything changes.
@@ -177,6 +179,7 @@ pub async fn reload(
         // A removed unit must not keep a live socket: a connection would still
         // wake the main loop for a name the directory no longer defines.
         activation.remove(&name);
+        notify.disarm(&name);
         manager.clear_listener(&name);
         manager.retire(&name);
         report.removed.push(name);
@@ -190,6 +193,14 @@ pub async fn reload(
         // purposes even though the runtime entry still exists: it was hidden
         // and stopped, and the boot target should be able to pull it in again.
         let was_retired = manager.get(&name).is_some_and(|rt| rt.retired);
+        if manager.get(&name).is_some_and(|rt| {
+            rt.config.service_kind == rinit_core::ServiceKind::Notify
+                && config.service_kind != rinit_core::ServiceKind::Notify
+        }) {
+            // A type change leaves the old notify socket and reader behind
+            // otherwise; only the next start would create a different one.
+            notify.disarm(&name);
+        }
         let change = manager.add_with_in_flight(config.clone(), starts.is_starting(&name));
         if was_retired {
             added.insert(name.clone());

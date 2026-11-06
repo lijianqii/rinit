@@ -37,7 +37,14 @@ pub fn resolve(config: &UnitConfig) -> Result<Sandbox, RuntimeError> {
         // capability-only unit does not depend on `/etc/passwd` existing.
         return resolve_from(config, "", "");
     }
-    let passwd = read(PASSWD, "read /etc/passwd")?;
+    // A numeric User=/Group= needs no lookup, and a numeric User= with a
+    // numeric Group= must work on a rootfs with neither database. A named user
+    // still needs the group database for its supplementary memberships.
+    let passwd = if config.user.trim().parse::<u32>().is_ok() {
+        String::new()
+    } else {
+        read(PASSWD, "read /etc/passwd")?
+    };
     let groups = read(GROUP, "read /etc/group")?;
     resolve_from(config, &passwd, &groups)
 }
@@ -45,7 +52,9 @@ pub fn resolve(config: &UnitConfig) -> Result<Sandbox, RuntimeError> {
 /// Whether `config` names a user or a group, i.e. whether `/etc/passwd` and
 /// `/etc/group` have to be read at all.
 fn needs_user_database(config: &UnitConfig) -> bool {
-    !config.user.trim().is_empty() || !config.group.trim().is_empty()
+    let user_name = !config.user.trim().is_empty() && config.user.trim().parse::<u32>().is_err();
+    let group_name = !config.group.trim().is_empty() && config.group.trim().parse::<u32>().is_err();
+    user_name || group_name
 }
 
 /// [`resolve`] against explicit database bodies.
@@ -227,6 +236,14 @@ nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin
                 .collect()
         });
         cfg
+    }
+
+    #[test]
+    fn numeric_ids_do_not_require_a_user_database() {
+        assert!(!needs_user_database(&config("1000", "1000")));
+        assert!(!needs_user_database(&config("1000", "")));
+        assert!(needs_user_database(&config("nobody", "")));
+        assert!(needs_user_database(&config("", "nogroup")));
     }
 
     /// The common case: nothing asked for, nothing changed - and in particular

@@ -238,8 +238,13 @@ pub(crate) fn unescape_mount_field(field: &str) -> String {
 /// one that still will not go is reported and left alone: the shutdown must
 /// reach `reboot(2)` regardless.
 pub fn unmount_filesystems() -> UnmountReport {
-    // No /proc: nothing we can enumerate, so there is nothing to do.
-    let contents = std::fs::read_to_string("/proc/mounts").ok();
+    // No /proc: nothing we can enumerate, so there is nothing to do. Read
+    // bytes rather than UTF-8 so one non-UTF-8 mount point cannot make the
+    // whole table look empty; lossy decoding still lets every valid path be
+    // unmounted.
+    let contents = std::fs::read("/proc/mounts")
+        .ok()
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
     unmount_filesystems_with(&mut RealMounts, contents.as_deref())
 }
 

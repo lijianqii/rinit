@@ -304,12 +304,19 @@ fn sync_socket_activation(
         let Some(rt) = manager.get(&unit) else {
             continue;
         };
-        if rt.pid.is_some()
-            || matches!(
-                rt.state,
-                UnitState::Starting | UnitState::RestartWait | UnitState::Deactivating
-            )
-            || manager.is_failed(&unit)
+        if rt.pid.is_some() {
+            if activations
+                .get(&unit)
+                .is_none_or(|at| at.elapsed() >= SOCKET_IDLE_REFRESH)
+            {
+                activation.rearm(&unit);
+            }
+            continue;
+        }
+        if matches!(
+            rt.state,
+            UnitState::Starting | UnitState::RestartWait | UnitState::Deactivating
+        ) || manager.is_failed(&unit)
             || manager
                 .required_closure(&unit)
                 .iter()
@@ -568,11 +575,14 @@ fn try_start_socket(
     let cooling_down = socket_activations
         .get(unit)
         .is_some_and(|at| at.elapsed() < SOCKET_ACTIVATION_COOLDOWN);
-    if manager.is_running(unit)
-        || starts.flows.contains_key(unit)
-        || manager.is_failed(unit)
-        || cooling_down
-    {
+    if manager.is_running(unit) {
+        // A connection while the service is already up still refreshes its
+        // idle clock; rate-limit the report so a level-triggered listener does
+        // not spin the main loop.
+        socket_activations.insert(unit.clone(), Instant::now());
+        return;
+    }
+    if starts.flows.contains_key(unit) || manager.is_failed(unit) || cooling_down {
         return;
     }
     if manager
@@ -593,6 +603,21 @@ fn try_start_socket(
             rlog!("{unit}: started by a connection");
         }
         Err(e) => rlog!("error: cannot start {unit} for its connection: {e}"),
+    }
+}
+
+/// How long the loop may sleep before it must give a running socket-activated
+/// unit another chance to refresh its idle deadline.
+fn socket_refresh_wait(manager: &UnitManager, activation: &Activated) -> Duration {
+    if activation.units().iter().any(|unit| {
+        manager.is_running(unit)
+            && manager
+                .get(unit)
+                .is_some_and(|rt| rt.config.idle_timeout_sec > 0)
+    }) {
+        SOCKET_IDLE_REFRESH
+    } else {
+        Duration::from_secs(3600)
     }
 }
 
@@ -708,7 +733,8 @@ async fn supervise(
         // has something to poll.
         let wait = next_deadline(manager)
             .min(watchdog.next_feed_in())
-            .min(starts.next_wait());
+            .min(starts.next_wait())
+            .min(socket_refresh_wait(manager, activation));
         // Plan §7.9: a connection on an activated socket. Collected here rather
         // than handled in the `select!` arm, because the arm cannot borrow the
         // socket set while its own `recv` is one of the branches.
@@ -772,6 +798,7 @@ async fn supervise(
                         manager,
                         supervised.logs,
                         activation,
+                        supervised.notify,
                         &mut starts,
                         &request,
                     )
@@ -992,6 +1019,12 @@ const START_POLL: Duration = Duration::from_millis(20);
 /// this covers the successful-but-already-exited case.
 const SOCKET_ACTIVATION_COOLDOWN: Duration = Duration::from_secs(1);
 
+/// How often a running socket-activated service is allowed to see another
+/// readiness report so its idle deadline follows new connections. The watcher
+/// is level-triggered, so this also keeps a queue the service has not accepted
+/// yet from waking the loop every iteration.
+const SOCKET_IDLE_REFRESH: Duration = Duration::from_millis(100);
+
 /// One in-flight start, advanced one non-blocking step at a time.
 ///
 /// The supervisor must stay responsive while a service starts: a slow
@@ -1070,6 +1103,9 @@ impl StartFlow {
         let Some(rt) = manager.get(unit) else {
             return Err(format!("{unit} is not registered"));
         };
+        if rt.retired {
+            return Err(format!("{unit} was removed by a reload"));
+        }
         let paths = rt.config.needs_socket.clone();
         let deadline = start_deadline(rt.config.timeout_start_sec);
         let stage = if paths.is_empty() {
@@ -2171,6 +2207,7 @@ async fn handle_control(
     manager: &mut UnitManager,
     logs: &ServiceLogs,
     activation: &mut Activated,
+    notify: &mut NotifyHub,
     starts: &mut StartCoordinator,
     request: &Request,
 ) -> ControlAction {
@@ -2274,7 +2311,7 @@ async fn handle_control(
         // Plan §7.6. The reply is the report: what was added, changed, removed
         // and deferred, so a reload is never a silent act.
         Request::Reload => {
-            let (status, text) = control_reload(cfg, manager, activation, starts).await;
+            let (status, text) = control_reload(cfg, manager, activation, notify, starts).await;
             ControlAction::Reply(status, text)
         }
         // The supervisor handles the side effect (it owns the shutdown path);
@@ -2293,9 +2330,10 @@ async fn control_reload(
     cfg: &Config,
     manager: &mut UnitManager,
     activation: &mut Activated,
+    notify: &mut NotifyHub,
     starts: &mut StartCoordinator,
 ) -> (Status, String) {
-    match crate::reload::reload(cfg, manager, activation, starts).await {
+    match crate::reload::reload(cfg, manager, activation, notify, starts).await {
         Ok(report) => {
             let mut lines = report.lines();
             let summary = report.summary();
@@ -3048,11 +3086,12 @@ fn shutdown_now(action: ShutdownAction, watchdog: Option<Watchdog>) -> ! {
         rlog!("warning: {warning}");
     }
     reboot::sync();
-    // Magic close only now: the unmount and sync above are the slow part, and
-    // keeping the hardware timer alive through them is the shutdown fallback.
-    if let Some(watchdog) = watchdog {
-        watchdog.disarm();
-    }
+    // Keep the hardware timer armed through the reboot attempt. If
+    // `reboot(2)` is refused and SysRq also fails, the watchdog is the last
+    // fallback; disarming before the attempt would make the following pause
+    // loop permanent. A successful reboot lets the kernel stop the device
+    // (`watchdog_stop_on_reboot`), so the magic close is not needed here.
+    let _watchdog = watchdog;
     if let Err(e) = reboot::reboot(command) {
         // `reboot(2)` failed. The kernel's SysRq trigger is the last resort, so
         // PID 1 never ends up in the "cannot shut down" state plan §1.3(8)
@@ -3177,6 +3216,7 @@ mod tests {
             manager,
             logs,
             &mut activation,
+            notify,
             &mut starts,
             request,
         )

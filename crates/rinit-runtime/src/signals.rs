@@ -98,6 +98,9 @@ impl Signal {
 /// with `Acquire` and the descriptor is only cleared (with `Release`) after
 /// the pipe itself is gone. See the [`Drop`] implementation for why.
 extern "C" fn dispatch(signal: libc::c_int) {
+    // A handler must not leak its errno into the interrupted syscall.
+    // SAFETY: the thread-local errno location is valid in signal context.
+    let saved_errno = unsafe { *libc::__errno_location() };
     // Published before the fd load, so `Drop` can wait for a handler that may
     // already be about to write. Both operations are lock-free atomics and safe
     // in signal context.
@@ -113,6 +116,8 @@ extern "C" fn dispatch(signal: libc::c_int) {
         }
     }
     ACTIVE_HANDLERS.fetch_sub(1, Ordering::Release);
+    // SAFETY: same thread-local errno location as above.
+    unsafe { *libc::__errno_location() = saved_errno };
 }
 
 /// An async stream of the signals rinit cares about.

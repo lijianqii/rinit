@@ -407,8 +407,7 @@ impl PendingSpawn {
     /// blocking here for up to five seconds would defeat the asynchronous
     /// spawn path.
     pub fn abandon(mut self) {
-        // SAFETY: `pid` is our unreaped child and SIGKILL takes no pointer.
-        unsafe { libc::kill(self.pid, libc::SIGKILL) };
+        kill_unreaped_child(self.pid);
         self.completed = true;
     }
 
@@ -448,9 +447,9 @@ impl Drop for PendingSpawn {
             return;
         }
         // Nobody consumed the confirmation: the safest outcome is that the
-        // child never becomes an untracked service.
-        // SAFETY: `pid` is our unreaped child and SIGKILL takes no pointer.
-        unsafe { libc::kill(self.pid, libc::SIGKILL) };
+        // child never becomes an untracked service. The helper checks that the
+        // pid is still our unreaped child before sending a signal, so a pid
+        // already reaped by the global reaper cannot be reused and killed.
         reap_failed_spawn(self.pid);
     }
 }
@@ -688,6 +687,16 @@ fn child_exec(setup: &ChildSetup<'_>, report_read: libc::c_int, report_write: li
                 die(report_write, ChildStep::Dup2);
             }
         }
+        // systemd passes the listening socket to the service in blocking mode.
+        // The parent's watcher only needs readiness, so clearing O_NONBLOCK on
+        // the shared open-file description is safe and keeps a normal
+        // `accept()` loop from failing with EAGAIN after the first connection.
+        let flags = unsafe { libc::fcntl(LISTEN_FD, libc::F_GETFL) };
+        if flags < 0
+            || unsafe { libc::fcntl(LISTEN_FD, libc::F_SETFL, flags & !libc::O_NONBLOCK) } < 0
+        {
+            die(report_write, ChildStep::Dup2);
+        }
     }
 
     if let Some(fd) = setup.options.stdio {
@@ -769,13 +778,7 @@ fn child_exec(setup: &ChildSetup<'_>, report_read: libc::c_int, report_write: li
     // `execve`, so a later EOF can be told apart from a death during setup.
     // SAFETY: the report pipe is the parent/child protocol, and one byte is an
     // atomic pipe write.
-    unsafe {
-        libc::write(
-            report_write,
-            (&READY_BYTE as *const u8).cast::<libc::c_void>(),
-            1,
-        )
-    };
+    write_report(report_write, &[READY_BYTE]);
 
     // SAFETY: `path` and both arrays are valid, NUL-terminated, and live in the
     // memory this child inherited from the parent. `execve` does not return on
@@ -855,6 +858,23 @@ fn setup_tty(tty: &ChildTty<'_>, report_write: libc::c_int) {
     }
 }
 
+/// Write the child report without letting a detached parent's closed pipe kill
+/// the child with SIGPIPE. The signal mask is restored immediately afterwards;
+/// `_exit`/`execve` then see the normal mask.
+fn write_report(fd: libc::c_int, bytes: &[u8]) {
+    // SAFETY: the local signal sets are valid storage for sigemptyset/
+    // sigaddset, and sigprocmask only changes the current thread's mask.
+    unsafe {
+        let mut blocked = std::mem::zeroed::<libc::sigset_t>();
+        let mut previous = std::mem::zeroed::<libc::sigset_t>();
+        libc::sigemptyset(&mut blocked);
+        libc::sigaddset(&mut blocked, libc::SIGPIPE);
+        libc::sigprocmask(libc::SIG_BLOCK, &blocked, &mut previous);
+        libc::write(fd, bytes.as_ptr().cast(), bytes.len());
+        libc::sigprocmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut());
+    }
+}
+
 /// Report the current `errno` for `step` and exit with 127.
 fn die(report_write: libc::c_int, step: ChildStep) -> ! {
     // SAFETY: nothing was called since the failing call but `errno` readers.
@@ -871,7 +891,7 @@ fn die_reporting(report_write: libc::c_int, step: ChildStep, errno: i32) -> ! {
     // SAFETY: `bytes` is a valid 8-byte buffer. A pipe write of this size is
     // atomic and cannot come up short; if it fails (the parent is gone), the
     // `_exit` below still ends the child, and the parent sees end-of-file.
-    unsafe { libc::write(report_write, bytes.as_ptr().cast(), bytes.len()) };
+    write_report(report_write, &bytes);
     // SAFETY: `_exit` never returns and runs no destructors and no `atexit`
     // handlers - which is exactly what a process that exists only between
     // `fork` and `exec` needs: it must not touch what it shares with its parent
@@ -1031,6 +1051,20 @@ fn decode_report(buf: &[u8; REPORT_LEN]) -> Option<(ChildStep, i32)> {
     // fallback did exactly that, and every step added after it silently
     // reported itself as a failed `exec`.
     ChildStep::from_code(code).map(|step| (step, errno))
+}
+
+/// Kill a child only if `waitpid` still identifies it as our unreaped child.
+///
+/// `abandon` leaves reaping to the main loop; it must not signal a pid that a
+/// concurrent reaper has already reaped and the kernel has reused.
+fn kill_unreaped_child(pid: libc::pid_t) {
+    let mut status = 0;
+    // SAFETY: `status` is valid storage; WNOHANG keeps this non-blocking.
+    let rc = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+    if rc == 0 {
+        // SAFETY: waitpid(WNOHANG) returned 0, so this is still our child.
+        let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
 }
 
 /// Reap a child that failed before `exec`.

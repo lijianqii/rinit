@@ -160,6 +160,7 @@ fn format_dir(path: &Path, options: Options) -> io::Result<Vec<u8>> {
 fn list_path(path: &Path, display: &OsStr, options: Options) -> io::Result<Vec<u8>> {
     let meta = fs::symlink_metadata(path)?;
     let follows_to_directory = !options.directory
+        && !options.long
         && fs::metadata(path)
             .map(|target| target.is_dir())
             .unwrap_or(false);

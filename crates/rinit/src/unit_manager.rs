@@ -315,8 +315,16 @@ impl UnitRuntime {
             return;
         }
         if let Some(config) = self.pending_config.take() {
-            self.config = config;
+            self.apply_config(config);
         }
+    }
+
+    fn apply_config(&mut self, config: UnitConfig) {
+        let base = config.restart_delay();
+        let burst = config.start_limit_burst;
+        let interval = Duration::from_secs(config.start_limit_interval_sec);
+        self.config = config;
+        self.backoff.reconfigure(base, burst, interval);
     }
 
     /// The effective restart policy.
@@ -657,7 +665,7 @@ impl UnitManager {
             rt.pending_config = Some(config);
             ConfigChange::Deferred
         } else {
-            rt.config = config;
+            rt.apply_config(config);
             rt.pending_config = None;
             self.invalidate_graph();
             ConfigChange::Applied
@@ -678,8 +686,19 @@ impl UnitManager {
     /// Hidden from every protocol answer from now on; the entry stays until its
     /// stop has landed, and the next reload drops it.
     pub fn retire(&mut self, unit: &UnitName) {
+        self.queued_starts.remove(unit);
         if let Some(rt) = self.units.get_mut(unit) {
             rt.retired = true;
+            // A retired unit must not be resurrected by a timer or a queued
+            // start after the directory has stopped defining it.
+            rt.restart_at = None;
+            rt.health_at = None;
+            rt.probe_deadline = None;
+            rt.idle_at = None;
+            rt.restart_after_stop = false;
+            if let Some(probe) = rt.probe_pid.take() {
+                let _ = process::kill_process_group(probe, libc::SIGKILL);
+            }
             self.invalidate_graph();
         }
     }
@@ -691,7 +710,9 @@ impl UnitManager {
     /// known to be the truth again.
     pub fn prune_retired(&mut self) -> usize {
         let before = self.units.len();
-        self.units.retain(|_, rt| !rt.retired || rt.is_up());
+        self.units.retain(|_, rt| {
+            !rt.retired || rt.is_up() || rt.exec_stop_pid.is_some() || rt.probe_pid.is_some()
+        });
         let removed = before - self.units.len();
         if removed > 0 {
             self.invalidate_graph();
@@ -728,7 +749,12 @@ impl UnitManager {
             .as_ref()
             .is_none_or(|(cached, _)| *cached != revision)
         {
-            let configs: Vec<&UnitConfig> = self.units.values().map(|rt| &rt.config).collect();
+            let configs: Vec<&UnitConfig> = self
+                .units
+                .values()
+                .filter(|rt| !rt.retired)
+                .map(|rt| &rt.config)
+                .collect();
             let graph = DependencyGraph::build(configs).map_err(|e| e.to_string())?;
             *self.graph_cache.borrow_mut() = Some((revision, graph));
         }
@@ -893,6 +919,11 @@ impl UnitManager {
             .collect();
         let mut ready = Vec::new();
         for (unit, source) in queued {
+            // A removed unit must not be started by a stale queued request.
+            if !self.exists(&unit) {
+                self.queued_starts.remove(&unit);
+                continue;
+            }
             // Still stopping: leave it queued.
             if self.is_deactivating(&unit) {
                 continue;
@@ -1311,6 +1342,23 @@ impl UnitManager {
             }
         }
 
+        // A previous instance's probe must not outlive a new start. The normal
+        // exit path clears it, but a failed start or a cancelled flow can leave
+        // the pid behind without an exit being attributed to it.
+        if let Some(rt) = self.units.get_mut(unit)
+            && rt.pid.is_none()
+            && let Some(probe) = rt.probe_pid.take()
+        {
+            let _ = process::kill_process_group(probe, libc::SIGKILL);
+            rt.probe_deadline = None;
+        }
+        if let Some(rt) = self.units.get_mut(unit)
+            && rt.pid.is_none()
+            && let Some(stop_pid) = rt.exec_stop_pid.take()
+        {
+            let _ = process::kill_process_group(stop_pid, libc::SIGKILL);
+        }
+
         // Everything the spawn needs, read through an immutable borrow so the
         // `EnvironmentFile=` read below cannot race the state update.
         let (argv, env, cwd, kind, sandbox, limits, tty_path, tty_reset, idle_secs) = {
@@ -1422,9 +1470,10 @@ impl UnitManager {
         // well, so an early exit is interpreted against the right `Type=`.
         let now = self.now_millis();
         let Some(rt) = self.units.get_mut(unit) else {
-            let _ = process::kill(pid, libc::SIGKILL);
             if let Some(pending) = pending {
                 pending.abandon();
+            } else {
+                let _ = process::kill(pid, libc::SIGKILL);
             }
             return Err(RuntimeError::Io {
                 op: "spawn unit",
@@ -1883,6 +1932,7 @@ impl UnitManager {
                     rt.state = UnitState::Deactivating;
                     rt.restart_after_stop = true;
                     if rt.config.timeout_stop_sec == 0 {
+                        self.cgroup.signal_members(unit, libc::SIGKILL);
                         let _ = process::kill_process_group(pid, libc::SIGKILL);
                     } else {
                         rt.kill_at = Some(crate::deadline::after_secs(rt.config.timeout_stop_sec));
@@ -1923,6 +1973,11 @@ impl UnitManager {
         let Some(rt) = self.units.get_mut(unit) else {
             return;
         };
+        // A second stop while the first one is still running would replace the
+        // tracked ExecStop pid and orphan the first command.
+        if rt.state == UnitState::Deactivating {
+            return;
+        }
         rt.restart_at = None;
         rt.start_deadline = None;
         // A fresh stop re-arms the kill deadline below, so clear any stale one
@@ -2041,7 +2096,13 @@ impl UnitManager {
 
         if stopping {
             if rt.config.timeout_stop_sec == 0 {
-                // Plan §1.1: `TimeoutStopSec=0` means SIGKILL at once.
+                // Plan §1.1: `TimeoutStopSec=0` means SIGKILL at once. Reach
+                // the cgroup as well as the main group, and take the ExecStop
+                // command down with it; otherwise either can outlive the stop.
+                self.cgroup.signal_members(unit, libc::SIGKILL);
+                if let Some(stop_pid) = rt.exec_stop_pid.take() {
+                    let _ = process::kill_process_group(stop_pid, libc::SIGKILL);
+                }
                 let _ = process::kill_process_group(pid, libc::SIGKILL);
             } else {
                 rt.kill_at = Some(crate::deadline::after_secs(rt.config.timeout_stop_sec));
@@ -2125,6 +2186,12 @@ impl UnitManager {
         let oom_baseline = rt.oom_kills_at_start.take();
         rt.pid = None;
         rt.start_deadline = None;
+        // A probe belongs to the instance that was running when it started. If
+        // the main process exits first, its result must not be applied to the
+        // next instance, so take it down with this one.
+        if let Some(probe) = rt.probe_pid.take() {
+            let _ = process::kill_process_group(probe, libc::SIGKILL);
+        }
         // A stop in progress may still have children in the unit's group. Their
         // exits are reaped by the global reaper but cannot be matched back to
         // this unit. The leader itself may still be an unreaped zombie here, so
@@ -2307,6 +2374,10 @@ impl UnitManager {
         let now = Instant::now();
         let mut due = Vec::new();
         for (name, rt) in self.units.iter_mut() {
+            if rt.retired {
+                rt.restart_at = None;
+                continue;
+            }
             if let Some(at) = rt.restart_at
                 && at <= now
             {
@@ -4412,6 +4483,36 @@ mod tests {
     fn next_deadline_in_is_none_without_timers() {
         let m = manager_with("a.service", RestartPolicy::No);
         assert_eq!(m.next_deadline_in(), None);
+    }
+
+    /// A retired unit must not be brought back by a restart timer.
+    #[test]
+    fn retiring_a_restart_wait_unit_cancels_the_restart() {
+        let mut m = manager_with("a.service", RestartPolicy::Always);
+        let unit = UnitName::parse("a.service").unwrap();
+        m.units.get_mut(&unit).unwrap().restart_at = Some(Instant::now());
+        m.retire(&unit);
+        assert!(m.due_restarts().is_empty());
+        assert!(!m.exists(&unit));
+    }
+
+    /// A probe belongs to the instance that started it; the main exit must not
+    /// leave it around to be applied to the replacement.
+    #[test]
+    fn a_main_exit_cancels_an_in_flight_probe() {
+        let mut m = manager_with("a.service", RestartPolicy::No);
+        let unit = UnitName::parse("a.service").unwrap();
+        {
+            let rt = m.units.get_mut(&unit).unwrap();
+            rt.pid = Some(4000);
+            rt.probe_pid = Some(4001);
+            rt.probe_deadline = Some(Instant::now());
+            rt.state = UnitState::Active;
+        }
+        m.on_child_exit(4000, ExitOutcome::Success);
+        let rt = m.get(&unit).unwrap();
+        assert!(rt.probe_pid.is_none(), "the old probe must be forgotten");
+        assert!(rt.probe_deadline.is_none());
     }
 
     /// `reset-failed` clears the failure without starting the unit.

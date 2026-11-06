@@ -5,7 +5,7 @@
 //! not copied: the tools run as root on the device image, and a test build does
 //! not have the privileges to reproduce an arbitrary owner.
 
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
@@ -31,18 +31,24 @@ pub fn copy_entry(src: &Path, dst: &Path, recursive: bool, preserve: bool) -> io
                 "omitting directory",
             ));
         }
-        match fs::symlink_metadata(dst) {
+        let created = match fs::symlink_metadata(dst) {
             Ok(existing) if !existing.is_dir() => {
                 return Err(io::Error::new(
                     io::ErrorKind::AlreadyExists,
                     "destination is not a directory",
                 ));
             }
-            Ok(_) => {}
+            Ok(_) => false,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 fs::create_dir(dst)?;
+                true
             }
             Err(error) => return Err(error),
+        };
+        if created {
+            // A recursive copy must not widen a private source directory just
+            // because the process umask is more permissive.
+            fs::set_permissions(dst, fs::Permissions::from_mode(meta.mode() & 0o7777))?;
         }
         for entry in fs::read_dir(src)? {
             let entry = entry?;
@@ -67,20 +73,135 @@ pub fn copy_entry(src: &Path, dst: &Path, recursive: bool, preserve: bool) -> io
 }
 
 /// Remove one entry, descending into directories only when `recursive`.
+///
+/// The traversal is fd-relative and opens every child directory with
+/// `O_NOFOLLOW`. A path component swapped for a symlink after the first check
+/// therefore fails instead of redirecting the deletion outside the tree.
 pub fn remove_entry(path: &Path, recursive: bool) -> io::Result<()> {
     let meta = fs::symlink_metadata(path)?;
     if meta.is_dir() {
         if !recursive {
             return Err(io::Error::other("is a directory"));
         }
-        for entry in fs::read_dir(path)? {
-            let entry = entry?;
-            remove_entry(&entry.path(), true)?;
-        }
-        fs::remove_dir(path)
+        remove_tree(path)
     } else {
         fs::remove_file(path)
     }
+}
+
+fn remove_tree(path: &Path) -> io::Result<()> {
+    let path_c = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    // SAFETY: `path_c` is NUL-terminated and the flags only describe a
+    // directory open with the final component not followed.
+    let fd = unsafe {
+        libc::open(
+            path_c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let result = remove_tree_fd(fd);
+    if result.is_ok() {
+        // The fd traversal below removed the contents. `rmdir` cannot follow a
+        // symlink, so a replaced final component fails rather than escaping.
+        fs::remove_dir(path)
+    } else {
+        result
+    }
+}
+
+fn remove_tree_fd(fd: libc::c_int) -> io::Result<()> {
+    // SAFETY: fd is a directory we own; fdopendir takes ownership of it.
+    let dir = unsafe { libc::fdopendir(fd) };
+    if dir.is_null() {
+        // SAFETY: fd is still ours when fdopendir fails.
+        unsafe { libc::close(fd) };
+        return Err(io::Error::last_os_error());
+    }
+
+    let mut result = Ok(());
+    loop {
+        // SAFETY: dir is a valid DIR stream. errno is set to zero because
+        // readdir returns NULL both at EOF and on error.
+        unsafe { *libc::__errno_location() = 0 };
+        // SAFETY: dir is valid and readdir returns a valid dirent or NULL.
+        let entry = unsafe { libc::readdir(dir) };
+        if entry.is_null() {
+            // SAFETY: errno storage is valid.
+            let errno = unsafe { *libc::__errno_location() };
+            if errno != 0 {
+                result = Err(io::Error::from_raw_os_error(errno));
+            }
+            break;
+        }
+        // SAFETY: a non-null dirent has a NUL-terminated d_name.
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+        let bytes = name.to_bytes();
+        if bytes == b"." || bytes == b".." {
+            continue;
+        }
+        let Ok(name_c) = CString::new(bytes) else {
+            result = Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "directory entry contains NUL",
+            ));
+            break;
+        };
+        // SAFETY: dir and name_c are valid; fstatat does not follow the final
+        // component when AT_SYMLINK_NOFOLLOW is set.
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe {
+            libc::fstatat(
+                libc::dirfd(dir),
+                name_c.as_ptr(),
+                &mut stat,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            result = Err(io::Error::last_os_error());
+            break;
+        }
+        if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
+            // SAFETY: dirfd/name_c are valid and the child is opened without
+            // following a final symlink.
+            let child = unsafe {
+                libc::openat(
+                    libc::dirfd(dir),
+                    name_c.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if child < 0 {
+                result = Err(io::Error::last_os_error());
+                break;
+            }
+            if let Err(error) = remove_tree_fd(child) {
+                result = Err(error);
+                break;
+            }
+            // SAFETY: the child has been emptied, and unlinkat removes the
+            // directory relative to the already-open parent.
+            if unsafe { libc::unlinkat(libc::dirfd(dir), name_c.as_ptr(), libc::AT_REMOVEDIR) } != 0
+            {
+                result = Err(io::Error::last_os_error());
+                break;
+            }
+        } else {
+            // SAFETY: unlinkat with flags 0 removes a non-directory entry and
+            // does not follow a symlink.
+            if unsafe { libc::unlinkat(libc::dirfd(dir), name_c.as_ptr(), 0) } != 0 {
+                result = Err(io::Error::last_os_error());
+                break;
+            }
+        }
+    }
+    // SAFETY: dir was returned by fdopendir and is no longer used.
+    unsafe { libc::closedir(dir) };
+    result
 }
 
 /// Restore mode and atime/mtime from `meta` onto `path`.

@@ -96,6 +96,16 @@ impl Activated {
         {
             return Ok(());
         }
+        if let Some((other, _)) = self
+            .sockets
+            .iter()
+            .find(|(other, bound)| *other != unit && bound.path.as_path() == path)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("{} is already bound for {other}", path.display()),
+            ));
+        }
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -320,6 +330,27 @@ mod tests {
         assert!(!old.exists(), "the old path is released after the new bind");
         assert!(new.exists());
         assert_eq!(activated.path_of(&unit), Some(new.as_path()));
+
+        activated.disarm();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A path can have only one owner: a second unit must not unlink the first
+    /// listener and bind over it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_second_unit_cannot_bind_the_same_path() {
+        let dir = scratch("duplicate");
+        let path = dir.join("svc.sock");
+        let first = name("first.service");
+        let second = name("second.service");
+        let mut activated = Activated::disabled();
+
+        activated.bind(&first, &path).expect("first bind");
+        let error = activated.bind(&second, &path).expect_err("duplicate bind");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(activated.path_of(&first), Some(path.as_path()));
+        assert!(activated.listener_fd(&first).is_some());
+        assert!(activated.listener_fd(&second).is_none());
 
         activated.disarm();
         let _ = std::fs::remove_dir_all(&dir);

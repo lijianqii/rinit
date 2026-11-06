@@ -102,6 +102,7 @@ fn render(format: &str, name: impl AsRef<Path>, meta: &Metadata) -> String {
 
 fn run<A: AsRef<OsStr>>(args: &[A], program: &str) -> ExitCode {
     let mut follow = false;
+    let mut custom_format = false;
     let mut format = DEFAULT_FORMAT.to_string();
     let mut paths: Vec<PathBuf> = Vec::new();
     let marker = args.iter().position(|arg| arg.as_ref() == OsStr::new("--"));
@@ -130,6 +131,7 @@ fn run<A: AsRef<OsStr>>(args: &[A], program: &str) -> ExitCode {
                     return ExitCode::from(usage_error(program, "-c needs a UTF-8 format"));
                 };
                 format = value.to_string();
+                custom_format = true;
             }
             Some(value) if value.starts_with('-') && value != "-" => {
                 return ExitCode::from(usage_error(program, &format!("unknown option '{value}'")));
@@ -150,7 +152,14 @@ fn run<A: AsRef<OsStr>>(args: &[A], program: &str) -> ExitCode {
             fs::symlink_metadata(&name)
         };
         match result {
-            Ok(meta) => print!("{}", render(&format, &name, &meta)),
+            Ok(meta) => {
+                let text = render(&format, &name, &meta);
+                if custom_format {
+                    println!("{text}");
+                } else {
+                    print!("{text}");
+                }
+            }
             Err(error) => {
                 eprintln!("{program}: {}: {error}", name.display());
                 failed = true;

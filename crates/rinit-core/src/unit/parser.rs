@@ -598,21 +598,22 @@ fn logical_lines(input: &str) -> Vec<(usize, String)> {
         let line = raw.strip_suffix('\r').unwrap_or(raw);
         let line_no = idx + 1;
 
-        // A comment line never continues, and any other line ending in `\`
-        // does - including a bare `\`, which the EBNF's `continuation` rule
-        // allows.
-        let continuing = !line.trim_start().starts_with('#') && line.trim_end().ends_with('\\');
+        // A comment starts at the first unquoted, unescaped `#`, even mid-value.
+        // Strip it before looking for the continuation backslash: a comment's
+        // trailing `\` is text, not a request to join the next line.
+        let code = comment_prefix(line);
+        let continuing = code.trim_end().ends_with('\\');
 
         if current.is_empty() {
             start = line_no;
         }
         if continuing {
-            let head = line.trim_end().strip_suffix('\\').unwrap_or(line);
+            let head = code.trim_end().strip_suffix('\\').unwrap_or(code);
             current.push_str(head);
             // Join with a single space so `Description=a \` + `b` is `a b`.
             current.push(' ');
         } else {
-            current.push_str(line);
+            current.push_str(code);
             out.push((start, core::mem::take(&mut current)));
         }
     }
@@ -620,6 +621,25 @@ fn logical_lines(input: &str) -> Vec<(usize, String)> {
         out.push((start, current));
     }
     out
+}
+
+/// The part of `line` before the first unquoted, unescaped `#`.
+fn comment_prefix(line: &str) -> &str {
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, ch) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '"' => quoted = !quoted,
+            '#' if !quoted => return &line[..index],
+            _ => {}
+        }
+    }
+    line
 }
 
 /// Recognise a `[Section]` header, rejecting trailing content.
@@ -1155,6 +1175,17 @@ mod tests {
         let cfg = ok(
             "app.service",
             "[Unit]\n# comment \\\nDescription=App\n[Service]\nExecStart=/bin/true\n",
+        );
+        assert_eq!(cfg.description, "App");
+    }
+
+    /// A comment is stripped before continuation detection, so a trailing
+    /// backslash inside a comment cannot swallow the next section.
+    #[test]
+    fn a_backslash_in_an_inline_comment_does_not_continue() {
+        let cfg = ok(
+            "app.service",
+            "[Unit]\nDescription=App # trailing comment \\\n[Service]\nExecStart=/bin/true\n",
         );
         assert_eq!(cfg.description, "App");
     }

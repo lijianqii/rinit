@@ -61,7 +61,9 @@ fn named(id: u32, name: Option<String>) -> String {
 
 fn label(id: u32, names: bool, lookup: fn(u32) -> Option<String>) -> String {
     if names {
-        named(id, lookup(id))
+        // `-n` asks for the name alone; the default full output is what uses
+        // the `id(name)` spelling.
+        lookup(id).unwrap_or_else(|| id.to_string())
     } else {
         id.to_string()
     }

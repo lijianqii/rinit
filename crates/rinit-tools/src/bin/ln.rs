@@ -33,15 +33,34 @@ fn destination_for(target: &Path, dst: &Path, options: Options) -> Result<PathBu
 }
 
 fn link_one(target: &Path, link: &Path, options: Options) -> Result<(), String> {
-    if options.force && fs::symlink_metadata(link).is_ok() {
-        fs::remove_file(link).map_err(|error| format!("{}: {error}", link.display()))?;
-    }
-    let result = if options.symbolic {
-        std::os::unix::fs::symlink(target, link)
-    } else {
-        fs::hard_link(target, link)
+    let create = || {
+        if options.symbolic {
+            std::os::unix::fs::symlink(target, link)
+        } else {
+            fs::hard_link(target, link)
+        }
     };
-    result.map_err(|error| format!("{} -> {}: {error}", link.display(), target.display()))
+    match create() {
+        Ok(()) => Ok(()),
+        Err(error) if options.force && error.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Try to create first: a missing/invalid target must not delete an
+            // existing link. Only replace it after the failure is specifically
+            // "the link already exists".
+            match fs::symlink_metadata(link) {
+                Ok(existing) if existing.is_dir() => {
+                    return Err(format!("{}: is a directory", link.display()));
+                }
+                _ => {}
+            }
+            fs::remove_file(link).map_err(|error| format!("{}: {error}", link.display()))?;
+            create().map_err(|error| format!("{} -> {}: {error}", link.display(), target.display()))
+        }
+        Err(error) => Err(format!(
+            "{} -> {}: {error}",
+            link.display(),
+            target.display()
+        )),
+    }
 }
 
 fn run<A: AsRef<OsStr>>(args: &[A], program: &str) -> ExitCode {
@@ -159,6 +178,21 @@ mod tests {
         };
         link_one(&target, &link, options).expect("replace");
         assert_eq!(fs::read(&link).expect("link"), b"target");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn force_does_not_destroy_the_destination_when_the_target_is_missing() {
+        let root = temp_root("force-missing");
+        let missing = root.join("missing");
+        let link = root.join("link");
+        fs::write(&link, b"keep me").expect("link");
+        let options = Options {
+            force: true,
+            ..Options::default()
+        };
+        assert!(link_one(&missing, &link, options).is_err());
+        assert_eq!(fs::read(&link).expect("link survives"), b"keep me");
         let _ = fs::remove_dir_all(root);
     }
 

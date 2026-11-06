@@ -2054,7 +2054,7 @@ fn a_socket_activated_unit_starts_on_its_first_connection() {
         "api.service",
         &format!(
             "[Service]\nType=oneshot\nSocketActivate={}\n\
-             ExecStart=/bin/sh -c \"test -S /proc/self/fd/3 && test \\\"$LISTEN_PID\\\" = \\\"$$\\\" && echo activated > {} || echo no-fd > {}\"\n",
+             ExecStart=/bin/sh -c \"if test -S /proc/self/fd/3 && test \\\"$LISTEN_PID\\\" = \\\"$$\\\" && ! grep -Eq '^flags:.*4000' /proc/self/fdinfo/3; then echo activated-blocking > {}; else echo no-fd > {}; fi\"\n",
             sock.display(),
             probe.display(),
             probe.display()
@@ -2094,8 +2094,8 @@ fn a_socket_activated_unit_starts_on_its_first_connection() {
     );
     assert_eq!(
         probed.trim(),
-        "activated",
-        "the service must have the *listening* socket on fd 3, not an accepted one"
+        "activated-blocking",
+        "the service must have the *blocking* listening socket on fd 3"
     );
 }
 
@@ -2158,6 +2158,65 @@ fn an_idle_socket_activated_unit_is_stopped() {
     assert!(
         log.contains("stopping api.service: idle"),
         "and being idle stops it again:\n{log}"
+    );
+}
+
+/// A connection while the unit is already running refreshes the idle clock.
+/// This is the case the first implementation missed: the unit was stopped
+/// exactly `IdleTimeoutSec` after startup even when clients kept connecting.
+#[test]
+fn new_connections_refresh_the_socket_idle_timeout() {
+    let dir = TempDir::new("activation-idle-refresh");
+    let sock = std::env::temp_dir().join(format!("rinit-idle-refresh-{}.sock", std::process::id()));
+    let _ = fs::remove_file(&sock);
+    dir.write("all.target", "[Unit]\nType=target\nRequires=api.service\n");
+    dir.write(
+        "api.service",
+        &format!(
+            "[Service]\nType=simple\nSocketActivate={}\nIdleTimeoutSec=1\n\
+             ExecStart=/bin/sleep 30\n",
+            sock.display()
+        ),
+    );
+
+    let log = boot_units_inspect(&dir, "all.target", libc::SIGTERM, &[], |socket, _| {
+        let api = || {
+            control(
+                socket,
+                rinit_core::Request::Status {
+                    unit: Some(rinit_core::UnitName::parse("api.service").expect("name")),
+                    tail: 0,
+                },
+            )
+            .1
+        };
+        let _ = std::os::unix::net::UnixStream::connect(&sock);
+        wait_for(Duration::from_secs(5), "api.service to start", || {
+            api().contains("state: active")
+        });
+        // Keep the listener active across more than one idle interval. If the
+        // running branch does not rearm the watcher, the unit is stopped at
+        // about one second even though these connections arrive.
+        for _ in 0..12 {
+            std::thread::sleep(Duration::from_millis(100));
+            let _ = std::os::unix::net::UnixStream::connect(&sock);
+        }
+        assert!(
+            api().contains("state: active"),
+            "connections must keep the unit alive: {}",
+            api()
+        );
+        wait_for(
+            Duration::from_secs(10),
+            "the idle timeout after the last connection",
+            || api().contains("state: inactive"),
+        );
+    })
+    .0;
+    let _ = fs::remove_file(&sock);
+    assert!(
+        log.contains("stopping api.service: idle"),
+        "the service is stopped only after the connections stop:\n{log}"
     );
 }
 

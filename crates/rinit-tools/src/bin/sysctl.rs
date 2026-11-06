@@ -31,7 +31,7 @@ fn write_key(root: &Path, key: &str, value: &str) -> Result<(), String> {
     std::fs::write(&path, format!("{value}\n")).map_err(|e| format!("{key}: {e}"))
 }
 
-fn walk(dir: &Path, prefix: &str, out: &mut Vec<String>) -> io::Result<()> {
+fn walk(dir: &Path, prefix: &str, out: &mut Vec<String>, program: &str) -> io::Result<()> {
     let mut entries: Vec<_> = std::fs::read_dir(dir)?.collect::<Result<_, _>>()?;
     entries.sort_by_key(|entry| entry.file_name());
     for entry in entries {
@@ -43,9 +43,16 @@ fn walk(dir: &Path, prefix: &str, out: &mut Vec<String>) -> io::Result<()> {
             format!("{prefix}.{name}")
         };
         if path.is_dir() {
-            walk(&path, &key, out)?;
+            if let Err(error) = walk(&path, &key, out, program) {
+                eprintln!("{program}: {key}: {error}");
+            }
         } else {
-            out.push(format!("{key} = {}", read_trimmed(&path)?));
+            // One unreadable knob must not discard every other value in a
+            // `sysctl -a` listing.
+            match read_trimmed(&path) {
+                Ok(value) => out.push(format!("{key} = {value}")),
+                Err(error) => eprintln!("{program}: {key}: {error}"),
+            }
         }
     }
     Ok(())
@@ -62,7 +69,7 @@ fn run(args: &[String], root: &Path, program: &str) -> ExitCode {
         }
         "-a" | "--all" => {
             let mut lines = Vec::new();
-            if let Err(e) = walk(&root.join("proc/sys"), "", &mut lines) {
+            if let Err(e) = walk(&root.join("proc/sys"), "", &mut lines, program) {
                 eprintln!("{program}: {e}");
                 return ExitCode::from(1);
             }

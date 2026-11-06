@@ -105,7 +105,8 @@ fn run<A: AsRef<OsStr>>(args: &[A], root: &std::path::Path, program: &str) -> Ex
     if !paths.is_empty() {
         let mut selected = Vec::new();
         for path in &paths {
-            match mount_for(&mounts, path) {
+            let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+            match mount_for(&mounts, &path) {
                 Some(entry) => {
                     if !selected.contains(entry) {
                         selected.push(entry.clone());

@@ -10,6 +10,7 @@
 //! refer to the same unit and cannot both exist.
 
 use std::fs;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use rinit_core::UnitName;
@@ -62,16 +63,12 @@ pub fn load_unit_files(dir: &Path) -> Result<(Vec<UnitFile>, Vec<String>), Runti
         // dotfiles and other names are skipped here. A candidate that cannot be
         // read - including a directory whose name ends in a unit suffix - is
         // skipped with a warning rather than failing the whole load.
-        let Some(name) = unit_name_of(&path) else {
+        let Some(_name) = unit_name_of(&path) else {
             continue;
         };
 
-        match fs::read_to_string(&path) {
-            Ok(contents) => files.push(UnitFile {
-                name,
-                path,
-                contents,
-            }),
+        match read_unit_file(&path) {
+            Ok(file) => files.push(file),
             Err(e) => warnings.push(format!("skipping {}: {e}", path.display())),
         }
     }
@@ -106,12 +103,42 @@ fn unit_name_of(path: &Path) -> Option<UnitName> {
 /// Returns [`RuntimeError::Io`] if the file cannot be read, or
 /// [`RuntimeError::Syscall`] if its name is not a valid unit name.
 pub fn read_unit_file(path: &Path) -> Result<UnitFile, RuntimeError> {
+    const MAX_UNIT_FILE_BYTES: u64 = 1024 * 1024;
     let name = unit_name_of(path)
         .ok_or_else(|| RuntimeError::Syscall(SyscallError::new("unit file name", libc::EINVAL)))?;
-    let contents = fs::read_to_string(path).map_err(|e| RuntimeError::Io {
-        op: "read_to_string(unit)",
+    let metadata = fs::metadata(path).map_err(|e| RuntimeError::Io {
+        op: "metadata(unit)",
         source: e,
     })?;
+    if !metadata.file_type().is_file() {
+        return Err(RuntimeError::Io {
+            op: "read(unit)",
+            source: io::Error::new(io::ErrorKind::InvalidInput, "not a regular file"),
+        });
+    }
+    if metadata.len() > MAX_UNIT_FILE_BYTES {
+        return Err(RuntimeError::Io {
+            op: "read(unit)",
+            source: io::Error::new(io::ErrorKind::InvalidInput, "unit file is too large"),
+        });
+    }
+    let file = fs::File::open(path).map_err(|e| RuntimeError::Io {
+        op: "open(unit)",
+        source: e,
+    })?;
+    let mut contents = String::new();
+    file.take(MAX_UNIT_FILE_BYTES + 1)
+        .read_to_string(&mut contents)
+        .map_err(|e| RuntimeError::Io {
+            op: "read_to_string(unit)",
+            source: e,
+        })?;
+    if contents.len() as u64 > MAX_UNIT_FILE_BYTES {
+        return Err(RuntimeError::Io {
+            op: "read(unit)",
+            source: io::Error::new(io::ErrorKind::InvalidInput, "unit file is too large"),
+        });
+    }
     Ok(UnitFile {
         name,
         path: path.to_path_buf(),
@@ -122,6 +149,18 @@ pub fn read_unit_file(path: &Path) -> Result<UnitFile, RuntimeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_oversized_unit_file_is_rejected_without_reading_it() {
+        let dir = std::env::temp_dir().join(format!("rinit-unit-size-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("huge.service");
+        std::fs::write(&path, vec![b'x'; 1024 * 1024 + 1]).expect("huge unit");
+        let error = read_unit_file(&path).expect_err("oversized unit");
+        assert!(format!("{error}").contains("too large"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A scratch directory that cleans itself up, so these tests never touch
     /// the real `/etc/rinit/units`.
@@ -280,7 +319,7 @@ mod tests {
             matches!(
                 err,
                 RuntimeError::Io {
-                    op: "read_to_string(unit)",
+                    op: "read(unit)",
                     ..
                 }
             ),

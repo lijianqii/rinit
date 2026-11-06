@@ -80,10 +80,14 @@ fn run(args: &[String], root: &Path, program: &str) -> ExitCode {
     let free = field(&values, "MemFree");
     let buffers = field(&values, "Buffers");
     let cached = field(&values, "Cached");
+    let reclaimable = field(&values, "SReclaimable");
     let shared = field(&values, "Shmem");
-    let available = field(&values, "MemAvailable").max(free);
-    let used = total.saturating_sub(free + buffers + cached);
-    let buff_cache = buffers + cached;
+    let buff_cache = buffers.saturating_add(cached).saturating_add(reclaimable);
+    let available = values
+        .get("MemAvailable")
+        .copied()
+        .unwrap_or_else(|| free.saturating_add(buff_cache));
+    let used = total.saturating_sub(free.saturating_add(buff_cache));
 
     println!("              total        used        free      shared  buff/cache   available");
     println!(
@@ -143,6 +147,27 @@ mod tests {
         assert_eq!(scaled(1024, "b"), "1048576");
         assert_eq!(human(1024), "1.0Mi");
         assert_eq!(human(1024 * 1024), "1.0Gi");
+    }
+
+    #[test]
+    fn reclaimable_cache_is_part_of_used_and_buff_cache() {
+        let values = parse_meminfo(
+            "MemTotal: 1000 kB\nMemFree: 100 kB\nBuffers: 50 kB\nCached: 100 kB\nSReclaimable: 150 kB\n",
+        );
+        let total = field(&values, "MemTotal");
+        let free = field(&values, "MemFree");
+        let buffers = field(&values, "Buffers");
+        let cached = field(&values, "Cached");
+        let reclaimable = field(&values, "SReclaimable");
+        let buff_cache = buffers + cached + reclaimable;
+        let used = total - free - buff_cache;
+        assert_eq!(buff_cache, 300);
+        assert_eq!(used, 600);
+        let available = values
+            .get("MemAvailable")
+            .copied()
+            .unwrap_or_else(|| free + buff_cache);
+        assert_eq!(available, 400, "fallback includes buffers and cache");
     }
 
     #[test]

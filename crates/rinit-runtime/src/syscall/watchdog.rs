@@ -196,8 +196,12 @@ impl Watchdog {
         if !self.armed {
             return Ok(());
         }
+        // Only mark disarmed once the write succeeds. If the device rejects
+        // the magic close, Drop must be allowed to try again instead of
+        // leaving a `nowayout` timer running.
+        self.write_byte(MAGIC_CLOSE, "write(watchdog V)")?;
         self.armed = false;
-        self.write_byte(MAGIC_CLOSE, "write(watchdog V)")
+        Ok(())
     }
 
     /// One byte to the device.

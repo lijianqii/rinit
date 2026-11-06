@@ -56,8 +56,8 @@ fn write_log<W: Write>(log: &FileLog, out: &mut W) -> io::Result<()> {
     let mut line = String::new();
 
     for path in log_paths(&log.path) {
-        let file = match std::fs::File::open(&path) {
-            Ok(file) => file,
+        let metadata = match std::fs::metadata(&path) {
+            Ok(metadata) => metadata,
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => {
                 return Err(io::Error::new(
@@ -66,18 +66,24 @@ fn write_log<W: Write>(log: &FileLog, out: &mut W) -> io::Result<()> {
                 ));
             }
         };
-        let metadata = file.metadata().map_err(|error| {
+        if !metadata.is_file() {
+            // A failed rotation can leave a directory at `.1` or `.2`; that
+            // must not hide a perfectly good current file. The current path is
+            // still an error because the user asked for a log, not a directory.
+            if path == log.path {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("cannot read {}: not a regular file", path.display()),
+                ));
+            }
+            continue;
+        }
+        let file = std::fs::File::open(&path).map_err(|error| {
             io::Error::new(
                 error.kind(),
                 format!("cannot read {}: {error}", path.display()),
             )
         })?;
-        if !metadata.is_file() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("cannot read {}: not a regular file", path.display()),
-            ));
-        }
         found = true;
         let mut reader = BufReader::new(file);
         loop {
@@ -206,6 +212,30 @@ mod tests {
         assert_eq!(
             String::from_utf8(out).expect("UTF-8"),
             "app.service: oldest\napp.service: middle\napp.service: newest\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_non_file_rotation_is_skipped_but_the_current_file_is_read() {
+        let dir =
+            std::env::temp_dir().join(format!("rctl-file-log-bad-rotation-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("log");
+        std::fs::create_dir(rotated(&path, 2)).expect("bad rotation directory");
+        write(&path, "app.service: current\n");
+
+        let log = FileLog {
+            path,
+            unit: Some(unit("app.service")),
+            tail: 0,
+        };
+        let mut out = Vec::new();
+        write_log(&log, &mut out).expect("bad rotation must not abort");
+        assert_eq!(
+            String::from_utf8(out).expect("UTF-8"),
+            "app.service: current\n"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

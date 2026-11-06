@@ -66,9 +66,16 @@ fn copy_one(src: &Path, dst: &Path, options: Options) -> Result<(), String> {
             ));
         }
     }
-    if options.force && !meta.is_dir() {
+    if options.force && (meta.is_file() || meta.file_type().is_symlink()) {
         match fs::symlink_metadata(dst) {
             Ok(existing) if !existing.is_dir() => {
+                // Do not destroy the destination until the source has been
+                // proven readable. Otherwise `cp -f missing dest` loses dest.
+                if meta.file_type().is_symlink() {
+                    fs::read_link(src).map_err(|error| format!("{}: {error}", src.display()))?;
+                } else if meta.is_file() {
+                    fs::File::open(src).map_err(|error| format!("{}: {error}", src.display()))?;
+                }
                 fs::remove_file(dst).map_err(|error| format!("{}: {error}", dst.display()))?;
             }
             _ => {}
@@ -176,6 +183,21 @@ mod tests {
         copy_one(&src, &dst, options).expect("copy");
         assert_eq!(fs::read(&dst).expect("dst"), b"payload");
         assert_eq!(fs::metadata(&dst).expect("meta").mode() & 0o777, 0o640);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn force_does_not_destroy_the_destination_when_the_source_cannot_be_read() {
+        let root = temp_root("force-missing");
+        let missing = root.join("missing");
+        let dst = root.join("dst");
+        fs::write(&dst, b"keep me").expect("dst");
+        let options = Options {
+            force: true,
+            ..Options::default()
+        };
+        assert!(copy_one(&missing, &dst, options).is_err());
+        assert_eq!(fs::read(&dst).expect("dst survives"), b"keep me");
         let _ = fs::remove_dir_all(root);
     }
 
