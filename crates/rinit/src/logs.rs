@@ -41,13 +41,6 @@ pub(crate) const DEFAULT_LOG_FILE_MAX_BYTES: u64 = 1024 * 1024;
 /// The smallest log-file bound accepted from the command line.
 pub(crate) const MIN_LOG_FILE_MAX_BYTES: u64 = 4096;
 
-/// How many rotated files `--log-keep` may retain.
-///
-/// A bound is necessary because rotation walks the whole chain: accepting an
-/// arbitrarily large count would turn one write into an unbounded series of
-/// renames.
-pub(crate) const MAX_LOG_KEEP: usize = 64;
-
 /// Default number of rotated logs: zero keeps the historical truncate policy.
 pub(crate) const DEFAULT_LOG_KEEP: usize = 0;
 
@@ -337,6 +330,7 @@ impl LogFile {
                 true
             }
             Err(e) => {
+                self.file = None;
                 self.warn(&e);
                 false
             }
@@ -710,6 +704,77 @@ mod tests {
             let len = std::fs::metadata(kept).expect("metadata").len();
             assert!(len <= 64 + 32, "bounded file {kept:?}: {len} bytes");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A rename that cannot happen must fall back to the bounded truncate
+    /// policy instead of leaving the file unbounded.
+    #[test]
+    fn a_failed_rotation_falls_back_to_truncation() {
+        let dir =
+            std::env::temp_dir().join(format!("rinit-logs-rotate-fail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("rinit.log");
+        let mut file = LogFile::open(&path, 64, 2).expect("open");
+        file.append_text(&"a".repeat(64));
+        for index in [1, 2] {
+            let target = file.rotated_path(index);
+            std::fs::create_dir_all(&target).expect("blocking directory");
+            std::fs::write(target.join("keep"), b"x").expect("non-empty");
+        }
+
+        file.append_text("after\n");
+
+        let written = std::fs::read_to_string(&path).expect("current file");
+        assert!(
+            written.contains("log truncated"),
+            "fallback marker: {written}"
+        );
+        assert!(written.ends_with("after\n"), "newest line kept: {written}");
+        assert!(file.rotated_path(1).is_dir(), "the blocker remains");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A failed reopen is not fatal: the next append retries after the directory
+    /// becomes usable again.
+    #[test]
+    fn a_failed_reopen_is_retried_on_the_next_write() {
+        let dir = std::env::temp_dir().join(format!("rinit-logs-reopen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("rinit.log");
+        let mut file = LogFile::open(&path, 1024, 0).expect("open");
+        std::fs::remove_dir_all(&dir).expect("remove open file's directory");
+        assert!(!file.reopen(), "the missing parent must fail the reopen");
+
+        file.append_text("dropped-until-reopen\n");
+        assert!(!path.exists(), "a failed reopen writes nothing");
+
+        std::fs::create_dir_all(&dir).expect("recreate scratch dir");
+        file.append_text("second\n");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read back"),
+            "second\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A bound smaller than the marker drops the marker rather than exceeding
+    /// the bound just to announce a truncation.
+    #[test]
+    fn a_tiny_bound_skips_the_truncate_marker() {
+        let dir = std::env::temp_dir().join(format!("rinit-logs-tiny-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("rinit.log");
+        let mut file = LogFile::open(&path, 4, 0).expect("open");
+        file.append_text("abc\n");
+        file.append_text("x\n");
+
+        let written = std::fs::read_to_string(&path).expect("read back");
+        assert_eq!(written, "x\n");
+        assert!(!written.contains("log truncated"), "{written}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

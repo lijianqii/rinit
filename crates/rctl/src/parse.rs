@@ -3,10 +3,23 @@
 //! Pure and separate from `main` so every subcommand, every missing argument
 //! and every `--tail` spelling is unit-tested without a socket.
 
-use rinit_core::{ListFormat, Request, StatusFormat, UnitName};
+use std::path::PathBuf;
+
+use rinit_core::{DEFAULT_LOG_FILE, ListFormat, Request, StatusFormat, UnitName};
 
 /// How many recent log lines the default systemd status view includes.
 const DEFAULT_STATUS_TAIL: u32 = 10;
+
+/// Read the persisted log instead of asking rinit for the ring.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileLog {
+    /// Current log path; rotated files are derived as `path.1` ... `path.N`.
+    pub path: PathBuf,
+    /// Restrict output to one unit, or `None` for every unit.
+    pub unit: Option<UnitName>,
+    /// Newest line count; zero means everything.
+    pub tail: u32,
+}
 
 /// What a command line asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,6 +30,8 @@ pub enum Parsed {
     Version,
     /// A request to send.
     Request(Request),
+    /// Read the persisted log locally, without the control socket.
+    FileLog(FileLog),
 }
 
 /// Parse `rctl`'s arguments (excluding `argv[0]`).
@@ -44,10 +59,7 @@ pub fn command_line(args: &[String]) -> Result<Parsed, String> {
                 format,
             }))
         }
-        "log" => {
-            let (unit, tail) = parse_optional_unit_and_tail(rest)?;
-            Ok(Parsed::Request(Request::Log { unit, tail }))
-        }
+        "log" => parse_log(rest),
         "start" => Ok(Parsed::Request(Request::Start(required_unit(rest)?))),
         "stop" => Ok(Parsed::Request(Request::Stop(required_unit(rest)?))),
         "restart" => Ok(Parsed::Request(Request::Restart(required_unit(rest)?))),
@@ -79,10 +91,11 @@ fn required_unit(rest: &[String]) -> Result<UnitName, String> {
     }
 }
 
-/// `status`/`log` take an optional unit and an optional `--tail`.
-fn parse_optional_unit_and_tail(rest: &[String]) -> Result<(Option<UnitName>, u32), String> {
+/// `log` reads the ring by default, or a persisted file with `--file`.
+fn parse_log(rest: &[String]) -> Result<Parsed, String> {
     let mut unit: Option<UnitName> = None;
     let mut tail: u32 = 0;
+    let mut file: Option<PathBuf> = None;
     let mut index = 0;
     while let Some(arg) = rest.get(index) {
         if let Some(value) = arg.strip_prefix("--tail=") {
@@ -93,6 +106,13 @@ fn parse_optional_unit_and_tail(rest: &[String]) -> Result<(Option<UnitName>, u3
                 .ok_or_else(|| "--tail needs a line count".to_string())?;
             tail = parse_tail(value)?;
             index += 1;
+        } else if let Some(value) = arg.strip_prefix("--file=") {
+            if value.is_empty() {
+                return Err("--file needs a path".to_string());
+            }
+            file = Some(PathBuf::from(value));
+        } else if arg == "--file" {
+            file = Some(PathBuf::from(DEFAULT_LOG_FILE));
         } else if arg.starts_with('-') {
             return Err(format!("unknown option '{arg}'"));
         } else if unit.is_none() {
@@ -102,7 +122,10 @@ fn parse_optional_unit_and_tail(rest: &[String]) -> Result<(Option<UnitName>, u3
         }
         index += 1;
     }
-    Ok((unit, tail))
+    match file {
+        Some(path) => Ok(Parsed::FileLog(FileLog { path, unit, tail })),
+        None => Ok(Parsed::Request(Request::Log { unit, tail })),
+    }
 }
 
 /// `list` takes an optional presentation format and no unit name.
@@ -345,6 +368,35 @@ mod tests {
                 tail: 0
             }))
         );
+    }
+
+    #[test]
+    fn log_file_mode_uses_the_default_or_an_explicit_path() {
+        assert_eq!(
+            parse(&["log", "--file"]),
+            Ok(Parsed::FileLog(FileLog {
+                path: PathBuf::from(DEFAULT_LOG_FILE),
+                unit: None,
+                tail: 0
+            }))
+        );
+        assert_eq!(
+            parse(&["log", "app", "--file=/tmp/rinit.log", "--tail", "5"]),
+            Ok(Parsed::FileLog(FileLog {
+                path: PathBuf::from("/tmp/rinit.log"),
+                unit: Some(unit("app.service")),
+                tail: 5
+            }))
+        );
+        assert_eq!(
+            parse(&["log", "--file=/tmp/rinit.log", "app", "--tail=3"]),
+            Ok(Parsed::FileLog(FileLog {
+                path: PathBuf::from("/tmp/rinit.log"),
+                unit: Some(unit("app.service")),
+                tail: 3
+            }))
+        );
+        assert!(parse(&["log", "--file="]).is_err());
     }
 
     /// The default systemd status view includes a small tail; explicit

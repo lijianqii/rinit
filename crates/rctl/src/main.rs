@@ -25,6 +25,7 @@
 )]
 
 mod client;
+mod file_log;
 mod parse;
 
 use std::ffi::OsString;
@@ -46,7 +47,8 @@ Commands:
   stop <UNIT>             Stop a unit
   restart <UNIT>          Restart a unit
   reset-failed <UNIT>     Clear a unit's failed/start-limit state
-  log [UNIT] [--tail N]   Show buffered log (default: all lines)
+  log [UNIT] [--tail N] [--file[=PATH]]
+                          Show buffered log, or read the persisted file
   reload                  Re-read the unit directory and apply the difference
   reboot                  Stop services and reboot
   poweroff                Stop services and power off
@@ -63,6 +65,8 @@ Options:
   --table                 list alias for --format=table
   --tail N                limit status/log to N recent lines
                           (status defaults to 10; 0 disables status logs)
+  --file[=PATH]           log reads the persisted file instead of the ring
+                          (default: /var/log/rinit/log)
 
 Exit codes:
   0 success   1 error   2 usage   3 no such unit   4 operation conflict
@@ -114,6 +118,7 @@ fn main() -> ExitCode {
             return ExitCode::from(if emit(&text) { 0 } else { 1 });
         }
         Ok(parse::Parsed::Request(request)) => request,
+        Ok(parse::Parsed::FileLog(log)) => return file_log::run(&log),
         Err(message) => {
             eprintln!("rctl: {message}\n\n{USAGE}");
             return ExitCode::from(2);

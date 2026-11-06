@@ -40,6 +40,17 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+/// Default path where rinit mirrors captured service output.
+///
+/// Shared with `rctl log --file` so the client and PID 1 cannot disagree about
+/// where the persisted log lives when neither was given an override.
+pub const DEFAULT_LOG_FILE: &str = "/var/log/rinit/log";
+
+/// Maximum number of rotated log files `--log-keep` accepts.
+///
+/// Shared with `rctl log --file`, which walks the same `.1` ... `.N` chain.
+pub const MAX_LOG_KEEP: usize = 64;
+
 pub mod control;
 pub mod error;
 pub mod logger;

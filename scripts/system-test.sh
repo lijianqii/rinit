@@ -193,6 +193,8 @@ await_log() {
     await_log 10 'started logdemo.service' || true
     # Give the oneshot a moment to run and its output to reach the buffer.
     sleep 1
+    printf 'rctl status logdemo.service\n' >&3
+    await_log 10 'log:' || true
     printf 'rctl log logdemo.service\n' >&3
     await_log 10 'rinit-log-marker' || true
     # A completed oneshot has nothing to restart: exit 4.
@@ -624,6 +626,7 @@ expect "rctl status --plain described the console unit" "target: started"
 expect "rctl status showed process memory" "Memory:"
 expect "rctl status showed process CPU" "CPU:"
 expect "rctl started a unit on demand" "started logdemo.service"
+expect "rctl status included recent service logs" "log:"
 expect "rctl log returned captured service output" "rinit-log-marker"
 expect "rctl stop stopped a unit" "stopped logdemo.service"
 expect "rctl reset-failed cleared the failed unit" "fault.service: cleared"

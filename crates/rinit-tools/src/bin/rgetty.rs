@@ -555,6 +555,27 @@ mod tests {
     }
 
     #[test]
+    fn option_parser_rejects_missing_values() {
+        for args in [
+            ["-l"].as_slice(),
+            ["-h"].as_slice(),
+            ["-t"].as_slice(),
+            ["-I"].as_slice(),
+        ] {
+            assert!(
+                parse_args(
+                    &args
+                        .iter()
+                        .map(|arg| (*arg).to_string())
+                        .collect::<Vec<_>>()
+                )
+                .is_err(),
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
     fn tty_paths_are_anchored_under_dev() {
         assert_eq!(tty_path("ttyAMA0"), "/dev/ttyAMA0");
         assert_eq!(tty_path("/dev/ttyS0"), "/dev/ttyS0");

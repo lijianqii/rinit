@@ -199,6 +199,30 @@ fn a_usage_error_exits_two() {
     assert_eq!(output.status.code(), Some(2));
 }
 
+/// `log --file` reads the persisted files locally, including rotation order,
+/// and must not need a control socket.
+#[test]
+fn log_file_mode_reads_rotations_without_a_server() {
+    let dir = TempDir::new("file-log");
+    let path = dir.0.join("log");
+    std::fs::write(
+        dir.0.join("log.2"),
+        "app.service: oldest\nother.service: noise\n",
+    )
+    .expect("rotated 2");
+    std::fs::write(dir.0.join("log.1"), "app.service: middle\n").expect("rotated 1");
+    std::fs::write(&path, "app.service: newest\n").expect("current");
+
+    let file = format!("--file={}", path.display());
+    let output = run_rctl(&dir, &["log", "app.service", &file, "--tail", "2"]);
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "app.service: middle\napp.service: newest\n"
+    );
+}
+
 /// `--help` and `--version` succeed without a server.
 #[test]
 fn help_and_version_need_no_server() {

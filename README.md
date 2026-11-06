@@ -323,12 +323,12 @@ make test           # check + test-system
 make gates          # acceptance gates: binary size + coverage thresholds
 ```
 
-`cargo test --offline --workspace` (what `make check` runs last) executes **1039
+`cargo test --offline --workspace` (what `make check` runs last) executes **1051
 tests** across 58 cargo test targets. The five shapes, and why each is not
 redundant:
 
-- **unit tests** next to the code (core 335, rinit 221, rinit-runtime 135,
-  rinit-tools 224, rctl 17, processes 5), including `proptest` properties over
+- **unit tests** next to the code (core 335, rinit 224, rinit-runtime 135,
+  rinit-tools 226, rctl 21, processes 7), including `proptest` properties over
   the parser;
 - **integration tests** in `crates/*/tests/`: the syscall layer against the real
   kernel (`rinit-runtime` 26: run unprivileged, they assert that each drop is
@@ -420,12 +420,12 @@ they are measured on the tree as it stands rather than copied from one run:
 | crate            | line coverage | functions |
 | ---------------- | ------------- | --------- |
 | `rinit-core`     | **97.87%**    | 581/591   |
-| `rinit-runtime`  | 85.73%        | 362/410   |
-| `rinit`          | 87.81%        | 794/887   |
-| `rinit-tools`    | 81.50%        | 653/851   |
-| `rctl`           | 93.38%        | 44/52     |
-| `processes`      | 83.98%        | 60/80     |
-| **total**        | **87.20%**    | 2494/2871 |
+| `rinit-runtime`  | 85.61%        | 362/410   |
+| `rinit`          | 88.12%        | 798/890   |
+| `rinit-tools`    | 81.67%        | 657/855   |
+| `rctl`           | 93.31%        | 55/64     |
+| `processes`      | 89.58%        | 67/83     |
+| **total**        | **87.50%**    | 2520/2893 |
 
 The plan's checklist asks for ≥80% overall and ≥90% in the core, so these are the
 numbers that answer it rather than a shape:
@@ -466,10 +466,11 @@ cargo llvm-cov --offline --workspace --html                  # target/llvm-cov/h
   queued to a bounded buffer and written
   in batches by the main loop, deliberately without a writer thread so `fork()`
   stays single-threaded; a disk slower than the queue drops its oldest lines and
-  says so in the file. There are no per-unit files, no `journalctl` query over
-  the file, and no syslog protocol. `rctl log` reads the ring, so a line is only
-  in the file for as long as the file is; whether that outlives a reboot is the
-  filesystem's business (tmpfs does not, a disk does).
+  says so in the file. There are no per-unit files, no indexed journal query,
+  and no syslog protocol; `rctl log --file` can read the plain text and its
+  rotations. `rctl log` reads the ring, so a line is only in the file for as long
+  as the file is; whether that outlives a reboot is the filesystem's business
+  (tmpfs does not, a disk does).
 - **Path-bearing tools accept byte paths; only their textual output is
   lossy.** `rm`, `cp`, `mv`, `cat`, `ls`, `stat`, `mkdir`, `ln`, `touch`,
   `readlink`, `realpath`, `basename`, `dirname`, `df`, `mktemp`, `mount` and
@@ -490,15 +491,17 @@ cargo llvm-cov --offline --workspace --html                  # target/llvm-cov/h
   `PR_CAPBSET_DROP`, so those units fail rather than run with the drop skipped -
   fail-closed by design, and the reason the §7.4 *success* paths are only ever
   proven in the guest, where rinit is root. The host tests prove the refusals.
-- **The shutdown path - `reboot(2)`, the SysRq fallback, the watchdog's magic
-  close - is not covered by the automated tests.** On the host it must not run
-  (it would reboot the machine), and the system test kills qemu rather than
-  asking the guest to shut down, so sending `SIGTERM` to PID 1 in the guest is
-  the manual check. The magic close is the one piece of it with automated
-  evidence: asserted against a stand-in device in `m2_lifecycle.rs`, where the
-  file shows the `V` after the feed bytes. In the guest the kernel also stops the
-  device on a reboot (`watchdog_stop_on_reboot`), so a graceful shutdown has two
-  independent reasons not to reset the machine.
+- **Shutdown is split between automated and unexercised paths.**
+  `scripts/reboot-test.sh` sends `SIGTERM` to PID 1, checks the shutdown log and
+  verifies that the guest comes back with its filesystem intact; it runs in CI.
+  The SysRq fallback has writer-level tests (`crates/rinit-runtime/src/syscall/reboot.rs`)
+  but is not triggered against a real `/proc/sysrq-trigger`, and the watchdog
+  reset itself is not exercised because proving it means deliberately wedging
+  PID 1. The magic close is asserted against a stand-in device in
+  `m2_lifecycle.rs`, where the file shows the `V` after the feed bytes. In the
+  guest the kernel also stops the device on a reboot
+  (`watchdog_stop_on_reboot`), so a graceful shutdown has two independent reasons
+  not to reset the machine.
 - **What a watchdog is *for* cannot be tested without hanging rinit.** The reset
   itself is not exercised: proving it means deliberately wedging PID 1 until the
   hardware fires, which would end the run being validated. What is proven is
@@ -552,7 +555,7 @@ repository or a measurement in this README:
 
 | plan §6 | where it stands |
 | ------- | --------------- |
-| boots as PID 1 in qemu (256M) with no kernel panic | `make test-system`: 105 assertions on aarch64 and armv7, including "no rinit panic" and four kernel-log checks |
+| boots as PID 1 in qemu (256M) with no kernel panic | `make test-system`: 106 assertions on aarch64 and armv7, including "no rinit panic" and four kernel-log checks |
 | 20 services in parallel, visibly faster than serial | **19.2x**: `make parallel` - 20 `oneshot` services that each sleep 1 s finish in 1065 ms together and 20 424 ms chained |
 | crash-restart, breaker, health checks | `make test-system` ("a crashed service is scheduled for restart", "the breaker tripped on the failing unit") and `crates/rinit/tests/m2_lifecycle.rs` |
 | `rctl` can start, stop, query and read logs | `make test-system`'s M3 block and `crates/rctl/tests/control.rs` |
@@ -560,7 +563,7 @@ repository or a measurement in this README:
 | 72 h soak with stable RSS | **Passed on the host.** Segment 9 on `8b373d8` completed **4,320/4,320 samples** and **8,640/8,640 control commands**. RSS peak per half fell from 5,168 kB to 4,300 kB, descriptor minima were 11 and 11 (peak 22), the maximum zombie streak was 1 transient sample, and the final quiescent sweep found 0 zombies. |
 | 24 h soak in the target guest | **Passed.** `7a5df04`, aarch64 `run-disk`, guest-side sampler: **1,440/1,440 samples** and **2,880/2,880 control commands** over 86,343 s. RSS stayed within 2,364–2,528 kB (half peaks 2,520/2,528), descriptors within 19–20, no zombie was ever observed, and the final sweep returned `quiescent=0 health_fail=0`. `eth0`, the default route, `udhcpc`, dropbear, `network.service` and `sshd.service` were healthy in every sample; the serial log shows one boot and no panic/OOM. Sampling runs inside the guest (`scripts/soak-qemu.sh` + `scripts/soak-guest.sh`), so a host SSH outage cannot end the run silently. |
 | binaries ≤2 MB dynamic / ≤4 MB static | [Measurements](#measurements-plan-01-calibration-point): 1.00 MiB dynamic arm64 / 1.07 MiB armv7, checked by `make size-check` |
-| unit test coverage ≥80% overall, ≥90% in the core | **87.20%** and **97.87%** (`make coverage-check`, [above](#testing)) |
+| unit test coverage ≥80% overall, ≥90% in the core | **87.50%** and **97.87%** (`make coverage-check`, [above](#testing)) |
 | documentation: architecture, unit format, `rctl`, porting | this README (architecture, status, measurements), [`docs/units.md`](docs/units.md) (every directive, its value syntax and its default), [`docs/porting.md`](docs/porting.md) (kernel, userspace, build, differences from systemd), and `rinit-开发计划.md` |
 
 One number the checklist does not ask for, but plan §0.1's design goals do: rinit's
@@ -877,7 +880,8 @@ rctl <COMMAND> [ARGS]
   stop <UNIT>             Stop a unit
   restart <UNIT>          Restart a unit
   reset-failed <UNIT>     Clear a unit's failed/start-limit state
-  log [UNIT] [--tail N]   Show buffered log (default: all lines)
+  log [UNIT] [--tail N] [--file[=PATH]]
+                          Show buffered log, or read the persisted file
   reload                  Re-read the unit directory and apply the difference
 
 Exit codes: 0 success  1 error  2 usage  3 no such unit  4 operation conflict
@@ -926,6 +930,12 @@ buffer. `rctl status UNIT` in the default systemd view appends the newest 10
 lines; `--tail N` changes that and `--tail 0` disables it. The other formats
 (`--plain`, `--short`, `--json`, `--card`) only include logs when `--tail` is
 given explicitly.
+
+`rctl log --file` reads the persisted file locally instead of asking rinit:
+`--file` uses `/var/log/rinit/log`, `--file=PATH` names another path, and the
+reader walks `PATH.1` ... `PATH.64` oldest-first before the current file. It
+filters by `{unit}: `, applies `--tail` to the matching lines, and never touches
+the control socket; a missing file is a normal read error.
 
 The ring is one global byte-bounded buffer shared by all units, so a noisy unit
 can evict another unit's oldest lines; `LINE_OVERHEAD` is part of the accounting,
@@ -1166,9 +1176,9 @@ command through the same spawn path a unit uses.
 
 The packed images (`build/out/initramfs-aarch64-unknown-linux-gnu.cpio.gz` and
 `…-demo.cpio.gz`: static busybox + dynamic rinit/rctl/processes + the installed
-tools + the unit directory + the `/etc`/`/var` skeleton) are 9.10 MiB
-(9 544 702 B) and 9.11 MiB (9 550 948 B) gzipped. The arm32 pair is 9.33 MiB
-(9 784 988 B) and 9.34 MiB (9 790 851 B).
+tools + the unit directory + the `/etc`/`/var` skeleton) are 9.11 MiB
+(9 550 172 B) and 9.11 MiB (9 556 333 B) gzipped. The arm32 pair is 9.34 MiB
+(9 789 786 B) and 9.34 MiB (9 795 897 B).
 The `run-disk` images are ext4 files of about 80-81 MiB logical size (roughly
 51-52 MiB used before the first boot, including the default 32 MiB swap file);
 they are not

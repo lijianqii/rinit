@@ -819,6 +819,68 @@ mod tests {
     }
 
     #[test]
+    fn optional_and_json_formatters_are_stable() {
+        assert_eq!(format_optional_bytes(None), "-");
+        assert_eq!(format_optional_bytes(Some(2048)), "2.0K");
+        assert_eq!(json_num(None), "null");
+        assert_eq!(json_num(Some(42)), "42");
+        assert_eq!(
+            json_string("\"\\\n\r\t\u{1}"),
+            "\"\\\"\\\\\\n\\r\\t\\u0001\""
+        );
+        assert_eq!(
+            format_row(&["a".to_string(), "bb".to_string()], &[2, 3]),
+            "a   bb "
+        );
+    }
+
+    #[test]
+    fn option_parser_accepts_equals_forms_and_rejects_incomplete_ones() {
+        let args = [
+            "--sort=rss",
+            "--limit=5",
+            "--pid=1,2",
+            "--user=1000",
+            "--proc-root=/tmp",
+            "--tree",
+            "--long",
+            "--json",
+            "--ascii",
+            "--no-header",
+            "--full",
+            "--reverse",
+        ]
+        .into_iter()
+        .map(String::from);
+        let opts = parse_args(args).expect("parse").expect("not help");
+        assert!(matches!(opts.sort, SortKey::Rss));
+        assert_eq!(opts.limit, Some(5));
+        assert_eq!(opts.pids.as_ref().map(BTreeSet::len), Some(2));
+        assert_eq!(opts.user.as_deref(), Some("1000"));
+        assert_eq!(opts.proc_root, PathBuf::from("/tmp"));
+        assert!(
+            opts.tree && opts.long && opts.json && opts.ascii && opts.no_header && opts.reverse
+        );
+
+        for args in [
+            ["--sort"].as_slice(),
+            ["--sort=bogus"].as_slice(),
+            ["--limit"].as_slice(),
+            ["--limit=x"].as_slice(),
+            ["--pid"].as_slice(),
+            ["--pid=,"].as_slice(),
+            ["--user"].as_slice(),
+            ["--proc-root"].as_slice(),
+            ["--unknown"].as_slice(),
+        ] {
+            assert!(
+                parse_args(args.iter().map(|arg| (*arg).to_string())).is_err(),
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
     fn format_helpers_are_stable() {
         assert_eq!(format_bytes(0), "0B");
         assert_eq!(format_bytes(1024), "1.0K");

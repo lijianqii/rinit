@@ -18,7 +18,7 @@
 描述符 19–20，全程无 zombie，最终扫描干净。
 
 下面列出现有的能力，以及各自的证据。每一条结论要么来自宿主测试（`make check`），
-要么来自客户机断言（`make test-system`，`scripts/system-test.sh` 里共 105 条）；
+要么来自客户机断言（`make test-system`，`scripts/system-test.sh` 里共 106 条）；
 "在宿主机上验证"始终指同一段代码的 fake-runtime 或 `--dev` 形态，"客户机"指真实形态。
 
 | 里程碑 | 内容 | 证据 |
@@ -295,9 +295,9 @@ make gates          # acceptance gates: binary size + coverage thresholds
 ```
 
 `cargo test --offline --workspace`（`make check` 最后一步跑的就是它）在 58 个
-cargo 测试目标里执行 **1039 个测试**。五种形态，以及为什么每种都不是多余的：
+cargo 测试目标里执行 **1051 个测试**。五种形态，以及为什么每种都不是多余的：
 
-- **单元测试**紧挨着代码（core 335、rinit 221、rinit-runtime 135、rinit-tools 224、rctl 17、processes 5），
+- **单元测试**紧挨着代码（core 335、rinit 224、rinit-runtime 135、rinit-tools 226、rctl 21、processes 7），
   包括解析器上的 `proptest` 属性测试；
 - **集成测试**在 `crates/*/tests/`：系统调用层面对真实内核（`rinit-runtime` 26 个：
   以非特权身份运行，断言每次降权都*被拒绝*而不是被静默跳过——`setuid(0)`、
@@ -330,7 +330,7 @@ cargo 测试目标里执行 **1039 个测试**。五种形态，以及为什么�
   这样门禁自己的算术也能被测；
 - **客户机系统测试**（`scripts/system-test.sh`，计划 §4.3）：在所选架构的 qemu 上启动
   真实的 initramfs，在控制台上输入以证明 root shell 可达，对运行中的系统驱动
-  `rctl`，并断言 105 件事——包括层级按依赖顺序运行、target 从不被 exec、§7.4 的
+  `rctl`，并断言 106 件事——包括层级按依赖顺序运行、target 从不被 exec、§7.4 的
   降权结果、§7.3 的限额从客户机自己的内核里读回、rinit 自己在启动时和 20 个服务下的
   RSS（从 `/proc/1/status` 读）、§4.3 的启动耗时（取自内核时钟）、qemu 真实挂载的
   设备上的 §7.5 看门狗、DHCP 客户端拿到的地址/路由/DNS、针对客户机自己的（可写的
@@ -363,12 +363,12 @@ qemu 的 `i6300esb` 设备和带该驱动编译的内核是测试装置的一部
 | crate            | 行覆盖率      | 函数      |
 | ---------------- | ------------- | --------- |
 | `rinit-core`     | **97.87%**    | 581/591   |
-| `rinit-runtime`  | 85.73%        | 362/410   |
-| `rinit`          | 87.81%        | 794/887   |
-| `rinit-tools`    | 81.50%        | 653/851   |
-| `rctl`           | 93.38%        | 44/52     |
-| `processes`      | 83.98%        | 60/80     |
-| **总计**         | **87.20%**    | 2494/2871 |
+| `rinit-runtime`  | 85.61%        | 362/410   |
+| `rinit`          | 88.12%        | 798/890   |
+| `rinit-tools`    | 81.67%        | 657/855   |
+| `rctl`           | 93.31%        | 55/64     |
+| `processes`      | 89.58%        | 67/83     |
+| **总计**         | **87.50%**    | 2520/2893 |
 
 计划清单要求总体 ≥80%、核心 ≥90%，所以回答它的是这些数字，而不是某种形状：
 
@@ -400,9 +400,10 @@ cargo llvm-cov --offline --workspace --html                  # target/llvm-cov/h
   `--log-max-bytes` 调整上限，用 `--log-keep` 保留轮转文件而不是原地截断；压缩
   刻意留给外部 logrotate，文件保持纯文本。捕获的行先进入
   有界队列，由主循环分批写入；为保持 `fork()` 单线程约束，故意不使用写线程。磁盘
-  慢于队列时丢弃最旧的行并在文件中说明。没有按单元分文件，不能对文件做
-  `journalctl` 式查询，也没有 syslog 协议。`rctl log` 读的是日志环，所以一行只在
-  文件存在期间才在文件里；它能不能活过一次重启取决于文件系统（tmpfs 不能，磁盘能）。
+  慢于队列时丢弃最旧的行并在文件中说明。没有按单元分文件，没有索引式 journal
+  查询，也没有 syslog 协议；`rctl log --file` 可以直接读取纯文本文件和轮转文件。
+  `rctl log` 读的是日志环，所以一行只在文件存在期间才在文件里；它能不能活过一次
+  重启取决于文件系统（tmpfs 不能，磁盘能）。
 - **带路径的工具都接受字节路径，只有文本输出仍可能有损。** `rm`、`cp`、
   `mv`、`cat`、`ls`、`stat`、`mkdir`、`ln`、`touch`、`readlink`、`realpath`、
   `basename`、`dirname`、`df`、`mktemp`、`mount`、`umount` 会把非 UTF-8 操作数
@@ -418,10 +419,12 @@ cargo llvm-cov --offline --workspace --html                  # target/llvm-cov/h
   `setgid`、`setgroups` 和 `PR_CAPBSET_DROP` 得到 `EPERM`，所以这些单元会失败，
   而不是跳过降权继续运行——这是有意的 fail-closed，也是为什么 §7.4 的*成功*路径只能
   在客户机（rinit 是 root）里证明。宿主测试证明的是拒绝行为。
-- **关闭路径——`reboot(2)`、SysRq 兜底、看门狗的 magic close——没有被自动化测试
-  覆盖。** 在宿主机上它不能运行（会重启机器），而系统测试是直接杀掉 qemu，而不是请
-  客户机自己关机，所以"向客户机的 PID 1 发 `SIGTERM`"是手工检查项。其中唯一有自动化
-  证据的是 magic close：在 `m2_lifecycle.rs` 里针对替身设备断言，文件在喂狗字节之后
+- **关闭路径分成已自动化和未演练两部分。**
+  `scripts/reboot-test.sh` 向 PID 1 发送 `SIGTERM`，检查关闭日志，并验证客户机带着
+  完整文件系统重新启动；它已经接入 CI。SysRq 兜底只有 writer 级测试
+  （`crates/rinit-runtime/src/syscall/reboot.rs`），没有对真实
+  `/proc/sysrq-trigger` 触发；看门狗复位本身仍不演练，因为证明它意味着故意卡死
+  PID 1。magic close 在 `m2_lifecycle.rs` 里针对替身设备断言，文件在喂狗字节之后
   出现 `V`。在客户机里，内核在重启时也会停止设备（`watchdog_stop_on_reboot`），
   所以一次优雅关闭有两条独立理由不会复位机器。
 - **看门狗*到底能干什么*没法在不卡死 rinit 的前提下测试。** 复位本身没有演练过：
@@ -460,7 +463,7 @@ cargo llvm-cov --offline --workspace --html                  # target/llvm-cov/h
 
 | 计划 §6 | 现状 |
 | ------- | --------------- |
-| 在 qemu（256M）里作为 PID 1 启动，内核无 panic | `make test-system`：aarch64 与 armv7 各 105 条断言，包括 "no rinit panic" 和四条内核日志检查 |
+| 在 qemu（256M）里作为 PID 1 启动，内核无 panic | `make test-system`：aarch64 与 armv7 各 106 条断言，包括 "no rinit panic" 和四条内核日志检查 |
 | 20 个服务并行，明显快于串行 | **19.2x**：`make parallel`——20 个各睡 1 s 的 `oneshot` 服务，并行总耗时 1065 ms，串行 20 424 ms |
 | 崩溃重启、熔断、健康检查 | `make test-system`（"a crashed service is scheduled for restart"、"the breaker tripped on the failing unit"）和 `crates/rinit/tests/m2_lifecycle.rs` |
 | `rctl` 能启动、停止、查询、读日志 | `make test-system` 的 M3 段和 `crates/rctl/tests/control.rs` |
@@ -468,7 +471,7 @@ cargo llvm-cov --offline --workspace --html                  # target/llvm-cov/h
 | 72 小时 soak，RSS 稳定 | **宿主上已通过。** 第九段在 `8b373d8` 上完成 **4,320/4,320 个样本**和 **8,640/8,640 条 control 命令**。前半段与后半段的 RSS 峰值分别为 5,168 kB 和 4,300 kB，描述符最低值均为 11（峰值 22），最大 zombie 连续出现 1 个瞬时采样，最终静默扫描为 0。 |
 | 24 小时目标客户机 soak | **已通过。** `7a5df04`，aarch64 `run-disk`，guest 内采样：86,343 秒内完成 **1,440/1,440 个样本**和 **2,880/2,880 条 control 命令**。RSS 保持在 2,364–2,528 kB（前后半段峰值 2,520/2,528），描述符 19–20，全程未观察到 zombie，最终检查为 `quiescent=0 health_fail=0`。每个样本里 `eth0`、默认路由、`udhcpc`、dropbear、`network.service` 和 `sshd.service` 都正常；串口日志只有一次启动，无 panic/OOM。采样在 guest 内运行（`scripts/soak-qemu.sh` + `scripts/soak-guest.sh`），宿主 SSH 断开不会让测试静默失效。 |
 | 二进制 ≤2 MB 动态 / ≤4 MB 静态 | [测量](#测量计划-01-校准点)：aarch64 动态 1.00 MiB、armv7 动态 1.07 MiB，由 `make size-check` 检查 |
-| 单元测试覆盖率总体 ≥80%、核心 ≥90% | **87.20%** 和 **97.87%**（`make coverage-check`，见[上文](#测试)） |
+| 单元测试覆盖率总体 ≥80%、核心 ≥90% | **87.50%** 和 **97.87%**（`make coverage-check`，见[上文](#测试)） |
 | 文档：架构、单元格式、`rctl`、移植 | 本 README（架构、状态、测量）、[`docs/units.md`](docs/units.md)（每条指令、取值语法和默认值）、[`docs/porting.md`](docs/porting.md)（内核、用户空间、构建、与 systemd 的差异），以及 `rinit-开发计划.md` |
 
 还有一个清单没要求、但计划 §0.1 的设计目标要求的数字：rinit 的 RSS，在*客户机里*从
@@ -745,7 +748,8 @@ rctl <COMMAND> [ARGS]
   stop <UNIT>             Stop a unit
   restart <UNIT>          Restart a unit
   reset-failed <UNIT>     Clear a unit's failed/start-limit state
-  log [UNIT] [--tail N]   Show buffered log (default: all lines)
+  log [UNIT] [--tail N] [--file[=PATH]]
+                          Show buffered log, or read the persisted file
   reload                  Re-read the unit directory and apply the difference
 
 Exit codes: 0 success  1 error  2 usage  3 no such unit  4 operation conflict
@@ -790,6 +794,11 @@ rinit 对**自己的**控制台输出限流，按调用点：每 5 秒 40 行，
 `rctl status UNIT` 会附带最近 10 行日志；`--tail N` 改变数量，`--tail 0` 关闭。
 `--plain`、`--short`、`--json`、`--card` 等其他格式只有在显式传入
 `--tail` 时才附带日志。
+
+`rctl log --file` 不经过控制 socket，直接在客户端读取持久化文件：`--file` 使用
+`/var/log/rinit/log`，`--file=PATH` 指定其他路径；读取顺序是 `PATH.1` …
+`PATH.64`（最旧到最新），最后读当前文件。它按 `{unit}: ` 前缀过滤，`--tail` 作用于
+匹配行；文件不存在时是普通读取错误。
 
 日志环是所有单元共享的一个有界字节缓冲，所以刷屏的单元可能挤掉其他单元最旧的行；
 `LINE_OVERHEAD` 也计入这份账，这样单元名不会让预算说谎。回复帧上限为 512 KiB
@@ -978,8 +987,8 @@ M0 的 bring-up 辅助程序 `rinit-testservice` 已经删除：没有东西再�
 
 打包后的镜像（`build/out/initramfs-aarch64-unknown-linux-gnu.cpio.gz` 和
 `…-demo.cpio.gz`：静态 busybox + 动态 rinit/rctl/processes + 已安装的工具 + 单元目录 + `/etc`/`/var` 骨架）
-gzip 后分别是 9.10 MiB（9 544 702 B）和 9.11 MiB（9 550 948 B）；arm32 的两个镜像
-分别是 9.33 MiB（9 784 988 B）和 9.34 MiB（9 790 851 B）。`run-disk` 的镜像是
+gzip 后分别是 9.11 MiB（9 550 172 B）和 9.11 MiB（9 556 333 B）；arm32 的两个镜像
+分别是 9.34 MiB（9 789 786 B）和 9.34 MiB（9 795 897 B）。`run-disk` 的镜像是
 约 80-81 MiB 的 ext4（首次启动前实际使用约 51-52 MiB，其中默认 swap 文件占
 32 MiB），不放进 initramfs。差值就是 `units/demo/`
 里的十四个文件，只有第二个镜像带它们。打包是可复现的——`scripts/mkinitramfs.sh` 把归档

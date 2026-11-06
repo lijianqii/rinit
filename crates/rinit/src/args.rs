@@ -83,7 +83,7 @@ pub struct Config {
 }
 
 /// Where captured service output is persisted by default (plan §1.3(7)).
-pub const DEFAULT_LOG_FILE: &str = "/var/log/rinit/log";
+pub use rinit_core::DEFAULT_LOG_FILE;
 
 /// Where the second-wave mount table lives by default (plan §1.3(9)).
 pub const DEFAULT_FSTAB: &str = "/etc/fstab";
@@ -316,10 +316,10 @@ fn parse_with_default<I: IntoIterator<Item = OsString>>(
             ));
         }
         match value.parse::<usize>() {
-            Ok(keep) if keep <= crate::logs::MAX_LOG_KEEP => Ok(keep),
+            Ok(keep) if keep <= rinit_core::MAX_LOG_KEEP => Ok(keep),
             Ok(_) => Err(format!(
                 "--log-keep: at most {} rotated files are supported",
-                crate::logs::MAX_LOG_KEEP
+                rinit_core::MAX_LOG_KEEP
             )),
             Err(_) => Err(format!("--log-keep: '{value}' is out of range")),
         }

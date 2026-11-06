@@ -631,6 +631,41 @@ mod tests {
     }
 
     #[test]
+    fn malformed_passwd_shadow_and_option_records_are_rejected() {
+        assert!(parse_passwd("short:x:0\n", "short").is_none());
+        assert!(parse_passwd("missing:x:not-a-uid:0::/:/bin/sh\n", "missing").is_none());
+        assert!(parse_shadow_hash("malformed\n", "malformed").is_none());
+        assert!(shadow_login_denied(
+            "root:$6$h:soon:0:99999:7:::",
+            "root",
+            1
+        ));
+        assert!(shadow_login_denied("root:$6$h:0:0:soon:7:::", "root", 1));
+        assert_eq!(password_hash_from("", None, "root"), None);
+        assert_eq!(
+            password_hash_from("x", Some("root:$6$h:0:0:99999:7:::\n"), "root").as_deref(),
+            Some("$6$h")
+        );
+        for args in [
+            ["-l"].as_slice(),
+            ["-h"].as_slice(),
+            ["-f"].as_slice(),
+            ["-p", "-h"].as_slice(),
+        ] {
+            assert!(
+                parse_args(
+                    &args
+                        .iter()
+                        .map(|arg| (*arg).to_string())
+                        .collect::<Vec<_>>()
+                )
+                .is_err(),
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
     fn password_hash_uses_passwd_or_shadow() {
         assert_eq!(
             password_hash_from("$6$direct$hash", None, "root").as_deref(),
