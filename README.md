@@ -323,12 +323,12 @@ make test           # check + test-system
 make gates          # acceptance gates: binary size + coverage thresholds
 ```
 
-`cargo test --offline --workspace` (what `make check` runs last) executes **1066
+`cargo test --offline --workspace` (what `make check` runs last) executes **1071
 tests** across 58 cargo test targets. The five shapes, and why each is not
 redundant:
 
-- **unit tests** next to the code (core 337, rinit 228, rinit-runtime 137,
-  rinit-tools 230, rctl 22, processes 8), including `proptest` properties over
+- **unit tests** next to the code (core 339, rinit 229, rinit-runtime 138,
+  rinit-tools 231, rctl 22, processes 8), including `proptest` properties over
   the parser;
 - **integration tests** in `crates/*/tests/`: the syscall layer against the real
   kernel (`rinit-runtime` 26: run unprivileged, they assert that each drop is
@@ -419,13 +419,13 @@ they are measured on the tree as it stands rather than copied from one run:
 
 | crate            | line coverage | functions |
 | ---------------- | ------------- | --------- |
-| `rinit-core`     | **97.86%**    | 585/595   |
-| `rinit-runtime`  | 84.90%        | 364/417   |
-| `rinit`          | 88.09%        | 812/903   |
-| `rinit-tools`    | 81.67%        | 666/869   |
+| `rinit-core`     | **97.87%**    | 587/597   |
+| `rinit-runtime`  | 84.84%        | 369/423   |
+| `rinit`          | 88.00%        | 815/906   |
+| `rinit-tools`    | 81.13%        | 670/877   |
 | `rctl`           | 93.54%        | 56/65     |
 | `processes`      | 89.61%        | 70/86     |
-| **total**        | **87.39%**    | 2553/2935 |
+| **total**        | **87.12%**    | 2567/2954 |
 
 The plan's checklist asks for ≥80% overall and ≥90% in the core, so these are the
 numbers that answer it rather than a shape:
@@ -563,7 +563,7 @@ repository or a measurement in this README:
 | 72 h soak with stable RSS | **Passed on the host.** Segment 9 on `8b373d8` completed **4,320/4,320 samples** and **8,640/8,640 control commands**. RSS peak per half fell from 5,168 kB to 4,300 kB, descriptor minima were 11 and 11 (peak 22), the maximum zombie streak was 1 transient sample, and the final quiescent sweep found 0 zombies. |
 | 24 h soak in the target guest | **Passed.** `7a5df04`, aarch64 `run-disk`, guest-side sampler: **1,440/1,440 samples** and **2,880/2,880 control commands** over 86,343 s. RSS stayed within 2,364–2,528 kB (half peaks 2,520/2,528), descriptors within 19–20, no zombie was ever observed, and the final sweep returned `quiescent=0 health_fail=0`. `eth0`, the default route, `udhcpc`, dropbear, `network.service` and `sshd.service` were healthy in every sample; the serial log shows one boot and no panic/OOM. Sampling runs inside the guest (`scripts/soak-qemu.sh` + `scripts/soak-guest.sh`), so a host SSH outage cannot end the run silently. |
 | binaries ≤2 MB dynamic / ≤4 MB static | [Measurements](#measurements-plan-01-calibration-point): 1.00 MiB dynamic arm64 / 1.07 MiB armv7, checked by `make size-check` |
-| unit test coverage ≥80% overall, ≥90% in the core | **87.39%** and **97.86%** (`make coverage-check`, [above](#testing)) |
+| unit test coverage ≥80% overall, ≥90% in the core | **87.12%** and **97.87%** (`make coverage-check`, [above](#testing)) |
 | documentation: architecture, unit format, `rctl`, porting | this README (architecture, status, measurements), [`docs/units.md`](docs/units.md) (every directive, its value syntax and its default), [`docs/porting.md`](docs/porting.md) (kernel, userspace, build, differences from systemd), and `rinit-开发计划.md` |
 
 One number the checklist does not ask for, but plan §0.1's design goals do: rinit's
@@ -1177,8 +1177,8 @@ command through the same spawn path a unit uses.
 The packed images (`build/out/initramfs-aarch64-unknown-linux-gnu.cpio.gz` and
 `…-demo.cpio.gz`: static busybox + dynamic rinit/rctl/processes + the installed
 tools + the unit directory + the `/etc`/`/var` skeleton) are 9.11 MiB
-(9 554 132 B) and 9.12 MiB (9 559 587 B) gzipped. The arm32 pair is 9.34 MiB
-(9 793 644 B) and 9.35 MiB (9 799 761 B).
+(9 553 070 B) and 9.12 MiB (9 558 799 B) gzipped. The arm32 pair is 9.34 MiB
+(9 791 153 B) and 9.35 MiB (9 799 266 B).
 The `run-disk` images are ext4 files of about 80-81 MiB logical size (roughly
 51-52 MiB used before the first boot, including the default 32 MiB swap file);
 they are not
