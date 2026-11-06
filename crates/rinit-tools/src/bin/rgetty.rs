@@ -211,6 +211,18 @@ fn open_tty(path: &str, local: bool, baud: u32) -> Result<(), String> {
         unsafe { libc::close(fd) };
         return Err(format!("{path}: not a terminal"));
     }
+    // Hang up the previous session on the old controlling terminal, if any.
+    // The new descriptor was opened first, so it survives the hangup; the
+    // explicit TIOCSCTTY below then makes it the new controlling terminal.
+    // The call is best-effort: a process without an old tty, or without
+    // CAP_SYS_TTY_CONFIG, still gets its terminal.
+    // SAFETY: vhangup takes no arguments; SIGHUP is temporarily ignored
+    // because the hangup targets the previous foreground group.
+    unsafe {
+        let previous = libc::signal(libc::SIGHUP, libc::SIG_IGN);
+        let _ = libc::vhangup();
+        libc::signal(libc::SIGHUP, previous);
+    }
     // SAFETY: a fresh session may fail only when this process is already the
     // session leader. In that case, drop any inherited controlling tty first:
     // TIOCSCTTY would otherwise fail even for the tty we are about to own.

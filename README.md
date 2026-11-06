@@ -420,9 +420,9 @@ they are measured on the tree as it stands rather than copied from one run:
 | crate            | line coverage | functions |
 | ---------------- | ------------- | --------- |
 | `rinit-core`     | **97.87%**    | 587/597   |
-| `rinit-runtime`  | 84.84%        | 369/423   |
+| `rinit-runtime`  | 84.95%        | 369/423   |
 | `rinit`          | 88.00%        | 815/906   |
-| `rinit-tools`    | 81.13%        | 670/877   |
+| `rinit-tools`    | 81.09%        | 670/877   |
 | `rctl`           | 93.54%        | 56/65     |
 | `processes`      | 89.61%        | 70/86     |
 | **total**        | **87.12%**    | 2567/2954 |
@@ -1177,8 +1177,8 @@ command through the same spawn path a unit uses.
 The packed images (`build/out/initramfs-aarch64-unknown-linux-gnu.cpio.gz` and
 `…-demo.cpio.gz`: static busybox + dynamic rinit/rctl/processes + the installed
 tools + the unit directory + the `/etc`/`/var` skeleton) are 9.11 MiB
-(9 553 070 B) and 9.12 MiB (9 558 799 B) gzipped. The arm32 pair is 9.34 MiB
-(9 791 153 B) and 9.35 MiB (9 799 266 B).
+(9 553 124 B) and 9.12 MiB (9 558 861 B) gzipped. The arm32 pair is 9.34 MiB
+(9 791 253 B) and 9.35 MiB (9 799 353 B).
 The `run-disk` images are ext4 files of about 80-81 MiB logical size (roughly
 51-52 MiB used before the first boot, including the default 32 MiB swap file);
 they are not

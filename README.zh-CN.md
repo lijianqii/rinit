@@ -363,9 +363,9 @@ qemu 的 `i6300esb` 设备和带该驱动编译的内核是测试装置的一部
 | crate            | 行覆盖率      | 函数      |
 | ---------------- | ------------- | --------- |
 | `rinit-core`     | **97.87%**    | 587/597   |
-| `rinit-runtime`  | 84.84%        | 369/423   |
+| `rinit-runtime`  | 84.95%        | 369/423   |
 | `rinit`          | 88.00%        | 815/906   |
-| `rinit-tools`    | 81.13%        | 670/877   |
+| `rinit-tools`    | 81.09%        | 670/877   |
 | `rctl`           | 93.54%        | 56/65     |
 | `processes`      | 89.61%        | 70/86     |
 | **总计**         | **87.12%**    | 2567/2954 |
@@ -987,8 +987,8 @@ M0 的 bring-up 辅助程序 `rinit-testservice` 已经删除：没有东西再�
 
 打包后的镜像（`build/out/initramfs-aarch64-unknown-linux-gnu.cpio.gz` 和
 `…-demo.cpio.gz`：静态 busybox + 动态 rinit/rctl/processes + 已安装的工具 + 单元目录 + `/etc`/`/var` 骨架）
-gzip 后分别是 9.11 MiB（9 553 070 B）和 9.12 MiB（9 558 799 B）；arm32 的两个镜像
-分别是 9.34 MiB（9 791 153 B）和 9.35 MiB（9 799 266 B）。`run-disk` 的镜像是
+gzip 后分别是 9.11 MiB（9 553 124 B）和 9.12 MiB（9 558 861 B）；arm32 的两个镜像
+分别是 9.34 MiB（9 791 253 B）和 9.35 MiB（9 799 353 B）。`run-disk` 的镜像是
 约 80-81 MiB 的 ext4（首次启动前实际使用约 51-52 MiB，其中默认 swap 文件占
 32 MiB），不放进 initramfs。差值就是 `units/demo/`
 里的十四个文件，只有第二个镜像带它们。打包是可复现的——`scripts/mkinitramfs.sh` 把归档
