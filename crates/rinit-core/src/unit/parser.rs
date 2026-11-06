@@ -416,10 +416,20 @@ impl Parser {
                 self.cfg.restart_sec = number(line, key, &tokens, Zero::Allowed)?;
             }
             (Section::Service, "StartLimitBurst") => {
+                const MAX_START_LIMIT_BURST: u32 = 1_000_000;
                 let value = number(line, key, &tokens, Zero::Rejected)?;
-                self.cfg.start_limit_burst = u32::try_from(value).map_err(|_| {
+                let value = u32::try_from(value).map_err(|_| {
                     invalid(line, key, &join_tokens(&tokens), "must fit in 32 bits")
                 })?;
+                if value > MAX_START_LIMIT_BURST {
+                    return Err(invalid(
+                        line,
+                        key,
+                        &join_tokens(&tokens),
+                        "is larger than the supported maximum of 1000000",
+                    ));
+                }
+                self.cfg.start_limit_burst = value;
             }
             (Section::Service, "StartLimitIntervalSec") => {
                 self.cfg.start_limit_interval_sec = number(line, key, &tokens, Zero::Allowed)?;
@@ -487,11 +497,19 @@ impl Parser {
                 self.cfg.idle_timeout_sec = number(line, key, &tokens, Zero::Allowed)?;
             }
             (Section::Service, "Sockets") => {
+                if tokens.is_empty() {
+                    // List-valued directives treat an empty value as an empty
+                    // list, the same way Requires= and Wants= do.
+                    return Ok(());
+                }
                 let path = joined();
                 require_absolute(line, key, &path)?;
                 self.cfg.sockets.push(path);
             }
             (Section::Service, "NeedsSocket") => {
+                if tokens.is_empty() {
+                    return Ok(());
+                }
                 let path = joined();
                 require_absolute(line, key, &path)?;
                 self.cfg.needs_socket.push(path);
@@ -1720,6 +1738,16 @@ mod tests {
         ));
     }
 
+    /// A huge burst would otherwise let the failure window grow without bound.
+    #[test]
+    fn a_start_limit_burst_above_the_memory_bound_is_rejected() {
+        let text = "[Service]\nExecStart=/bin/true\nStartLimitBurst=1000001\n";
+        assert!(matches!(
+            err("app.service", text),
+            ParseError::InvalidValue { line: 3, .. }
+        ));
+    }
+
     /// Plan §1.1: every numeric directive *other* than the four above rejects
     /// 0 with `InvalidValue`.
     #[test]
@@ -2064,6 +2092,16 @@ mod tests {
     }
 
     /// The complete example from plan §1.3(1) must parse verbatim.
+    #[test]
+    fn empty_socket_lists_are_empty_not_invalid_paths() {
+        let cfg = ok(
+            "app.service",
+            "[Service]\nExecStart=/bin/true\nSockets=\nNeedsSocket=\n",
+        );
+        assert!(cfg.sockets.is_empty());
+        assert!(cfg.needs_socket.is_empty());
+    }
+
     #[test]
     fn the_plans_full_example_parses() {
         let cfg = ok(

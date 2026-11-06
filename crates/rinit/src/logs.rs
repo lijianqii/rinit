@@ -207,28 +207,53 @@ impl LogFile {
 
     /// Append one already-formatted record, rotating or truncating first when
     /// the write would pass the bound.
+    ///
+    /// A drained batch contains whole records. Splitting the batch at newlines
+    /// keeps the bound meaningful when a batch is larger than a small
+    /// `--log-max-bytes`; one individual record may still be larger than the
+    /// bound, because truncating an arbitrary log line would silently lose
+    /// more than the size limit itself.
     fn append_text(&mut self, text: &str) {
-        if text.is_empty() {
-            return;
-        }
-        if self.file.is_none() && !self.reopen() {
-            return;
-        }
-        if self.written.saturating_add(text.len() as u64) > self.max_bytes && !self.rotate() {
-            return;
-        }
-        let Some(file) = self.file.as_mut() else {
-            return;
-        };
-        match file.write_all(text.as_bytes()) {
-            Ok(()) => {
-                self.written = self.written.saturating_add(text.len() as u64);
-                self.warned = false;
+        for record in text.split_inclusive('\n') {
+            if !self.append_record(record) {
+                return;
             }
-            // A log is diagnostic: a full disk must not take the system with it,
-            // and it must not fill the console either - hence once.
-            Err(e) => self.warn(&e),
         }
+    }
+
+    fn append_record(&mut self, record: &str) -> bool {
+        let bytes = record.as_bytes();
+        let mut offset = 0;
+        while offset < bytes.len() {
+            if self.file.is_none() && !self.reopen() {
+                return false;
+            }
+            if self.written >= self.max_bytes && !self.rotate(bytes.len() - offset) {
+                return false;
+            }
+            let room = (self.max_bytes - self.written) as usize;
+            let take = room.min(bytes.len() - offset);
+            let Some(chunk) = bytes.get(offset..offset.saturating_add(take)) else {
+                return false;
+            };
+            let Some(file) = self.file.as_mut() else {
+                return false;
+            };
+            match file.write_all(chunk) {
+                Ok(()) => {
+                    self.written = self.written.saturating_add(take as u64);
+                    self.warned = false;
+                    offset += take;
+                }
+                // A log is diagnostic: a full disk must not take the system with
+                // it, and it must not fill the console either - hence once.
+                Err(e) => {
+                    self.warn(&e);
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     /// Make room for the next write.
@@ -237,9 +262,9 @@ impl LogFile {
     /// and leave a marker. With `keep > 0` the current file becomes `path.1`,
     /// older files shift up, and the oldest is removed; the total on-disk bound
     /// is therefore roughly `(keep + 1) * max_bytes`.
-    fn rotate(&mut self) -> bool {
+    fn rotate(&mut self, needed: usize) -> bool {
         if self.keep == 0 {
-            return self.truncate();
+            return self.truncate(needed);
         }
 
         let oldest = self.rotated_path(self.keep);
@@ -264,7 +289,7 @@ impl LogFile {
                 self.warn(&e);
                 // Rotation did not happen, but the current file is still the
                 // one we own: fall back to the bounded truncate policy.
-                return self.truncate();
+                return self.truncate(needed);
             }
         }
         // The old descriptor still names the renamed file; close it before
@@ -281,19 +306,20 @@ impl LogFile {
     ///
     /// The marker bytes count against the bound, so a file that is truncated at
     /// `max_bytes` does not silently exceed it just because it says so.
-    fn truncate(&mut self) -> bool {
+    fn truncate(&mut self, needed: usize) -> bool {
         if self.file.is_none() && !self.reopen() {
             return false;
         }
         let marker = b"log truncated: the previous contents were dropped\n";
         let marker_len = marker.len() as u64;
         let max_bytes = self.max_bytes;
+        let marker_fits = marker_len.saturating_add(needed as u64) <= max_bytes;
         let outcome = {
             let Some(file) = self.file.as_mut() else {
                 return false;
             };
             file.set_len(0).and_then(|()| {
-                if marker_len <= max_bytes {
+                if marker_fits {
                     file.write_all(marker)
                 } else {
                     Ok(())
@@ -302,11 +328,7 @@ impl LogFile {
         };
         match outcome {
             Ok(()) => {
-                self.written = if marker_len <= max_bytes {
-                    marker_len
-                } else {
-                    0
-                };
+                self.written = if marker_fits { marker_len } else { 0 };
                 self.warned = false;
                 true
             }
@@ -654,7 +676,7 @@ mod tests {
     fn the_log_file_truncates_at_its_bound() {
         let path = std::env::temp_dir().join(format!("rinit-logs-cap-{}", std::process::id()));
         let _ = std::fs::remove_file(&path);
-        let mut file = LogFile::open(&path, 64, 0).expect("open");
+        let mut file = LogFile::open(&path, 128, 0).expect("open");
         let app = unit("app.service");
         for _ in 0..20 {
             file.append_text(&format!("{app}: 0123456789\n"));
@@ -775,6 +797,23 @@ mod tests {
         let written = std::fs::read_to_string(&path).expect("read back");
         assert_eq!(written, "x\n");
         assert!(!written.contains("log truncated"), "{written}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_batch_larger_than_the_bound_is_split_at_records() {
+        let dir =
+            std::env::temp_dir().join(format!("rinit-logs-batch-bound-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("rinit.log");
+        let mut file = LogFile::open(&path, 64, 0).expect("open");
+        let batch = (0..10)
+            .map(|index| format!("app.service: line {index}\n"))
+            .collect::<String>();
+        file.append_text(&batch);
+        let written = std::fs::read(&path).expect("read back");
+        assert!(written.len() <= 64, "got {} bytes", written.len());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

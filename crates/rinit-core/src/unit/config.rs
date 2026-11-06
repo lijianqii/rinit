@@ -177,13 +177,13 @@ impl CpuQuota {
             return pct
                 .parse::<u32>()
                 .ok()
-                .filter(|p| *p <= 100)
+                .filter(|p| *p > 0 && *p <= 100)
                 .map(CpuQuota::Percent);
         }
         let mut parts = s.split_whitespace();
         let quota = parts.next()?.parse::<u64>().ok()?;
         let period = parts.next()?.parse::<u64>().ok()?;
-        if parts.next().is_some() || period == 0 {
+        if parts.next().is_some() || quota == 0 || period == 0 {
             return None;
         }
         Some(CpuQuota::QuotaPeriod { quota, period })
@@ -566,8 +566,10 @@ mod tests {
         for bad in [
             "",
             "%",
+            "0%",
             "101%",
             "abc%",
+            "0 100000",
             "200000",
             "200000 0",
             "200000 100000 x",

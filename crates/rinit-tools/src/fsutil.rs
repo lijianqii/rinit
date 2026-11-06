@@ -8,8 +8,9 @@
 use std::ffi::{CStr, CString};
 use std::fs;
 use std::io;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 /// Copy one filesystem entry.
@@ -31,45 +32,335 @@ pub fn copy_entry(src: &Path, dst: &Path, recursive: bool, preserve: bool) -> io
                 "omitting directory",
             ));
         }
-        let created = match fs::symlink_metadata(dst) {
-            Ok(existing) if !existing.is_dir() => {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "destination is not a directory",
-                ));
-            }
-            Ok(_) => false,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                fs::create_dir(dst)?;
-                true
-            }
-            Err(error) => return Err(error),
-        };
-        if created {
-            // A recursive copy must not widen a private source directory just
-            // because the process umask is more permissive.
-            fs::set_permissions(dst, fs::Permissions::from_mode(meta.mode() & 0o7777))?;
-        }
-        for entry in fs::read_dir(src)? {
-            let entry = entry?;
-            copy_entry(&entry.path(), &dst.join(entry.file_name()), true, preserve)?;
-        }
-        if preserve {
-            apply_metadata(dst, &meta)?;
-        }
-        Ok(())
+        copy_directory(src, dst, preserve)
     } else if file_type.is_file() {
-        fs::copy(src, dst)?;
-        if preserve {
-            apply_metadata(dst, &meta)?;
-        }
-        Ok(())
+        copy_file(src, dst, preserve)
     } else {
         Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "unsupported file type",
         ))
     }
+}
+
+/// Open a directory without following a final symlink.
+fn open_directory(path: &Path) -> io::Result<fs::File> {
+    let path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    // SAFETY: the path is NUL-terminated and the flags describe a directory
+    // open with O_NOFOLLOW.
+    let fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        // SAFETY: open returned a fresh descriptor we own.
+        Ok(unsafe { fs::File::from_raw_fd(fd) })
+    }
+}
+
+fn copy_file(src: &Path, dst: &Path, preserve: bool) -> io::Result<()> {
+    let meta = fs::metadata(src)?;
+    let mut source = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(src)?;
+    let mut destination = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(meta.mode() & 0o7777)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(dst)?;
+    io::copy(&mut source, &mut destination)?;
+    destination.set_permissions(fs::Permissions::from_mode(meta.mode() & 0o7777))?;
+    if preserve {
+        set_file_times(destination.as_raw_fd(), &meta)?;
+    }
+    Ok(())
+}
+
+fn set_file_times(fd: libc::c_int, meta: &fs::Metadata) -> io::Result<()> {
+    let times = [
+        libc::timespec {
+            tv_sec: meta.atime() as libc::time_t,
+            tv_nsec: meta.atime_nsec() as libc::c_long,
+        },
+        libc::timespec {
+            tv_sec: meta.mtime() as libc::time_t,
+            tv_nsec: meta.mtime_nsec() as libc::c_long,
+        },
+    ];
+    // SAFETY: fd is an open file and `times` holds two valid timespecs.
+    if unsafe { libc::futimens(fd, times.as_ptr()) } != 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn copy_directory(src: &Path, dst: &Path, preserve: bool) -> io::Result<()> {
+    let source = open_directory(src)?;
+    let source_meta = fs::metadata(src)?;
+    let created = match fs::symlink_metadata(dst) {
+        Ok(existing) if !existing.is_dir() => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "destination is not a directory",
+            ));
+        }
+        Ok(_) => false,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir(dst)?;
+            true
+        }
+        Err(error) => return Err(error),
+    };
+    let destination = open_directory(dst)?;
+    if created {
+        destination.set_permissions(fs::Permissions::from_mode(source_meta.mode() & 0o7777))?;
+    }
+    copy_dir_entries(source.as_raw_fd(), destination.as_raw_fd(), preserve)?;
+    if preserve {
+        set_file_times(destination.as_raw_fd(), &source_meta)?;
+    }
+    Ok(())
+}
+
+fn copy_dir_entries(
+    source_fd: libc::c_int,
+    destination_fd: libc::c_int,
+    preserve: bool,
+) -> io::Result<()> {
+    // SAFETY: dup creates a private descriptor for fdopendir to own.
+    let duplicated = unsafe { libc::dup(source_fd) };
+    if duplicated < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: duplicated is an open directory descriptor and fdopendir owns it.
+    let dir = unsafe { libc::fdopendir(duplicated) };
+    if dir.is_null() {
+        // SAFETY: fdopendir failed, so the duplicate is still ours.
+        unsafe { libc::close(duplicated) };
+        return Err(io::Error::last_os_error());
+    }
+
+    let mut result = Ok(());
+    loop {
+        // SAFETY: errno is reset because readdir uses NULL for both EOF and error.
+        unsafe { *libc::__errno_location() = 0 };
+        // SAFETY: dir is a valid DIR stream.
+        let entry = unsafe { libc::readdir(dir) };
+        if entry.is_null() {
+            // SAFETY: errno storage is valid.
+            let errno = unsafe { *libc::__errno_location() };
+            if errno != 0 {
+                result = Err(io::Error::from_raw_os_error(errno));
+            }
+            break;
+        }
+        // SAFETY: a non-null dirent has a NUL-terminated d_name.
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+        let bytes = name.to_bytes();
+        if bytes == b"." || bytes == b".." {
+            continue;
+        }
+        let Ok(name_c) = CString::new(bytes) else {
+            result = Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "directory entry contains NUL",
+            ));
+            break;
+        };
+        // SAFETY: both descriptors are valid directories and name_c is valid.
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe {
+            libc::fstatat(
+                source_fd,
+                name_c.as_ptr(),
+                &mut stat,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            result = Err(io::Error::last_os_error());
+            break;
+        }
+        let mode = stat.st_mode & 0o7777;
+        if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
+            // SAFETY: openat does not follow the final component.
+            let child_source = unsafe {
+                libc::openat(
+                    source_fd,
+                    name_c.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if child_source < 0 {
+                result = Err(io::Error::last_os_error());
+                break;
+            }
+            // SAFETY: mkdirat creates the destination relative to its dirfd.
+            let mkdir = unsafe { libc::mkdirat(destination_fd, name_c.as_ptr(), mode) };
+            if mkdir != 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::AlreadyExists {
+                    unsafe { libc::close(child_source) };
+                    result = Err(error);
+                    break;
+                }
+            }
+            // SAFETY: the child undertakes the same no-follow open as above.
+            let child_destination = unsafe {
+                libc::openat(
+                    destination_fd,
+                    name_c.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if child_destination < 0 {
+                unsafe { libc::close(child_source) };
+                result = Err(io::Error::last_os_error());
+                break;
+            }
+            // SAFETY: both child descriptors are valid directory descriptors
+            // and are consumed by the recursive call's dup/fdopendir path.
+            if let Err(error) = copy_dir_entries(child_source, child_destination, preserve) {
+                unsafe {
+                    libc::close(child_source);
+                    libc::close(child_destination);
+                }
+                result = Err(error);
+                break;
+            }
+            // SAFETY: descriptors are still ours after the recursive read.
+            unsafe {
+                libc::fchmod(child_destination, mode);
+                if preserve {
+                    let mut child_meta: libc::stat = std::mem::zeroed();
+                    libc::fstat(child_source, &mut child_meta);
+                    // `futimens` is easiest through a File view, but the fd is
+                    // still our own here.
+                    let file = fs::File::from_raw_fd(child_destination);
+                    let times = [
+                        libc::timespec {
+                            tv_sec: child_meta.st_atime as libc::time_t,
+                            tv_nsec: child_meta.st_atime_nsec as libc::c_long,
+                        },
+                        libc::timespec {
+                            tv_sec: child_meta.st_mtime as libc::time_t,
+                            tv_nsec: child_meta.st_mtime_nsec as libc::c_long,
+                        },
+                    ];
+                    libc::futimens(file.as_raw_fd(), times.as_ptr());
+                    libc::close(child_source);
+                    // File drops and closes child_destination.
+                    drop(file);
+                } else {
+                    libc::close(child_source);
+                    libc::close(child_destination);
+                }
+            }
+        } else if stat.st_mode & libc::S_IFMT == libc::S_IFLNK {
+            let mut target = vec![0u8; 4096];
+            // SAFETY: readlinkat writes at most target.len() bytes.
+            let read = unsafe {
+                libc::readlinkat(
+                    source_fd,
+                    name_c.as_ptr(),
+                    target.as_mut_ptr().cast(),
+                    target.len(),
+                )
+            };
+            if read < 0 {
+                result = Err(io::Error::last_os_error());
+                break;
+            }
+            target.truncate(read as usize);
+            // SAFETY: unlinkat ignores a missing destination.
+            unsafe { libc::unlinkat(destination_fd, name_c.as_ptr(), 0) };
+            let target_c = CString::new(target)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "symlink contains NUL"))?;
+            // SAFETY: symlinkat creates the link relative to the destination fd.
+            if unsafe { libc::symlinkat(target_c.as_ptr(), destination_fd, name_c.as_ptr()) } != 0 {
+                result = Err(io::Error::last_os_error());
+                break;
+            }
+        } else if stat.st_mode & libc::S_IFMT == libc::S_IFREG {
+            // SAFETY: openat does not follow the final component.
+            let child_source = unsafe {
+                libc::openat(
+                    source_fd,
+                    name_c.as_ptr(),
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if child_source < 0 {
+                result = Err(io::Error::last_os_error());
+                break;
+            }
+            // SAFETY: openat creates/truncates the destination file without
+            // following a final symlink.
+            let child_destination = unsafe {
+                libc::openat(
+                    destination_fd,
+                    name_c.as_ptr(),
+                    libc::O_WRONLY
+                        | libc::O_CREAT
+                        | libc::O_TRUNC
+                        | libc::O_NOFOLLOW
+                        | libc::O_CLOEXEC,
+                    mode,
+                )
+            };
+            if child_destination < 0 {
+                unsafe { libc::close(child_source) };
+                result = Err(io::Error::last_os_error());
+                break;
+            }
+            // SAFETY: both descriptors are fresh and owned here.
+            let mut source = unsafe { fs::File::from_raw_fd(child_source) };
+            let mut destination = unsafe { fs::File::from_raw_fd(child_destination) };
+            if let Err(error) = io::copy(&mut source, &mut destination) {
+                result = Err(error);
+                break;
+            }
+            if unsafe { libc::fchmod(destination.as_raw_fd(), mode) } != 0 {
+                result = Err(io::Error::last_os_error());
+                break;
+            }
+            if preserve {
+                let mut child_meta: libc::stat = unsafe { std::mem::zeroed() };
+                // SAFETY: source is valid and its fd is open.
+                unsafe { libc::fstat(source.as_raw_fd(), &mut child_meta) };
+                let times = [
+                    libc::timespec {
+                        tv_sec: child_meta.st_atime as libc::time_t,
+                        tv_nsec: child_meta.st_atime_nsec as libc::c_long,
+                    },
+                    libc::timespec {
+                        tv_sec: child_meta.st_mtime as libc::time_t,
+                        tv_nsec: child_meta.st_mtime_nsec as libc::c_long,
+                    },
+                ];
+                // SAFETY: destination is valid and times holds two timespecs.
+                unsafe { libc::futimens(destination.as_raw_fd(), times.as_ptr()) };
+            }
+        } else {
+            result = Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "unsupported file type",
+            ));
+            break;
+        }
+    }
+    // SAFETY: dir was returned by fdopendir and is no longer used.
+    unsafe { libc::closedir(dir) };
+    result
 }
 
 /// Remove one entry, descending into directories only when `recursive`.

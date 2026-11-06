@@ -237,6 +237,26 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn recursive_copy_recreates_symlinks_without_following_them() {
+        let root = temp_root("symlink-copy");
+        let src = root.join("tree");
+        let target = root.join("outside");
+        fs::create_dir_all(&src).expect("tree");
+        fs::write(&target, b"outside").expect("target");
+        std::os::unix::fs::symlink(&target, src.join("link")).expect("link");
+        let options = Options {
+            recursive: true,
+            ..Options::default()
+        };
+        copy_one(&src, &root.join("copy"), options).expect("copy");
+        let copied = root.join("copy/link");
+        assert_eq!(fs::read_link(&copied).expect("readlink"), target);
+        assert_eq!(fs::read(&target).expect("target"), b"outside");
+        assert!(!root.join("copy/outside").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
     /// Copying a directory into its own subtree must fail before the first
     /// mkdir, or the directory walk sees the new child and recurses forever.
     #[test]

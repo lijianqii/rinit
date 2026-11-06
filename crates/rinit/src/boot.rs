@@ -500,6 +500,15 @@ impl Boot {
                     } else if matches!(state, Some(UnitState::Starting)) {
                         // Still starting; the manager's deadline or the notify
                         // socket will make the next step observable.
+                    } else if matches!(
+                        state,
+                        Some(UnitState::RestartWait | UnitState::Deactivating)
+                    ) {
+                        // The unit reached supervision and is now restarting or
+                        // stopping; that is not a boot-start failure. A service
+                        // that never became ready stays Starting until its
+                        // deadline and takes the failure path below.
+                        self.pending.remove(&unit);
                     } else {
                         // The flow is gone and the unit never reached the
                         // readiness point: this is a failed start, and its

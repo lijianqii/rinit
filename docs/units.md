@@ -79,8 +79,8 @@ of that). `After` alone orders without pulling in, exactly as in systemd.
 | `PIDFile` | absolute path | none | Where a `Type=forking` daemon writes its pid (plan §7.10). Only a regular file is accepted, at most 4 KiB; an unreadable, non-regular or oversized file fails the start. |
 | `SocketActivate` | absolute path | none | A socket rinit binds and starts the unit from (plan §7.9): the unit is *not* started at boot, the first connection is. The service is handed the listening socket on fd 3, with `LISTEN_FDS=1`. |
 | `IdleTimeoutSec` | seconds, `0` = never stop | `0` | How long a socket-activated unit may stay up with no *new* connection before rinit stops it. |
-| `Sockets` | absolute path (repeatable) | none | A socket path this unit creates (plan §7.8). rinit creates nothing - this is the declaration that lets another unit's `NeedsSocket=` resolve to *this* unit. |
-| `NeedsSocket` | absolute path (repeatable) | none | A socket path this unit needs before it starts (plan §7.8). The unit waits for the path, bounded by `TimeoutStartSec`, and fails its start if it never appears. |
+| `Sockets` | absolute path (repeatable; empty = none) | none | A socket path this unit creates (plan §7.8). rinit creates nothing - this is the declaration that lets another unit's `NeedsSocket=` resolve to *this* unit. |
+| `NeedsSocket` | absolute path (repeatable; empty = none) | none | A socket path this unit needs before it starts (plan §7.8). The unit waits for the path, bounded by `TimeoutStartSec`, and fails its start if it never appears. |
 | `TTYPath` | absolute path | none | A controlling terminal for the service (plan §7.11): the child opens it after `setsid`, takes it with `TIOCSCTTY` and uses it as stdin/stdout/stderr. |
 | `TTYReset` | `true`/`false` | `true` | Hang the terminal up when taking it over, so a respawned console service starts on a clean one rather than on the last session's leftovers. Best effort: a device that does not implement it is still used. |
 | `WorkingDirectory` | absolute path | `/` | The child's working directory. Empty keeps the default. |
@@ -198,7 +198,7 @@ rather than leaving a service that believes it owns a terminal.
 | --- | ----- | ------- | ------- |
 | `Restart` | `no`, `always`, `on-success`, `on-failure`, `on-abnormal` | `no` | Which exits are retried. |
 | `RestartSec` | seconds, `0` allowed | `2` | Backoff base; the delay jitters upward from it. |
-| `StartLimitBurst` | count, `0` rejected | `5` | Restart attempts allowed inside the window before the breaker trips. Clean exits under `Restart=always`/`on-success` count too: the breaker is a restart-rate limit, not only a crash counter. |
+| `StartLimitBurst` | count, `1`–`1000000` | `5` | Restart attempts allowed inside the window before the breaker trips. Clean exits under `Restart=always`/`on-success` count too: the breaker is a restart-rate limit, not only a crash counter. |
 | `StartLimitIntervalSec` | seconds, `0` allowed | `10` | The window. `0` disables the breaker. |
 | `TimeoutStartSec` | seconds, `0` = forever | `30` | How long a start may take (`notify`, `forking`, `oneshot`). |
 | `TimeoutStopSec` | seconds, `0` = `SIGKILL` at once | `10` | How long a stop may take before `SIGKILL`. |
@@ -240,7 +240,7 @@ unit starts; a unit with none of these has no cgroup of its own.
 | --- | ----- | ------- | ------- |
 | `CgroupMemoryMax` | bytes with optional `K`/`M`/`G` | unlimited | Hard limit; over it, the *cgroup's* OOM killer takes a process (reported on the console, and the unit's `Restart=` decides what happens next). |
 | `CgroupMemoryHigh` | bytes, same suffixes | unlimited | Soft limit: throttling and reclaim pressure before the hard one. |
-| `CgroupCPUMax` | `50%` or `quota period` in microseconds | unlimited | CPU bandwidth. |
+| `CgroupCPUMax` | positive `50%` or `quota period` in microseconds | unlimited | CPU bandwidth. |
 | `CgroupTasksMax` | count, `0` rejected | unlimited | `pids.max`. |
 
 A limit the kernel cannot express (no `pids` controller, no `cpu.max` without

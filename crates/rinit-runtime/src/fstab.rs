@@ -190,6 +190,14 @@ pub fn enabled(cmdline: &str) -> bool {
 /// fstab line names where a filesystem *goes*, and a board whose `/data` is empty
 /// because nothing has ever mounted there is the normal case.
 pub fn mount_with(ops: &mut impl MountOps, text: &str) -> FstabReport {
+    mount_with_mounted(ops, text, None)
+}
+
+fn mount_with_mounted(
+    ops: &mut impl MountOps,
+    text: &str,
+    current_mounts: Option<&str>,
+) -> FstabReport {
     let (entries, mut warnings) = parse(text);
     let mut mounted = Vec::new();
     for entry in entries {
@@ -199,6 +207,17 @@ pub fn mount_with(ops: &mut impl MountOps, text: &str) -> FstabReport {
             continue;
         }
         let point = entry.mountpoint.to_string_lossy().into_owned();
+        if current_mounts.is_some_and(|mounts| {
+            mounts
+                .lines()
+                .filter_map(|line| line.split_whitespace().nth(1))
+                .map(crate::mounts::unescape_mount_field)
+                .any(|mounted| mounted == point)
+        }) {
+            // The first wave (or the kernel) already mounted it. Mounting it
+            // again would stack a second filesystem on the same point.
+            continue;
+        }
         if let Err(e) = ops.mkdir_p(&entry.mountpoint) {
             warnings.push(format!("cannot create {point}: {e}"));
             continue;
@@ -254,7 +273,10 @@ pub fn run_with(ops: &mut impl MountOps, path: &Path) -> Result<FstabReport, Sys
         Ok(text) => text,
         Err(e) => return Err(SyscallError::from_io("read(/etc/fstab)", &e)),
     };
-    Ok(mount_with(ops, &text))
+    let current = std::fs::read("/proc/mounts")
+        .ok()
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+    Ok(mount_with_mounted(ops, &text, current.as_deref()))
 }
 
 #[cfg(test)]
@@ -459,6 +481,19 @@ mod tests {
             3,
             "and the third entry was still attempted"
         );
+    }
+
+    #[test]
+    fn already_mounted_targets_are_not_mounted_again() {
+        let mut ops = Recorder::default();
+        let report = mount_with_mounted(
+            &mut ops,
+            "proc /proc proc defaults 0 0\ntmpfs /data tmpfs defaults 0 0\n",
+            Some("proc /proc proc rw 0 0\n"),
+        );
+        assert_eq!(report.mounted, ["/data"]);
+        assert_eq!(ops.calls.len(), 1, "{:?}", ops.calls);
+        assert!(ops.calls[0].starts_with("tmpfs /data"), "{:?}", ops.calls);
     }
 
     /// `nofstab` is the plan's trigger, and it is a whole token rather than a
