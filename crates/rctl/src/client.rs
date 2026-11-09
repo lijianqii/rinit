@@ -12,12 +12,12 @@ use rinit_core::{
 
 /// The longest `rctl` waits for a reply.
 ///
-/// The server gives the manager 60 s and then sends its own timeout reply; 65 s
-/// leaves 5 s for that reply to arrive, so the client normally reports the
-/// server's sentence ("timed out waiting for the manager") instead of a bare
-/// socket timeout. Without it, a server that stops sending would leave `rctl`
-/// blocked in `read` forever, and a CI job hanging looks like the machine, not
-/// like the bug.
+/// The server gives the manager 600 s and then sends its own timeout reply;
+/// 605 s leaves 5 s for that reply to arrive, so the client normally reports
+/// the server's sentence ("timed out waiting for the manager") instead of a
+/// bare socket timeout. Without it, a server that stops sending would leave
+/// `rctl` blocked in `read` forever, and a CI job hanging looks like the
+/// machine, not like the bug.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(605);
 
 /// Send `request` to rinit and return its status and payload.

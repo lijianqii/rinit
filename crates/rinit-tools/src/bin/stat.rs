@@ -2,6 +2,8 @@
 
 use std::ffi::OsStr;
 use std::fs::{self, Metadata};
+use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -59,41 +61,44 @@ fn group_label(gid: u32) -> String {
     users::group_name(gid).unwrap_or_else(|| "UNKNOWN".to_string())
 }
 
-fn render(format: &str, name: impl AsRef<Path>, meta: &Metadata) -> String {
-    let name = name.as_ref().display().to_string();
-    let mut out = String::new();
+fn render(format: &str, name: impl AsRef<Path>, meta: &Metadata) -> Vec<u8> {
+    let name = name.as_ref().as_os_str().as_bytes();
+    let mut out = Vec::new();
     let mut chars = format.chars();
+    let push = |out: &mut Vec<u8>, text: &str| out.extend_from_slice(text.as_bytes());
     while let Some(ch) = chars.next() {
         if ch != '%' {
-            out.push(ch);
+            let mut buf = [0u8; 4];
+            out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
             continue;
         }
         let Some(directive) = chars.next() else {
-            out.push('%');
+            out.push(b'%');
             break;
         };
         match directive {
-            '%' => out.push('%'),
-            'n' => out.push_str(&name),
-            's' => out.push_str(&meta.size().to_string()),
-            'a' => out.push_str(&format!("{:o}", meta.mode() & 0o7777)),
-            'f' => out.push_str(&format!("{:x}", meta.mode())),
-            'u' => out.push_str(&meta.uid().to_string()),
-            'U' => out.push_str(&user_label(meta.uid())),
-            'g' => out.push_str(&meta.gid().to_string()),
-            'G' => out.push_str(&group_label(meta.gid())),
-            'h' => out.push_str(&meta.nlink().to_string()),
-            'i' => out.push_str(&meta.ino().to_string()),
-            'd' => out.push_str(&meta.dev().to_string()),
-            'D' => out.push_str(&format!("{:x}", meta.dev())),
-            'F' => out.push_str(file_type(meta)),
-            'X' => out.push_str(&meta.atime().to_string()),
-            'Y' => out.push_str(&meta.mtime().to_string()),
-            'Z' => out.push_str(&meta.ctime().to_string()),
-            'y' => out.push_str(&human_time(meta.mtime())),
+            '%' => out.push(b'%'),
+            'n' => out.extend_from_slice(name),
+            's' => push(&mut out, &meta.size().to_string()),
+            'a' => push(&mut out, &format!("{:o}", meta.mode() & 0o7777)),
+            'f' => push(&mut out, &format!("{:x}", meta.mode())),
+            'u' => push(&mut out, &meta.uid().to_string()),
+            'U' => push(&mut out, &user_label(meta.uid())),
+            'g' => push(&mut out, &meta.gid().to_string()),
+            'G' => push(&mut out, &group_label(meta.gid())),
+            'h' => push(&mut out, &meta.nlink().to_string()),
+            'i' => push(&mut out, &meta.ino().to_string()),
+            'd' => push(&mut out, &meta.dev().to_string()),
+            'D' => push(&mut out, &format!("{:x}", meta.dev())),
+            'F' => push(&mut out, file_type(meta)),
+            'X' => push(&mut out, &meta.atime().to_string()),
+            'Y' => push(&mut out, &meta.mtime().to_string()),
+            'Z' => push(&mut out, &meta.ctime().to_string()),
+            'y' => push(&mut out, &human_time(meta.mtime())),
             other => {
-                out.push('%');
-                out.push(other);
+                out.push(b'%');
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(other.encode_utf8(&mut buf).as_bytes());
             }
         }
     }
@@ -154,10 +159,20 @@ fn run<A: AsRef<OsStr>>(args: &[A], program: &str) -> ExitCode {
         match result {
             Ok(meta) => {
                 let text = render(&format, &name, &meta);
-                if custom_format {
-                    println!("{text}");
+                let mut stdout = std::io::stdout().lock();
+                let result = if custom_format {
+                    stdout
+                        .write_all(&text)
+                        .and_then(|()| stdout.write_all(b"\n"))
                 } else {
-                    print!("{text}");
+                    stdout.write_all(&text)
+                };
+                if let Err(error) = result {
+                    if error.kind() == std::io::ErrorKind::BrokenPipe {
+                        return ExitCode::from(EXIT_OK);
+                    }
+                    eprintln!("{program}: cannot write output: {error}");
+                    failed = true;
                 }
             }
             Err(error) => {
@@ -200,10 +215,27 @@ mod tests {
         let file = root.join("file");
         fs::write(&file, b"abc").expect("file");
         let meta = fs::metadata(&file).expect("meta");
-        let text = render("%n|%s|%a|%F|%u|%g|%h|%i", "file", &meta);
+        let text = String::from_utf8(render("%n|%s|%a|%F|%u|%g|%h|%i", "file", &meta))
+            .expect("UTF-8 render");
         assert!(text.starts_with("file|3|"));
         assert!(text.contains("regular file"));
-        assert_eq!(render("%%", "file", &meta), "%");
+        assert_eq!(render("%%", "file", &meta), b"%");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_non_utf8_name_is_rendered_as_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = temp_root("raw-name");
+        let path = root.join(std::ffi::OsString::from_vec(b"f\xff".to_vec()));
+        fs::write(&path, b"x").expect("file");
+        let meta = fs::symlink_metadata(&path).expect("meta");
+        let rendered = render("%n", &path, &meta);
+        assert!(
+            rendered.windows(2).any(|window| window == b"f\xff"),
+            "{rendered:?}"
+        );
         let _ = fs::remove_dir_all(root);
     }
 

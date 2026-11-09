@@ -1,5 +1,6 @@
 //! `dmesg` - dump the kernel ring buffer.
 
+use std::io::Write;
 use std::process::ExitCode;
 
 use rinit_tools::{EXIT_OK, program_name, usage_error};
@@ -38,8 +39,17 @@ fn run(args: &[String], program: &str, read: impl Fn() -> std::io::Result<Vec<u8
     }
     match read() {
         Ok(bytes) => {
-            print!("{}", String::from_utf8_lossy(&bytes));
-            ExitCode::from(EXIT_OK)
+            let mut stdout = std::io::stdout().lock();
+            match stdout.write_all(&bytes) {
+                Ok(()) => ExitCode::from(EXIT_OK),
+                Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {
+                    ExitCode::from(EXIT_OK)
+                }
+                Err(error) => {
+                    eprintln!("{program}: cannot write output: {error}");
+                    ExitCode::from(1)
+                }
+            }
         }
         Err(e) => {
             eprintln!("{program}: cannot read kernel log: {e}");

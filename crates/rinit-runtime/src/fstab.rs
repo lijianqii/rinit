@@ -17,8 +17,10 @@
 //! sequence are all testable through [`MountOps`], and the guest test mounts a
 //! real `tmpfs` to prove the sequence reaches `mount(2)`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::CString;
 use std::io::{self, Read};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use crate::error::SyscallError;
@@ -260,6 +262,38 @@ fn visible_mount_points(text: &str) -> Vec<String> {
     visible
 }
 
+/// The visible mount id at `path`, using `statx(STATX_MNT_ID)`.
+///
+/// `mountinfo` still lists mounts hidden behind a later mount on the same
+/// path. `statx` asks the kernel which mount actually contains the path now,
+/// which is exactly the question the fstab skip needs to answer.
+fn statx_mount_id(path: &Path) -> Option<u64> {
+    let path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stat: libc::statx = unsafe { std::mem::zeroed() };
+    // SAFETY: `path` is NUL-terminated and `stat` is valid writable storage.
+    let rc = unsafe {
+        libc::statx(
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+            libc::STATX_MNT_ID,
+            &mut stat,
+        )
+    };
+    (rc == 0).then_some(stat.stx_mnt_id)
+}
+
+/// The highest mount id for each mountpoint in mountinfo.
+fn mount_ids_by_point(text: &str) -> BTreeMap<String, u64> {
+    let mut ids = BTreeMap::new();
+    for entry in text.lines().filter_map(parse_mountinfo_line) {
+        ids.entry(entry.point)
+            .and_modify(|id: &mut u64| *id = (*id).max(entry.id))
+            .or_insert(entry.id);
+    }
+    ids
+}
+
 fn parse_mountinfo_line(line: &str) -> Option<MountInfoLine> {
     line.find(" - ")?;
     let mut fields = line.split_whitespace();
@@ -278,6 +312,7 @@ fn mount_with_mounted(
 ) -> FstabReport {
     let (entries, mut warnings) = parse(text);
     let visible = current_mounts.map(visible_mount_points);
+    let mount_ids = current_mounts.map(mount_ids_by_point);
     let mut mounted = Vec::new();
     for entry in entries {
         // Swap is not a mount. It is activated by `swapon -a`, which reads the
@@ -286,13 +321,25 @@ fn mount_with_mounted(
             continue;
         }
         let point = entry.mountpoint.to_string_lossy().into_owned();
-        if visible
-            .as_ref()
-            .is_some_and(|mounts| mounts.iter().any(|mounted| mounted == &point))
+        let already_mounted = if let Some(ids) = &mount_ids
+            && !ids.is_empty()
         {
-            // The first wave (or the kernel) already mounted it. Mounting it
-            // again would stack a second filesystem on the same point. A hidden
-            // mount at the same path is deliberately not in `visible`.
+            match statx_mount_id(&entry.mountpoint) {
+                Some(id) => ids.get(&point).is_some_and(|configured| *configured == id),
+                // If statx is unavailable, keep the conservative path/point
+                // check rather than mounting over an existing filesystem.
+                None => visible
+                    .as_ref()
+                    .is_some_and(|mounts| mounts.iter().any(|mounted| mounted == &point)),
+            }
+        } else {
+            visible
+                .as_ref()
+                .is_some_and(|mounts| mounts.iter().any(|mounted| mounted == &point))
+        };
+        if already_mounted {
+            // The first wave (or the kernel) already mounted *this* mount at
+            // the path. A hidden mount at the same path does not count.
             continue;
         }
         if let Err(e) = ops.mkdir_p(&entry.mountpoint) {
@@ -586,6 +633,15 @@ mod tests {
         assert_eq!(report.mounted, ["/data"]);
         assert_eq!(ops.calls.len(), 1, "{:?}", ops.calls);
         assert!(ops.calls[0].starts_with("tmpfs /data"), "{:?}", ops.calls);
+    }
+
+    #[test]
+    fn statx_identifies_the_visible_proc_mount() {
+        let info = std::fs::read_to_string("/proc/self/mountinfo").expect("mountinfo");
+        let mut ops = Recorder::default();
+        let report = mount_with_mounted(&mut ops, "proc /proc proc defaults 0 0\n", Some(&info));
+        assert!(report.mounted.is_empty(), "{:?}", report.mounted);
+        assert!(ops.calls.is_empty(), "{:?}", ops.calls);
     }
 
     #[test]

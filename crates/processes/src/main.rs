@@ -164,11 +164,19 @@ fn main() {
             opts
         }
         Ok(ParsedArgs::Help) => {
-            let _ = std::io::stdout().write_all(USAGE.as_bytes());
+            if let Err(error) = std::io::stdout().write_all(USAGE.as_bytes()) {
+                eprintln!("processes: cannot write output: {error}");
+                std::process::exit(1);
+            }
             return;
         }
         Ok(ParsedArgs::Version) => {
-            let _ = writeln!(std::io::stdout(), "processes {}", env!("CARGO_PKG_VERSION"));
+            if let Err(error) =
+                writeln!(std::io::stdout(), "processes {}", env!("CARGO_PKG_VERSION"))
+            {
+                eprintln!("processes: cannot write output: {error}");
+                std::process::exit(1);
+            }
             return;
         }
         Err(message) => {

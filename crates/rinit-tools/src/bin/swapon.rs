@@ -23,7 +23,9 @@ fn swapon_one(path: &OsStr, flags: libc::c_int, verbose: bool) -> io::Result<()>
     let rc = unsafe { libc::swapon(path_c.as_ptr(), flags) };
     if rc == 0 {
         if verbose {
-            println!("{}", path.to_string_lossy());
+            let mut stdout = io::stdout().lock();
+            stdout.write_all(path.as_bytes())?;
+            stdout.write_all(b"\n")?;
         }
         Ok(())
     } else {

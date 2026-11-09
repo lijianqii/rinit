@@ -1,7 +1,7 @@
 //! `swapoff` - deactivate swap devices from `/proc/swaps`, `/etc/fstab` or by path.
 
 use std::ffi::{CString, OsStr, OsString};
-use std::io;
+use std::io::{self, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::Path;
 use std::process::ExitCode;
@@ -17,7 +17,9 @@ fn swapoff_one(path: &OsStr, verbose: bool) -> io::Result<()> {
     let rc = unsafe { libc::swapoff(path_c.as_ptr()) };
     if rc == 0 {
         if verbose {
-            println!("{}", path.to_string_lossy());
+            let mut stdout = io::stdout().lock();
+            stdout.write_all(path.as_bytes())?;
+            stdout.write_all(b"\n")?;
         }
         Ok(())
     } else {

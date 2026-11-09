@@ -129,6 +129,47 @@ fn open_parent(path: &Path) -> io::Result<(fs::File, CString)> {
 fn open_directory_follow(path: &Path) -> io::Result<fs::File> {
     let path = CString::new(path.as_os_str().as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    // Refuse symlinked parent components. A path-based open here is the
+    // remaining window for a root `cp`/`mv` into an attacker-writable parent:
+    // the attacker can replace a component with a symlink after the caller's
+    // canonicalization. `openat2(RESOLVE_NO_SYMLINKS)` closes that window for
+    // the normal case; kernels without openat2 fall back to open(2).
+    #[cfg(target_os = "linux")]
+    {
+        #[repr(C)]
+        struct OpenHow {
+            flags: u64,
+            mode: u64,
+            resolve: u64,
+        }
+        const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+        let how = OpenHow {
+            flags: (libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
+            mode: 0,
+            resolve: RESOLVE_NO_SYMLINKS,
+        };
+        // SAFETY: `path` is NUL-terminated and `how` is a valid open_how.
+        let fd = unsafe {
+            libc::syscall(
+                libc::SYS_openat2,
+                libc::AT_FDCWD,
+                path.as_ptr(),
+                &how as *const OpenHow,
+                std::mem::size_of::<OpenHow>(),
+            )
+        };
+        if fd >= 0 {
+            // SAFETY: openat2 returned a fresh descriptor we own.
+            return Ok(unsafe { fs::File::from_raw_fd(fd as libc::c_int) });
+        }
+        let error = io::Error::last_os_error();
+        if !matches!(
+            error.raw_os_error(),
+            Some(libc::ENOSYS) | Some(libc::EINVAL)
+        ) {
+            return Err(error);
+        }
+    }
     // SAFETY: the path is NUL-terminated and the flags describe a directory
     // open that may follow the final component.
     let fd = unsafe {
