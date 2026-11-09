@@ -349,6 +349,10 @@ multiple sources require an existing destination directory. `cp` preserves
 symlinks instead of following them. `rm` refuses `/`, `.` and `..`. `touch -t`
 accepts `MMDDhhmm`, `YYMMDDhhmm`, `CCYYMMDDhhmm`, each with an optional `.ss`.
 Ownership is not preserved by `cp -p`; mode and timestamps are.
+On Linux, `cp`/`mv` open the destination parent with `openat2` and
+`RESOLVE_NO_SYMLINKS` when the kernel provides it. A symlinked parent component
+is refused rather than followed, so a privileged copy cannot be redirected after
+the destination was resolved.
 
 ## 7. Architecture
 
