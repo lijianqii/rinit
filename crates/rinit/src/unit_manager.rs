@@ -596,6 +596,12 @@ impl UnitManager {
     /// an instance name at all, no such template, a `%` specifier this build does
     /// not know, or a template whose expansion does not parse.
     pub fn instantiate(&mut self, unit: &UnitName) -> Result<(), String> {
+        if let Some(rt) = self.units.get(unit) {
+            if rt.retired {
+                return Err(format!("{unit} is still stopping after removal"));
+            }
+            return Ok(());
+        }
         let Some(template) = unit.template() else {
             return Err(format!("{unit} is not a template instance"));
         };
@@ -728,6 +734,17 @@ impl UnitManager {
     /// Whether `unit` has a process, or is on its way to not having one.
     pub fn is_up(&self, unit: &UnitName) -> bool {
         self.units.get(unit).is_some_and(UnitRuntime::is_up)
+    }
+
+    /// Whether the unit's cgroup still holds any process.
+    ///
+    /// A service whose leader exited can leave a daemonized child in the
+    /// cgroup. That is not `is_up` (there is no pid), but a reload that removes
+    /// the unit must still stop it rather than dropping the runtime entry.
+    pub fn has_cgroup_members(&self, unit: &UnitName) -> bool {
+        self.cgroup
+            .members(unit)
+            .is_some_and(|members| !members.is_empty())
     }
 
     /// Read a unit.
@@ -934,8 +951,25 @@ impl UnitManager {
             // `Stopped`, and a start does not outrank a user stop
             // (plan §1.3(11)) - so asking again, now that the stop is done and
             // its target is spent, is what makes the queued start happen.
-            if self.request(&unit, JobTarget::Started, source) == Some(Effect::SpawnProcess) {
-                ready.push(unit);
+            match self.request(&unit, JobTarget::Started, source) {
+                Some(Effect::SpawnProcess) => ready.push(unit),
+                // A queued start can still land on a unit waiting out a
+                // backoff or a failed state. Dropping those effects would
+                // delete the queue entry without ever starting the unit.
+                Some(Effect::CancelBackoffAndStart) => {
+                    if let Some(rt) = self.units.get_mut(&unit) {
+                        rt.restart_at = None;
+                        if rt.state == UnitState::RestartWait {
+                            rt.state = UnitState::Inactive;
+                        }
+                    }
+                    ready.push(unit);
+                }
+                Some(Effect::ClearStartLimitAndStart) => {
+                    self.reset_failed(&unit);
+                    ready.push(unit);
+                }
+                _ => {}
             }
         }
         ready
@@ -1173,6 +1207,18 @@ impl UnitManager {
     ///
     /// A dependent that already has a process is left alone: it is running, and
     /// stopping it here would turn one failure into a cascade.
+    /// Drop a pid the spawn path has already reaped.
+    ///
+    /// `wait_blocking` reaps a child that failed before `execve`. `fail_start`
+    /// otherwise assumes the pid still names the unit's process and signals it;
+    /// between the reap and that call the pid can be reused.
+    pub fn forget_spawned_pid(&mut self, unit: &UnitName) {
+        if let Some(rt) = self.units.get_mut(unit) {
+            rt.pid = None;
+            rt.group = None;
+        }
+    }
+
     pub fn fail_start(&mut self, unit: &UnitName) -> Vec<UnitName> {
         // A start flow can fail after it has spawned (a readiness or
         // `ExecStartPost=` deadline, for example). Clearing `pid` without
@@ -1405,7 +1451,7 @@ impl UnitManager {
         // so the service is bounded from its first instruction rather than some
         // time after it started working. Only a failed limit write fails the
         // start; an unusable hierarchy degrades to a warning inside `setup`.
-        let cgroup_procs = if self.cgroup.is_enabled() && !limits.is_empty() {
+        let cgroup_procs = if self.cgroup.is_enabled() {
             match self.cgroup.setup(unit, &limits) {
                 Ok(procs) => procs,
                 Err(e) => {
@@ -1532,6 +1578,9 @@ impl UnitManager {
         if let Err(error) = pending.wait_blocking(&cancel) {
             // State was registered before the wait; make the failure terminal
             // and clear the pid rather than leaving a dead child as Active.
+            // The child has already been reaped by `wait_blocking`; clearing
+            // first keeps `fail_start` from signalling a reused pid.
+            self.forget_spawned_pid(unit);
             self.fail_start(unit);
             return Err(error.into());
         }
@@ -2104,6 +2153,10 @@ impl UnitManager {
                     let _ = process::kill_process_group(stop_pid, libc::SIGKILL);
                 }
                 let _ = process::kill_process_group(pid, libc::SIGKILL);
+                // SIGKILL is immediate, but the process still has to be
+                // reaped. Arming a now-deadline keeps shutdown from concluding
+                // that an unkillable unit is stuck before it has had one poll.
+                rt.kill_at = Some(Instant::now());
             } else {
                 rt.kill_at = Some(crate::deadline::after_secs(rt.config.timeout_stop_sec));
             }
@@ -2142,6 +2195,48 @@ impl UnitManager {
                 self.cgroup.signal_members(&unit, libc::SIGTERM);
                 if let Some(pid) = main {
                     let _ = signal_process(pid, libc::SIGTERM);
+                }
+            }
+            // The service leader may already be gone. In that case the
+            // ExecStop command was the last owner of the stop: complete the
+            // stop only after the cgroup is empty, not merely when the command
+            // exits. A health-triggered restart still takes precedence.
+            if main.is_none() {
+                let restart = self
+                    .units
+                    .get(&unit)
+                    .is_some_and(|rt| rt.state == UnitState::Deactivating && rt.restart_after_stop);
+                if restart {
+                    if let Some(rt) = self.units.get_mut(&unit) {
+                        rt.restart_after_stop = false;
+                    }
+                    return Some(self.schedule_restart(&unit, self.now_millis()));
+                }
+                if self
+                    .cgroup
+                    .members(&unit)
+                    .is_some_and(|members| !members.is_empty())
+                {
+                    self.cgroup.signal_members(&unit, libc::SIGKILL);
+                    if let Some(rt) = self.units.get_mut(&unit) {
+                        rt.kill_at = Some(Instant::now());
+                    }
+                    return None;
+                }
+                let completed = self
+                    .units
+                    .get_mut(&unit)
+                    .is_some_and(|rt| rt.state == UnitState::Deactivating);
+                if completed {
+                    if let Some(rt) = self.units.get_mut(&unit) {
+                        rt.state = UnitState::Inactive;
+                        rt.kill_at = None;
+                    }
+                    self.cgroup.cleanup(&unit);
+                    return Some(Outcome::Exited {
+                        unit,
+                        state: UnitState::Inactive,
+                    });
                 }
             }
             return None;
@@ -2209,7 +2304,12 @@ impl UnitManager {
             rlog!("warning: {unit}: killed leftover processes in group {group}");
         }
         rt.group = None;
-        rt.kill_at = None;
+        // If an ExecStop command is still running, it owns the rest of the
+        // stop and must keep its SIGKILL deadline. Clearing kill_at here would
+        // let a stuck ExecStop outlive TimeoutStopSec.
+        if !(rt.state == UnitState::Deactivating && rt.exec_stop_pid.is_some()) {
+            rt.kill_at = None;
+        }
         rt.health_at = None;
         rt.probe_deadline = None;
         rt.last_outcome = Some(outcome);
@@ -2243,9 +2343,33 @@ impl UnitManager {
         // was a health-triggered restart, which deliberately re-enters the
         // restart path.
         if rt.state == UnitState::Deactivating {
+            // The ExecStop command is the stop action; the main process exiting
+            // is not the end of the stop while that command is still in flight.
+            if rt.exec_stop_pid.is_some() {
+                return None;
+            }
             if rt.restart_after_stop {
                 rt.restart_after_stop = false;
-                return Some(self.schedule_restart(&unit, now));
+                let outcome = self.schedule_restart(&unit, now);
+                if matches!(outcome, Outcome::StartLimitTripped { .. }) {
+                    self.cgroup.cleanup(&unit);
+                    for dependent in self.fail_start(&unit) {
+                        rlog!("error: {dependent} requires {unit}, which failed");
+                    }
+                }
+                return Some(outcome);
+            }
+            // The leader is gone, but a daemonized child may still be in the
+            // unit's cgroup. The group check above only sees the process group;
+            // keep the stop open and let due_kills SIGKILL the cgroup.
+            if self
+                .cgroup
+                .members(&unit)
+                .is_some_and(|members| !members.is_empty())
+            {
+                self.cgroup.signal_members(&unit, libc::SIGKILL);
+                rt.kill_at = Some(Instant::now());
+                return None;
             }
             // The stop is complete, so plan §7.3's cleanup runs now: an empty
             // directory goes, one that still holds a stray process is kept.
@@ -4170,6 +4294,49 @@ mod tests {
         cleanup(&mut m, &unit);
     }
 
+    /// The main process may exit before an `ExecStop=` command finishes. The
+    /// stop is not complete until that command is gone, and its SIGKILL
+    /// deadline must survive the main exit.
+    #[test]
+    fn main_exit_waits_for_an_in_flight_exec_stop() {
+        let _guard = crate::test_support::children_lock();
+        let mut m = manager_with("a.service", RestartPolicy::No);
+        let unit = UnitName::parse("a.service").unwrap();
+        let pid = spawn_pid(&mut m, &unit);
+        let group = m.get(&unit).and_then(|rt| rt.group);
+        let rt = m.units.get_mut(&unit).unwrap();
+        rt.state = UnitState::Deactivating;
+        rt.exec_stop_pid = Some(999_999);
+        rt.kill_at = Some(crate::deadline::after_secs(10));
+
+        let outcome = m.on_child_exit(pid, ExitOutcome::Success);
+        assert!(
+            outcome.is_none(),
+            "the ExecStop command still owns the stop"
+        );
+        let rt = m.get(&unit).unwrap();
+        assert_eq!(rt.state, UnitState::Deactivating);
+        assert!(rt.kill_at.is_some(), "the ExecStop deadline must survive");
+        assert!(rt.exec_stop_pid.is_some());
+
+        // The command exits; now the stop can settle.
+        let outcome = m.on_child_exit(999_999, ExitOutcome::Success);
+        assert!(matches!(
+            outcome,
+            Some(Outcome::Exited {
+                state: UnitState::Inactive,
+                ..
+            })
+        ));
+        assert_eq!(m.get(&unit).unwrap().state, UnitState::Inactive);
+        assert!(m.get(&unit).unwrap().exec_stop_pid.is_none());
+
+        if let Some(group) = group {
+            let _ = process::kill_group(group, libc::SIGKILL);
+        }
+        let _ = wait::reap_children();
+    }
+
     /// Plan §1.3(13): a unit that fails to start fails everything that
     /// hard-`Requires=` it, so the dependents are not started on a broken
     /// foundation.
@@ -4232,8 +4399,8 @@ mod tests {
 
         let rt = m.get(&unit).unwrap();
         assert!(
-            rt.kill_at.is_none(),
-            "TimeoutStopSec=0 signals SIGKILL now, not later"
+            rt.kill_at.is_some(),
+            "a zero timeout still arms a reap deadline after SIGKILL"
         );
 
         cleanup(&mut m, &unit);
@@ -4282,6 +4449,26 @@ mod tests {
         // real child is still a zombie until this reaps it. A test that left
         // one behind would be reaped by whatever test ran next.
         cleanup(&mut m, &unit);
+    }
+
+    #[test]
+    fn a_queued_start_clears_a_failed_or_restarting_state() {
+        let mut m = manager_with("a.service", RestartPolicy::Always);
+        let unit = UnitName::parse("a.service").unwrap();
+
+        m.units.get_mut(&unit).unwrap().state = UnitState::Failed(FailedReason::StartLimitHit);
+        m.queued_starts
+            .insert(unit.clone(), RequestSource::UserStart);
+        assert_eq!(m.due_queued_starts(), std::slice::from_ref(&unit));
+        assert_eq!(m.get(&unit).unwrap().state, UnitState::Inactive);
+
+        m.units.get_mut(&unit).unwrap().state = UnitState::RestartWait;
+        m.units.get_mut(&unit).unwrap().restart_at = Some(Instant::now());
+        m.queued_starts
+            .insert(unit.clone(), RequestSource::UserStart);
+        assert_eq!(m.due_queued_starts(), std::slice::from_ref(&unit));
+        assert!(m.get(&unit).unwrap().restart_at.is_none());
+        assert_eq!(m.get(&unit).unwrap().state, UnitState::Inactive);
     }
 
     /// A user stop must not make a later user start impossible.

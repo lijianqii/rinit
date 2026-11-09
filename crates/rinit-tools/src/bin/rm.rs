@@ -59,6 +59,18 @@ fn remove_path(path: &Path, options: Options) -> Result<(), String> {
     }
 }
 
+fn apply_short_options(value: &str, options: &mut Options) -> Result<(), String> {
+    for ch in value[1..].chars() {
+        match ch {
+            'r' | 'R' => options.recursive = true,
+            'f' => options.force = true,
+            'd' => options.dir = true,
+            other => return Err(format!("unknown option '-{other}'")),
+        }
+    }
+    Ok(())
+}
+
 fn run<A: AsRef<OsStr>>(args: &[A], program: &str) -> ExitCode {
     let mut options = Options::default();
     let mut paths: Vec<PathBuf> = Vec::new();
@@ -79,6 +91,13 @@ fn run<A: AsRef<OsStr>>(args: &[A], program: &str) -> ExitCode {
             Some("-r" | "-R" | "--recursive") => options.recursive = true,
             Some("-f" | "--force") => options.force = true,
             Some("-d" | "--dir") => options.dir = true,
+            Some(value)
+                if value.starts_with('-') && value.len() > 1 && !value.starts_with("--") =>
+            {
+                if let Err(error) = apply_short_options(value, &mut options) {
+                    return ExitCode::from(usage_error(program, &error));
+                }
+            }
             Some(value) if value.starts_with('-') && value != "-" => {
                 return ExitCode::from(usage_error(program, &format!("unknown option '{value}'")));
             }
@@ -127,6 +146,15 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).expect("root");
         root
+    }
+
+    #[test]
+    fn clustered_short_options_are_parsed() {
+        let mut options = Options::default();
+        apply_short_options("-rf", &mut options).expect("parse");
+        assert!(options.recursive);
+        assert!(options.force);
+        assert!(apply_short_options("-x", &mut options).is_err());
     }
 
     #[test]

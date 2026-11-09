@@ -175,6 +175,11 @@ fn run<A: IntoIterator<Item = OsString>>(args: A, program: &str) -> ExitCode {
                 for line in describe_plan(&plan) {
                     println!("{line}");
                 }
+            } else if !ok {
+                eprintln!(
+                    "{program}: FAILED: {} warning(s); --strict treats them as errors",
+                    plan.warnings.len()
+                );
             } else {
                 println!(
                     "{program}: OK: {} unit(s), {} level(s), target {}",

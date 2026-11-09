@@ -234,7 +234,9 @@ fn run<A: AsRef<OsStr>>(args: &[A], program: &str) -> ExitCode {
     let mut index = 0;
     while let Some(arg) = option_args.get(index) {
         let Some(text) = arg.as_ref().to_str() else {
-            return ExitCode::from(usage_error(program, "an argument is not valid UTF-8"));
+            files.push(PathBuf::from(arg.as_ref()));
+            index += 1;
+            continue;
         };
         match text {
             "-h" | "--help" => {

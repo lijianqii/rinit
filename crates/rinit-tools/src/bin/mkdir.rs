@@ -27,13 +27,28 @@ fn parse_mode(value: &str) -> Result<u32, String> {
 }
 
 fn make_directory(path: &Path, options: Options) -> Result<(), String> {
-    let result = if options.parents {
-        fs::create_dir_all(path)
+    let mut created = true;
+    if options.parents {
+        if let Some(_name) = path.file_name() {
+            let parent = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", path.display()))?;
+        }
+        match fs::create_dir(path) {
+            Ok(()) => {}
+            // `-p` succeeds on an existing directory, but must not apply `-m`
+            // to it (and must not follow a symlink to chmod its target).
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => created = false,
+            Err(error) => return Err(format!("{}: {error}", path.display())),
+        }
     } else {
-        fs::create_dir(path)
-    };
-    result.map_err(|error| format!("{}: {error}", path.display()))?;
-    if let Some(mode) = options.mode {
+        fs::create_dir(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    }
+    if let Some(mode) = options.mode
+        && created
+    {
         fs::set_permissions(path, fs::Permissions::from_mode(mode))
             .map_err(|error| format!("{}: {error}", path.display()))?;
     }
@@ -146,6 +161,29 @@ mod tests {
         };
         make_directory(&dir, options).expect("private");
         assert_eq!(fs::metadata(&dir).expect("meta").mode() & 0o777, 0o700);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn parents_does_not_reapply_mode_to_existing_paths() {
+        let root = temp_root("existing-mode");
+        let dir = root.join("dir");
+        fs::create_dir(&dir).expect("dir");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).expect("mode");
+        let options = Options {
+            parents: true,
+            mode: Some(0o700),
+        };
+        make_directory(&dir, options).expect("existing");
+        assert_eq!(fs::metadata(&dir).expect("meta").mode() & 0o777, 0o755);
+
+        let target = root.join("target");
+        fs::create_dir(&target).expect("target");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).expect("target mode");
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&target, &link).expect("link");
+        make_directory(&link, options).expect("symlink");
+        assert_eq!(fs::metadata(&target).expect("meta").mode() & 0o777, 0o755);
         let _ = fs::remove_dir_all(root);
     }
 

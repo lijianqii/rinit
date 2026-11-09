@@ -357,7 +357,10 @@ if [[ -n "${busybox_src}" ]]; then
     printf 'root:x:0:0:root:/root:/bin/sh\nnobody:x:65534:65534:nobody:/nonexistent:/sbin/nologin\n' >"${work}/etc/passwd"
     default_root_hash='$6$rinit$h.sfVK5a75HqcCQ8mjFVlpyRSK5rin/8GpC7okbfq82BH16wN0lJDJUvCd.0bpt2/q/MtfkobUfMxtG72uIuj.'
     root_hash="${RINIT_ROOT_PASSWORD_HASH:-${default_root_hash}}"
-    printf 'root:%s:0:0:99999:7:::\nnobody:!:65534:0:99999:7:::\n' "${root_hash}" >"${work}/etc/shadow"
+    # `last_change=0` means "change the password now", not "never expires";
+    # rlogin correctly refuses it. Use a real day so the development credential
+    # is usable.
+    printf 'root:%s:19000:0:99999:7:::\nnobody:!:65534:0:99999:7:::\n' "${root_hash}" >"${work}/etc/shadow"
     if [[ -n "${device_units}" && "${root_hash}" == "${default_root_hash}" ]]; then
         echo "warning: device image uses the development root/toor password; set RINIT_ROOT_PASSWORD_HASH (use '!' to lock root) before deploying" >&2
     fi

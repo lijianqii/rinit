@@ -64,6 +64,26 @@ struct Bound {
     _watch: tokio::task::JoinHandle<()>,
 }
 
+/// A comparison key for a socket path.
+///
+/// `Path` equality is textual, so `/run/a.sock` and `/run/sub/../a.sock` name
+/// the same file but compare differently. Resolve the parent when it exists;
+/// the final component is intentionally not resolved, because the socket does
+/// not exist before the bind.
+fn socket_key(path: &Path) -> PathBuf {
+    let Some(name) = path.file_name() else {
+        return path.to_path_buf();
+    };
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    match std::fs::canonicalize(parent) {
+        Ok(parent) => parent.join(name),
+        Err(_) => path.to_path_buf(),
+    }
+}
+
 impl Activated {
     /// No sockets: every unit starts the ordinary way.
     pub fn disabled() -> Self {
@@ -92,14 +112,14 @@ impl Activated {
         if self
             .sockets
             .get(unit)
-            .is_some_and(|bound| bound.path.as_path() == path)
+            .is_some_and(|bound| socket_key(&bound.path) == socket_key(path))
         {
             return Ok(());
         }
         if let Some((other, _)) = self
             .sockets
             .iter()
-            .find(|(other, bound)| *other != unit && bound.path.as_path() == path)
+            .find(|(other, bound)| *other != unit && socket_key(&bound.path) == socket_key(path))
         {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -174,6 +194,25 @@ impl Activated {
     /// The units whose sockets rinit currently holds.
     pub fn units(&self) -> Vec<UnitName> {
         self.sockets.keys().cloned().collect()
+    }
+
+    /// Whether `unit`'s listening socket currently has a connection waiting.
+    ///
+    /// A level-triggered readiness watcher would report the same backlog on every
+    /// rearm. The supervisor uses this check to avoid rearming (and therefore
+    /// refreshing the idle clock) until the service has accepted the backlog.
+    pub fn is_readable(&self, unit: &UnitName) -> bool {
+        let Some(bound) = self.sockets.get(unit) else {
+            return false;
+        };
+        let mut pollfd = libc::pollfd {
+            fd: bound.listener.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `pollfd` is one valid descriptor and the timeout is zero.
+        let ready = unsafe { libc::poll(&mut pollfd, 1, 0) };
+        ready > 0 && pollfd.revents & libc::POLLIN != 0
     }
 
     /// Allow the watcher for `unit` to report one more connection.
@@ -293,6 +332,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn readability_follows_the_pending_backlog() {
+        let dir = scratch("readable");
+        let path = dir.join("svc.sock");
+        let unit = name("svc.service");
+        let mut activated = Activated::disabled();
+        activated.bind(&unit, &path).expect("bind");
+        assert!(!activated.is_readable(&unit));
+
+        let _client = UnixStream::connect(&path).expect("connect");
+        assert!(activated.is_readable(&unit));
+
+        let fd = activated.listener_fd(&unit).expect("listener");
+        // SAFETY: `fd` is the listening socket owned by `activated`; null
+        // address arguments are the documented "do not report the peer".
+        let accepted = unsafe { libc::accept(fd, std::ptr::null_mut(), std::ptr::null_mut()) };
+        assert!(accepted >= 0, "accept: {}", std::io::Error::last_os_error());
+        // SAFETY: accept returned a fresh descriptor.
+        unsafe { libc::close(accepted) };
+        assert!(!activated.is_readable(&unit));
+
+        activated.disarm();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A reload changes the path by binding the new socket first. A failed
     /// bind must leave the old listener and file in place.
     #[tokio::test(flavor = "current_thread")]
@@ -352,6 +416,23 @@ mod tests {
         assert!(activated.listener_fd(&first).is_some());
         assert!(activated.listener_fd(&second).is_none());
 
+        activated.disarm();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_dot_dot_alias_is_the_same_socket_path() {
+        let dir = scratch("alias");
+        std::fs::create_dir(dir.join("nested")).expect("nested");
+        let direct = dir.join("svc.sock");
+        let alias = dir.join("nested").join("..").join("svc.sock");
+        let first = name("first.service");
+        let second = name("second.service");
+        let mut activated = Activated::disabled();
+        activated.bind(&first, &direct).expect("first bind");
+        let error = activated.bind(&second, &alias).expect_err("alias bind");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(activated.listener_fd(&second).is_none());
         activated.disarm();
         let _ = std::fs::remove_dir_all(&dir);
     }

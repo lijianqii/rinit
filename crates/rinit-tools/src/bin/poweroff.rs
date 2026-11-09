@@ -23,7 +23,7 @@ fn main() -> ExitCode {
 
 fn run(args: &[String], program: &str) -> ExitCode {
     rinit_tools::restore_sigpipe();
-    if let Some(arg) = args.first() {
+    for arg in args {
         match arg.as_str() {
             "-h" | "--help" => {
                 println!("Usage: poweroff [-f]");

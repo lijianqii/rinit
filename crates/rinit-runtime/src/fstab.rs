@@ -17,7 +17,8 @@
 //! sequence are all testable through [`MountOps`], and the guest test mounts a
 //! real `tmpfs` to prove the sequence reaches `mount(2)`.
 
-use std::io;
+use std::collections::BTreeSet;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use crate::error::SyscallError;
@@ -193,12 +194,90 @@ pub fn mount_with(ops: &mut impl MountOps, text: &str) -> FstabReport {
     mount_with_mounted(ops, text, None)
 }
 
+/// One line of `/proc/self/mountinfo`, reduced to what visibility needs.
+struct MountInfoLine {
+    id: u64,
+    parent: u64,
+    point: String,
+}
+
+/// The mountpoints reachable from the current mount namespace.
+///
+/// `/proc/mounts` and mountinfo both retain mounts hidden behind a later mount
+/// on the same path. Comparing only the path would treat an old, hidden
+/// `/dev/pts` as if the visible one were mounted. Walk each mount's parent chain
+/// and discard entries whose mountpoint (or an ancestor's) has a higher mount
+/// id at the same path; mount ids increase with mount order.
+fn visible_mount_points(text: &str) -> Vec<String> {
+    let entries: Vec<MountInfoLine> = text.lines().filter_map(parse_mountinfo_line).collect();
+    if entries.is_empty() {
+        return text
+            .lines()
+            .filter_map(|line| line.split_whitespace().nth(1))
+            .map(crate::mounts::unescape_mount_field)
+            .collect();
+    }
+    let mut visible = Vec::new();
+    for entry in &entries {
+        let mut current = Some(entry);
+        let mut hidden = false;
+        let mut seen = BTreeSet::new();
+        while let Some(mount) = current {
+            // A malformed or namespace-crossing mountinfo must not turn this
+            // walk into an infinite loop in PID 1.
+            if !seen.insert(mount.id) {
+                hidden = true;
+                break;
+            }
+            if entries
+                .iter()
+                .any(|other| other.point == mount.point && other.id > mount.id)
+            {
+                hidden = true;
+                break;
+            }
+            current = entries.iter().find(|other| other.id == mount.parent);
+        }
+        if !hidden {
+            visible.push(entry.point.clone());
+        }
+    }
+    if visible.is_empty() && !entries.is_empty() {
+        // A mount namespace can present a parent chain this walk cannot
+        // resolve (a cycle or an ID outside the namespace). Falling back to
+        // "highest id per path" is still better than treating every mount as
+        // hidden and stacking a second filesystem on all of them.
+        for entry in &entries {
+            if !visible.iter().any(|point| point == &entry.point)
+                && !entries
+                    .iter()
+                    .any(|other| other.point == entry.point && other.id > entry.id)
+            {
+                visible.push(entry.point.clone());
+            }
+        }
+    }
+    visible
+}
+
+fn parse_mountinfo_line(line: &str) -> Option<MountInfoLine> {
+    line.find(" - ")?;
+    let mut fields = line.split_whitespace();
+    let id = fields.next()?.parse().ok()?;
+    let parent = fields.next()?.parse().ok()?;
+    let _major_minor = fields.next()?;
+    let _root = fields.next()?;
+    let point = crate::mounts::unescape_mount_field(fields.next()?);
+    Some(MountInfoLine { id, parent, point })
+}
+
 fn mount_with_mounted(
     ops: &mut impl MountOps,
     text: &str,
     current_mounts: Option<&str>,
 ) -> FstabReport {
     let (entries, mut warnings) = parse(text);
+    let visible = current_mounts.map(visible_mount_points);
     let mut mounted = Vec::new();
     for entry in entries {
         // Swap is not a mount. It is activated by `swapon -a`, which reads the
@@ -207,15 +286,13 @@ fn mount_with_mounted(
             continue;
         }
         let point = entry.mountpoint.to_string_lossy().into_owned();
-        if current_mounts.is_some_and(|mounts| {
-            mounts
-                .lines()
-                .filter_map(|line| line.split_whitespace().nth(1))
-                .map(crate::mounts::unescape_mount_field)
-                .any(|mounted| mounted == point)
-        }) {
+        if visible
+            .as_ref()
+            .is_some_and(|mounts| mounts.iter().any(|mounted| mounted == &point))
+        {
             // The first wave (or the kernel) already mounted it. Mounting it
-            // again would stack a second filesystem on the same point.
+            // again would stack a second filesystem on the same point. A hidden
+            // mount at the same path is deliberately not in `visible`.
             continue;
         }
         if let Err(e) = ops.mkdir_p(&entry.mountpoint) {
@@ -248,34 +325,49 @@ fn mount_with_mounted(
 /// `/etc/fstab` is the plan's "optional" case, not a failure.
 pub fn run_with(ops: &mut impl MountOps, path: &Path) -> Result<FstabReport, SyscallError> {
     const MAX_FSTAB_BYTES: u64 = 1024 * 1024;
-    let metadata = match std::fs::metadata(path) {
-        Ok(metadata) => metadata,
+    // Open first and inspect the handle: a path metadata check followed by a
+    // second open is a TOCTOU window, and a regular file can grow between the
+    // two. `take(MAX + 1)` bounds the read even if it does.
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(FstabReport::default()),
-        Err(e) => return Err(SyscallError::from_io("stat(/etc/fstab)", &e)),
-    };
-    if !metadata.file_type().is_file() {
-        return Err(SyscallError::new(
-            "read(/etc/fstab)",
-            io::Error::from(io::ErrorKind::InvalidInput)
-                .raw_os_error()
-                .unwrap_or(libc::EINVAL),
-        ));
-    }
-    if metadata.len() > MAX_FSTAB_BYTES {
-        return Err(SyscallError::new(
-            "read(/etc/fstab)",
-            io::Error::from(io::ErrorKind::InvalidInput)
-                .raw_os_error()
-                .unwrap_or(libc::EINVAL),
-        ));
-    }
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
         Err(e) => return Err(SyscallError::from_io("read(/etc/fstab)", &e)),
     };
-    let current = std::fs::read("/proc/mounts")
+    let metadata = match file.metadata() {
+        Ok(metadata) => metadata,
+        Err(e) => return Err(SyscallError::from_io("stat(/etc/fstab)", &e)),
+    };
+    if !metadata.file_type().is_file() || metadata.len() > MAX_FSTAB_BYTES {
+        return Err(SyscallError::new(
+            "read(/etc/fstab)",
+            io::Error::from(io::ErrorKind::InvalidInput)
+                .raw_os_error()
+                .unwrap_or(libc::EINVAL),
+        ));
+    }
+    let mut text = String::new();
+    if let Err(e) = file.take(MAX_FSTAB_BYTES + 1).read_to_string(&mut text) {
+        return Err(SyscallError::from_io("read(/etc/fstab)", &e));
+    }
+    if text.len() as u64 > MAX_FSTAB_BYTES {
+        return Err(SyscallError::new(
+            "read(/etc/fstab)",
+            io::Error::from(io::ErrorKind::InvalidInput)
+                .raw_os_error()
+                .unwrap_or(libc::EINVAL),
+        ));
+    }
+    // mountinfo has the parent/mount-id pairs needed to tell the visible mount
+    // at a path from one hidden by a later mount. Fall back to /proc/mounts on
+    // kernels or containers that do not expose it.
+    let current = std::fs::read("/proc/self/mountinfo")
         .ok()
-        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .or_else(|| {
+            std::fs::read("/proc/mounts")
+                .ok()
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        });
     Ok(mount_with_mounted(ops, &text, current.as_deref()))
 }
 
@@ -494,6 +586,27 @@ mod tests {
         assert_eq!(report.mounted, ["/data"]);
         assert_eq!(ops.calls.len(), 1, "{:?}", ops.calls);
         assert!(ops.calls[0].starts_with("tmpfs /data"), "{:?}", ops.calls);
+    }
+
+    #[test]
+    fn a_hidden_mount_does_not_hide_the_visible_target() {
+        let mut ops = Recorder::default();
+        let mountinfo = "\
+2 1 0:2 / /dev rw - tmpfs dev rw\n\
+3 2 0:3 / /dev/pts rw - devpts devpts rw\n\
+4 1 0:4 / /dev rw - tmpfs dev2 rw\n";
+        let report = mount_with_mounted(
+            &mut ops,
+            "devpts /dev/pts devpts defaults 0 0\n",
+            Some(mountinfo),
+        );
+        assert_eq!(report.mounted, ["/dev/pts"]);
+        assert_eq!(ops.calls.len(), 1, "{:?}", ops.calls);
+        assert!(
+            ops.calls[0].starts_with("devpts /dev/pts"),
+            "{:?}",
+            ops.calls
+        );
     }
 
     /// `nofstab` is the plan's trigger, and it is a whole token rather than a

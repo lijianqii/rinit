@@ -3,6 +3,7 @@
 use std::ffi::OsString;
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, ExitCode};
 
 use rinit_tools::{EXIT_OK, program_name, usage_error};
@@ -31,7 +32,7 @@ fn parse(args: &[String]) -> Result<Parsed, String> {
         }
         match arg.as_str() {
             "--help" => return Ok(Parsed::Help),
-            "-i" | "--ignore-environment" => plan.clear = true,
+            "-" | "-i" | "--ignore-environment" => plan.clear = true,
             "-u" | "--unset" => {
                 index += 1;
                 let Some(name) = args.get(index) else {
@@ -132,15 +133,25 @@ fn run(args: &[String], program: &str) -> ExitCode {
         command.env(name, value);
     }
     match command.status() {
-        Ok(status) => ExitCode::from(
-            status
-                .code()
-                .and_then(|code| u8::try_from(code).ok())
-                .unwrap_or(1),
-        ),
+        Ok(status) => {
+            if let Some(code) = status.code() {
+                ExitCode::from(u8::try_from(code).unwrap_or(1))
+            } else if let Some(signal) = status.signal() {
+                ExitCode::from((128 + signal).clamp(0, 255) as u8)
+            } else {
+                ExitCode::from(1)
+            }
+        }
         Err(error) => {
             eprintln!("{program}: {}: {error}", plan.command[0]);
-            ExitCode::from(1)
+            // The shell's env contract: 127 for "not found", 126 for "found
+            // but could not be executed".
+            let code = match error.kind() {
+                std::io::ErrorKind::NotFound => 127,
+                std::io::ErrorKind::PermissionDenied => 126,
+                _ => 126,
+            };
+            ExitCode::from(code)
         }
     }
 }
@@ -213,6 +224,14 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_command_uses_the_shells_127_exit_code() {
+        assert_eq!(
+            run(&["/no/such/command".to_string()], "env"),
+            ExitCode::from(127)
+        );
+    }
+
+    #[test]
     fn run_prints_environment_and_help() {
         assert_eq!(run(&[], "env"), ExitCode::from(EXIT_OK));
         assert_eq!(run(&["--help".to_string()], "env"), ExitCode::from(EXIT_OK));
@@ -265,7 +284,7 @@ mod coverage_tests {
         );
         assert_eq!(
             run(&["/definitely/missing".to_string()], "env"),
-            ExitCode::from(1)
+            ExitCode::from(127)
         );
     }
 }

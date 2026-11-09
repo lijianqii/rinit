@@ -78,12 +78,18 @@ fn write_log<W: Write>(log: &FileLog, out: &mut W) -> io::Result<()> {
             }
             continue;
         }
-        let file = std::fs::File::open(&path).map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!("cannot read {}: {error}", path.display()),
-            )
-        })?;
+        let file = match std::fs::File::open(&path) {
+            Ok(file) => file,
+            // Rotation can remove this file between metadata() and open().
+            // That is normal, not a reason to fail the whole read.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("cannot read {}: {error}", path.display()),
+                ));
+            }
+        };
         found = true;
         let mut reader = BufReader::new(file);
         loop {

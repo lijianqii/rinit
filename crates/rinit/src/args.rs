@@ -299,11 +299,17 @@ fn parse_with_default<I: IntoIterator<Item = OsString>>(
             ));
         }
         match value.parse::<u64>() {
-            Ok(bytes) if bytes >= crate::logs::MIN_LOG_FILE_MAX_BYTES => Ok(bytes),
-            Ok(_) => Err(format!(
+            Ok(bytes) if bytes < crate::logs::MIN_LOG_FILE_MAX_BYTES => Err(format!(
                 "--log-max-bytes: at least {} bytes are required",
                 crate::logs::MIN_LOG_FILE_MAX_BYTES
             )),
+            // The writer computes the remaining room as `usize`. A value the
+            // platform cannot address would truncate that subtraction to zero
+            // and make `append_record` loop without advancing.
+            Ok(bytes) if usize::try_from(bytes).is_err() => Err(format!(
+                "--log-max-bytes: '{value}' is larger than this platform can address"
+            )),
+            Ok(bytes) => Ok(bytes),
             Err(_) => Err(format!("--log-max-bytes: '{value}' is out of range")),
         }
     }

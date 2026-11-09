@@ -179,7 +179,12 @@ fn run<A: AsRef<OsStr>>(args: &[A], program: &str) -> ExitCode {
             let mut stdout = std::io::stdout().lock();
             let mut bytes = path.as_os_str().as_bytes().to_vec();
             bytes.push(b'\n');
-            let _ = stdout.write_all(&bytes);
+            if let Err(error) = stdout.write_all(&bytes) {
+                if !options.quiet {
+                    eprintln!("{program}: cannot write output: {error}");
+                }
+                return ExitCode::from(1);
+            }
             ExitCode::from(EXIT_OK)
         }
         Err(error) => {

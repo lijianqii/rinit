@@ -117,8 +117,12 @@ impl Cgroup {
             return Ok(None);
         };
         if limits.is_empty() {
-            // A unit with no directives is not given a cgroup of its own; see
-            // `CgroupLimits::is_empty`.
+            // A unit with no directives is not given a cgroup of its own. If a
+            // previous definition left one behind, remove it when it is empty;
+            // a populated one is still reported and kept.
+            if dir.exists() {
+                self.cleanup(unit);
+            }
             return Ok(None);
         }
 
@@ -144,8 +148,34 @@ impl Cgroup {
             }
         };
 
+        let files = limits.files();
+        // A reload can remove a directive while the cgroup directory is reused
+        // across restarts. Writes are additive, so an attribute that is no
+        // longer configured has to be reset explicitly or the old limit would
+        // silently keep applying.
+        for (controller, file) in [
+            ("cpu", "cpu.max"),
+            ("memory", "memory.max"),
+            ("memory", "memory.high"),
+            ("pids", "pids.max"),
+        ] {
+            if files.iter().any(|(_, configured, _)| *configured == file)
+                || !has_controller(&available, controller)
+            {
+                continue;
+            }
+            if let Err(e) = cgroup::write_limit(&dir, file, "max")
+                && e.errno() != libc::ENOENT
+            {
+                rlog!(
+                    "warning: {unit}: cannot reset {file} in {}: {e}",
+                    dir.display()
+                );
+            }
+        }
+
         let mut applied = Vec::new();
-        for (controller, file, value) in limits.files() {
+        for (controller, file, value) in files {
             if !has_controller(&available, controller) {
                 rlog!(
                     "warning: {unit}: this kernel has no '{controller}' controller; {file} not applied"

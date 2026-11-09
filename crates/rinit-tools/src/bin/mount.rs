@@ -12,8 +12,7 @@ struct ParsedOptions {
     data: Vec<String>,
 }
 
-fn parse_options(spec: &str) -> ParsedOptions {
-    let mut parsed = ParsedOptions::default();
+fn apply_options(parsed: &mut ParsedOptions, spec: &str) {
     for option in spec.split(',').filter(|option| !option.is_empty()) {
         match option {
             "defaults" | "auto" | "noauto" | "user" | "users" | "owner" | "group" => {}
@@ -40,6 +39,11 @@ fn parse_options(spec: &str) -> ParsedOptions {
             other => parsed.data.push(other.to_string()),
         }
     }
+}
+
+fn parse_options(spec: &str) -> ParsedOptions {
+    let mut parsed = ParsedOptions::default();
+    apply_options(&mut parsed, spec);
     parsed
 }
 
@@ -104,7 +108,12 @@ fn list_mounts(root: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
-fn mount_fstab(root: &std::path::Path) -> Result<(), String> {
+fn mount_fstab(
+    root: &std::path::Path,
+    fstype_filter: Option<&str>,
+    read_only: Option<bool>,
+    option_specs: &[String],
+) -> Result<(), String> {
     let text =
         std::fs::read_to_string(root.join("etc/fstab")).map_err(|e| format!("/etc/fstab: {e}"))?;
     let (entries, warnings) = fstab::parse(&text);
@@ -118,7 +127,22 @@ fn mount_fstab(root: &std::path::Path) -> Result<(), String> {
         if entry.fstype == "swap" || fstab::has_option(&entry.options, "noauto") {
             continue;
         }
-        let options = parse_options(&entry.options);
+        if fstype_filter.is_some_and(|filter| filter != entry.fstype) {
+            continue;
+        }
+        let mut options = parse_options(&entry.options);
+        // Command-line `-r`/`-w` and `-o` override the fstab entry, with later
+        // options winning inside the same `-o` list too.
+        if let Some(read_only) = read_only {
+            if read_only {
+                options.flags |= libc::MS_RDONLY;
+            } else {
+                options.flags &= !libc::MS_RDONLY;
+            }
+        }
+        for spec in option_specs {
+            apply_options(&mut options, spec);
+        }
         if let Err(e) = mount_one(
             &entry.device,
             &entry.mountpoint,
@@ -149,6 +173,8 @@ fn run<A: AsRef<OsStr>>(args: &[A], root: &std::path::Path, program: &str) -> Ex
 
     let mut fstype: Option<String> = None;
     let mut options = ParsedOptions::default();
+    let mut read_only: Option<bool> = None;
+    let mut option_specs: Vec<String> = Vec::new();
     let mut all = false;
     let mut positional: Vec<OsString> = Vec::new();
     let mut index = 0;
@@ -160,8 +186,14 @@ fn run<A: AsRef<OsStr>>(args: &[A], root: &std::path::Path, program: &str) -> Ex
             }
             Some("-a" | "--all") => all = true,
             Some("-n") => {}
-            Some("-r") => options.flags |= libc::MS_RDONLY,
-            Some("-w") => options.flags &= !libc::MS_RDONLY,
+            Some("-r") => {
+                options.flags |= libc::MS_RDONLY;
+                read_only = Some(true);
+            }
+            Some("-w") => {
+                options.flags &= !libc::MS_RDONLY;
+                read_only = Some(false);
+            }
             Some("-t") => {
                 index += 1;
                 let Some(value) = args.get(index) else {
@@ -180,9 +212,8 @@ fn run<A: AsRef<OsStr>>(args: &[A], root: &std::path::Path, program: &str) -> Ex
                 let Some(value) = value.as_ref().to_str() else {
                     return ExitCode::from(usage_error(program, "-o needs UTF-8 options"));
                 };
-                let extra = parse_options(value);
-                options.flags |= extra.flags;
-                options.data.extend(extra.data);
+                apply_options(&mut options, value);
+                option_specs.push(value.to_string());
             }
             Some(value) if value.starts_with('-') => {
                 return ExitCode::from(usage_error(program, &format!("unknown option '{value}'")));
@@ -193,7 +224,7 @@ fn run<A: AsRef<OsStr>>(args: &[A], root: &std::path::Path, program: &str) -> Ex
     }
 
     if all {
-        return match mount_fstab(root) {
+        return match mount_fstab(root, fstype.as_deref(), read_only, &option_specs) {
             Ok(()) => ExitCode::from(EXIT_OK),
             Err(e) => {
                 eprintln!("{program}: {e}");
@@ -253,6 +284,14 @@ mod tests {
     fn rw_clears_the_read_only_flag() {
         let parsed = parse_options("ro,rw");
         assert_eq!(parsed.flags & libc::MS_RDONLY, 0);
+    }
+
+    #[test]
+    fn a_later_option_spec_clears_an_earlier_one() {
+        let mut parsed = parse_options("ro,noexec");
+        apply_options(&mut parsed, "rw,exec");
+        assert_eq!(parsed.flags & libc::MS_RDONLY, 0);
+        assert_eq!(parsed.flags & libc::MS_NOEXEC, 0);
     }
 
     #[test]

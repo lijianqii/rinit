@@ -102,10 +102,10 @@ impl BackoffState {
             base,
             consecutive: 0,
             window: VecDeque::new(),
-            // The parser rejects `StartLimitBurst=0`; a programmatic caller
-            // that passes it gets the conservative one-failure breaker rather
-            // than an accidentally disabled one.
-            burst: burst.max(1),
+            // The parser rejects `StartLimitBurst=0` and values above its
+            // one-million cap; a programmatic caller gets the same bounds
+            // rather than an accidentally disabled or memory-unbounded breaker.
+            burst: burst.clamp(1, 1_000_000),
             interval,
             became_active_at: None,
             jitter: Jitter::new(seed),
@@ -118,7 +118,7 @@ impl BackoffState {
     /// new base and interval.
     pub fn reconfigure(&mut self, base: Duration, burst: u32, interval: Duration) {
         self.base = base;
-        self.burst = burst.max(1);
+        self.burst = burst.clamp(1, 1_000_000);
         self.interval = interval;
         while self.window.len() > self.burst as usize {
             self.window.pop_front();

@@ -139,9 +139,16 @@ mod root_tests {
     #[test]
     fn run_all_reads_fake_mounts_and_reports_failures() {
         let root = test_root("all");
+        // Never use a real mountpoint here: `run` calls the real umount2 even
+        // when the mount table is a fixture, and a root test run must not
+        // unmount the host's /run.
+        let target = root.join("not-a-real-mount");
         std::fs::write(
             root.join("proc/mounts"),
-            "/dev/vda / ext4 rw 0 0\ntmpfs /run tmpfs rw 0 0\n",
+            format!(
+                "/dev/vda / ext4 rw 0 0\ntmpfs {} tmpfs rw 0 0\n",
+                target.display()
+            ),
         )
         .expect("mounts");
         assert_eq!(run(&["-a".to_string()], &root, "umount"), ExitCode::from(1));

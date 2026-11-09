@@ -105,7 +105,14 @@ fn run<A: AsRef<OsStr>>(args: &[A], root: &std::path::Path, program: &str) -> Ex
     if !paths.is_empty() {
         let mut selected = Vec::new();
         for path in &paths {
-            let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+            let path = match std::fs::canonicalize(path) {
+                Ok(path) => path,
+                Err(error) => {
+                    eprintln!("{program}: {}: {error}", path.display());
+                    failed = true;
+                    continue;
+                }
+            };
             match mount_for(&mounts, &path) {
                 Some(entry) => {
                     if !selected.contains(entry) {
@@ -125,7 +132,12 @@ fn run<A: AsRef<OsStr>>(args: &[A], root: &std::path::Path, program: &str) -> Ex
     for (device, mount) in mounts {
         match statvfs(&mount) {
             Ok((total, used, avail)) => {
-                let percent = used.saturating_mul(100).checked_div(total).unwrap_or(0);
+                let denominator = used.saturating_add(avail);
+                let percent = used
+                    .saturating_mul(100)
+                    .saturating_add(denominator.saturating_sub(1))
+                    .checked_div(denominator)
+                    .unwrap_or(0);
                 let (total_s, used_s, avail_s) = if human_flag {
                     (human(total), human(used), human(avail))
                 } else {
@@ -205,6 +217,7 @@ mod root_tests {
     fn run_lists_a_fake_mount_and_filters_paths() {
         let root = test_root("run");
         let mount = root.join("mnt");
+        std::fs::create_dir(mount.join("child")).expect("child");
         let line = format!("tmpfs {} tmpfs rw 0 0\n", mount.display());
         std::fs::write(root.join("proc/mounts"), line).expect("mounts");
         assert_eq!(run(&[] as &[String], &root, "df"), ExitCode::from(0));

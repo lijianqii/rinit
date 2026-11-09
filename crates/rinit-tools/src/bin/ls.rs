@@ -159,11 +159,12 @@ fn format_dir(path: &Path, options: Options) -> io::Result<Vec<u8>> {
 
 fn list_path(path: &Path, display: &OsStr, options: Options) -> io::Result<Vec<u8>> {
     let meta = fs::symlink_metadata(path)?;
+    // A directory operand is listed by its contents, including under `-l`.
+    // A symlink operand is the exception: `ls -l link` prints the link itself,
+    // while `ls link` follows it to a directory.
     let follows_to_directory = !options.directory
-        && !options.long
-        && fs::metadata(path)
-            .map(|target| target.is_dir())
-            .unwrap_or(false);
+        && (meta.is_dir()
+            || (!options.long && fs::metadata(path).is_ok_and(|target| target.is_dir())));
     if follows_to_directory {
         format_dir(path, options)
     } else {
@@ -173,17 +174,46 @@ fn list_path(path: &Path, display: &OsStr, options: Options) -> io::Result<Vec<u
     }
 }
 
+enum Emit {
+    Written,
+    BrokenPipe,
+    Failed,
+}
+
 /// Write raw listing bytes. A closed pipe ends the command successfully; any
-/// other write error is a real failure.
-fn emit(bytes: &[u8]) -> bool {
+/// other write error is a real failure and must set the exit code.
+fn emit(bytes: &[u8]) -> Emit {
     match std::io::stdout().write_all(bytes) {
-        Ok(()) => true,
-        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => false,
+        Ok(()) => Emit::Written,
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Emit::BrokenPipe,
         Err(error) => {
             eprintln!("ls: cannot write output: {error}");
-            false
+            Emit::Failed
         }
     }
+}
+
+fn emitted(outcome: Emit) -> Option<ExitCode> {
+    match outcome {
+        Emit::Written => None,
+        Emit::BrokenPipe => Some(ExitCode::from(EXIT_OK)),
+        Emit::Failed => Some(ExitCode::from(1)),
+    }
+}
+
+fn apply_short_options(value: &str, options: &mut Options) -> Result<(), String> {
+    for ch in value[1..].chars() {
+        match ch {
+            'a' => options.all = true,
+            'A' => options.almost_all = true,
+            'l' => options.long = true,
+            'h' => options.human = true,
+            'd' => options.directory = true,
+            '1' => {}
+            other => return Err(format!("unknown option '-{other}'")),
+        }
+    }
+    Ok(())
 }
 
 fn run<A: AsRef<OsStr>>(args: &[A], program: &str) -> ExitCode {
@@ -209,6 +239,13 @@ fn run<A: AsRef<OsStr>>(args: &[A], program: &str) -> ExitCode {
             Some("-h" | "--human-readable") => options.human = true,
             Some("-d" | "--directory") => options.directory = true,
             Some("-1") => {}
+            Some(value)
+                if value.starts_with('-') && value.len() > 1 && !value.starts_with("--") =>
+            {
+                if let Err(error) = apply_short_options(value, &mut options) {
+                    return ExitCode::from(usage_error(program, &error));
+                }
+            }
             Some(value) if value.starts_with('-') && value != "-" => {
                 return ExitCode::from(usage_error(program, &format!("unknown option '{value}'")));
             }
@@ -223,16 +260,24 @@ fn run<A: AsRef<OsStr>>(args: &[A], program: &str) -> ExitCode {
     let mut failed = false;
     for (index, path) in paths.iter().enumerate() {
         let display = path.as_os_str();
-        if multiple && index > 0 && !emit(b"\n") {
-            return ExitCode::from(EXIT_OK);
+        if multiple
+            && index > 0
+            && let Some(code) = emitted(emit(b"\n"))
+        {
+            return code;
         }
         match list_path(path, display, options) {
             Ok(text) => {
-                if multiple && (!emit(display.as_bytes()) || !emit(b":\n")) {
-                    return ExitCode::from(EXIT_OK);
+                if multiple {
+                    if let Some(code) = emitted(emit(display.as_bytes())) {
+                        return code;
+                    }
+                    if let Some(code) = emitted(emit(b":\n")) {
+                        return code;
+                    }
                 }
-                if !emit(&text) {
-                    return ExitCode::from(EXIT_OK);
+                if let Some(code) = emitted(emit(&text)) {
+                    return code;
                 }
             }
             Err(error) => {
@@ -355,6 +400,43 @@ mod tests {
         );
         assert!(listing.contains("-rw-r--r--"));
         assert!(listing.contains("file"));
+    }
+
+    #[test]
+    fn long_directory_operand_lists_contents_but_a_symlink_stays_a_link() {
+        let root = temp_root("long-dir");
+        let dir = root.join("dir");
+        fs::create_dir(&dir).expect("dir");
+        fs::write(dir.join("inside"), b"x").expect("inside");
+        let listing = text(
+            list_path(
+                &dir,
+                OsStr::new("dir"),
+                Options {
+                    long: true,
+                    ..Options::default()
+                },
+            )
+            .expect("list"),
+        );
+        assert!(listing.contains("inside"), "{listing}");
+
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&dir, &link).expect("link");
+        let listing = text(
+            list_path(
+                &link,
+                OsStr::new("link"),
+                Options {
+                    long: true,
+                    ..Options::default()
+                },
+            )
+            .expect("link listing"),
+        );
+        assert!(listing.contains("link ->"), "{listing}");
+        assert!(!listing.contains("inside"), "{listing}");
+        let _ = fs::remove_dir_all(root);
     }
 
     /// A directory entry is bytes; it must appear unchanged in the raw listing.

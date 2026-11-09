@@ -7,6 +7,7 @@ use std::os::unix::process::CommandExt;
 use std::process::{Command, ExitCode};
 use std::time::{Duration, Instant};
 
+use rinit_runtime::syscall::process::TIOCVHANGUP;
 use rinit_tools::{EXIT_OK, program_name, usage_error, utmp};
 
 struct Options {
@@ -203,7 +204,14 @@ fn open_tty(path: &str, local: bool, baud: u32) -> Result<(), String> {
     let tty = CString::new(path.as_str()).map_err(|_| "tty path contains NUL".to_string())?;
     let pid = unsafe { libc::getpid() };
     // SAFETY: `tty` is a valid C string; the descriptor is checked below.
-    let fd = unsafe { libc::open(tty.as_ptr(), libc::O_RDWR | libc::O_NOCTTY) };
+    // O_NONBLOCK keeps a serial line without carrier from blocking the open
+    // before termios can set CLOCAL.
+    let fd = unsafe {
+        libc::open(
+            tty.as_ptr(),
+            libc::O_RDWR | libc::O_NOCTTY | libc::O_NONBLOCK,
+        )
+    };
     if fd < 0 {
         return Err(format!("{path}: {}", io::Error::last_os_error()));
     }
@@ -211,17 +219,31 @@ fn open_tty(path: &str, local: bool, baud: u32) -> Result<(), String> {
         unsafe { libc::close(fd) };
         return Err(format!("{path}: not a terminal"));
     }
-    // Hang up the previous session on the old controlling terminal, if any.
-    // The new descriptor was opened first, so it survives the hangup; the
-    // explicit TIOCSCTTY below then makes it the new controlling terminal.
-    // The call is best-effort: a process without an old tty, or without
-    // CAP_SYS_TTY_CONFIG, still gets its terminal.
-    // SAFETY: vhangup takes no arguments; SIGHUP is temporarily ignored
+    // Hang up whatever session still owns the *target* terminal. vhangup(2)
+    // acts on the caller's current controlling terminal, which is not this fd
+    // yet (it was opened O_NOCTTY), so the ioctl is the one that names the
+    // terminal being taken over. Best effort: a device that does not support
+    // it still works as a terminal.
+    // SAFETY: `fd` is the terminal opened above; SIGHUP is temporarily ignored
     // because the hangup targets the previous foreground group.
     unsafe {
         let previous = libc::signal(libc::SIGHUP, libc::SIG_IGN);
-        let _ = libc::vhangup();
+        let _ = libc::ioctl(fd, TIOCVHANGUP);
         libc::signal(libc::SIGHUP, previous);
+    }
+    // TIOCVHANGUP leaves the terminal in its hung-up state until it is
+    // reopened. The old session is gone now; reopen so TIOCSCTTY can take the
+    // fresh instance rather than returning EIO.
+    unsafe { libc::close(fd) };
+    // SAFETY: `tty` is still a valid C string.
+    let fd = unsafe {
+        libc::open(
+            tty.as_ptr(),
+            libc::O_RDWR | libc::O_NOCTTY | libc::O_NONBLOCK,
+        )
+    };
+    if fd < 0 {
+        return Err(format!("{path}: {}", io::Error::last_os_error()));
     }
     // SAFETY: a fresh session may fail only when this process is already the
     // session leader. In that case, drop any inherited controlling tty first:
@@ -281,6 +303,16 @@ fn open_tty(path: &str, local: bool, baud: u32) -> Result<(), String> {
     // SAFETY: the settings were read from the same terminal.
     if unsafe { libc::tcsetattr(0, libc::TCSANOW, &term) } != 0 {
         return Err(format!("tcsetattr: {}", io::Error::last_os_error()));
+    }
+    // The open used O_NONBLOCK only to survive a carrier wait; the login
+    // session itself expects ordinary blocking reads.
+    // SAFETY: fd 0 is the configured terminal and the flag change is local to
+    // this open file description.
+    unsafe {
+        let flags = libc::fcntl(0, libc::F_GETFL);
+        if flags >= 0 {
+            libc::fcntl(0, libc::F_SETFL, flags & !libc::O_NONBLOCK);
+        }
     }
     // Reclaim the device from the previous session only after it has been
     // proven to be a terminal and configured, so a mistyped regular file is

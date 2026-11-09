@@ -859,19 +859,26 @@ fn setup_tty(tty: &ChildTty<'_>, report_write: libc::c_int) {
 }
 
 /// Write the child report without letting a detached parent's closed pipe kill
-/// the child with SIGPIPE. The signal mask is restored immediately afterwards;
-/// `_exit`/`execve` then see the normal mask.
+/// the child with SIGPIPE.
+///
+/// Blocking SIGPIPE and then restoring the mask is not enough: a failed write
+/// leaves SIGPIPE pending, and restoring the mask delivers it immediately. The
+/// child would then die before `execve` even though the report failure is
+/// expected when `PendingSpawn::detach` has already closed the read end. Ignore
+/// the signal for the duration of the write and restore the previous action
+/// afterwards; ignored signals are never made pending.
 fn write_report(fd: libc::c_int, bytes: &[u8]) {
-    // SAFETY: the local signal sets are valid storage for sigemptyset/
-    // sigaddset, and sigprocmask only changes the current thread's mask.
+    // SAFETY: `action` and `previous` are valid storage for sigaction, and the
+    // signal mask is untouched. SIGPIPE has no handler state to preserve.
     unsafe {
-        let mut blocked = std::mem::zeroed::<libc::sigset_t>();
-        let mut previous = std::mem::zeroed::<libc::sigset_t>();
-        libc::sigemptyset(&mut blocked);
-        libc::sigaddset(&mut blocked, libc::SIGPIPE);
-        libc::sigprocmask(libc::SIG_BLOCK, &blocked, &mut previous);
+        let mut action = std::mem::zeroed::<libc::sigaction>();
+        action.sa_sigaction = libc::SIG_IGN;
+        action.sa_flags = 0;
+        libc::sigemptyset(&mut action.sa_mask);
+        let mut previous = std::mem::zeroed::<libc::sigaction>();
+        libc::sigaction(libc::SIGPIPE, &action, &mut previous);
         libc::write(fd, bytes.as_ptr().cast(), bytes.len());
-        libc::sigprocmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut());
+        libc::sigaction(libc::SIGPIPE, &previous, std::ptr::null_mut());
     }
 }
 

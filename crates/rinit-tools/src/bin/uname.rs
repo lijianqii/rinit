@@ -62,6 +62,36 @@ fn fields(selected: Selected, name: &libc::utsname) -> Vec<String> {
     out
 }
 
+fn apply_short_options(value: &str, selected: &mut Selected, any: &mut bool) -> Result<(), String> {
+    for ch in value[1..].chars() {
+        match ch {
+            'a' => {
+                *selected = Selected {
+                    sysname: true,
+                    nodename: true,
+                    release: true,
+                    version: true,
+                    machine: true,
+                    processor: true,
+                    hardware: true,
+                    os: true,
+                };
+            }
+            's' => selected.sysname = true,
+            'n' => selected.nodename = true,
+            'r' => selected.release = true,
+            'v' => selected.version = true,
+            'm' => selected.machine = true,
+            'p' => selected.processor = true,
+            'i' => selected.hardware = true,
+            'o' => selected.os = true,
+            other => return Err(format!("unknown option '-{other}'")),
+        }
+        *any = true;
+    }
+    Ok(())
+}
+
 fn run(args: &[String], program: &str) -> ExitCode {
     let mut selected = Selected::default();
     let mut any = false;
@@ -115,6 +145,11 @@ fn run(args: &[String], program: &str) -> ExitCode {
             "-o" | "--operating-system" => {
                 selected.os = true;
                 any = true;
+            }
+            value if value.starts_with('-') && value.len() > 1 && !value.starts_with("--") => {
+                if let Err(error) = apply_short_options(value, &mut selected, &mut any) {
+                    return ExitCode::from(usage_error(program, &error));
+                }
             }
             value if value.starts_with('-') && value != "-" => {
                 return ExitCode::from(usage_error(program, &format!("unknown option '{value}'")));
@@ -177,6 +212,18 @@ mod tests {
         );
         assert_eq!(all.len(), 8);
         assert_eq!(all.get(7).map(String::as_str), Some("GNU/Linux"));
+    }
+
+    #[test]
+    fn clustered_short_options_are_parsed() {
+        let mut selected = Selected::default();
+        let mut any = false;
+        apply_short_options("-mrs", &mut selected, &mut any).expect("parse");
+        assert!(any);
+        assert!(selected.machine);
+        assert!(selected.release);
+        assert!(selected.sysname);
+        assert!(!selected.nodename);
     }
 
     #[test]

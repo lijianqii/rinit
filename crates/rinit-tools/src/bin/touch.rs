@@ -143,7 +143,11 @@ fn now() -> io::Result<(i64, i64)> {
 }
 
 fn touch_path(path: &Path, options: Options) -> Result<(), String> {
-    let existing = fs::metadata(path).ok();
+    let existing = match fs::metadata(path) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!("{}: {error}", path.display())),
+    };
     if existing.is_none() {
         if options.no_create {
             return Ok(());

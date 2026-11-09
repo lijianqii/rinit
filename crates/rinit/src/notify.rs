@@ -54,6 +54,7 @@ const NOTIFY_QUEUE: usize = 64;
 /// One armed unit: its socket path and the task reading it.
 struct Armed {
     path: PathBuf,
+    generation: u64,
     reader: JoinHandle<()>,
 }
 
@@ -63,10 +64,14 @@ pub struct NotifyHub {
     /// `READY=1` and other readiness transitions. Kept separate from status
     /// chatter so one service flooding `STATUS=` cannot delay another unit's
     /// readiness report.
-    ready_sender: mpsc::Sender<(UnitName, NotifyMessage)>,
-    ready_receiver: mpsc::Receiver<(UnitName, NotifyMessage)>,
-    status_sender: mpsc::Sender<(UnitName, NotifyMessage)>,
-    status_receiver: mpsc::Receiver<(UnitName, NotifyMessage)>,
+    /// Monotonic per-unit arming generation. Messages carry the generation of
+    /// the socket that produced them, so a READY left over from a previous
+    /// instance cannot make a new start look ready.
+    generation: u64,
+    ready_sender: mpsc::Sender<(UnitName, u64, NotifyMessage)>,
+    ready_receiver: mpsc::Receiver<(UnitName, u64, NotifyMessage)>,
+    status_sender: mpsc::Sender<(UnitName, u64, NotifyMessage)>,
+    status_receiver: mpsc::Receiver<(UnitName, u64, NotifyMessage)>,
     armed: BTreeMap<UnitName, Armed>,
 }
 
@@ -85,6 +90,7 @@ impl NotifyHub {
         let (status_sender, status_receiver) = mpsc::channel(NOTIFY_QUEUE);
         NotifyHub {
             dir: dir.into(),
+            generation: 0,
             ready_sender,
             ready_receiver,
             status_sender,
@@ -144,8 +150,17 @@ impl NotifyHub {
         }
         fs::chmod(&path_str, SOCKET_MODE)?;
 
-        let reader = self.spawn_reader(unit.clone(), socket);
-        if let Some(previous) = self.armed.insert(unit, Armed { path, reader }) {
+        let generation = self.generation;
+        self.generation = self.generation.wrapping_add(1);
+        let reader = self.spawn_reader(unit.clone(), socket, generation);
+        if let Some(previous) = self.armed.insert(
+            unit,
+            Armed {
+                path,
+                generation,
+                reader,
+            },
+        ) {
             // A previous socket for the same unit is stale by definition.
             previous.reader.abort();
         }
@@ -159,11 +174,16 @@ impl NotifyHub {
             .map(|armed| format!("NOTIFY_SOCKET={}", armed.path.display()))
     }
 
+    /// The generation of the socket currently armed for `unit`, if any.
+    pub fn generation_for(&self, unit: &UnitName) -> Option<u64> {
+        self.armed.get(unit).map(|armed| armed.generation)
+    }
+
     /// Wait for the next notify message from any armed unit.
     ///
     /// Never returns `None` while the hub is alive: the hub holds a sender, so
     /// the channel cannot close. It is safe to `select!` on.
-    pub async fn recv(&mut self) -> Option<(UnitName, NotifyMessage)> {
+    pub async fn recv(&mut self) -> Option<(UnitName, u64, NotifyMessage)> {
         tokio::select! {
             // Readiness first: boot and restart decisions depend on it, while a
             // status flood is disposable.
@@ -190,7 +210,12 @@ impl NotifyHub {
         }
     }
 
-    fn spawn_reader(&self, unit: UnitName, socket: UnixDatagram) -> JoinHandle<()> {
+    fn spawn_reader(
+        &self,
+        unit: UnitName,
+        socket: UnixDatagram,
+        generation: u64,
+    ) -> JoinHandle<()> {
         let ready_sender = self.ready_sender.clone();
         let status_sender = self.status_sender.clone();
         tokio::spawn(async move {
@@ -210,7 +235,11 @@ impl NotifyHub {
                         } else {
                             &status_sender
                         };
-                        if sender.send((unit.clone(), message)).await.is_err() {
+                        if sender
+                            .send((unit.clone(), generation, message))
+                            .await
+                            .is_err()
+                        {
                             // The hub is gone; nothing left to notify.
                             break;
                         }
@@ -311,16 +340,33 @@ mod tests {
         let client = std::os::unix::net::UnixDatagram::unbound().unwrap();
         client.send_to(b"READY=1\nSTATUS=up", &path).unwrap();
 
-        let (unit, message) = tokio::time::timeout(std::time::Duration::from_secs(5), hub.recv())
-            .await
-            .expect("a message must arrive")
-            .expect("hub is live");
+        let (unit, generation, message) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), hub.recv())
+                .await
+                .expect("a message must arrive")
+                .expect("hub is live");
         assert_eq!(unit, cfg.name);
+        assert_eq!(Some(generation), hub.generation_for(&cfg.name));
         assert!(message.ready);
         assert_eq!(message.status.as_deref(), Some("up"));
 
         hub.disarm_all();
         drop(client);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn rearming_increments_the_generation() {
+        let dir = temp_dir("generation");
+        std::fs::create_dir_all(&dir).expect("dir");
+        let mut hub = NotifyHub::new_at(&dir);
+        let cfg = notify_config("svc.service");
+        hub.arm(&cfg).expect("first arm");
+        let first = hub.generation_for(&cfg.name).expect("first generation");
+        hub.arm(&cfg).expect("second arm");
+        let second = hub.generation_for(&cfg.name).expect("second generation");
+        assert_ne!(first, second);
+        hub.disarm_all();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -199,7 +199,7 @@ impl LogFile {
             file: Some(file),
             path: path.to_path_buf(),
             written,
-            max_bytes: max_bytes.max(1),
+            max_bytes: max_bytes.max(1).min(usize::MAX as u64),
             keep,
             warned: false,
         })
@@ -223,6 +223,33 @@ impl LogFile {
 
     fn append_record(&mut self, record: &str) -> bool {
         let bytes = record.as_bytes();
+        // A single record larger than the whole file must not rotate once per
+        // chunk: that would push every rotated history file out and leave only
+        // the tail of one log line. Truncate it once, with a marker, and keep
+        // the rotation budget for actual records.
+        if bytes.len() as u64 > self.max_bytes {
+            const MARKER: &[u8] = b"\n[record truncated]\n";
+            let max = self.max_bytes as usize;
+            let keep = max.saturating_sub(MARKER.len());
+            let prefix = bytes.get(..keep).unwrap_or(bytes);
+            let suffix = if max >= MARKER.len() { MARKER } else { &[] };
+            if self.file.is_none() && !self.reopen() {
+                return false;
+            }
+            if self.written > 0 && !self.rotate(max) {
+                return false;
+            }
+            let Some(file) = self.file.as_mut() else {
+                return false;
+            };
+            if let Err(e) = file.write_all(prefix).and_then(|()| file.write_all(suffix)) {
+                self.warn(&e);
+                return false;
+            }
+            self.written = (prefix.len() + suffix.len()) as u64;
+            self.warned = false;
+            return true;
+        }
         let mut offset = 0;
         while offset < bytes.len() {
             if self.file.is_none() && !self.reopen() {
@@ -814,6 +841,33 @@ mod tests {
         file.append_text(&batch);
         let written = std::fs::read(&path).expect("read back");
         assert!(written.len() <= 64, "got {} bytes", written.len());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn one_oversized_record_does_not_evict_all_history() {
+        let dir = std::env::temp_dir().join(format!(
+            "rinit-logs-oversized-record-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("rinit.log");
+        let mut file = LogFile::open(&path, 128, 2).expect("open");
+        file.append_text("previous record\n");
+        file.append_text(&"x".repeat(4096));
+
+        let current = std::fs::read(&path).expect("current");
+        assert!(
+            current.len() <= 128,
+            "current file bound: {}",
+            current.len()
+        );
+        let previous = std::fs::read(file.rotated_path(1)).expect("rotated");
+        assert!(
+            String::from_utf8_lossy(&previous).contains("previous record"),
+            "one oversized record must not flush the older history"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -2,6 +2,7 @@
 
 use std::ffi::OsStr;
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -46,11 +47,20 @@ fn link_one(target: &Path, link: &Path, options: Options) -> Result<(), String> 
             // Try to create first: a missing/invalid target must not delete an
             // existing link. Only replace it after the failure is specifically
             // "the link already exists".
-            match fs::symlink_metadata(link) {
-                Ok(existing) if existing.is_dir() => {
+            if let Ok(existing) = fs::symlink_metadata(link) {
+                if existing.is_dir() {
                     return Err(format!("{}: is a directory", link.display()));
                 }
-                _ => {}
+                if let Ok(target_meta) = fs::symlink_metadata(target)
+                    && target_meta.dev() == existing.dev()
+                    && target_meta.ino() == existing.ino()
+                {
+                    return Err(format!(
+                        "{} and {} are the same file",
+                        target.display(),
+                        link.display()
+                    ));
+                }
             }
             fs::remove_file(link).map_err(|error| format!("{}: {error}", link.display()))?;
             create().map_err(|error| format!("{} -> {}: {error}", link.display(), target.display()))
@@ -162,6 +172,28 @@ mod tests {
         };
         link_one(&target, &soft, options).expect("soft");
         assert_eq!(fs::read_link(&soft).expect("readlink"), target);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn force_refuses_to_replace_the_source_with_itself() {
+        let root = temp_root("same");
+        let path = root.join("file");
+        fs::write(&path, b"payload").expect("file");
+        let options = Options {
+            force: true,
+            ..Options::default()
+        };
+        assert!(link_one(&path, &path, options).is_err());
+        assert_eq!(fs::read(&path).expect("source survives"), b"payload");
+
+        let symbolic = Options {
+            symbolic: true,
+            force: true,
+            ..Options::default()
+        };
+        assert!(link_one(&path, &path, symbolic).is_err());
+        assert_eq!(fs::read(&path).expect("source survives -s"), b"payload");
         let _ = fs::remove_dir_all(root);
     }
 

@@ -63,23 +63,78 @@ fn open_directory(path: &Path) -> io::Result<fs::File> {
     }
 }
 
+fn open_parent(path: &Path) -> io::Result<(fs::File, CString)> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = path.file_name().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "destination has no file name")
+    })?;
+    let parent = open_directory_follow(parent)?;
+    let name = CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    Ok((parent, name))
+}
+
+/// Open a directory for use as a parent dirfd, following a final symlink when
+/// the caller supplied one. The descriptor is what keeps the parent stable
+/// while the child name is resolved with `openat`/`mkdirat`.
+fn open_directory_follow(path: &Path) -> io::Result<fs::File> {
+    let path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    // SAFETY: the path is NUL-terminated and the flags describe a directory
+    // open that may follow the final component.
+    let fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        // SAFETY: open returned a fresh descriptor we own.
+        Ok(unsafe { fs::File::from_raw_fd(fd) })
+    }
+}
+
 fn copy_file(src: &Path, dst: &Path, preserve: bool) -> io::Result<()> {
-    let meta = fs::metadata(src)?;
     let mut source = fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(src)?;
-    let mut destination = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(meta.mode() & 0o7777)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(dst)?;
+    let source_meta = source.metadata()?;
+    let (parent, name) = open_parent(dst)?;
+    // SAFETY: the parent is a directory descriptor, `name` is NUL-terminated,
+    // and the flags create the file without following a final symlink.
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            source_meta.mode() & 0o7777,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: openat returned a fresh descriptor we own.
+    let mut destination = unsafe { fs::File::from_raw_fd(fd) };
+    let destination_meta = destination.metadata()?;
+    if source_meta.dev() == destination_meta.dev() && source_meta.ino() == destination_meta.ino() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "source and destination are the same file",
+        ));
+    }
+    // Truncate only after the same-inode check: `cp a a` must not empty the
+    // source before the copy has read a single byte.
+    destination.set_len(0)?;
     io::copy(&mut source, &mut destination)?;
-    destination.set_permissions(fs::Permissions::from_mode(meta.mode() & 0o7777))?;
     if preserve {
-        set_file_times(destination.as_raw_fd(), &meta)?;
+        destination.set_permissions(fs::Permissions::from_mode(source_meta.mode() & 0o7777))?;
+        set_file_times(destination.as_raw_fd(), &source_meta)?;
     }
     Ok(())
 }
@@ -105,26 +160,90 @@ fn set_file_times(fd: libc::c_int, meta: &fs::Metadata) -> io::Result<()> {
 
 fn copy_directory(src: &Path, dst: &Path, preserve: bool) -> io::Result<()> {
     let source = open_directory(src)?;
-    let source_meta = fs::metadata(src)?;
-    let created = match fs::symlink_metadata(dst) {
-        Ok(existing) if !existing.is_dir() => {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "destination is not a directory",
-            ));
+    let source_meta = source.metadata()?;
+    let mode = source_meta.mode() & 0o7777;
+    let (destination, created) = match open_parent(dst) {
+        Ok((parent, name)) => {
+            let mut existing: libc::stat = unsafe { std::mem::zeroed() };
+            // SAFETY: `parent` is a directory descriptor and `name` is a valid
+            // NUL-terminated child name.
+            let found = unsafe {
+                libc::fstatat(
+                    parent.as_raw_fd(),
+                    name.as_ptr(),
+                    &mut existing,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            let created = if found == 0 {
+                if existing.st_mode & libc::S_IFMT != libc::S_IFDIR {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "destination is not a directory",
+                    ));
+                }
+                false
+            } else {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::NotFound {
+                    return Err(error);
+                }
+                // A read-only source directory must not make its new
+                // destination read-only before the copy has written the
+                // children into it.
+                // SAFETY: the parent is a directory descriptor and `name` is
+                // valid.
+                let made =
+                    unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), mode | 0o700) };
+                if made != 0 {
+                    let error = io::Error::last_os_error();
+                    if error.kind() != io::ErrorKind::AlreadyExists {
+                        return Err(error);
+                    }
+                    // Another process created it between fstatat and mkdirat;
+                    // do not chmod a directory this call did not create.
+                    false
+                } else {
+                    true
+                }
+            };
+
+            // SAFETY: `parent` is a directory descriptor, `name` is valid, and
+            // the final component is not followed.
+            let fd = unsafe {
+                libc::openat(
+                    parent.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: openat returned a fresh descriptor we own.
+            (unsafe { fs::File::from_raw_fd(fd) }, created)
         }
-        Ok(_) => false,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            fs::create_dir(dst)?;
-            true
+        // `cp -a src/. .` and `cp -a src/. /` name an existing directory rather
+        // than a child of its parent; copy the entries into it directly.
+        Err(error) if error.kind() == io::ErrorKind::InvalidInput => {
+            let destination = open_directory_follow(dst)?;
+            if !destination.metadata()?.is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "destination is not a directory",
+                ));
+            }
+            (destination, false)
         }
         Err(error) => return Err(error),
     };
-    let destination = open_directory(dst)?;
     if created {
-        destination.set_permissions(fs::Permissions::from_mode(source_meta.mode() & 0o7777))?;
+        destination.set_permissions(fs::Permissions::from_mode(mode | 0o700))?;
     }
     copy_dir_entries(source.as_raw_fd(), destination.as_raw_fd(), preserve)?;
+    if created {
+        destination.set_permissions(fs::Permissions::from_mode(mode))?;
+    }
     if preserve {
         set_file_times(destination.as_raw_fd(), &source_meta)?;
     }
@@ -205,7 +324,9 @@ fn copy_dir_entries(
                 break;
             }
             // SAFETY: mkdirat creates the destination relative to its dirfd.
-            let mkdir = unsafe { libc::mkdirat(destination_fd, name_c.as_ptr(), mode) };
+            // Keep the owner's write bit while the children are copied; the
+            // final chmod below restores the source mode.
+            let mkdir = unsafe { libc::mkdirat(destination_fd, name_c.as_ptr(), mode | 0o700) };
             if mkdir != 0 {
                 let error = io::Error::last_os_error();
                 if error.kind() != io::ErrorKind::AlreadyExists {
@@ -303,17 +424,13 @@ fn copy_dir_entries(
                 result = Err(io::Error::last_os_error());
                 break;
             }
-            // SAFETY: openat creates/truncates the destination file without
-            // following a final symlink.
+            // SAFETY: openat creates the destination file without following a
+            // final symlink. Truncation waits for the same-inode check below.
             let child_destination = unsafe {
                 libc::openat(
                     destination_fd,
                     name_c.as_ptr(),
-                    libc::O_WRONLY
-                        | libc::O_CREAT
-                        | libc::O_TRUNC
-                        | libc::O_NOFOLLOW
-                        | libc::O_CLOEXEC,
+                    libc::O_WRONLY | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
                     mode,
                 )
             };
@@ -325,11 +442,38 @@ fn copy_dir_entries(
             // SAFETY: both descriptors are fresh and owned here.
             let mut source = unsafe { fs::File::from_raw_fd(child_source) };
             let mut destination = unsafe { fs::File::from_raw_fd(child_destination) };
+            let source_meta = match source.metadata() {
+                Ok(meta) => meta,
+                Err(error) => {
+                    result = Err(error);
+                    break;
+                }
+            };
+            let destination_meta = match destination.metadata() {
+                Ok(meta) => meta,
+                Err(error) => {
+                    result = Err(error);
+                    break;
+                }
+            };
+            if source_meta.dev() == destination_meta.dev()
+                && source_meta.ino() == destination_meta.ino()
+            {
+                result = Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "source and destination are the same file",
+                ));
+                break;
+            }
+            if let Err(error) = destination.set_len(0) {
+                result = Err(error);
+                break;
+            }
             if let Err(error) = io::copy(&mut source, &mut destination) {
                 result = Err(error);
                 break;
             }
-            if unsafe { libc::fchmod(destination.as_raw_fd(), mode) } != 0 {
+            if preserve && unsafe { libc::fchmod(destination.as_raw_fd(), mode) } != 0 {
                 result = Err(io::Error::last_os_error());
                 break;
             }

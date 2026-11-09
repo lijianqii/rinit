@@ -171,7 +171,7 @@ pub async fn reload(
         {
             continue;
         }
-        if manager.is_up(&name) {
+        if manager.is_up(&name) || manager.has_cgroup_members(&name) {
             let effect = manager.request_stop(&name, RequestSource::UserStop);
             apply_effect(manager, &name, effect).await?;
             report.stopped.push(name.clone());
@@ -193,15 +193,20 @@ pub async fn reload(
         // purposes even though the runtime entry still exists: it was hidden
         // and stopped, and the boot target should be able to pull it in again.
         let was_retired = manager.get(&name).is_some_and(|rt| rt.retired);
-        if manager.get(&name).is_some_and(|rt| {
-            rt.config.service_kind == rinit_core::ServiceKind::Notify
-                && config.service_kind != rinit_core::ServiceKind::Notify
-        }) {
-            // A type change leaves the old notify socket and reader behind
-            // otherwise; only the next start would create a different one.
+        let was_notify = manager
+            .get(&name)
+            .is_some_and(|rt| rt.config.service_kind == rinit_core::ServiceKind::Notify);
+        let change = manager.add_with_in_flight(config.clone(), starts.is_starting(&name));
+        if was_notify
+            && config.service_kind != rinit_core::ServiceKind::Notify
+            && matches!(change, ConfigChange::Applied)
+        {
+            // A running unit keeps its old definition until its next start, so
+            // its notify socket must survive a deferred type change. Disarm it
+            // only when the new definition is already in force; the start path
+            // disarms a stale socket for a non-notify unit.
             notify.disarm(&name);
         }
-        let change = manager.add_with_in_flight(config.clone(), starts.is_starting(&name));
         if was_retired {
             added.insert(name.clone());
             report.added.push(name);

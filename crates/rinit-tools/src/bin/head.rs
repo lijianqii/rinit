@@ -142,7 +142,9 @@ fn run<A: AsRef<OsStr>>(args: &[A], program: &str) -> ExitCode {
     let mut index = 0;
     while let Some(arg) = option_args.get(index) {
         let Some(text) = arg.as_ref().to_str() else {
-            return ExitCode::from(usage_error(program, "an argument is not valid UTF-8"));
+            files.push(PathBuf::from(arg.as_ref()));
+            index += 1;
+            continue;
         };
         match text {
             "-h" | "--help" => {
@@ -391,6 +393,16 @@ mod tests {
         assert_eq!(
             run(&["-n".to_string(), "x".to_string()] as &[String], "head"),
             ExitCode::from(EXIT_USAGE)
+        );
+        use std::os::unix::ffi::OsStringExt;
+        let raw = root.join(std::ffi::OsString::from_vec(b"raw\xff".to_vec()));
+        std::fs::write(&raw, b"one\n").expect("raw file");
+        assert_eq!(
+            run(
+                &[OsString::from("-c1"), raw.into_os_string()] as &[OsString],
+                "head"
+            ),
+            ExitCode::from(EXIT_OK)
         );
         assert_eq!(
             run(&["--help".to_string()] as &[String], "head"),

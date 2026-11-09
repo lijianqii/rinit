@@ -127,8 +127,15 @@ fn main() -> ExitCode {
 
     match client::send(&request) {
         Ok((Status::Ok, text)) => {
-            if !text.is_empty() && !emit(&format!("{text}\n")) {
-                return ExitCode::from(1);
+            if !text.is_empty() {
+                let output = if text.ends_with('\n') {
+                    text.clone()
+                } else {
+                    format!("{text}\n")
+                };
+                if !emit(&output) {
+                    return ExitCode::from(1);
+                }
             }
             ExitCode::from(Status::Ok.exit_code())
         }

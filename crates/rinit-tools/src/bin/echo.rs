@@ -1,72 +1,76 @@
 //! `echo` - write arguments to standard output.
 
+use std::ffi::OsString;
+use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
 use std::process::ExitCode;
 
 use rinit_tools::{EXIT_OK, program_name};
 
-fn expand(input: &str, out: &mut String) -> bool {
-    let mut chars = input.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch != '\\' {
-            out.push(ch);
+fn expand(input: &[u8], out: &mut Vec<u8>) -> bool {
+    let mut index = 0;
+    while index < input.len() {
+        let byte = input[index];
+        index += 1;
+        if byte != b'\\' {
+            out.push(byte);
             continue;
         }
-        let Some(escape) = chars.next() else {
-            out.push('\\');
+        let Some(&escape) = input.get(index) else {
+            out.push(b'\\');
             break;
         };
+        index += 1;
         match escape {
-            'a' => out.push('\x07'),
-            'b' => out.push('\x08'),
-            'c' => return true,
-            'e' => out.push('\x1b'),
-            'f' => out.push('\x0c'),
-            'n' => out.push('\n'),
-            'r' => out.push('\r'),
-            't' => out.push('\t'),
-            'v' => out.push('\x0b'),
-            '\\' => out.push('\\'),
-            '0' => {
-                let mut value = 0_u32;
+            b'a' => out.push(0x07),
+            b'b' => out.push(0x08),
+            b'c' => return true,
+            b'e' => out.push(0x1b),
+            b'f' => out.push(0x0c),
+            b'n' => out.push(b'\n'),
+            b'r' => out.push(b'\r'),
+            b't' => out.push(b'\t'),
+            b'v' => out.push(0x0b),
+            b'\\' => out.push(b'\\'),
+            b'0' => {
+                let mut value = 0_u16;
                 let mut digits = 0;
                 while digits < 3 {
-                    let Some(next) = chars.peek().copied() else {
+                    let Some(&next) = input.get(index) else {
                         break;
                     };
-                    let Some(digit) = next.to_digit(8) else {
+                    if !(b'0'..=b'7').contains(&next) {
                         break;
-                    };
-                    chars.next();
-                    value = value * 8 + digit;
+                    }
+                    index += 1;
+                    value = value * 8 + u16::from(next - b'0');
                     digits += 1;
                 }
-                if let Some(character) = char::from_u32(value) {
-                    out.push(character);
-                }
+                out.push(value as u8);
             }
-            'x' => {
-                let mut value = 0_u32;
+            b'x' => {
+                let mut value = 0_u16;
                 let mut digits = 0;
                 while digits < 2 {
-                    let Some(next) = chars.peek().copied() else {
+                    let Some(&next) = input.get(index) else {
                         break;
                     };
-                    let Some(digit) = next.to_digit(16) else {
+                    let Some(digit) = (next as char).to_digit(16) else {
                         break;
                     };
-                    chars.next();
-                    value = value * 16 + digit;
+                    index += 1;
+                    value = value * 16 + digit as u16;
                     digits += 1;
                 }
                 if digits == 0 {
-                    out.push('\\');
-                    out.push('x');
-                } else if let Some(character) = char::from_u32(value) {
-                    out.push(character);
+                    out.push(b'\\');
+                    out.push(b'x');
+                } else {
+                    out.push(value as u8);
                 }
             }
             other => {
-                out.push('\\');
+                out.push(b'\\');
                 out.push(other);
             }
         }
@@ -74,64 +78,73 @@ fn expand(input: &str, out: &mut String) -> bool {
     false
 }
 
-fn render(args: &[String], escapes: bool) -> (String, bool) {
-    let mut out = String::new();
+fn render(args: &[OsString], escapes: bool) -> (Vec<u8>, bool) {
+    let mut out = Vec::new();
     let mut stop = false;
     for (index, arg) in args.iter().enumerate() {
         if index > 0 {
-            out.push(' ');
+            out.push(b' ');
         }
+        let bytes = arg.as_bytes();
         if escapes {
-            if expand(arg, &mut out) {
+            if expand(bytes, &mut out) {
                 stop = true;
                 break;
             }
         } else {
-            out.push_str(arg);
+            out.extend_from_slice(bytes);
         }
     }
     (out, stop)
 }
 
-fn run(args: &[String], _program: &str) -> ExitCode {
+fn run(args: &[OsString], program: &str) -> ExitCode {
     let mut newline = true;
     let mut escapes = false;
-    let mut values: Vec<String> = Vec::new();
+    let mut values: Vec<OsString> = Vec::new();
     let mut parsing = true;
     for arg in args {
         if parsing {
-            match arg.as_str() {
-                "--help" => {
+            if let Some(text) = arg.to_str() {
+                if text == "--help" {
                     println!("Usage: echo [-neE] [STRING...]");
                     return ExitCode::from(EXIT_OK);
                 }
-                "-n" => {
-                    newline = false;
-                    continue;
+                if text.len() > 1 && text.starts_with('-') {
+                    let flags = &text[1..];
+                    if flags.chars().all(|ch| matches!(ch, 'n' | 'e' | 'E')) {
+                        for ch in flags.chars() {
+                            match ch {
+                                'n' => newline = false,
+                                'e' => escapes = true,
+                                'E' => escapes = false,
+                                _ => {}
+                            }
+                        }
+                        continue;
+                    }
                 }
-                "-e" => {
-                    escapes = true;
-                    continue;
-                }
-                "-E" => {
-                    escapes = false;
-                    continue;
-                }
-                value if value.starts_with('-') && value.len() > 1 => {
-                    parsing = false;
-                }
-                _ => parsing = false,
             }
+            parsing = false;
         }
         values.push(arg.clone());
     }
     let (text, stop) = render(&values, escapes);
-    if !stop && newline {
-        println!("{text}");
+    let mut stdout = std::io::stdout().lock();
+    let result = if !stop && newline {
+        stdout
+            .write_all(&text)
+            .and_then(|()| stdout.write_all(b"\n"))
     } else {
-        print!("{text}");
+        stdout.write_all(&text)
+    };
+    match result {
+        Ok(()) => ExitCode::from(EXIT_OK),
+        Err(error) => {
+            eprintln!("{program}: {error}");
+            ExitCode::from(1)
+        }
     }
-    ExitCode::from(EXIT_OK)
 }
 
 fn main() -> ExitCode {
@@ -143,10 +156,7 @@ fn main() -> ExitCode {
             .and_then(|arg| arg.to_str()),
         "echo",
     );
-    let Some(args) = rinit_tools::utf8_args(&program) else {
-        return ExitCode::from(rinit_tools::EXIT_USAGE);
-    };
-    let args: Vec<String> = args.into_iter().skip(1).collect();
+    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     run(&args, &program)
 }
 
@@ -154,36 +164,43 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
 
+    fn os(values: &[&str]) -> Vec<OsString> {
+        values.iter().map(OsString::from).collect()
+    }
+
     #[test]
     fn plain_rendering_joins_arguments() {
-        let args = vec!["one".to_string(), "two".to_string()];
-        assert_eq!(render(&args, false), ("one two".to_string(), false));
+        assert_eq!(
+            render(&os(&["one", "two"]), false),
+            (b"one two".to_vec(), false)
+        );
     }
 
     #[test]
     fn escapes_cover_common_sequences() {
-        let args = vec!["a\\tb\\nc".to_string()];
-        assert_eq!(render(&args, true), ("a\tb\nc".to_string(), false));
-        let args = vec!["stop\\chere".to_string()];
-        assert_eq!(render(&args, true), ("stop".to_string(), true));
-        let args = vec!["\\x41\\0101".to_string()];
-        assert_eq!(render(&args, true), ("AA".to_string(), false));
+        assert_eq!(
+            render(&os(&["a\\tb\\nc"]), true),
+            (b"a\tb\nc".to_vec(), false)
+        );
+        assert_eq!(
+            render(&os(&["stop\\chere"]), true),
+            (b"stop".to_vec(), true)
+        );
+        assert_eq!(render(&os(&["\\x41\\0101"]), true), (b"AA".to_vec(), false));
     }
 
     #[test]
-    fn run_handles_help_and_options() {
-        assert_eq!(
-            run(&["--help".to_string()], "echo"),
-            ExitCode::from(EXIT_OK)
-        );
-        assert_eq!(
-            run(&["-n".to_string(), "x".to_string()], "echo"),
-            ExitCode::from(EXIT_OK)
-        );
-        assert_eq!(
-            run(&["-e".to_string(), "x".to_string()], "echo"),
-            ExitCode::from(EXIT_OK)
-        );
+    fn hex_escapes_are_raw_bytes_not_utf8() {
+        assert_eq!(render(&os(&["\\xFF"]), true), (vec![0xff], false));
+        assert_eq!(render(&os(&["\\0377"]), true), (vec![0xff], false));
+    }
+
+    #[test]
+    fn run_handles_help_and_clustered_options() {
+        assert_eq!(run(&os(&["--help"]), "echo"), ExitCode::from(EXIT_OK));
+        assert_eq!(run(&os(&["-n", "x"]), "echo"), ExitCode::from(EXIT_OK));
+        assert_eq!(run(&os(&["-e", "x"]), "echo"), ExitCode::from(EXIT_OK));
+        assert_eq!(run(&os(&["-ne", "x"]), "echo"), ExitCode::from(EXIT_OK));
     }
 }
 
@@ -191,27 +208,16 @@ mod tests {
 mod coverage_tests {
     use super::*;
 
+    fn os(values: &[&str]) -> Vec<OsString> {
+        values.iter().map(OsString::from).collect()
+    }
+
     #[test]
     fn run_parses_flags_and_escapes() {
-        assert_eq!(
-            run(&["--help".to_string()], "echo"),
-            ExitCode::from(EXIT_OK)
-        );
-        assert_eq!(
-            run(&["-n".to_string(), "x".to_string()], "echo"),
-            ExitCode::from(EXIT_OK)
-        );
-        assert_eq!(
-            run(&["-e".to_string(), "a\nb".to_string()], "echo"),
-            ExitCode::from(EXIT_OK)
-        );
-        assert_eq!(
-            run(&["-E".to_string(), "a\nb".to_string()], "echo"),
-            ExitCode::from(EXIT_OK)
-        );
-        assert_eq!(
-            run(&["-ne".to_string(), "x".to_string()], "echo"),
-            ExitCode::from(EXIT_OK)
-        );
+        assert_eq!(run(&os(&["--help"]), "echo"), ExitCode::from(EXIT_OK));
+        assert_eq!(run(&os(&["-n", "x"]), "echo"), ExitCode::from(EXIT_OK));
+        assert_eq!(run(&os(&["-e", "a\nb"]), "echo"), ExitCode::from(EXIT_OK));
+        assert_eq!(run(&os(&["-E", "a\nb"]), "echo"), ExitCode::from(EXIT_OK));
+        assert_eq!(run(&os(&["-ne", "x"]), "echo"), ExitCode::from(EXIT_OK));
     }
 }

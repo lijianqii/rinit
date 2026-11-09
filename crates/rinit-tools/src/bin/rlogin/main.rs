@@ -106,8 +106,17 @@ fn shadow_login_denied(text: &str, name: &str, today: u64) -> bool {
         Ok(value) => value,
         Err(()) => return true,
     };
+    // `last_change == 0` means "change it at the next login", and
+    // `max_age == 0` means the password is already expired. rlogin cannot run
+    // passwd, so both are denials. A future last-change date is malformed for
+    // this purpose and is refused rather than treated as an unlimited age.
+    if last_change == Some(0) || max_age == Some(0) {
+        return true;
+    }
+    if last_change.is_some_and(|last_change| last_change > today) {
+        return true;
+    }
     if let (Some(last_change), Some(max_age)) = (last_change, max_age)
-        && max_age > 0
         && today >= last_change.saturating_add(max_age)
     {
         return true;
@@ -610,6 +619,13 @@ mod tests {
 
         let no_aging = "root:$6$h:19000:0::::";
         assert!(!shadow_login_denied(no_aging, "root", today));
+
+        let must_change = "root:$6$h:0:0:99999:7:::";
+        assert!(shadow_login_denied(must_change, "root", today));
+        let max_age_zero = "root:$6$h:19000:0:0:7:::";
+        assert!(shadow_login_denied(max_age_zero, "root", today));
+        let future_change = "root:$6$h:30000:0:99999:7:::";
+        assert!(shadow_login_denied(future_change, "root", today));
 
         let malformed = "root:$6$h:19000:0:99999:7::soon:";
         assert!(

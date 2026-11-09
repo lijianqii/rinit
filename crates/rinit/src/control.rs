@@ -18,7 +18,7 @@
 //!   which is what makes `RINIT_CONTROL_DIR` usable without root.
 
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -115,6 +115,14 @@ impl ControlServer {
                 op: "create control dir",
                 source: e,
             })?;
+        // `DirBuilder::mode` only applies when the directory is created. An
+        // existing directory must not silently keep a wider mode.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
+            RuntimeError::Io {
+                op: "chmod control dir",
+                source: e,
+            }
+        })?;
         let path = dir.join("control.sock");
         // A stale socket from a previous run would make `bind` fail with
         // EADDRINUSE; nothing else is supposed to be at this path.

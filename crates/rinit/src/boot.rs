@@ -305,6 +305,14 @@ fn sync_socket_activation(
             continue;
         };
         if rt.pid.is_some() {
+            // A level-triggered listener stays readable until the service
+            // accepts the queued connection. Rearming it now would report the
+            // same arrival again and again, refreshing IdleTimeoutSec forever.
+            // Wait for the backlog to drain first; a new connection then makes
+            // the watcher readable again.
+            if activation.is_readable(&unit) {
+                continue;
+            }
             if activations
                 .get(&unit)
                 .is_none_or(|at| at.elapsed() >= SOCKET_IDLE_REFRESH)
@@ -768,7 +776,13 @@ async fn supervise(
                     break;
                 }
             },
-            Some((unit, message)) = supervised.notify.recv() => {
+            Some((unit, generation, message)) = supervised.notify.recv() => {
+                // A READY or STATUS from the socket of a previous instance is
+                // not evidence about the current one. The generation is
+                // incremented by `arm`, which every start performs.
+                if supervised.notify.generation_for(&unit) != Some(generation) {
+                    continue;
+                }
                 if let Some(status) = &message.status {
                     rlog!("{unit}: {status}");
                 }
@@ -979,7 +993,12 @@ fn begin_spawn_unit(
             notify.arm(&config)?;
             notify.env_for(unit).into_iter().collect()
         }
-        _ => Vec::new(),
+        _ => {
+            // The unit may have just adopted a deferred change from notify to
+            // another type. Its old socket is no longer meaningful.
+            notify.disarm(unit);
+            Vec::new()
+        }
     };
 
     // Plan §7.9: a unit rinit holds a socket for gets it on fd 3, and says so in
@@ -1470,6 +1489,8 @@ impl StartFlow {
                         };
                     }
                     Ok(Err(e)) => {
+                        // `wait_blocking` already reaped the failed child.
+                        manager.forget_spawned_pid(&self.unit);
                         return Some(self.failed(
                             manager,
                             format!(
@@ -2301,12 +2322,12 @@ async fn handle_control(
             };
             ControlAction::Reply(Status::Ok, text)
         }
-        Request::Start(unit) => control_start(manager, unit),
+        Request::Start(unit) => control_start(manager, activation, unit),
         Request::Stop(unit) => {
             let (status, text) = control_stop(manager, unit).await;
             ControlAction::Reply(status, text)
         }
-        Request::Restart(unit) => control_restart(manager, unit),
+        Request::Restart(unit) => control_restart(manager, activation, unit),
         Request::ResetFailed(unit) => {
             if !manager.exists(unit) {
                 return ControlAction::Reply(Status::NoSuchUnit, format!("no such unit: {unit}"));
@@ -2357,7 +2378,11 @@ async fn control_reload(
 }
 
 /// `rctl start`: plan §1.3(13)'s action-derivation for a user request.
-fn control_start(manager: &mut UnitManager, unit: &UnitName) -> ControlAction {
+fn control_start(
+    manager: &mut UnitManager,
+    activation: &mut Activated,
+    unit: &UnitName,
+) -> ControlAction {
     if !manager.exists(unit) {
         // Plan §7.7's boundary: a template is a name to instantiate, not a unit,
         // and saying which is which is the whole message.
@@ -2376,6 +2401,28 @@ fn control_start(manager: &mut UnitManager, unit: &UnitName) -> ControlAction {
                 Status::NoSuchUnit,
                 format!("no such unit: {unit} ({why})"),
             );
+        }
+    }
+    // A template instance did not exist during boot, so its SocketActivate=
+    // was never bound there. An explicit start has to bind it before spawning,
+    // exactly as boot does for a static unit.
+    if let Some(path) = manager
+        .get(unit)
+        .and_then(|rt| rt.config.socket_activate.clone())
+        && manager.listener_fd(unit).is_none()
+    {
+        match activation.bind(unit, std::path::Path::new(&path)) {
+            Ok(()) => {
+                if let Some(fd) = activation.listener_fd(unit) {
+                    manager.set_listener(unit, fd);
+                }
+            }
+            Err(e) => {
+                return ControlAction::Reply(
+                    Status::Error,
+                    format!("cannot bind {path} for {unit}: {e}"),
+                );
+            }
         }
     }
     match ControlStart::new(manager, unit) {
@@ -2415,7 +2462,11 @@ async fn control_stop(manager: &mut UnitManager, unit: &UnitName) -> (Status, St
 ///
 /// A unit that has no process to restart and nothing to redo is a conflict
 /// (plan §3 M3's exit code 4).
-fn control_restart(manager: &mut UnitManager, unit: &UnitName) -> ControlAction {
+fn control_restart(
+    manager: &mut UnitManager,
+    activation: &mut Activated,
+    unit: &UnitName,
+) -> ControlAction {
     if !manager.exists(unit) {
         return ControlAction::Reply(Status::NoSuchUnit, format!("no such unit: {unit}"));
     }
@@ -2424,7 +2475,7 @@ fn control_restart(manager: &mut UnitManager, unit: &UnitName) -> ControlAction 
             rlog!("restarting {unit}");
             ControlAction::Reply(Status::Ok, format!("restarting {unit}"))
         }
-        RestartPlan::Start => control_start(manager, unit),
+        RestartPlan::Start => control_start(manager, activation, unit),
         RestartPlan::NotApplicable => ControlAction::Reply(
             Status::Conflict,
             format!("{unit} has no process to restart"),

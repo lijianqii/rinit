@@ -37,10 +37,12 @@ pub fn resolve(config: &UnitConfig) -> Result<Sandbox, RuntimeError> {
         // capability-only unit does not depend on `/etc/passwd` existing.
         return resolve_from(config, "", "");
     }
-    // A numeric User=/Group= needs no lookup, and a numeric User= with a
-    // numeric Group= must work on a rootfs with neither database. A named user
-    // still needs the group database for its supplementary memberships.
-    let passwd = if config.user.trim().parse::<u32>().is_ok() {
+    // An empty User= is root and needs no passwd lookup; only a non-empty,
+    // non-numeric name does. This lets a unit that sets only Group= start on a
+    // rootfs without /etc/passwd. A named user still needs the group database
+    // for its supplementary memberships.
+    let user = config.user.trim();
+    let passwd = if user.is_empty() || user.parse::<u32>().is_ok() {
         String::new()
     } else {
         read(PASSWD, "read /etc/passwd")?

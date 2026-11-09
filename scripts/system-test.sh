@@ -37,7 +37,7 @@ set -euo pipefail
 arch="aarch64"
 kernel=""
 initrd=""
-timeout_s=90
+timeout_s=120
 mem="${QEMU_MEM:-256M}"
 log_file=""
 keep_log=0
@@ -137,12 +137,24 @@ await_log() {
     # getty shows `login:`, so answer with the username and the default password
     # from /etc/shadow. `id` afterwards proves the shadow/login path worked.
     await_log 40 'login:' || true
-    printf 'root\n' >&3
-    sleep 1
-    printf 'toor\n' >&3
-    sleep 1
-    printf 'id\n' >&3
-    await_log 10 'uid=0\(root\)' || true
+    # The prompt is printed just before login starts reading. On a slow serial
+    # guest the first characters can otherwise arrive before the line discipline
+    # is ready and be lost. Retry the credential pair if the first attempt did
+    # not reach a shell; each failed attempt returns to a fresh `login:`.
+    sleep 2
+    for _attempt in 1 2 3; do
+        printf 'root\n' >&3
+        sleep 1
+        printf 'toor\n' >&3
+        sleep 1
+        printf 'id\n' >&3
+        if await_log 6 'uid=0\(root\)'; then
+            break
+        fi
+        printf '\n' >&3
+        sleep 1
+    done
+    await_log 5 'uid=0\(root\)' || true
 
     # The boot set's DHCP client. qemu's user-mode network answers the lease, so
     # the interface, the default route and the resolver all have to be set by
@@ -481,13 +493,11 @@ feeder_pid=$!
 # The guest never exits on its own (rinit stays PID 1), so a bounded `timeout`
 # is the expected outcome. `timeout` returns 124 when it had to stop qemu.
 #
-# Ninety seconds, not sixty: the feeder types a lot more than it used to (every
-# §7.x acceptance step), and the last assertion waits for a *restart* that follows
-# the console work. Sixty was enough until §7.8's socket wait pushed the boot's
-# tail - "getty.service will restart in 2.157s" was scheduled and then qemu was
-# killed before it happened.
+# 120 seconds, not 90: arm32 under host load can need longer to run the full
+# console script and the post-getty restart step. The guest still never exits on
+# its own, so the timeout is the expected end of the test.
 set +e
-timeout -k 5 "${timeout_s}" \
+timeout -k 15 "${timeout_s}" \
     "${repo_root}/scripts/run-qemu.sh" \
     --arch "${arch}" --kernel "${kernel}" --initrd "${initrd}" --mem "${mem}" \
     ${service:+--service "${service}"} \
@@ -496,8 +506,10 @@ qemu_rc=$?
 wait "${feeder_pid}" 2>/dev/null || true
 set -e
 
-# 124 = we killed it (expected). Anything else means qemu died early.
-if [[ ${qemu_rc} -ne 124 && ${qemu_rc} -ne 0 ]]; then
+# 124 = timeout's TERM, 137 = timeout's KILL after the grace period. Both are
+# the expected bounded shutdown; a slow arm32 guest can need the harder signal.
+# Anything else means qemu died early.
+if [[ ${qemu_rc} -ne 124 && ${qemu_rc} -ne 137 && ${qemu_rc} -ne 0 ]]; then
     echo "FAIL: qemu exited with ${qemu_rc} before the assertions could be checked" >&2
     tail -20 "${log_file}" >&2
     exit 3

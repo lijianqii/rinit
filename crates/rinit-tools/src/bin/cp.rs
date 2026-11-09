@@ -2,6 +2,8 @@
 
 use std::ffi::OsStr;
 use std::fs;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -18,6 +20,14 @@ struct Options {
 
 fn target_for(src: &Path, dst: &Path, dst_is_dir: bool) -> Result<PathBuf, String> {
     if dst_is_dir {
+        // `cp -a src/. dest` copies the *contents* of src into dest, and
+        // `cp -a . dest` copies the current directory's contents. Path's
+        // `file_name()` returns `src` and `None` respectively; both must map to
+        // dest itself rather than dest/src or an error.
+        let bytes = src.as_os_str().as_bytes();
+        if bytes == b"." || bytes.ends_with(b"/.") {
+            return Ok(dst.to_path_buf());
+        }
         let name = src
             .file_name()
             .ok_or_else(|| format!("cannot determine the name of '{}'", src.display()))?;
@@ -66,6 +76,17 @@ fn copy_one(src: &Path, dst: &Path, options: Options) -> Result<(), String> {
             ));
         }
     }
+    if let Ok(existing) = fs::symlink_metadata(dst)
+        && !existing.is_dir()
+        && existing.dev() == meta.dev()
+        && existing.ino() == meta.ino()
+    {
+        return Err(format!(
+            "{} and {} are the same file",
+            src.display(),
+            dst.display()
+        ));
+    }
     if options.force && (meta.is_file() || meta.file_type().is_symlink()) {
         match fs::symlink_metadata(dst) {
             Ok(existing) if !existing.is_dir() => {
@@ -83,6 +104,23 @@ fn copy_one(src: &Path, dst: &Path, options: Options) -> Result<(), String> {
     }
     fsutil::copy_entry(src, dst, options.recursive, options.preserve)
         .map_err(|error| format!("{} -> {}: {error}", src.display(), dst.display()))
+}
+
+fn apply_short_options(value: &str, options: &mut Options) -> Result<(), String> {
+    for ch in value[1..].chars() {
+        match ch {
+            'r' | 'R' => options.recursive = true,
+            'a' => {
+                options.recursive = true;
+                options.preserve = true;
+            }
+            'f' => options.force = true,
+            'p' => options.preserve = true,
+            'n' => options.no_clobber = true,
+            other => return Err(format!("unknown option '-{other}'")),
+        }
+    }
+    Ok(())
 }
 
 fn run<A: AsRef<OsStr>>(args: &[A], program: &str) -> ExitCode {
@@ -110,6 +148,13 @@ fn run<A: AsRef<OsStr>>(args: &[A], program: &str) -> ExitCode {
             Some("-p" | "--preserve") => options.preserve = true,
             Some("-f" | "--force") => options.force = true,
             Some("-n" | "--no-clobber") => options.no_clobber = true,
+            Some(value)
+                if value.starts_with('-') && value.len() > 1 && !value.starts_with("--") =>
+            {
+                if let Err(error) = apply_short_options(value, &mut options) {
+                    return ExitCode::from(usage_error(program, &error));
+                }
+            }
             Some(value) if value.starts_with('-') && value != "-" => {
                 return ExitCode::from(usage_error(program, &format!("unknown option '{value}'")));
             }
@@ -170,6 +215,17 @@ mod tests {
     }
 
     #[test]
+    fn clustered_short_options_are_parsed() {
+        let mut options = Options::default();
+        apply_short_options("-rf", &mut options).expect("parse");
+        assert!(options.recursive);
+        assert!(options.force);
+        apply_short_options("-Rp", &mut options).expect("parse");
+        assert!(options.preserve);
+        assert!(apply_short_options("-x", &mut options).is_err());
+    }
+
+    #[test]
     fn copies_a_file_and_preserves_mode() {
         let root = temp_root("file");
         let src = root.join("src");
@@ -198,6 +254,76 @@ mod tests {
         };
         assert!(copy_one(&missing, &dst, options).is_err());
         assert_eq!(fs::read(&dst).expect("dst survives"), b"keep me");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn copying_a_file_onto_itself_is_refused_without_truncating_it() {
+        let root = temp_root("same-file");
+        let path = root.join("file");
+        fs::write(&path, b"payload").expect("file");
+        assert!(copy_one(&path, &path, Options::default()).is_err());
+        assert_eq!(fs::read(&path).expect("source survives"), b"payload");
+
+        let options = Options {
+            force: true,
+            ..Options::default()
+        };
+        assert!(copy_one(&path, &path, options).is_err());
+        assert_eq!(fs::read(&path).expect("source survives -f"), b"payload");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn copying_a_hard_link_onto_its_source_is_refused() {
+        let root = temp_root("same-inode");
+        let src = root.join("src");
+        let link = root.join("link");
+        fs::write(&src, b"payload").expect("src");
+        fs::hard_link(&src, &link).expect("hard link");
+        assert!(copy_one(&src, &link, Options::default()).is_err());
+        assert_eq!(fs::read(&src).expect("source survives"), b"payload");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recursive_copy_of_a_read_only_directory_works() {
+        let root = temp_root("read-only");
+        let src = root.join("tree");
+        fs::create_dir(&src).expect("tree");
+        fs::write(src.join("file"), b"payload").expect("file");
+        fs::set_permissions(&src, fs::Permissions::from_mode(0o555)).expect("mode");
+        let options = Options {
+            recursive: true,
+            ..Options::default()
+        };
+        copy_one(&src, &root.join("copy"), options).expect("copy");
+        assert_eq!(
+            fs::read(root.join("copy/file")).expect("copied file"),
+            b"payload"
+        );
+        let _ = fs::set_permissions(&src, fs::Permissions::from_mode(0o755));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_trailing_dot_copies_directory_contents() {
+        let root = temp_root("trailing-dot");
+        let src = root.join("src");
+        let dest = root.join("dest");
+        fs::create_dir_all(&src).expect("src");
+        fs::create_dir(&dest).expect("dest");
+        fs::write(src.join("file"), b"payload").expect("file");
+        let target = target_for(&src.join("."), &dest, true).expect("target");
+        assert_eq!(target, dest);
+        let options = Options {
+            recursive: true,
+            preserve: true,
+            ..Options::default()
+        };
+        copy_one(&src.join("."), &target, options).expect("copy");
+        assert_eq!(fs::read(dest.join("file")).expect("file"), b"payload");
+        assert!(!dest.join("src").exists());
         let _ = fs::remove_dir_all(root);
     }
 
