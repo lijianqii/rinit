@@ -226,6 +226,44 @@ mod tests {
     }
 
     #[test]
+    fn double_dash_allows_dash_leading_operands() {
+        let root = temp_root("double-dash");
+        let dest = root.join("dest");
+        fs::create_dir(&dest).expect("dest");
+        let dash = root.join("-r");
+        let good = root.join("good");
+        fs::write(&dash, b"dash").expect("dash");
+        fs::write(&good, b"good").expect("good");
+        let args = vec![
+            "--".to_string(),
+            dash.display().to_string(),
+            good.display().to_string(),
+            dest.display().to_string(),
+        ];
+        assert_eq!(run(&args, "cp"), ExitCode::from(EXIT_OK));
+        assert_eq!(fs::read(dest.join("-r")).expect("dash copy"), b"dash");
+        assert_eq!(fs::read(dest.join("good")).expect("good copy"), b"good");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_failed_source_does_not_stop_the_next_one() {
+        let root = temp_root("partial-failure");
+        let dest = root.join("dest");
+        fs::create_dir(&dest).expect("dest");
+        let good = root.join("good");
+        fs::write(&good, b"good").expect("good");
+        let args = vec![
+            root.join("missing").display().to_string(),
+            good.display().to_string(),
+            dest.display().to_string(),
+        ];
+        assert_eq!(run(&args, "cp"), ExitCode::from(1));
+        assert_eq!(fs::read(dest.join("good")).expect("good copy"), b"good");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn copies_a_file_and_preserves_mode() {
         let root = temp_root("file");
         let src = root.join("src");

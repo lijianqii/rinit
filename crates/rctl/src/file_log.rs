@@ -45,7 +45,7 @@ fn log_paths(path: &Path) -> Vec<PathBuf> {
 /// Write the selected lines, preserving the file's line endings.
 fn write_log<W: Write>(log: &FileLog, out: &mut W) -> io::Result<()> {
     let prefix = log.unit.as_ref().map(|unit| format!("{unit}: "));
-    let mut selected: Option<VecDeque<String>> = if log.tail == 0 {
+    let mut selected: Option<VecDeque<Vec<u8>>> = if log.tail == 0 {
         None
     } else {
         // Do not trust the requested count as an allocation size: a CLI can
@@ -53,7 +53,7 @@ fn write_log<W: Write>(log: &FileLog, out: &mut W) -> io::Result<()> {
         Some(VecDeque::new())
     };
     let mut found = false;
-    let mut line = String::new();
+    let mut line = Vec::new();
 
     for path in log_paths(&log.path) {
         let metadata = match std::fs::metadata(&path) {
@@ -94,13 +94,13 @@ fn write_log<W: Write>(log: &FileLog, out: &mut W) -> io::Result<()> {
         let mut reader = BufReader::new(file);
         loop {
             line.clear();
-            if reader.read_line(&mut line)? == 0 {
+            if reader.read_until(b'\n', &mut line)? == 0 {
                 break;
             }
-            let content = line.strip_suffix('\n').unwrap_or(&line);
-            let content = content.strip_suffix('\r').unwrap_or(content);
+            let content = line.strip_suffix(b"\n").unwrap_or(&line);
+            let content = content.strip_suffix(b"\r").unwrap_or(content);
             if let Some(prefix) = &prefix
-                && !content.starts_with(prefix)
+                && !content.starts_with(prefix.as_bytes())
             {
                 continue;
             }
@@ -110,7 +110,7 @@ fn write_log<W: Write>(log: &FileLog, out: &mut W) -> io::Result<()> {
                     queue.pop_front();
                 }
             } else {
-                out.write_all(line.as_bytes())?;
+                out.write_all(&line)?;
             }
         }
     }
@@ -124,7 +124,7 @@ fn write_log<W: Write>(log: &FileLog, out: &mut W) -> io::Result<()> {
 
     if let Some(queue) = selected {
         for line in queue {
-            out.write_all(line.as_bytes())?;
+            out.write_all(&line)?;
         }
     }
     out.flush()
@@ -141,6 +141,10 @@ mod tests {
 
     fn write(path: &Path, text: &str) {
         std::fs::write(path, text).expect("write scratch log");
+    }
+
+    fn write_bytes(path: &Path, bytes: &[u8]) {
+        std::fs::write(path, bytes).expect("write scratch log");
     }
 
     fn rotated(path: &Path, index: usize) -> PathBuf {
@@ -171,6 +175,35 @@ mod tests {
             String::from_utf8(out).expect("UTF-8"),
             "app.service: one\napp.service: two\n"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn non_utf8_lines_are_preserved_byte_for_byte() {
+        let dir = std::env::temp_dir().join(format!("rctl-file-log-bytes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("log");
+        let bytes = b"app.service: one\napp.service: \xff\xfe\napp.service: two";
+        write_bytes(&path, bytes);
+
+        let log = FileLog {
+            path: path.clone(),
+            unit: Some(unit("app.service")),
+            tail: 0,
+        };
+        let mut out = Vec::new();
+        write_log(&log, &mut out).expect("read log");
+        assert_eq!(out, bytes);
+
+        let tail = FileLog {
+            path,
+            unit: Some(unit("app.service")),
+            tail: 1,
+        };
+        let mut out = Vec::new();
+        write_log(&tail, &mut out).expect("read tail");
+        assert_eq!(out, b"app.service: two");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

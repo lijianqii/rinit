@@ -184,6 +184,28 @@ fn a_missing_server_is_an_error() {
     assert!(stderr.contains("control.sock"), "got: {stderr}");
 }
 
+#[test]
+fn a_bad_frame_prefix_is_reported_as_a_protocol_error() {
+    let dir = TempDir::new("bad-frame");
+    let socket = dir.0.join("control.sock");
+    let listener = UnixListener::bind(&socket).expect("bind");
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let _ = read_request(&mut stream);
+        stream
+            .write_all(&u32::MAX.to_le_bytes())
+            .expect("write bad prefix");
+    });
+
+    let output = run_rctl(&dir, &["list"]);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("bad frame"), "got: {stderr}");
+    server.join().expect("server");
+}
+
 /// A usage error is exit 2 and never touches the socket.
 #[test]
 fn a_usage_error_exits_two() {

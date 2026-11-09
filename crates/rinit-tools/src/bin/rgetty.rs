@@ -680,8 +680,26 @@ mod tests {
         assert_ne!(term.c_cflag & libc::CLOCAL, 0);
         assert_ne!(term.c_lflag & libc::ECHO, 0);
         assert_ne!(term.c_lflag & libc::ICANON, 0);
+        for (index, expected) in [
+            (libc::VINTR, 3),
+            (libc::VQUIT, 28),
+            (libc::VERASE, 127),
+            (libc::VKILL, 21),
+            (libc::VEOF, 4),
+            (libc::VSTART, 17),
+            (libc::VSTOP, 19),
+            (libc::VSUSP, 26),
+            (libc::VMIN, 1),
+            (libc::VTIME, 0),
+        ] {
+            assert_eq!(term.c_cc[index], expected, "c_cc[{index}]");
+        }
+        assert_eq!(unsafe { libc::cfgetispeed(&term) }, libc::B115200);
+        assert_eq!(unsafe { libc::cfgetospeed(&term) }, libc::B115200);
         configure_termios(&mut term, false, 9600);
         assert_eq!(term.c_cflag & libc::CLOCAL, 0);
+        assert_eq!(unsafe { libc::cfgetispeed(&term) }, libc::B9600);
+        assert_eq!(unsafe { libc::cfgetospeed(&term) }, libc::B9600);
     }
 
     #[test]

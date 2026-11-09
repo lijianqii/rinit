@@ -215,6 +215,37 @@ mod tests {
     }
 
     #[test]
+    fn double_dash_and_partial_failures_keep_later_sources() {
+        let root = temp_root("double-dash");
+        let dest = root.join("dest");
+        fs::create_dir(&dest).expect("dest");
+        let dash = root.join("-f");
+        let good = root.join("good");
+        fs::write(&dash, b"dash").expect("dash");
+        fs::write(&good, b"good").expect("good");
+        let args = vec![
+            "--".to_string(),
+            dash.display().to_string(),
+            good.display().to_string(),
+            dest.display().to_string(),
+        ];
+        assert_eq!(run(&args, "mv"), ExitCode::from(EXIT_OK));
+        assert_eq!(fs::read(dest.join("-f")).expect("dash move"), b"dash");
+        assert_eq!(fs::read(dest.join("good")).expect("good move"), b"good");
+
+        let later = root.join("later");
+        fs::write(&later, b"later").expect("later");
+        let args = vec![
+            root.join("missing").display().to_string(),
+            later.display().to_string(),
+            dest.display().to_string(),
+        ];
+        assert_eq!(run(&args, "mv"), ExitCode::from(1));
+        assert_eq!(fs::read(dest.join("later")).expect("later move"), b"later");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn run_reports_usage_and_missing_sources() {
         let root = temp_root("run");
         assert_eq!(run(&["--help".to_string()], "mv"), ExitCode::from(EXIT_OK));

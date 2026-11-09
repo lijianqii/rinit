@@ -615,7 +615,8 @@ mod tests {
         assert!(shadow_login_denied(account_expired, "root", today));
 
         let password_expired = "root:$6$h:19000:0:30:7:::";
-        assert!(shadow_login_denied(password_expired, "root", today));
+        assert!(!shadow_login_denied(password_expired, "root", 19_029));
+        assert!(shadow_login_denied(password_expired, "root", 19_030));
 
         let no_aging = "root:$6$h:19000:0::::";
         assert!(!shadow_login_denied(no_aging, "root", today));

@@ -2926,6 +2926,74 @@ fn a_daemonized_cgroup_member_is_killed_after_the_leader_exits() {
     unsafe { libc::kill(child, libc::SIGKILL) };
 }
 
+/// A reload that arrives while `ExecStartPre=` is still running must defer the
+/// new definition; the current start keeps its snapshot, and the next start
+/// picks up the new one.
+#[test]
+fn a_reload_during_exec_start_pre_is_deferred() {
+    let dir = TempDir::new("reload-in-flight");
+    let marker = dir.0.join("pre-marker");
+    let result = dir.0.join("result");
+    dir.write("all.target", "[Unit]\nType=target\n");
+    dir.write(
+        "app.service",
+        &format!(
+            "[Service]\nType=oneshot\n\
+             ExecStartPre=/bin/sh -c \"echo pre > {}; sleep 1\"\n\
+             ExecStart=/bin/sh -c \"echo old > {}\"\n",
+            marker.display(),
+            result.display()
+        ),
+    );
+    let unit_dir = dir.0.clone();
+    let unit = rinit_core::UnitName::parse("app.service").expect("unit name");
+    let result_path = result.clone();
+
+    let (log, ()) = boot_units_inspect(&dir, "all.target", libc::SIGTERM, &[], |socket, _| {
+        let socket = socket.to_path_buf();
+        let start_socket = socket.clone();
+        let start_unit = unit.clone();
+        let start = std::thread::spawn(move || {
+            control(&start_socket, rinit_core::Request::Start(start_unit))
+        });
+
+        wait_for(Duration::from_secs(5), "the ExecStartPre marker", || {
+            marker.exists()
+        });
+        std::fs::write(
+            unit_dir.join("app.service"),
+            format!(
+                "[Service]\nType=oneshot\nExecStart=/bin/sh -c \"echo new > {}\"\n",
+                result_path.display()
+            ),
+        )
+        .expect("rewrite unit");
+        let (status, text) = control(&socket, rinit_core::Request::Reload);
+        assert_eq!(status, rinit_core::Status::Ok, "{text}");
+        assert!(text.contains("deferred"), "reload must defer: {text}");
+
+        let (status, text) = start.join().expect("start thread");
+        assert_eq!(status, rinit_core::Status::Ok, "{text}");
+        assert_eq!(
+            std::fs::read_to_string(&result_path).expect("old result"),
+            "old\n",
+            "the in-flight start must keep its old definition"
+        );
+
+        let (status, text) = control(&socket, rinit_core::Request::Stop(unit.clone()));
+        assert_eq!(status, rinit_core::Status::Ok, "{text}");
+        let (status, text) = control(&socket, rinit_core::Request::Start(unit));
+        assert_eq!(status, rinit_core::Status::Ok, "{text}");
+        assert_eq!(
+            std::fs::read_to_string(&result_path).expect("new result"),
+            "new\n",
+            "the next start must adopt the deferred definition"
+        );
+    });
+
+    assert!(log.contains("deferred"), "reload report missing: {log}");
+}
+
 fn control(socket: &std::path::Path, request: rinit_core::Request) -> (rinit_core::Status, String) {
     use std::io::{Read, Write};
 

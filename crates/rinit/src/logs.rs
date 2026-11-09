@@ -902,6 +902,36 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn the_file_queue_also_respects_its_byte_bound() {
+        let dir =
+            std::env::temp_dir().join(format!("rinit-logs-queue-bytes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("rinit.log");
+        let queue = FileQueue::new(LogFile::open(&path, 1 << 20, 0).expect("open"));
+        let payload = "x".repeat(16 * 1024);
+        for line in 0..40 {
+            queue.enqueue(format!("app.service: line {line} {payload}\n"));
+        }
+        {
+            let state = lock(&queue.state);
+            assert!(
+                state.bytes <= LOG_QUEUE_MAX_BYTES,
+                "queue bytes {} exceed {}",
+                state.bytes,
+                LOG_QUEUE_MAX_BYTES
+            );
+            assert!(state.dropped > 0, "the byte bound must drop lines");
+            assert!(state.lines.len() < 40);
+        }
+        while queue.drain() > 0 {}
+        let written = std::fs::read_to_string(&path).expect("read back");
+        assert!(written.contains("dropped "), "{written}");
+        assert!(written.contains("line 39"), "the newest line must survive");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The persisted queue is bounded: a service logging faster than the disk
     /// costs memory in the queue, not in PID 1's address space. The oldest line
     /// goes and the file says how many.

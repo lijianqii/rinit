@@ -406,6 +406,40 @@ mod tests {
         assert!(peer_allowed(true, 0, 1000));
     }
 
+    /// The production rule is enforced before a request is read, not only by
+    /// the pure predicate: a non-root peer gets the refusal frame and nothing
+    /// reaches the main loop.
+    #[tokio::test(flavor = "current_thread")]
+    async fn production_mode_refuses_a_non_root_peer_before_dispatch() {
+        if process::geteuid() == 0 {
+            return;
+        }
+        let (client, server) = UnixStream::pair().expect("socketpair");
+        let (tx, mut rx) = mpsc::channel(1);
+        let task = tokio::spawn(serve(server, tx, false));
+
+        let mut prefix = [0u8; LENGTH_PREFIX_BYTES];
+        let mut client = client;
+        client
+            .read_exact(&mut prefix)
+            .await
+            .expect("read the refusal prefix");
+        let len = frame_len(prefix).expect("frame length");
+        let mut body = vec![0u8; len];
+        client
+            .read_exact(&mut body)
+            .await
+            .expect("read the refusal");
+        let (status, text) = rinit_core::decode_response(&body).expect("decode the refusal");
+        assert_eq!(status, Status::Error);
+        assert!(text.contains("restricted to root"), "{text}");
+        assert!(
+            rx.try_recv().is_err(),
+            "a refused peer must not reach the dispatcher"
+        );
+        task.await.expect("serve task").expect("clean refusal");
+    }
+
     /// A job the manager never finishes still has to produce a reply; the
     /// production timeout is generous, so the test gives the same code 10 ms.
     #[tokio::test(flavor = "current_thread")]

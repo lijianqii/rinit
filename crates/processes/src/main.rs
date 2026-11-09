@@ -1004,6 +1004,9 @@ mod tests {
         assert_eq!(format_bytes(1024), "1.0K");
         assert_eq!(format_bytes(1024 * 1024), "1.0M");
         assert_eq!(format_time(1_234_000), "1.23");
+        assert_eq!(format_time(9_999), "0.00");
+        assert_eq!(format_time(59_990_000), "59.99");
+        assert_eq!(format_time(60_000_000), "1:00");
         assert_eq!(format_time(62_000_000), "1:02");
     }
 }

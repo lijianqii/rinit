@@ -4379,6 +4379,70 @@ mod tests {
         let _ = wait::reap_children();
     }
 
+    #[test]
+    fn a_runtime_start_limit_failure_fails_requires_dependents() {
+        let _guard = crate::test_support::children_lock();
+        let mut m = UnitManager::new();
+        let mut base = config("base.service", RestartPolicy::Always);
+        base.start_limit_burst = 1;
+        base.start_limit_interval_sec = 600;
+        m.add(base);
+        let mut dep = config("dep.service", RestartPolicy::No);
+        dep.deps.requires = vec![UnitName::parse("base.service").unwrap()];
+        m.add(dep);
+        let base = UnitName::parse("base.service").unwrap();
+        let dep = UnitName::parse("dep.service").unwrap();
+        let pid = spawn_pid(&mut m, &base);
+
+        let _ = process::kill_process_group(pid, libc::SIGKILL);
+        let outcome = m
+            .on_child_exit(pid, ExitOutcome::Signalled(libc::SIGKILL))
+            .expect("handled");
+        assert!(matches!(outcome, Outcome::StartLimitTripped { .. }));
+        assert!(m.is_failed(&base));
+        assert!(
+            m.is_failed(&dep),
+            "a hard dependent must follow the breaker"
+        );
+        assert!(m.get(&base).unwrap().restart_at.is_none());
+        let _ = wait::reap_children();
+    }
+
+    #[test]
+    fn a_failed_exec_stop_falls_back_to_sigterm() {
+        let _guard = crate::test_support::children_lock();
+        let mut m = manager_with("a.service", RestartPolicy::No);
+        let unit = UnitName::parse("a.service").unwrap();
+        m.units.get_mut(&unit).unwrap().config.exec_stop =
+            rinit_core::ExecCommand::new(vec!["/bin/false".to_string()]);
+        let main = spawn_pid(&mut m, &unit);
+
+        m.stop_unit(&unit);
+        let stop = m
+            .get(&unit)
+            .and_then(|rt| rt.exec_stop_pid)
+            .expect("ExecStop should have started");
+        assert!(m.get(&unit).unwrap().pid.is_some());
+
+        // The stop command failed before the main process could be stopped.
+        let outcome = m.on_child_exit(stop, ExitOutcome::Failure(1));
+        assert!(
+            outcome.is_none(),
+            "a failed ExecStop is not the service exit"
+        );
+        assert!(m.get(&unit).unwrap().exec_stop_pid.is_none());
+        assert!(
+            m.get(&unit).unwrap().pid.is_some(),
+            "the fallback signal must target the still-running service"
+        );
+
+        // Reap the service after the fallback SIGTERM and let the stop settle.
+        let _ = process::kill_process_group(main, libc::SIGKILL);
+        let _ = m.on_child_exit(main, ExitOutcome::Signalled(libc::SIGKILL));
+        assert_eq!(m.get(&unit).unwrap().state, UnitState::Inactive);
+        let _ = wait::reap_children();
+    }
+
     /// Plan §1.3(13): a unit that fails to start fails everything that
     /// hard-`Requires=` it, so the dependents are not started on a broken
     /// foundation.

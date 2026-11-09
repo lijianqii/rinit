@@ -829,6 +829,48 @@ mod tests {
     }
 
     #[test]
+    fn a_symlinked_destination_parent_is_refused() {
+        let root = temp_root("copy-symlink-parent");
+        let real = root.join("real");
+        fs::create_dir(&real).expect("real");
+        let src = root.join("src");
+        fs::write(&src, b"payload").expect("src");
+        let link = root.join("link");
+        symlink(&real, &link).expect("link");
+
+        assert!(
+            copy_entry(&src, &link.join("dst"), false, false).is_err(),
+            "a symlinked destination parent must not be followed"
+        );
+        assert!(!real.join("dst").exists());
+        copy_entry(&src, &real.join("dst"), false, false).expect("real parent works");
+        assert_eq!(fs::read(real.join("dst")).expect("dst"), b"payload");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_recursive_copy_refuses_a_hard_link_to_the_source() {
+        let root = temp_root("copy-hardlink");
+        let src = root.join("src");
+        let dst = root.join("dst");
+        fs::create_dir(&src).expect("src");
+        fs::create_dir(&dst).expect("dst");
+        fs::write(src.join("f"), b"payload").expect("src file");
+        fs::hard_link(src.join("f"), dst.join("f")).expect("hard link");
+
+        assert!(copy_entry(&src, &dst, true, false).is_err());
+        assert_eq!(
+            fs::read(src.join("f")).expect("source survives"),
+            b"payload"
+        );
+        assert_eq!(
+            fs::read(dst.join("f")).expect("destination survives"),
+            b"payload"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn copies_fifo_nodes() {
         let root = temp_root("copy-fifo");
         let src = root.join("fifo");

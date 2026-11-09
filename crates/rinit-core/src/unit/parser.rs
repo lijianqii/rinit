@@ -610,6 +610,7 @@ fn logical_lines(input: &str) -> Vec<(usize, String)> {
     let mut out: Vec<(usize, String)> = Vec::new();
     let mut current = String::new();
     let mut start = 0usize;
+    let mut last_continued = false;
 
     for (idx, raw) in input.lines().enumerate() {
         // The EBNF allows CRLF.
@@ -620,13 +621,18 @@ fn logical_lines(input: &str) -> Vec<(usize, String)> {
         // Strip it before looking for the continuation backslash: a comment's
         // trailing `\` is text, not a request to join the next line.
         let code = comment_prefix(line);
-        let continuing = code.trim_end().ends_with('\\');
+        let trimmed = code.trim_end();
+        let continuing = trailing_backslashes(trimmed) % 2 == 1;
+        last_continued = continuing;
 
         if current.is_empty() {
             start = line_no;
         }
         if continuing {
-            let head = code.trim_end().strip_suffix('\\').unwrap_or(code);
+            // Remove exactly one continuation backslash. The remaining
+            // backslashes are literal (`\\` is an escaped backslash, not two
+            // continuation markers).
+            let head = &trimmed[..trimmed.len() - 1];
             current.push_str(head);
             // Join with a single space so `Description=a \` + `b` is `a b`.
             current.push(' ');
@@ -635,10 +641,19 @@ fn logical_lines(input: &str) -> Vec<(usize, String)> {
             out.push((start, core::mem::take(&mut current)));
         }
     }
+    if last_continued {
+        // A continuation with no following line: keep the backslash literal
+        // rather than silently deleting the last byte of the file.
+        current.push('\\');
+    }
     if !current.is_empty() {
         out.push((start, current));
     }
     out
+}
+
+fn trailing_backslashes(line: &str) -> usize {
+    line.chars().rev().take_while(|ch| *ch == '\\').count()
 }
 
 /// The part of `line` before the first unquoted, unescaped `#`.
@@ -1216,6 +1231,28 @@ mod tests {
             "[Unit]\n\\\nDescription=App\n[Service]\nExecStart=/bin/true\n",
         );
         assert_eq!(cfg.description, "App");
+    }
+
+    /// Two backslashes at the end of a line are one literal backslash, not a
+    /// continuation marker.
+    #[test]
+    fn an_escaped_backslash_at_line_end_is_not_a_continuation() {
+        let cfg = ok(
+            "app.service",
+            "[Unit]\nDescription=ends\\\\\n[Service]\nExecStart=/bin/true\n",
+        );
+        assert_eq!(cfg.description, "ends\\");
+    }
+
+    /// A continuation at EOF has no next line; the backslash must stay literal
+    /// instead of being silently deleted.
+    #[test]
+    fn a_trailing_continuation_at_eof_keeps_the_backslash() {
+        let cfg = ok(
+            "app.service",
+            "[Service]\nExecStart=/bin/true\n[Unit]\nDescription=abc\\",
+        );
+        assert_eq!(cfg.description, "abc \\");
     }
 
     // --- sections and keys ---------------------------------------------

@@ -149,6 +149,20 @@ mod tests {
     }
 
     #[test]
+    fn a_symlink_to_the_root_is_protected() {
+        let root = temp_root("root-alias");
+        let alias = root.join("alias");
+        std::os::unix::fs::symlink("/", &alias).expect("alias");
+        assert!(protected(&alias), "canonicalize to / must be protected");
+        assert_eq!(
+            run(&["-rf".to_string(), alias.display().to_string()], "rm"),
+            ExitCode::from(1)
+        );
+        assert!(alias.exists(), "the alias itself must not be removed");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn clustered_short_options_are_parsed() {
         let mut options = Options::default();
         apply_short_options("-rf", &mut options).expect("parse");

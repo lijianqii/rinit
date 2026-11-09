@@ -790,7 +790,7 @@ async fn supervise(
                 // A READY or STATUS from the socket of a previous instance is
                 // not evidence about the current one. The generation is
                 // incremented by `arm`, which every start performs.
-                if supervised.notify.generation_for(&unit) != Some(generation) {
+                if !supervised.notify.is_current(&unit, generation) {
                     continue;
                 }
                 if let Some(status) = &message.status {

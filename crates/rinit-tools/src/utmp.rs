@@ -162,6 +162,50 @@ mod tests {
     }
 
     #[test]
+    fn a_record_carries_the_expected_fields() {
+        let root = temp_root("fields");
+        let utmp = root.join("utmp");
+        let wtmp = root.join("wtmp");
+        record_at(
+            &utmp,
+            &wtmp,
+            USER_PROCESS,
+            4242,
+            "/dev/ttyAMA0",
+            "alice",
+            Some("host"),
+        )
+        .expect("user record");
+
+        let data = std::fs::read(&utmp).expect("utmp");
+        let size = std::mem::size_of::<libc::utmpx>();
+        let chunk = data.chunks_exact(size).last().expect("one record");
+        let mut entry: libc::utmpx = unsafe { std::mem::zeroed() };
+        // SAFETY: `chunk` is exactly one utmpx record.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                chunk.as_ptr(),
+                (&mut entry as *mut libc::utmpx).cast::<u8>(),
+                size,
+            );
+        }
+        let field = |bytes: &[libc::c_char]| {
+            bytes
+                .iter()
+                .map(|byte| *byte as u8)
+                .take_while(|byte| *byte != 0)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(entry.ut_type, USER_PROCESS);
+        assert_eq!(entry.ut_pid, 4242);
+        assert_eq!(field(&entry.ut_line), b"ttyAMA0");
+        assert_eq!(field(&entry.ut_id), b"AMA0");
+        assert_eq!(field(&entry.ut_user), b"alice");
+        assert_eq!(field(&entry.ut_host), b"host");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn writes_utmp_and_wtmp_records() {
         let root = temp_root("record");
         let utmp = root.join("utmp");

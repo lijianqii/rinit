@@ -179,6 +179,11 @@ impl NotifyHub {
         self.armed.get(unit).map(|armed| armed.generation)
     }
 
+    /// Whether a message carrying `generation` belongs to the current socket.
+    pub fn is_current(&self, unit: &UnitName, generation: u64) -> bool {
+        self.generation_for(unit) == Some(generation)
+    }
+
     /// Wait for the next notify message from any armed unit.
     ///
     /// Never returns `None` while the hub is alive: the hub holds a sender, so
@@ -381,6 +386,8 @@ mod tests {
             hub.generation_for(&cfg.name),
             "the boot loop filters this message by generation"
         );
+        assert!(!hub.is_current(&cfg.name, old_generation));
+        assert!(hub.is_current(&cfg.name, second));
         hub.disarm_all();
         let _ = std::fs::remove_dir_all(&dir);
     }

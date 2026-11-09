@@ -650,6 +650,39 @@ mod tests {
         assert_eq!(h.read(dir.join("pids.max")), "64");
     }
 
+    #[test]
+    fn setup_resets_limits_removed_by_a_reload() {
+        let h = Hierarchy::new("reset", "cpu memory pids\n");
+        let cgroup = prepare(false, Some(h.root.clone()));
+        let dir = h.with_unit(
+            "worker.service",
+            "cpu memory pids\n",
+            &["cpu.max", "memory.max", "memory.high", "pids.max"],
+        );
+        std::fs::write(dir.join("cpu.max"), "50000 100000").unwrap();
+        std::fs::write(dir.join("memory.max"), "33554432").unwrap();
+        std::fs::write(dir.join("memory.high"), "25165824").unwrap();
+        std::fs::write(dir.join("pids.max"), "64").unwrap();
+
+        let only_memory = CgroupLimits {
+            cpu_max: None,
+            memory_max: SizeBytes::parse("16M"),
+            memory_high: None,
+            tasks_max: None,
+        };
+        cgroup
+            .setup(&unit("worker"), &only_memory)
+            .expect("the new definition applies");
+
+        assert_eq!(h.read(dir.join("cpu.max")), "max");
+        assert_eq!(h.read(dir.join("memory.high")), "max");
+        assert_eq!(h.read(dir.join("pids.max")), "max");
+        assert_eq!(
+            h.read(dir.join("memory.max")),
+            (16u64 * 1024 * 1024).to_string()
+        );
+    }
+
     /// A unit that asked for nothing is not given a cgroup, so there is nothing
     /// to place, nothing to clean up and no directory to litter the hierarchy.
     #[test]

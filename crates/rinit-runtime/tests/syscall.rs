@@ -141,6 +141,24 @@ fn an_abandoned_spawn_is_killed_and_reaped_by_the_global_reaper() {
     assert!(killed, "abandon must kill the unconfirmed child");
 }
 
+/// Dropping an unconsumed `PendingSpawn` must kill and reap the child rather
+/// than leaving an untracked process behind.
+#[test]
+fn dropping_a_pending_spawn_kills_and_reaps_the_child() {
+    let _guard = REAP_LOCK.lock().unwrap();
+    let pending = pending_sleep();
+    let pid = pending.pid();
+    drop(pending);
+    // `Drop` waits for the child to be reaped, so this is deterministic: the
+    // pid is gone, not merely signalled.
+    assert_eq!(
+        process::kill(pid, 0)
+            .expect_err("the child must be gone")
+            .errno(),
+        libc::ESRCH
+    );
+}
+
 /// `kill` on a non-existent PID reports `ESRCH` without panicking.
 #[test]
 fn kill_missing_pid_reports_esrch() {
