@@ -103,6 +103,22 @@ impl Console {
         self.text().contains(needle)
     }
 
+    /// Wait until `needle` has appeared `count` times.
+    fn wait_for_count(&self, needle: &str, count: usize, timeout: Duration) {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if self.text().matches(needle).count() >= count {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out after {timeout:?} waiting for {count} x {needle:?} in rinit's console:\n{}",
+                self.text()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// Wait for `needle` to appear, or fail the test with what did appear.
     fn wait_for(&self, needle: &str, timeout: Duration) {
         let deadline = std::time::Instant::now() + timeout;
@@ -2722,6 +2738,194 @@ TTYPath=/dev/null
 /// The client half of the protocol is `rctl`'s, but a reload needs several
 /// requests in sequence against one running rinit - and a test that shells out to
 /// `rctl` for each of them would be testing the CLI, not the reload.
+/// A sandboxed auxiliary command takes the fork path and is left for the global
+/// reaper after `PendingSpawn::detach`. Writing its READY marker must not deliver
+/// a pending SIGPIPE and kill it before `execve`.
+#[test]
+fn a_sandboxed_exec_start_pre_survives_the_detached_report() {
+    let dir = TempDir::new("detach-report");
+    let marker = dir.0.join("pre-ran");
+    dir.write("all.target", "[Unit]\nType=target\nRequires=app.service\n");
+    dir.write(
+        "app.service",
+        &format!(
+            "[Service]\nType=oneshot\nNoNewPrivileges=true\n\
+             ExecStartPre=/bin/sh -c \"echo pre > {}\"\n\
+             ExecStart=/bin/true\n",
+            marker.display()
+        ),
+    );
+
+    let log = boot_units(&dir, "all.target");
+
+    assert!(
+        marker.exists(),
+        "the detached ExecStartPre must have run:\n{log}"
+    );
+    assert!(
+        log.contains("started app.service"),
+        "the oneshot must complete:\n{log}"
+    );
+}
+
+/// The main process can exit before an `ExecStop=` command has finished. The
+/// stop is not complete until that command exits, so a start queued behind it
+/// must not overlap the old stop.
+#[test]
+fn exec_stop_finishes_before_a_queued_restart() {
+    let dir = TempDir::new("execstop-main-exit");
+    let pidfile = dir.0.join("main.pid");
+    dir.write("all.target", "[Unit]\nType=target\nRequires=app.service\n");
+    dir.write(
+        "app.service",
+        &format!(
+            "[Service]\nType=simple\n\
+             ExecStart=/bin/sh -c \"echo $$ > {}; trap 'exit 0' TERM; while :; do sleep 0.1; done\"\n\
+             ExecStop=/bin/sh -c \"kill -TERM $(cat {}); sleep 1\"\n\
+             TimeoutStopSec=10\n",
+            pidfile.display(),
+            pidfile.display()
+        ),
+    );
+
+    let (log, ()) =
+        boot_units_inspect(&dir, "all.target", libc::SIGTERM, &[], |socket, console| {
+            let unit = rinit_core::UnitName::parse("app.service").expect("unit name");
+            let (status, text) = control(socket, rinit_core::Request::Stop(unit.clone()));
+            assert_eq!(status, rinit_core::Status::Ok, "{text}");
+            let (status, text) = control(socket, rinit_core::Request::Start(unit));
+            assert_eq!(status, rinit_core::Status::Ok, "{text}");
+            console.wait_for("ExecStop finished", Duration::from_secs(10));
+            console.wait_for_count("started app.service as pid", 2, Duration::from_secs(10));
+        });
+
+    let finished = log
+        .find("ExecStop finished")
+        .expect("the ExecStop command must report its exit");
+    let restarted = log
+        .rfind("started app.service as pid")
+        .expect("the queued start must run");
+    assert!(
+        finished < restarted,
+        "the new instance must not start before ExecStop exits:\n{log}"
+    );
+}
+
+/// A connection that the service never accepts must not keep refreshing
+/// `IdleTimeoutSec` through a level-triggered listener.
+#[test]
+fn idle_timeout_stops_a_socket_activated_service_with_an_unaccepted_connection() {
+    use std::os::unix::net::UnixStream;
+
+    let dir = TempDir::new("socket-idle");
+    let socket_path = dir.0.join("api.sock");
+    dir.write("all.target", "[Unit]\nType=target\n");
+    dir.write(
+        "app.service",
+        &format!(
+            "[Service]\nType=simple\nSocketActivate={}\nIdleTimeoutSec=1\n\
+             ExecStart=/bin/sleep 30\n",
+            socket_path.display()
+        ),
+    );
+
+    let (log, ()) = boot_units_inspect(&dir, "all.target", libc::SIGTERM, &[], |_, console| {
+        let _client = UnixStream::connect(&socket_path).expect("connect to activated socket");
+        console.wait_for("started app.service", Duration::from_secs(5));
+        console.wait_for("stopping app.service: idle", Duration::from_secs(10));
+    });
+
+    assert!(
+        log.contains("stopping app.service: idle"),
+        "the unaccepted connection must not keep the unit alive:\n{log}"
+    );
+}
+
+/// A stop must reach a daemonized child in the unit's cgroup even after the
+/// leader exits first. The child ignores SIGTERM and is in its own session; only
+/// the cgroup path can find it for the SIGKILL escalation.
+#[test]
+fn a_daemonized_cgroup_member_is_killed_after_the_leader_exits() {
+    let dir = TempDir::new("cgroup-straggler");
+    let child_file = dir.0.join("child.pid");
+    let script = dir.0.join("spawn.sh");
+    let cg = FakeCgroup::new("straggler", "memory\n");
+    cg.unit(
+        "app.service",
+        "memory\n",
+        &["memory.max", "cgroup.procs", "cgroup.events"],
+    );
+    fs::write(
+        cg.0.join("rinit/app.service/cgroup.events"),
+        "populated 0\n",
+    )
+    .expect("events");
+    let cgroup_procs = cg.0.join("rinit/app.service/cgroup.procs");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\n\
+             /usr/bin/setsid /bin/sh -c 'trap \"\" TERM; sleep 30' &\n\
+             child=$!\n\
+             echo \"$child\" > {}\n\
+             echo \"$child\" > {}\n\
+             sleep 30\n",
+            child_file.display(),
+            cgroup_procs.display()
+        ),
+    )
+    .expect("script");
+    dir.write("all.target", "[Unit]\nType=target\nRequires=app.service\n");
+    dir.write(
+        "app.service",
+        &format!(
+            "[Service]\nType=simple\nCgroupMemoryMax=16M\nExecStart=/bin/sh {}\n",
+            script.display()
+        ),
+    );
+
+    let (log, child) = boot_units_inspect(
+        &dir,
+        "all.target",
+        libc::SIGTERM,
+        &["--cgroup-root", cg.path()],
+        |socket, _| {
+            wait_for(Duration::from_secs(5), "the child pid file", || {
+                child_file.exists()
+            });
+            let child: libc::pid_t = fs::read_to_string(&child_file)
+                .expect("child pid")
+                .trim()
+                .parse()
+                .expect("numeric child pid");
+            wait_for(Duration::from_secs(5), "the child in cgroup.procs", || {
+                fs::read_to_string(&cgroup_procs)
+                    .map(|procs| procs.split_whitespace().any(|pid| pid == child.to_string()))
+                    .unwrap_or(false)
+            });
+            let unit = rinit_core::UnitName::parse("app.service").expect("unit name");
+            let (status, text) = control(socket, rinit_core::Request::Stop(unit));
+            assert_eq!(status, rinit_core::Status::Ok, "{text}");
+            wait_for(
+                Duration::from_secs(10),
+                "the cgroup child to be killed",
+                || {
+                    // SAFETY: signal 0 only probes whether the pid exists.
+                    (unsafe { libc::kill(child, 0) }) != 0
+                },
+            );
+            child
+        },
+    );
+
+    assert!(
+        log.contains("did not stop in time; killed"),
+        "the stop must escalate to the cgroup member:\n{log}"
+    );
+    // SAFETY: best-effort cleanup if an assertion above failed.
+    unsafe { libc::kill(child, libc::SIGKILL) };
+}
+
 fn control(socket: &std::path::Path, request: rinit_core::Request) -> (rinit_core::Status, String) {
     use std::io::{Read, Write};
 

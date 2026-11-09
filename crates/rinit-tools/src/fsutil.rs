@@ -36,12 +36,12 @@ pub fn copy_entry(src: &Path, dst: &Path, recursive: bool, preserve: bool) -> io
     } else if file_type.is_file() {
         copy_file(src, dst, preserve)
     } else {
-        copy_special(src, dst, &meta, preserve)
+        copy_special(dst, &meta, preserve)
     }
 }
 
 /// Recreate a FIFO or device node with `mknodat`, relative to its parent.
-fn copy_special(_src: &Path, dst: &Path, meta: &fs::Metadata, preserve: bool) -> io::Result<()> {
+fn copy_special(dst: &Path, meta: &fs::Metadata, preserve: bool) -> io::Result<()> {
     let (parent, name) = open_parent(dst)?;
     let kind = if meta.file_type().is_fifo() {
         libc::S_IFIFO

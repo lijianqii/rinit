@@ -323,7 +323,7 @@ make test           # check + test-system
 make gates          # acceptance gates: binary size + coverage thresholds
 ```
 
-`cargo test --offline --workspace` (what `make check` runs last) executes **1099
+`cargo test --offline --workspace` (what `make check` runs last) executes **1103
 tests** across 58 cargo test targets. The five shapes, and why each is not
 redundant:
 
@@ -420,12 +420,12 @@ they are measured on the tree as it stands rather than copied from one run:
 | crate            | line coverage | functions |
 | ---------------- | ------------- | --------- |
 | `rinit-core`     | **97.87%**    | 587/597   |
-| `rinit-runtime`  | 84.58%        | 375/433   |
-| `rinit`          | 87.28%        | 839/941   |
+| `rinit-runtime`  | 84.61%        | 375/433   |
+| `rinit`          | 87.63%        | 839/941   |
 | `rinit-tools`    | 80.52%        | 702/916   |
 | `rctl`           | 92.85%        | 58/66     |
 | `processes`      | 88.67%        | 72/88     |
-| **total**        | **86.50%**    | 2633/3041 |
+| **total**        | **86.61%**    | 2633/3041 |
 
 The plan's checklist asks for ≥80% overall and ≥90% in the core, so these are the
 numbers that answer it rather than a shape:
@@ -563,7 +563,7 @@ repository or a measurement in this README:
 | 72 h soak with stable RSS | **Passed on the host.** Segment 9 on `8b373d8` completed **4,320/4,320 samples** and **8,640/8,640 control commands**. RSS peak per half fell from 5,168 kB to 4,300 kB, descriptor minima were 11 and 11 (peak 22), the maximum zombie streak was 1 transient sample, and the final quiescent sweep found 0 zombies. |
 | 24 h soak in the target guest | **Passed.** `7a5df04`, aarch64 `run-disk`, guest-side sampler: **1,440/1,440 samples** and **2,880/2,880 control commands** over 86,343 s. RSS stayed within 2,364–2,528 kB (half peaks 2,520/2,528), descriptors within 19–20, no zombie was ever observed, and the final sweep returned `quiescent=0 health_fail=0`. `eth0`, the default route, `udhcpc`, dropbear, `network.service` and `sshd.service` were healthy in every sample; the serial log shows one boot and no panic/OOM. Sampling runs inside the guest (`scripts/soak-qemu.sh` + `scripts/soak-guest.sh`), so a host SSH outage cannot end the run silently. |
 | binaries ≤2 MB dynamic / ≤4 MB static | [Measurements](#measurements-plan-01-calibration-point): 1.00 MiB dynamic arm64 / 1.07 MiB armv7, checked by `make size-check` |
-| unit test coverage ≥80% overall, ≥90% in the core | **86.50%** and **97.87%** (`make coverage-check`, [above](#testing)) |
+| unit test coverage ≥80% overall, ≥90% in the core | **86.61%** and **97.87%** (`make coverage-check`, [above](#testing)) |
 | documentation: architecture, unit format, `rctl`, porting | this README (architecture, status, measurements), [`docs/units.md`](docs/units.md) (every directive, its value syntax and its default), [`docs/porting.md`](docs/porting.md) (kernel, userspace, build, differences from systemd), and `rinit-开发计划.md` |
 
 One number the checklist does not ask for, but plan §0.1's design goals do: rinit's

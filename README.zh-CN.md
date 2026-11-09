@@ -295,7 +295,7 @@ make gates          # acceptance gates: binary size + coverage thresholds
 ```
 
 `cargo test --offline --workspace`（`make check` 最后一步跑的就是它）在 58 个
-cargo 测试目标里执行 **1099 个测试**。五种形态，以及为什么每种都不是多余的：
+cargo 测试目标里执行 **1103 个测试**。五种形态，以及为什么每种都不是多余的：
 
 - **单元测试**紧挨着代码（core 339、rinit 237、rinit-runtime 139、rinit-tools 247、rctl 23、processes 10），
   包括解析器上的 `proptest` 属性测试；
@@ -363,12 +363,12 @@ qemu 的 `i6300esb` 设备和带该驱动编译的内核是测试装置的一部
 | crate            | 行覆盖率      | 函数      |
 | ---------------- | ------------- | --------- |
 | `rinit-core`     | **97.87%**    | 587/597   |
-| `rinit-runtime`  | 84.58%        | 375/433   |
-| `rinit`          | 87.28%        | 839/941   |
+| `rinit-runtime`  | 84.61%        | 375/433   |
+| `rinit`          | 87.63%        | 839/941   |
 | `rinit-tools`    | 80.52%        | 702/916   |
 | `rctl`           | 92.85%        | 58/66     |
 | `processes`      | 88.67%        | 72/88     |
-| **总计**         | **86.50%**    | 2633/3041 |
+| **总计**         | **86.61%**    | 2633/3041 |
 
 计划清单要求总体 ≥80%、核心 ≥90%，所以回答它的是这些数字，而不是某种形状：
 
@@ -471,7 +471,7 @@ cargo llvm-cov --offline --workspace --html                  # target/llvm-cov/h
 | 72 小时 soak，RSS 稳定 | **宿主上已通过。** 第九段在 `8b373d8` 上完成 **4,320/4,320 个样本**和 **8,640/8,640 条 control 命令**。前半段与后半段的 RSS 峰值分别为 5,168 kB 和 4,300 kB，描述符最低值均为 11（峰值 22），最大 zombie 连续出现 1 个瞬时采样，最终静默扫描为 0。 |
 | 24 小时目标客户机 soak | **已通过。** `7a5df04`，aarch64 `run-disk`，guest 内采样：86,343 秒内完成 **1,440/1,440 个样本**和 **2,880/2,880 条 control 命令**。RSS 保持在 2,364–2,528 kB（前后半段峰值 2,520/2,528），描述符 19–20，全程未观察到 zombie，最终检查为 `quiescent=0 health_fail=0`。每个样本里 `eth0`、默认路由、`udhcpc`、dropbear、`network.service` 和 `sshd.service` 都正常；串口日志只有一次启动，无 panic/OOM。采样在 guest 内运行（`scripts/soak-qemu.sh` + `scripts/soak-guest.sh`），宿主 SSH 断开不会让测试静默失效。 |
 | 二进制 ≤2 MB 动态 / ≤4 MB 静态 | [测量](#测量计划-01-校准点)：aarch64 动态 1.00 MiB、armv7 动态 1.07 MiB，由 `make size-check` 检查 |
-| 单元测试覆盖率总体 ≥80%、核心 ≥90% | **86.50%** 和 **97.87%**（`make coverage-check`，见[上文](#测试)） |
+| 单元测试覆盖率总体 ≥80%、核心 ≥90% | **86.61%** 和 **97.87%**（`make coverage-check`，见[上文](#测试)） |
 | 文档：架构、单元格式、`rctl`、移植 | 本 README（架构、状态、测量）、[`docs/units.md`](docs/units.md)（每条指令、取值语法和默认值）、[`docs/porting.md`](docs/porting.md)（内核、用户空间、构建、与 systemd 的差异），以及 `rinit-开发计划.md` |
 
 还有一个清单没要求、但计划 §0.1 的设计目标要求的数字：rinit 的 RSS，在*客户机里*从

@@ -363,9 +363,24 @@ mod tests {
         let cfg = notify_config("svc.service");
         hub.arm(&cfg).expect("first arm");
         let first = hub.generation_for(&cfg.name).expect("first generation");
+        let client = std::os::unix::net::UnixDatagram::unbound().expect("client");
+        client
+            .send_to(b"READY=1", hub.socket_path(&cfg.name))
+            .expect("send READY");
+        let (_, old_generation, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), hub.recv())
+                .await
+                .expect("message must arrive")
+                .expect("hub is live");
+        assert_eq!(old_generation, first);
         hub.arm(&cfg).expect("second arm");
         let second = hub.generation_for(&cfg.name).expect("second generation");
         assert_ne!(first, second);
+        assert_ne!(
+            Some(old_generation),
+            hub.generation_for(&cfg.name),
+            "the boot loop filters this message by generation"
+        );
         hub.disarm_all();
         let _ = std::fs::remove_dir_all(&dir);
     }
