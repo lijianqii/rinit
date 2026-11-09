@@ -22,7 +22,7 @@ fn targets_from_mounts(text: &str) -> Vec<OsString> {
         .lines()
         .filter_map(|line| line.split_whitespace().nth(1))
         .filter(|target| *target != "/")
-        .map(OsString::from)
+        .map(|target| OsString::from(rinit_runtime::mounts::unescape_mount_field(target)))
         .collect();
     targets.reverse();
     targets
@@ -95,6 +95,10 @@ mod tests {
     fn all_targets_skips_root_and_reverses_mount_order() {
         let text = "/dev/vda / ext4 rw 0 0\ntmpfs /run tmpfs rw 0 0\nproc /proc proc rw 0 0\n";
         assert_eq!(targets_from_mounts(text), ["/proc", "/run"]);
+        assert_eq!(
+            targets_from_mounts("/dev/vda /tmp/a\\040b ext4 rw 0 0\n"),
+            ["/tmp/a b"]
+        );
     }
 }
 

@@ -10,7 +10,7 @@ use std::fs;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 /// Copy one filesystem entry.
@@ -36,11 +36,57 @@ pub fn copy_entry(src: &Path, dst: &Path, recursive: bool, preserve: bool) -> io
     } else if file_type.is_file() {
         copy_file(src, dst, preserve)
     } else {
-        Err(io::Error::new(
+        copy_special(src, dst, &meta, preserve)
+    }
+}
+
+/// Recreate a FIFO or device node with `mknodat`, relative to its parent.
+fn copy_special(_src: &Path, dst: &Path, meta: &fs::Metadata, preserve: bool) -> io::Result<()> {
+    let (parent, name) = open_parent(dst)?;
+    let kind = if meta.file_type().is_fifo() {
+        libc::S_IFIFO
+    } else if meta.file_type().is_char_device() {
+        libc::S_IFCHR
+    } else if meta.file_type().is_block_device() {
+        libc::S_IFBLK
+    } else {
+        return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "unsupported file type",
-        ))
+        ));
+    };
+    let mode = kind | (meta.mode() & 0o7777);
+    // SAFETY: `parent` is a directory descriptor, `name` is a valid child
+    // name, and `mknodat` copies the descriptor's type and device number.
+    if unsafe { libc::mknodat(parent.as_raw_fd(), name.as_ptr(), mode, meta.rdev()) } != 0 {
+        return Err(io::Error::last_os_error());
     }
+    if preserve {
+        let times = [
+            libc::timespec {
+                tv_sec: meta.atime() as libc::time_t,
+                tv_nsec: meta.atime_nsec() as libc::c_long,
+            },
+            libc::timespec {
+                tv_sec: meta.mtime() as libc::time_t,
+                tv_nsec: meta.mtime_nsec() as libc::c_long,
+            },
+        ];
+        // SAFETY: the parent fd and child name are valid; AT_SYMLINK_NOFOLLOW
+        // keeps the just-created node as the target.
+        if unsafe {
+            libc::utimensat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                times.as_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
 }
 
 /// Open a directory without following a final symlink.
@@ -494,6 +540,42 @@ fn copy_dir_entries(
                 // SAFETY: destination is valid and times holds two timespecs.
                 unsafe { libc::futimens(destination.as_raw_fd(), times.as_ptr()) };
             }
+        } else if matches!(
+            stat.st_mode & libc::S_IFMT,
+            libc::S_IFIFO | libc::S_IFCHR | libc::S_IFBLK
+        ) {
+            let kind = stat.st_mode & libc::S_IFMT;
+            let mode = kind | (stat.st_mode & 0o7777);
+            // SAFETY: both the destination directory fd and name are valid.
+            if unsafe { libc::mknodat(destination_fd, name_c.as_ptr(), mode, stat.st_rdev) } != 0 {
+                result = Err(io::Error::last_os_error());
+                break;
+            }
+            if preserve {
+                let times = [
+                    libc::timespec {
+                        tv_sec: stat.st_atime as libc::time_t,
+                        tv_nsec: stat.st_atime_nsec as libc::c_long,
+                    },
+                    libc::timespec {
+                        tv_sec: stat.st_mtime as libc::time_t,
+                        tv_nsec: stat.st_mtime_nsec as libc::c_long,
+                    },
+                ];
+                // SAFETY: the destination fd and name are valid.
+                if unsafe {
+                    libc::utimensat(
+                        destination_fd,
+                        name_c.as_ptr(),
+                        times.as_ptr(),
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    )
+                } != 0
+                {
+                    result = Err(io::Error::last_os_error());
+                    break;
+                }
+            }
         } else {
             result = Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -703,6 +785,24 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).expect("temp root");
         root
+    }
+
+    #[test]
+    fn copies_fifo_nodes() {
+        let root = temp_root("copy-fifo");
+        let src = root.join("fifo");
+        let dst = root.join("copy");
+        let path = CString::new(src.as_os_str().as_bytes()).expect("path");
+        // SAFETY: `path` is a NUL-terminated path and the mode is valid.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o640) }, 0);
+        copy_entry(&src, &dst, false, true).expect("copy");
+        assert!(
+            fs::symlink_metadata(&dst)
+                .expect("dest")
+                .file_type()
+                .is_fifo()
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

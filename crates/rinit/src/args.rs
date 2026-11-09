@@ -14,7 +14,8 @@
 //! both racy and unsound. Tests therefore drive [`parse_with_default`] and
 //! [`service_argv_from_env`] directly.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
+use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
 /// Environment variable that overrides the hardcoded test service.
@@ -147,6 +148,12 @@ fn parse_with_default<I: IntoIterator<Item = OsString>>(
 
     let mut iter = args.into_iter();
     while let Some(arg_os) = iter.next() {
+        if arg_os.to_str().is_none() {
+            if non_utf8_path_arg(arg_os.as_os_str(), &mut cfg)? {
+                continue;
+            }
+            return Err(format!("argument is not valid UTF-8: {arg_os:?}"));
+        }
         let arg = arg_os.to_string_lossy();
         match arg.as_ref() {
             "-h" | "--help" => cfg.show_help = true,
@@ -156,7 +163,7 @@ fn parse_with_default<I: IntoIterator<Item = OsString>>(
                 let value = iter
                     .next()
                     .ok_or_else(|| "--units requires a directory".to_string())?;
-                cfg.unit_dir = PathBuf::from(value.to_string_lossy().into_owned());
+                cfg.unit_dir = PathBuf::from(value);
             }
             "--default" => {
                 let value = iter
@@ -169,25 +176,25 @@ fn parse_with_default<I: IntoIterator<Item = OsString>>(
                 let value = iter
                     .next()
                     .ok_or_else(|| "--cgroup-root requires a directory".to_string())?;
-                cfg.cgroup_root = Some(PathBuf::from(value.to_string_lossy().into_owned()));
+                cfg.cgroup_root = Some(PathBuf::from(value));
             }
             "--watchdog" => {
                 let value = iter
                     .next()
                     .ok_or_else(|| "--watchdog requires a device path".to_string())?;
-                cfg.watchdog_device = Some(PathBuf::from(value.to_string_lossy().into_owned()));
+                cfg.watchdog_device = Some(PathBuf::from(value));
             }
             "--fstab" => {
                 let value = iter
                     .next()
                     .ok_or_else(|| "--fstab requires a path".to_string())?;
-                cfg.fstab = log_file_path(&value.to_string_lossy());
+                cfg.fstab = path_or_none(&value);
             }
             "--log-file" => {
                 let value = iter
                     .next()
                     .ok_or_else(|| "--log-file requires a path".to_string())?;
-                cfg.log_file = log_file_path(&value.to_string_lossy());
+                cfg.log_file = path_or_none(&value);
             }
             "--log-max-bytes" => {
                 let value = iter
@@ -280,6 +287,44 @@ fn parse_with_default<I: IntoIterator<Item = OsString>>(
     /// spellings meaning the same thing is one fewer difference between a boot
     /// and a `make run`. Used by `--log-file` and `--fstab`, which are the two
     /// things a board may want to point somewhere else or turn off entirely.
+    fn path_or_none(value: &OsStr) -> Option<PathBuf> {
+        match value.to_str() {
+            Some(text) => log_file_path(text),
+            None => Some(PathBuf::from(value)),
+        }
+    }
+
+    fn non_utf8_path_arg(arg: &OsStr, cfg: &mut Config) -> Result<bool, String> {
+        let bytes = arg.as_bytes();
+        let Some(equals) = bytes.iter().position(|byte| *byte == b'=') else {
+            return Ok(false);
+        };
+        let (prefix, value) = bytes.split_at(equals);
+        let value = value.get(1..).unwrap_or_default();
+        let path = || PathBuf::from(OsStr::from_bytes(value));
+        match prefix {
+            b"--units" => cfg.unit_dir = path(),
+            b"--cgroup-root" => cfg.cgroup_root = Some(path()),
+            b"--watchdog" => cfg.watchdog_device = Some(path()),
+            b"--fstab" => {
+                cfg.fstab = if value.is_empty() || value.eq_ignore_ascii_case(b"none") {
+                    None
+                } else {
+                    Some(path())
+                };
+            }
+            b"--log-file" => {
+                cfg.log_file = if value.is_empty() || value.eq_ignore_ascii_case(b"none") {
+                    None
+                } else {
+                    Some(path())
+                };
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
     fn log_file_path(value: &str) -> Option<PathBuf> {
         let value = value.trim();
         if value.is_empty() || value.eq_ignore_ascii_case("none") {

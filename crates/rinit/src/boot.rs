@@ -301,6 +301,16 @@ fn sync_socket_activation(
         if starts.flows.contains_key(&unit) {
             continue;
         }
+        // A deferred control start already owns the dependency chain that
+        // includes this unit. Arming the socket again would create a second
+        // job for the same connection while the first one is still running.
+        if starts
+            .controls
+            .iter()
+            .any(|job| job.target == unit || job.order.iter().any(|ordered| ordered == &unit))
+        {
+            continue;
+        }
         let Some(rt) = manager.get(&unit) else {
             continue;
         };
@@ -737,7 +747,7 @@ async fn supervise(
         // directive exists to reclaim.
         for unit in manager.due_idle_units() {
             rlog!("stopping {unit}: idle");
-            starts.cancel(&unit);
+            starts.cancel(manager, &unit);
             let effect = manager.request_stop(&unit, RequestSource::UserStop);
             if let Err(e) = apply_effect(manager, &unit, effect).await {
                 rlog!("error: cannot stop idle {unit}: {e}");
@@ -813,7 +823,7 @@ async fn supervise(
                     let _ = reply.send((status, text));
                 } else {
                     if let Request::Stop(unit) = &request {
-                        starts.cancel(unit);
+                        starts.cancel(manager, unit);
                     }
                     let reloaded = matches!(&request, Request::Reload);
                     match handle_control(
@@ -887,7 +897,7 @@ async fn supervise(
     // A start that has not reached `ExecStart=` yet has no unit process for the
     // stop path to signal: kill its `ExecStartPre=`/`Post=` command here, and
     // release any control client still waiting for the reply.
-    starts.shutdown();
+    starts.shutdown(manager);
     if fast {
         manager.compress_stop_timeouts(FAST_STOP_SECS);
     }
@@ -1141,6 +1151,7 @@ impl StartFlow {
         } else {
             StartStage::Sockets { paths }
         };
+        manager.mark_starting(unit);
         Ok(StartFlow {
             unit: unit.clone(),
             stage,
@@ -1795,7 +1806,7 @@ impl StartCoordinator {
             }
         }
         for unit in finished {
-            self.remove_flow(&unit);
+            self.remove_flow(manager, &unit);
         }
 
         let mut index = 0;
@@ -1843,10 +1854,11 @@ impl StartCoordinator {
     /// it has no pid for an `ExecStartPre=` process, so without this the command
     /// would outlive the stop and could still create the state the start was
     /// preparing.
-    fn remove_flow(&mut self, unit: &UnitName) {
+    fn remove_flow(&mut self, manager: &mut UnitManager, unit: &UnitName) {
         let Some(flow) = self.flows.remove(unit) else {
             return;
         };
+        manager.clear_starting(unit);
         flow.cancel_pending();
         if let Some(pid) = flow.running_aux_pid() {
             let _ = process::kill_process_group(pid, libc::SIGKILL);
@@ -1854,8 +1866,8 @@ impl StartCoordinator {
         }
     }
 
-    fn cancel(&mut self, unit: &UnitName) {
-        self.remove_flow(unit);
+    fn cancel(&mut self, manager: &mut UnitManager, unit: &UnitName) {
+        self.remove_flow(manager, unit);
     }
 
     /// Drop work whose unit a reload removed.
@@ -1867,7 +1879,7 @@ impl StartCoordinator {
         let units: Vec<UnitName> = self.flows.keys().cloned().collect();
         for unit in units {
             if !manager.exists(&unit) {
-                self.cancel(&unit);
+                self.cancel(manager, &unit);
             }
         }
 
@@ -1899,8 +1911,9 @@ impl StartCoordinator {
 
     /// Abandon every in-flight start on shutdown, killing any auxiliary command
     /// that is still running so it is not orphaned past the service tree.
-    fn shutdown(&mut self) {
-        for flow in self.flows.values() {
+    fn shutdown(&mut self, manager: &mut UnitManager) {
+        for (unit, flow) in &self.flows {
+            manager.clear_starting(unit);
             flow.cancel_pending();
             if let Some(pid) = flow.running_aux_pid() {
                 let _ = process::kill_process_group(pid, libc::SIGKILL);
@@ -2102,6 +2115,7 @@ impl ControlStart {
                         && flow.advance(manager, notify, logs, aux).is_some()
                     {
                         flows.remove(&unit);
+                        manager.clear_starting(&unit);
                     }
                     self.waiting = Some(unit);
                 }

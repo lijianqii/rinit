@@ -28,8 +28,10 @@ mod client;
 mod file_log;
 mod parse;
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use rinit_core::Status;
@@ -80,8 +82,34 @@ Exit codes:
 /// message. Collecting `OsString`s and converting here is what keeps that
 /// promise; every argument rctl accepts is a unit name, a number or a keyword,
 /// so rejecting the odd byte is correct rather than lossy.
+#[cfg(test)]
 fn collect_args(args: impl Iterator<Item = OsString>) -> Result<Vec<String>, OsString> {
     args.map(OsString::into_string).collect()
+}
+
+/// Keep a non-UTF-8 `--file=PATH` as a path.
+///
+/// Every other argument rctl takes is a unit name, a number or a keyword, but
+/// a log path is arbitrary bytes on Unix. The parser itself remains string
+/// based, so the path is replaced by a sentinel and restored after parsing.
+const FILE_SENTINEL: &str = "\u{0}rinit-file-override";
+
+fn collect_args_with_file_override(
+    args: impl Iterator<Item = OsString>,
+) -> Result<(Vec<String>, Option<PathBuf>), OsString> {
+    let mut file = None;
+    let mut strings = Vec::new();
+    for arg in args {
+        if arg.to_str().is_none()
+            && let Some(path) = arg.as_bytes().strip_prefix(b"--file=")
+        {
+            file = Some(PathBuf::from(OsStr::from_bytes(path)));
+            strings.push(format!("--file={FILE_SENTINEL}"));
+            continue;
+        }
+        strings.push(arg.into_string()?);
+    }
+    Ok((strings, file))
 }
 
 /// Write a reply, treating a closed pipe as success and any other write error
@@ -98,7 +126,7 @@ fn emit(text: &str) -> bool {
 }
 
 fn main() -> ExitCode {
-    let args = match collect_args(std::env::args_os().skip(1)) {
+    let (args, file_override) = match collect_args_with_file_override(std::env::args_os().skip(1)) {
         Ok(args) => args,
         Err(argument) => {
             // A command line is user input, so a byte that is not UTF-8 is a
@@ -118,7 +146,14 @@ fn main() -> ExitCode {
             return ExitCode::from(if emit(&text) { 0 } else { 1 });
         }
         Ok(parse::Parsed::Request(request)) => request,
-        Ok(parse::Parsed::FileLog(log)) => return file_log::run(&log),
+        Ok(parse::Parsed::FileLog(mut log)) => {
+            if log.path == Path::new(FILE_SENTINEL)
+                && let Some(path) = file_override
+            {
+                log.path = path;
+            }
+            return file_log::run(&log);
+        }
         Err(message) => {
             eprintln!("rctl: {message}\n\n{USAGE}");
             return ExitCode::from(2);
@@ -153,12 +188,24 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
     #[test]
     fn non_utf8_arguments_are_a_usage_error() {
         let bad = OsString::from_vec(vec![b'x', 0xff]);
         assert_eq!(collect_args(std::iter::once(bad.clone())), Err(bad));
+    }
+
+    #[test]
+    fn a_non_utf8_file_path_is_preserved() {
+        let raw = OsString::from_vec(b"--file=/tmp/log-\xff".to_vec());
+        let (args, file) =
+            collect_args_with_file_override(std::iter::once(raw)).expect("the path is split out");
+        assert_eq!(args, [format!("--file={FILE_SENTINEL}")]);
+        assert_eq!(
+            file,
+            Some(PathBuf::from(OsStr::from_bytes(b"/tmp/log-\xff")))
+        );
     }
 
     #[test]

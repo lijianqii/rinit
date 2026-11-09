@@ -43,8 +43,14 @@ fn dirname(path: &str) -> String {
 
 fn run<A: AsRef<OsStr>>(args: &[A], program: &str) -> ExitCode {
     let mut paths: Vec<OsString> = Vec::new();
+    let mut parsing_options = true;
     for arg in args {
+        if !parsing_options {
+            paths.push(OsString::from(arg.as_ref()));
+            continue;
+        }
         match arg.as_ref().to_str() {
+            Some("--") => parsing_options = false,
             Some("--help") => {
                 println!("Usage: dirname PATH...");
                 return ExitCode::from(EXIT_OK);

@@ -200,7 +200,7 @@ pub fn unmount_order(proc_mounts: &str) -> Vec<String> {
 
 /// Decode the octal escapes `/proc/mounts` uses for space, tab, newline and
 /// backslash in a path.
-pub(crate) fn unescape_mount_field(field: &str) -> String {
+pub fn unescape_mount_field(field: &str) -> String {
     let bytes = field.as_bytes();
     if !bytes.contains(&b'\\') {
         return field.to_owned();

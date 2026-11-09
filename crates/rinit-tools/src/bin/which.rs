@@ -1,17 +1,24 @@
 //! `which` - locate a command in PATH.
 
-use std::ffi::OsStr;
+use std::ffi::{CString, OsStr};
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use rinit_tools::{EXIT_OK, program_name, usage_error};
 
 fn executable(path: &Path) -> bool {
-    fs::metadata(path)
-        .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
+    let is_file = fs::metadata(path).is_ok_and(|meta| meta.is_file());
+    if !is_file {
+        return false;
+    }
+    let Ok(path) = CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: `path` is a NUL-terminated path; `access` has no other
+    // preconditions.
+    unsafe { libc::access(path.as_ptr(), libc::X_OK) == 0 }
 }
 
 fn find_in_path(name: &str, path: &OsStr, all: bool) -> Vec<PathBuf> {

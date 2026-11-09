@@ -21,7 +21,9 @@ struct State {
 }
 
 fn is_blank(line: &[u8]) -> bool {
-    line.iter().all(|byte| *byte == b'\n' || *byte == b'\r')
+    // GNU `cat -s` treats only a bare newline as a blank line; CRLF is a line
+    // with content (the CR).
+    line.iter().all(|byte| *byte == b'\n')
 }
 
 fn copy_stream<R: BufRead, W: Write>(
@@ -188,6 +190,19 @@ mod tests {
             },
         );
         assert_eq!(squeezed, b"one\n\ntwo\n");
+    }
+
+    #[test]
+    fn squeeze_does_not_treat_crlf_as_a_blank_line() {
+        let input = b"one\r\n\r\ntwo\r\n";
+        let squeezed = output(
+            input,
+            Options {
+                squeeze: true,
+                ..Options::default()
+            },
+        );
+        assert_eq!(squeezed, input);
     }
 
     #[test]

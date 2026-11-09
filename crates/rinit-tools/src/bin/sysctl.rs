@@ -79,18 +79,23 @@ fn run(args: &[String], root: &Path, program: &str) -> ExitCode {
             ExitCode::from(EXIT_OK)
         }
         "-w" | "--write" => {
-            let Some(assignment) = args.get(1) else {
+            let assignments = args.get(1..).unwrap_or_default();
+            if assignments.is_empty() {
                 return ExitCode::from(usage_error(program, "-w needs KEY=VALUE"));
-            };
-            let Some((key, value)) = assignment.split_once('=') else {
-                return ExitCode::from(usage_error(program, "-w needs KEY=VALUE"));
-            };
-            if let Err(e) = write_key(root, key, value) {
-                eprintln!("{program}: {e}");
-                return ExitCode::from(1);
             }
-            println!("{key} = {value}");
-            ExitCode::from(EXIT_OK)
+            let mut failed = false;
+            for assignment in assignments {
+                let Some((key, value)) = assignment.split_once('=') else {
+                    return ExitCode::from(usage_error(program, "-w needs KEY=VALUE"));
+                };
+                if let Err(e) = write_key(root, key, value) {
+                    eprintln!("{program}: {e}");
+                    failed = true;
+                } else {
+                    println!("{key} = {value}");
+                }
+            }
+            ExitCode::from(if failed { 1 } else { EXIT_OK })
         }
         key => {
             let mut fail = false;
@@ -178,6 +183,19 @@ mod tests {
             ExitCode::from(2)
         );
         assert_eq!(run(&[], &root, "sysctl"), ExitCode::from(2));
+        assert_eq!(
+            run(
+                &[
+                    "-w".to_string(),
+                    "kernel.hostname=first".to_string(),
+                    "kernel.hostname=second".to_string(),
+                ],
+                &root,
+                "sysctl"
+            ),
+            ExitCode::from(0)
+        );
+        assert_eq!(read_key(&root, "kernel.hostname").as_deref(), Ok("second"));
         let _ = std::fs::remove_dir_all(root);
     }
 

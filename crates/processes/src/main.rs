@@ -21,9 +21,10 @@
 )]
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, BufWriter, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
@@ -145,7 +146,7 @@ struct Process {
 }
 
 fn main() {
-    let args = match collect_args(std::env::args_os().skip(1)) {
+    let (args, proc_root) = match collect_args_with_proc_root(std::env::args_os().skip(1)) {
         Ok(args) => args,
         Err(argument) => {
             eprintln!("processes: argument {argument:?} is not valid UTF-8\n\n{USAGE}");
@@ -154,7 +155,14 @@ fn main() {
     };
 
     let opts = match parse_args(args.into_iter()) {
-        Ok(ParsedArgs::Run(opts)) => opts,
+        Ok(ParsedArgs::Run(mut opts)) => {
+            if opts.proc_root == Path::new(PROC_ROOT_SENTINEL)
+                && let Some(path) = proc_root
+            {
+                opts.proc_root = PathBuf::from(OsStr::from_bytes(&path));
+            }
+            opts
+        }
         Ok(ParsedArgs::Help) => {
             let _ = std::io::stdout().write_all(USAGE.as_bytes());
             return;
@@ -179,8 +187,45 @@ fn main() {
     }
 }
 
+#[cfg(test)]
 fn collect_args(args: impl Iterator<Item = OsString>) -> Result<Vec<String>, OsString> {
     args.map(OsString::into_string).collect()
+}
+
+/// Keep a non-UTF-8 `--proc-root` value as a path.
+///
+/// Every other argument is a keyword or a number, but `/proc` can live at an
+/// arbitrary path on Unix. The parser remains string based, so the path is
+/// replaced by a sentinel and restored after parsing.
+const PROC_ROOT_SENTINEL: &str = "\u{0}rinit-proc-root";
+
+fn collect_args_with_proc_root(
+    args: impl Iterator<Item = OsString>,
+) -> Result<(Vec<String>, Option<Vec<u8>>), OsString> {
+    let mut root = None;
+    let mut strings = Vec::new();
+    let mut args = args.peekable();
+    while let Some(arg) = args.next() {
+        if arg.to_str().is_none() {
+            if let Some(path) = arg.as_bytes().strip_prefix(b"--proc-root=") {
+                root = Some(path.to_vec());
+                strings.push(format!("--proc-root={PROC_ROOT_SENTINEL}"));
+                continue;
+            }
+            return Err(arg);
+        }
+        let text = arg.to_str().unwrap_or_default();
+        if text == "--proc-root"
+            && let Some(value) = args.next()
+        {
+            root = Some(value.as_bytes().to_vec());
+            strings.push("--proc-root".to_string());
+            strings.push(PROC_ROOT_SENTINEL.to_string());
+            continue;
+        }
+        strings.push(text.to_string());
+    }
+    Ok((strings, root))
 }
 
 fn run(opts: &Options) -> io::Result<()> {
@@ -190,11 +235,7 @@ fn run(opts: &Options) -> io::Result<()> {
     let mut processes = read_processes(opts, &users, uptime, details)?;
     filter_processes(&mut processes, opts);
 
-    if opts.tree {
-        sort_for_tree(&mut processes);
-    } else {
-        sort_processes(&mut processes, opts);
-    }
+    sort_processes(&mut processes, opts);
     if let Some(limit) = opts.limit {
         processes.truncate(limit);
     }
@@ -249,6 +290,9 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<ParsedArgs, Stri
             }
             "--proc-root" => {
                 let value = args.next().ok_or("--proc-root needs a value")?;
+                if value.is_empty() || value.starts_with('-') {
+                    return Err("--proc-root needs a path".to_string());
+                }
                 opts.proc_root = PathBuf::from(value);
             }
             other => {
@@ -264,6 +308,9 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<ParsedArgs, Stri
                     }
                     opts.user = Some(value.to_string());
                 } else if let Some(value) = other.strip_prefix("--proc-root=") {
+                    if value.is_empty() || value.starts_with('-') {
+                        return Err("--proc-root needs a path".to_string());
+                    }
                     opts.proc_root = PathBuf::from(value);
                 } else {
                     return Err(format!("unknown option '{other}'"));
@@ -551,10 +598,6 @@ fn sort_processes(processes: &mut [Process], opts: &Options) {
     }
 }
 
-fn sort_for_tree(processes: &mut [Process]) {
-    processes.sort_by_key(|process| process.pid);
-}
-
 fn print_table(processes: &[Process], opts: &Options) -> io::Result<()> {
     let mut rows = Vec::new();
     for process in processes {
@@ -572,15 +615,11 @@ fn print_tree(processes: &[Process], opts: &Options) -> io::Result<()> {
     for process in processes {
         children.entry(process.ppid).or_default().push(process.pid);
     }
-    for list in children.values_mut() {
-        list.sort_unstable();
-    }
-    let mut roots: Vec<u32> = processes
+    let roots: Vec<u32> = processes
         .iter()
         .filter(|process| process.ppid == 0 || !by_pid.contains_key(&process.ppid))
         .map(|process| process.pid)
         .collect();
-    roots.sort_unstable();
 
     let mut tree = TreeContext {
         by_pid: &by_pid,
@@ -813,6 +852,25 @@ mod tests {
     fn non_utf8_arguments_are_a_usage_error() {
         let bad = OsString::from_vec(vec![b'x', 0xff]);
         assert_eq!(collect_args(std::iter::once(bad.clone())), Err(bad));
+    }
+
+    #[test]
+    fn a_non_utf8_proc_root_is_preserved() {
+        let raw = OsString::from_vec(b"--proc-root=/tmp/proc-\xff".to_vec());
+        let (args, root) =
+            collect_args_with_proc_root(std::iter::once(raw)).expect("the path is split out");
+        assert_eq!(args, [format!("--proc-root={PROC_ROOT_SENTINEL}")]);
+        assert_eq!(root.as_deref(), Some(b"/tmp/proc-\xff".as_slice()));
+    }
+
+    #[test]
+    fn a_separated_proc_root_is_preserved() {
+        let raw = OsString::from_vec(b"/tmp/proc-\xff".to_vec());
+        let (args, root) =
+            collect_args_with_proc_root([OsString::from("--proc-root"), raw].into_iter())
+                .expect("the path is split out");
+        assert_eq!(args, ["--proc-root", PROC_ROOT_SENTINEL]);
+        assert_eq!(root.as_deref(), Some(b"/tmp/proc-\xff".as_slice()));
     }
 
     #[test]

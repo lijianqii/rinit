@@ -179,6 +179,12 @@ pub struct UnitRuntime {
     pub config: UnitConfig,
     /// Where it actually is (plan §1.3(3)).
     pub state: UnitState,
+    /// A start flow exists for this unit, even before it has spawned.
+    ///
+    /// `pid` and `state` only describe a process that already exists. A
+    /// `Conflicts=` check must also see an `ExecStartPre=`/`NeedsSocket=` flow
+    /// that could still spawn later.
+    pub starting: bool,
     /// Restart bookkeeping (plan §1.3(4)).
     pub backoff: BackoffState,
     /// Its process, if one is running.
@@ -262,6 +268,7 @@ impl UnitRuntime {
         UnitRuntime {
             config,
             state: UnitState::Inactive,
+            starting: false,
             backoff,
             pid: None,
             group: None,
@@ -736,6 +743,20 @@ impl UnitManager {
         self.units.get(unit).is_some_and(UnitRuntime::is_up)
     }
 
+    /// Record that a start flow now exists for `unit`, before it has spawned.
+    pub fn mark_starting(&mut self, unit: &UnitName) {
+        if let Some(rt) = self.units.get_mut(unit) {
+            rt.starting = true;
+        }
+    }
+
+    /// The start flow for `unit` is gone, whatever its outcome.
+    pub fn clear_starting(&mut self, unit: &UnitName) {
+        if let Some(rt) = self.units.get_mut(unit) {
+            rt.starting = false;
+        }
+    }
+
     /// Whether the unit's cgroup still holds any process.
     ///
     /// A service whose leader exited can leave a daemonized child in the
@@ -1165,6 +1186,7 @@ impl UnitManager {
             // the flow (its `advance` checks for `Stopped`).
             let needs_stop = self.units.get(&other).is_some_and(|rt| {
                 rt.pid.is_some()
+                    || rt.starting
                     || matches!(
                         rt.state,
                         UnitState::Starting | UnitState::RestartWait | UnitState::Deactivating
@@ -4271,6 +4293,26 @@ mod tests {
         );
 
         cleanup(&mut m, &alpha);
+    }
+
+    #[test]
+    fn a_conflict_stops_a_start_flow_that_has_not_spawned() {
+        let mut m = UnitManager::new();
+        m.add(config("alpha.service", RestartPolicy::No));
+        let mut beta = config("beta.service", RestartPolicy::No);
+        beta.deps.conflicts = vec![UnitName::parse("alpha.service").unwrap()];
+        m.add(beta);
+
+        let alpha = UnitName::parse("alpha.service").unwrap();
+        let beta = UnitName::parse("beta.service").unwrap();
+        m.mark_starting(&alpha);
+
+        assert_eq!(m.stop_conflicts(&beta), std::slice::from_ref(&alpha));
+        assert_eq!(
+            m.target_of(&alpha),
+            Some(JobTarget::Stopped),
+            "the in-flight flow must observe a stop request"
+        );
     }
 
     /// `ExecStop=`, when set, is the stop action: the service is asked to stop

@@ -34,16 +34,14 @@ fn target_for(src: &Path, dst: &Path, dst_is_dir: bool) -> Result<PathBuf, Strin
 /// directory target), the temporary tree is removed and the source remains.
 fn move_across_filesystems(src: &Path, dst: &Path) -> Result<(), String> {
     static TEMPORARY: AtomicU64 = AtomicU64::new(0);
-    let name = dst
-        .file_name()
-        .ok_or_else(|| format!("cannot determine the name of '{}'", dst.display()))?;
     let parent = dst
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let mut temporary_name = OsString::from(".");
-    temporary_name.push(name);
-    temporary_name.push(format!(
+    // Keep the temporary name short: prefixing the destination name can
+    // exceed NAME_MAX for a 255-byte source. It is still unique per process
+    // and attempt.
+    let temporary_name = OsString::from(format!(
         ".rinit-mv.{}.{}",
         std::process::id(),
         TEMPORARY.fetch_add(1, Ordering::Relaxed)

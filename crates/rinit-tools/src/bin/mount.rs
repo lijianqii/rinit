@@ -102,7 +102,10 @@ fn list_mounts(root: &std::path::Path) -> Result<(), String> {
         }
         println!(
             "{} on {} type {} ({})",
-            fields[0], fields[1], fields[2], fields[3]
+            rinit_runtime::mounts::unescape_mount_field(fields[0]),
+            rinit_runtime::mounts::unescape_mount_field(fields[1]),
+            fields[2],
+            fields[3]
         );
     }
     Ok(())

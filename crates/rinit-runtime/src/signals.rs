@@ -172,11 +172,12 @@ impl SignalSet {
                 Err(e) => {
                     // Roll back so a failed construction leaves no handlers
                     // pointing at a pipe that is about to close.
-                    WRITE_FD.store(-1, Ordering::Release);
-                    LIVE.store(false, Ordering::Release);
                     for (number, previous) in restore.into_iter().rev() {
                         restore_disposition(number, &previous);
                     }
+                    WRITE_FD.store(-1, Ordering::Release);
+                    wait_for_handlers();
+                    LIVE.store(false, Ordering::Release);
                     return Err(e);
                 }
             }
@@ -192,11 +193,12 @@ impl SignalSet {
                 // Undo them here, or `dispatch` stays installed and points at a
                 // pipe that is about to close with `writer`/`reader`.
                 let (_fd, io) = e.into_parts();
-                WRITE_FD.store(-1, Ordering::Release);
-                LIVE.store(false, Ordering::Release);
                 for (number, previous) in restore.iter().rev() {
                     restore_disposition(*number, previous);
                 }
+                WRITE_FD.store(-1, Ordering::Release);
+                wait_for_handlers();
+                LIVE.store(false, Ordering::Release);
                 return Err(SyscallError::from_io("AsyncFd::register(signal pipe)", &io));
             }
         };
@@ -265,6 +267,19 @@ impl SignalSet {
     }
 }
 
+/// Wait for handlers that already loaded the write end to finish.
+///
+/// The bound only guards against a handler stuck on a frozen thread; the body
+/// is a load and a one-byte non-blocking write, so it is not expected to spin.
+fn wait_for_handlers() {
+    for _ in 0..1_000_000 {
+        if ACTIVE_HANDLERS.load(Ordering::Acquire) == 0 {
+            break;
+        }
+        std::hint::spin_loop();
+    }
+}
+
 impl Drop for SignalSet {
     /// Undo everything [`SignalSet::new`] installed, in the reverse order.
     ///
@@ -280,15 +295,8 @@ impl Drop for SignalSet {
         WRITE_FD.store(-1, Ordering::Release);
         // A handler that already loaded the descriptor is still counted; wait
         // for it before the fields close the pipe. No new handler can start
-        // because the dispositions are restored above. The bound only guards
-        // against a signal handler stuck on a frozen thread; the body is a
-        // load and a one-byte write, so it is not expected to spin at all.
-        for _ in 0..1_000_000 {
-            if ACTIVE_HANDLERS.load(Ordering::Acquire) == 0 {
-                break;
-            }
-            std::hint::spin_loop();
-        }
+        // because the dispositions are restored above.
+        wait_for_handlers();
         // `self.writer` and `self.reader` close here.
         LIVE.store(false, Ordering::Release);
     }

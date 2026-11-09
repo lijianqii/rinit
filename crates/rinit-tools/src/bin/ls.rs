@@ -157,6 +157,16 @@ fn format_dir(path: &Path, options: Options) -> io::Result<Vec<u8>> {
     Ok(out)
 }
 
+fn lists_directory(path: &Path, options: Options) -> bool {
+    if options.directory {
+        return false;
+    }
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    meta.is_dir() || (!options.long && fs::metadata(path).is_ok_and(|target| target.is_dir()))
+}
+
 fn list_path(path: &Path, display: &OsStr, options: Options) -> io::Result<Vec<u8>> {
     let meta = fs::symlink_metadata(path)?;
     // A directory operand is listed by its contents, including under `-l`.
@@ -258,17 +268,20 @@ fn run<A: AsRef<OsStr>>(args: &[A], program: &str) -> ExitCode {
     }
     let multiple = paths.len() > 1;
     let mut failed = false;
+    let mut previous_was_directory = false;
     for (index, path) in paths.iter().enumerate() {
         let display = path.as_os_str();
+        let is_directory = lists_directory(path, options);
         if multiple
             && index > 0
+            && (is_directory || previous_was_directory)
             && let Some(code) = emitted(emit(b"\n"))
         {
             return code;
         }
         match list_path(path, display, options) {
             Ok(text) => {
-                if multiple {
+                if multiple && is_directory {
                     if let Some(code) = emitted(emit(display.as_bytes())) {
                         return code;
                     }
@@ -285,6 +298,7 @@ fn run<A: AsRef<OsStr>>(args: &[A], program: &str) -> ExitCode {
                 failed = true;
             }
         }
+        previous_was_directory = is_directory;
     }
     ExitCode::from(if failed { 1 } else { EXIT_OK })
 }
@@ -400,6 +414,25 @@ mod tests {
         );
         assert!(listing.contains("-rw-r--r--"));
         assert!(listing.contains("file"));
+    }
+
+    #[test]
+    fn only_directory_operands_are_listed_with_headers() {
+        let root = temp_root("headers");
+        let dir = root.join("dir");
+        fs::create_dir(&dir).expect("dir");
+        let file = root.join("file");
+        fs::write(&file, b"x").expect("file");
+        assert!(lists_directory(&dir, Options::default()));
+        assert!(!lists_directory(&file, Options::default()));
+        assert!(!lists_directory(
+            &dir,
+            Options {
+                directory: true,
+                ..Options::default()
+            }
+        ));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

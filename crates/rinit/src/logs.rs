@@ -190,16 +190,29 @@ impl LogFile {
             // the problem onto whoever runs it.
             std::fs::create_dir_all(parent)?;
         }
-        let file = std::fs::OpenOptions::new()
+        let max_bytes = max_bytes.max(1).min(usize::MAX as u64);
+        let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(path)?;
-        let written = file.metadata().map(|meta| meta.len()).unwrap_or(0);
+        let mut written = file.metadata().map(|meta| meta.len()).unwrap_or(0);
+        if written > max_bytes {
+            // A lower --log-max-bytes must not let the next write push the old
+            // oversized file into `.1` and keep it there. Reset it now, with
+            // the same marker used by the truncate path.
+            file.set_len(0)?;
+            written = 0;
+            let marker = b"log truncated: the previous contents were dropped\n";
+            if marker.len() as u64 <= max_bytes {
+                file.write_all(marker)?;
+                written = marker.len() as u64;
+            }
+        }
         Ok(LogFile {
             file: Some(file),
             path: path.to_path_buf(),
             written,
-            max_bytes: max_bytes.max(1).min(usize::MAX as u64),
+            max_bytes,
             keep,
             warned: false,
         })
@@ -841,6 +854,24 @@ mod tests {
         file.append_text(&batch);
         let written = std::fs::read(&path).expect("read back");
         assert!(written.len() <= 64, "got {} bytes", written.len());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn opening_a_log_larger_than_the_bound_resets_it_in_place() {
+        let dir =
+            std::env::temp_dir().join(format!("rinit-logs-oversized-open-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("rinit.log");
+        std::fs::write(&path, vec![b'x'; 4096]).expect("old file");
+        let file = LogFile::open(&path, 128, 2).expect("open");
+        let written = std::fs::read(&path).expect("read back");
+        assert!(written.len() <= 128, "got {} bytes", written.len());
+        assert!(
+            !file.rotated_path(1).exists(),
+            "the old file is not retained"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

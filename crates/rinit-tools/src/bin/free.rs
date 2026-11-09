@@ -101,14 +101,13 @@ fn run(args: &[String], root: &Path, program: &str) -> ExitCode {
     );
     let swap_total = field(&values, "SwapTotal");
     let swap_free = field(&values, "SwapFree");
-    if swap_total > 0 {
-        println!(
-            "Swap:  {:>11} {:>11} {:>11}",
-            scaled(swap_total, &unit),
-            scaled(swap_total.saturating_sub(swap_free), &unit),
-            scaled(swap_free, &unit)
-        );
-    }
+    // procps/busybox print the Swap row even at zero; scripts parse it.
+    println!(
+        "Swap:  {:>11} {:>11} {:>11}",
+        scaled(swap_total, &unit),
+        scaled(swap_total.saturating_sub(swap_free), &unit),
+        scaled(swap_free, &unit)
+    );
     ExitCode::from(EXIT_OK)
 }
 
