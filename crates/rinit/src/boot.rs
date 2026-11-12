@@ -408,27 +408,33 @@ impl Boot {
     }
 
     /// Queue the next level, or settle the current one.
+    ///
+    /// Returns whether this pass began a new level. The caller uses that to
+    /// advance the new flows immediately instead of waiting for the next
+    /// `START_POLL` tick.
     fn advance(
         &mut self,
         manager: &mut UnitManager,
         starts: &mut StartCoordinator,
         spawned: &[UnitName],
-    ) {
+    ) -> bool {
         self.record_spawned(spawned);
         if self.complete {
-            return;
+            return false;
         }
+        let mut began = false;
         loop {
             if !self.active {
                 let Some(level) = self.plan.levels.get(self.level).cloned() else {
                     self.finish(manager);
-                    return;
+                    return false;
                 };
                 self.begin_level(manager, starts, level);
+                began = true;
             }
 
             if !self.settle_pending(manager, starts) {
-                return;
+                return began;
             }
             self.settle_targets(manager);
             self.level += 1;
@@ -681,7 +687,13 @@ async fn supervise(
         // conflicting unit or a long `ExecStartPre=` returns to this loop.
         let spawned = starts.advance(manager, supervised.notify, supervised.logs);
         if let Some(schedule) = boot.as_mut() {
-            schedule.advance(manager, &mut starts, &spawned);
+            let began = schedule.advance(manager, &mut starts, &spawned);
+            if began && !schedule.is_complete() {
+                // A level was queued after the top-of-loop advance. Run its
+                // first stage now instead of sleeping one START_POLL first.
+                let spawned_now = starts.advance(manager, supervised.notify, supervised.logs);
+                schedule.record_spawned(&spawned_now);
+            }
             if schedule.is_complete() {
                 manager.finish_boot();
                 boot = None;
