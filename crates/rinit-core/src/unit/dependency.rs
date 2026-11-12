@@ -359,13 +359,13 @@ impl DependencyGraph {
 
     /// The units `unit` must wait for before it may start.
     pub fn dependencies_of(&self, unit: &UnitName) -> Vec<UnitName> {
-        match self.units.iter().position(|u| u == unit) {
-            Some(i) => self.dependencies[i]
+        match self.units.binary_search(unit) {
+            Ok(i) => self.dependencies[i]
                 .iter()
                 .filter_map(|&d| self.units.get(d))
                 .cloned()
                 .collect(),
-            None => Vec::new(),
+            Err(_) => Vec::new(),
         }
     }
 
@@ -379,33 +379,26 @@ impl DependencyGraph {
     /// [`DependencyGraph::build`] cannot fail, since `build` already rejects
     /// cycles; the signature stays fallible so this can be used standalone.
     pub fn levels(&self) -> Result<Vec<Vec<UnitName>>, DependencyError> {
-        let order = self.topological_order()?;
-        let mut level_of: Vec<(UnitName, usize)> = Vec::with_capacity(order.len());
+        let order = self.topological_indices()?;
+        let mut level_of = vec![0usize; self.units.len()];
         let mut levels: Vec<Vec<UnitName>> = Vec::new();
 
-        for unit in order {
-            let deepest = self
-                .dependencies_of(&unit)
+        for index in order {
+            let deepest = self.dependencies[index]
                 .iter()
-                .map(|dep| {
-                    level_of
-                        .iter()
-                        .find(|(n, _)| n == dep)
-                        .map(|(_, l)| *l)
-                        .unwrap_or(0)
-                })
+                .map(|&dep| level_of[dep])
                 .max()
                 .unwrap_or(0);
-            let level = if deepest == 0 && self.dependencies_of(&unit).is_empty() {
+            let level = if self.dependencies[index].is_empty() {
                 0
             } else {
                 deepest + 1
             };
-            level_of.push((unit.clone(), level));
+            level_of[index] = level;
             if levels.len() <= level {
                 levels.resize(level + 1, Vec::new());
             }
-            levels[level].push(unit);
+            levels[level].push(self.units[index].clone());
         }
         Ok(levels)
     }
@@ -415,9 +408,17 @@ impl DependencyGraph {
     /// # Errors
     /// [`DependencyError::Cycle`] with the offending path spelled out.
     pub fn topological_order(&self) -> Result<Vec<UnitName>, DependencyError> {
+        Ok(self
+            .topological_indices()?
+            .into_iter()
+            .map(|index| self.units[index].clone())
+            .collect())
+    }
+
+    fn topological_indices(&self) -> Result<Vec<usize>, DependencyError> {
         let n = self.units.len();
         let mut remaining: Vec<usize> = (0..n).map(|i| self.dependencies[i].len()).collect();
-        let mut ordered: Vec<UnitName> = Vec::with_capacity(n);
+        let mut ordered: Vec<usize> = Vec::with_capacity(n);
         let mut placed = vec![false; n];
 
         // Pick the ready unit with the smallest name each round: stable output
@@ -430,7 +431,7 @@ impl DependencyGraph {
                 return Err(self.find_cycle());
             };
             placed[next] = true;
-            ordered.push(self.units[next].clone());
+            ordered.push(next);
             // Anything that was waiting on `next` is one step closer.
             for (i, deps) in self.dependencies.iter().enumerate() {
                 if deps.contains(&next) {

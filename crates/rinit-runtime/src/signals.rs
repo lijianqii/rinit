@@ -92,6 +92,21 @@ impl Signal {
     }
 }
 
+/// Signals rinit ignores for its own lifecycle (plan §7.1).
+///
+/// The child spawn path resets exactly the dispositions rinit changed. Keeping
+/// the list here gives the boot setup and the spawn path one source of truth:
+/// a signal added here is both ignored by rinit and restored in its children.
+pub const IGNORED: &[libc::c_int] = &[
+    libc::SIGWINCH,
+    // Reserved for `reload` (plan §7.1, §7.6): ignored until it is implemented.
+    libc::SIGHUP,
+    libc::SIGUSR1,
+    libc::SIGUSR2,
+    libc::SIGQUIT,
+    libc::SIGPIPE,
+];
+
 /// Async-signal-safe handler: record the signal number in the self-pipe.
 ///
 /// The read-modify-write of [`WRITE_FD`] is deliberately ordered: it is loaded

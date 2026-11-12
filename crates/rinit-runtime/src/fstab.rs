@@ -210,8 +210,11 @@ struct MountInfoLine {
 /// `/dev/pts` as if the visible one were mounted. Walk each mount's parent chain
 /// and discard entries whose mountpoint (or an ancestor's) has a higher mount
 /// id at the same path; mount ids increase with mount order.
-fn visible_mount_points(text: &str) -> Vec<String> {
-    let entries: Vec<MountInfoLine> = text.lines().filter_map(parse_mountinfo_line).collect();
+fn parse_mountinfo_entries(text: &str) -> Vec<MountInfoLine> {
+    text.lines().filter_map(parse_mountinfo_line).collect()
+}
+
+fn visible_mount_points_from(entries: &[MountInfoLine], text: &str) -> Vec<String> {
     if entries.is_empty() {
         return text
             .lines()
@@ -220,7 +223,7 @@ fn visible_mount_points(text: &str) -> Vec<String> {
             .collect();
     }
     let mut visible = Vec::new();
-    for entry in &entries {
+    for entry in entries {
         let mut current = Some(entry);
         let mut hidden = false;
         let mut seen = BTreeSet::new();
@@ -249,7 +252,7 @@ fn visible_mount_points(text: &str) -> Vec<String> {
         // resolve (a cycle or an ID outside the namespace). Falling back to
         // "highest id per path" is still better than treating every mount as
         // hidden and stacking a second filesystem on all of them.
-        for entry in &entries {
+        for entry in entries {
             if !visible.iter().any(|point| point == &entry.point)
                 && !entries
                     .iter()
@@ -284,10 +287,10 @@ fn statx_mount_id(path: &Path) -> Option<u64> {
 }
 
 /// The highest mount id for each mountpoint in mountinfo.
-fn mount_ids_by_point(text: &str) -> BTreeMap<String, u64> {
+fn mount_ids_by_point_from(entries: &[MountInfoLine]) -> BTreeMap<String, u64> {
     let mut ids = BTreeMap::new();
-    for entry in text.lines().filter_map(parse_mountinfo_line) {
-        ids.entry(entry.point)
+    for entry in entries {
+        ids.entry(entry.point.clone())
             .and_modify(|id: &mut u64| *id = (*id).max(entry.id))
             .or_insert(entry.id);
     }
@@ -311,8 +314,12 @@ fn mount_with_mounted(
     current_mounts: Option<&str>,
 ) -> FstabReport {
     let (entries, mut warnings) = parse(text);
-    let visible = current_mounts.map(visible_mount_points);
-    let mount_ids = current_mounts.map(mount_ids_by_point);
+    let mountinfo = current_mounts.map(parse_mountinfo_entries);
+    let mount_ids = mountinfo.as_deref().map(mount_ids_by_point_from);
+    // The parent-chain walk is only a fallback for kernels without
+    // `statx(STATX_MNT_ID)`; do it on the first entry that needs it rather
+    // than for every boot that will never call it.
+    let mut visible: Option<Vec<String>> = None;
     let mut mounted = Vec::new();
     for entry in entries {
         // Swap is not a mount. It is activated by `swapon -a`, which reads the
@@ -328,14 +335,24 @@ fn mount_with_mounted(
                 Some(id) => ids.get(&point).is_some_and(|configured| *configured == id),
                 // If statx is unavailable, keep the conservative path/point
                 // check rather than mounting over an existing filesystem.
-                None => visible
-                    .as_ref()
-                    .is_some_and(|mounts| mounts.iter().any(|mounted| mounted == &point)),
+                None => {
+                    let points = visible.get_or_insert_with(|| {
+                        visible_mount_points_from(
+                            mountinfo.as_deref().unwrap_or(&[]),
+                            current_mounts.unwrap_or(""),
+                        )
+                    });
+                    points.iter().any(|mounted| mounted == &point)
+                }
             }
         } else {
-            visible
-                .as_ref()
-                .is_some_and(|mounts| mounts.iter().any(|mounted| mounted == &point))
+            let points = visible.get_or_insert_with(|| {
+                visible_mount_points_from(
+                    mountinfo.as_deref().unwrap_or(&[]),
+                    current_mounts.unwrap_or(""),
+                )
+            });
+            points.iter().any(|mounted| mounted == &point)
         };
         if already_mounted {
             // The first wave (or the kernel) already mounted *this* mount at

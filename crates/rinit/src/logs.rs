@@ -227,6 +227,29 @@ impl LogFile {
     /// bound, because truncating an arbitrary log line would silently lose
     /// more than the size limit itself.
     fn append_text(&mut self, text: &str) {
+        // The common case is a whole drained batch that fits in the current
+        // file. Writing it once keeps the supervisor loop out of one syscall
+        // per line; the per-record path below still handles rotation, a batch
+        // that straddles the bound and an oversized single record.
+        if self.file.is_none() && !self.reopen() {
+            return;
+        }
+        if self.written.saturating_add(text.len() as u64) <= self.max_bytes {
+            let Some(file) = self.file.as_mut() else {
+                return;
+            };
+            match file.write_all(text.as_bytes()) {
+                Ok(()) => {
+                    self.written = self.written.saturating_add(text.len() as u64);
+                    self.warned = false;
+                    return;
+                }
+                Err(e) => {
+                    self.warn(&e);
+                    return;
+                }
+            }
+        }
         for record in text.split_inclusive('\n') {
             if !self.append_record(record) {
                 return;

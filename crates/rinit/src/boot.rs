@@ -63,16 +63,9 @@ const FAST_SHUTDOWN_BUDGET: std::time::Duration = std::time::Duration::from_secs
 /// `SIGCHLD`/`SIGTERM`/`SIGINT`/`SIGPWR` are handled by [`SignalSet`]; every
 /// other signal that could otherwise terminate rinit is explicitly ignored, so
 /// the whole disposition matrix is auditable in one place instead of relying on
-/// the kernel's special treatment of PID 1.
-const IGNORED_SIGNALS: &[libc::c_int] = &[
-    libc::SIGWINCH,
-    // Reserved for `reload` (plan §7.1, §7.6): ignored until it is implemented.
-    libc::SIGHUP,
-    libc::SIGUSR1,
-    libc::SIGUSR2,
-    libc::SIGQUIT,
-    libc::SIGPIPE,
-];
+/// the kernel's special treatment of PID 1. The list lives in `rinit-runtime`
+/// so the spawn path resets exactly the signals this setup changed.
+const IGNORED_SIGNALS: &[libc::c_int] = rinit_runtime::signals::IGNORED;
 
 /// Run the boot sequence and main loop. Returns `Ok` on a clean shutdown.
 ///

@@ -8,6 +8,7 @@
 
 use std::ffi::{CStr, CString};
 use std::os::fd::{AsRawFd, OwnedFd};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -198,15 +199,23 @@ pub fn posix_spawn_full(
             flags |= libc::POSIX_SPAWN_SETSID as libc::c_short;
         }
 
-        // `SIG_IGN` survives exec; reset the whole set to default and clear the
-        // inherited mask, just as the controlled fork path does.
+        // `SIG_IGN` survives exec; reset the dispositions rinit changed and
+        // clear the inherited mask, just as the controlled fork path does.
+        let reset_mask = signals_to_reset();
         // SAFETY: both sets are valid locals initialised by the libc helpers.
         let mut defaults: libc::sigset_t = unsafe { std::mem::zeroed() };
         let mut mask: libc::sigset_t = unsafe { std::mem::zeroed() };
         unsafe {
-            libc::sigfillset(&mut defaults);
-            libc::sigdelset(&mut defaults, libc::SIGKILL);
-            libc::sigdelset(&mut defaults, libc::SIGSTOP);
+            libc::sigemptyset(&mut defaults);
+            for signal in 1..=64 {
+                if signal == libc::SIGKILL
+                    || signal == libc::SIGSTOP
+                    || !signal_is_set(reset_mask, signal)
+                {
+                    continue;
+                }
+                libc::sigaddset(&mut defaults, signal);
+            }
             libc::sigemptyset(&mut mask);
         }
         // SAFETY: `attrs` is initialized, and both sets outlive the calls.
@@ -499,6 +508,7 @@ pub fn spawn_sandboxed_begin(
         steps: sandbox.steps(),
         paths,
         listen_pid,
+        signals_to_reset: signals_to_reset(),
     };
 
     // Close-on-exec, which is what makes the marker plus EOF mean "the child
@@ -567,16 +577,62 @@ struct ChildSetup<'a> {
     /// A parent-owned buffer the child fills with `LISTEN_PID=<pid>` before
     /// exec, when it was given a listening socket.
     listen_pid: Option<*mut u8>,
+    /// Bitmap of dispositions the child must set back to `SIG_DFL`, computed
+    /// in the parent because the child may not allocate or read files.
+    signals_to_reset: u64,
 }
 
-/// Reset signal dispositions and the signal mask for a child that is about to
-/// `exec`.
+/// Bit `n - 1` is set when signal `n` must start at `SIG_DFL` in a child.
+///
+/// rinit's own handlers and ignores are the only dispositions it changes; every
+/// other signal is already default. `SigIgn` also catches a disposition
+/// inherited in dev mode, where rinit is not PID 1. Read once in the parent,
+/// before `fork`/`posix_spawn`; the child only tests bits.
+fn signals_to_reset() -> u64 {
+    static MASK: OnceLock<u64> = OnceLock::new();
+    *MASK.get_or_init(|| {
+        let mut mask = 0u64;
+        for &signal in crate::signals::IGNORED {
+            mask |= signal_bit(signal);
+        }
+        for signal in crate::signals::Signal::ALL {
+            mask |= signal_bit(signal.number());
+        }
+        let Ok(text) = std::fs::read_to_string("/proc/self/status") else {
+            return mask;
+        };
+        let Some(hex) = text
+            .lines()
+            .find_map(|line| line.strip_prefix("SigIgn:"))
+            .and_then(|value| value.split_whitespace().next())
+        else {
+            return mask;
+        };
+        u64::from_str_radix(hex, 16).map_or(mask, |ignored| mask | ignored)
+    })
+}
+
+fn signal_bit(signal: libc::c_int) -> u64 {
+    if (1..=64).contains(&signal) {
+        1u64 << ((signal - 1) as u32)
+    } else {
+        0
+    }
+}
+
+fn signal_is_set(mask: u64, signal: libc::c_int) -> bool {
+    mask & signal_bit(signal) != 0
+}
+
+/// Reset the signal dispositions and the signal mask for a child that is about
+/// to `exec`.
 ///
 /// `SIG_IGN` is inherited across `exec`, while handled signals are reset by the
 /// kernel. rinit ignores several signals for its own lifecycle, so a child must
 /// start from `SIG_DFL` or a service would silently inherit an init's matrix.
-/// Only async-signal-safe libc calls are used.
-fn reset_child_signals() {
+/// Only async-signal-safe libc calls are used; `mask` is computed by the parent
+/// in [`signals_to_reset`].
+fn reset_child_signals(mask: u64) {
     // SAFETY: `action` is zeroed then filled with valid fields; `sigemptyset`
     // initialises the mask.
     let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
@@ -585,7 +641,7 @@ fn reset_child_signals() {
     // SAFETY: `action.sa_mask` is valid storage for `sigemptyset`.
     unsafe { libc::sigemptyset(&mut action.sa_mask) };
     for signal in 1..=64 {
-        if signal == libc::SIGKILL || signal == libc::SIGSTOP {
+        if signal == libc::SIGKILL || signal == libc::SIGSTOP || !signal_is_set(mask, signal) {
             continue;
         }
         // SAFETY: `action` is initialized; an invalid signal number is simply
@@ -597,10 +653,10 @@ fn reset_child_signals() {
 
     // SAFETY: a zeroed signal set is initialised by `sigemptyset`; passing it
     // as SIG_SETMASK with no old-set pointer is the documented form.
-    let mut mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+    let mut empty: libc::sigset_t = unsafe { std::mem::zeroed() };
     unsafe {
-        libc::sigemptyset(&mut mask);
-        libc::sigprocmask(libc::SIG_SETMASK, &mask, std::ptr::null_mut());
+        libc::sigemptyset(&mut empty);
+        libc::sigprocmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut());
     }
 }
 
@@ -646,13 +702,11 @@ fn child_exec(setup: &ChildSetup<'_>, report_read: libc::c_int, report_write: li
     // SAFETY: both descriptors are valid, and this one is not used again.
     unsafe { libc::close(report_read) };
 
-    // `SIG_IGN` survives exec. rinit ignores SIGPIPE/SIGHUP/SIGWINCH and
-    // friends, so without this every service would inherit an init's signal
-    // matrix instead of the one its shell or runtime expects. Handlers are
-    // reset by exec itself, but the ignored set is not; resetting every
-    // disposition also closes the fork-to-exec window where a service-directed
-    // signal would run rinit's handler.
-    reset_child_signals();
+    // `SIG_IGN` survives exec, and rinit's own handlers are still installed in
+    // the fork-to-exec window. Reset exactly the dispositions rinit changed
+    // (plus anything inherited as ignored in dev mode); the rest are already
+    // default.
+    reset_child_signals(setup.signals_to_reset);
     if let Some(buffer) = setup.listen_pid {
         write_listen_pid(buffer);
     }
@@ -1519,5 +1573,29 @@ mod report_tests {
         )
         .expect_err("an empty report must time out");
         assert_eq!(error.errno(), libc::ETIMEDOUT);
+    }
+}
+
+#[cfg(test)]
+mod signal_reset_tests {
+    use super::{signal_is_set, signals_to_reset};
+
+    #[test]
+    fn the_reset_mask_covers_every_disposition_rinit_changes() {
+        let mask = signals_to_reset();
+        for &signal in crate::signals::IGNORED {
+            assert!(
+                signal_is_set(mask, signal),
+                "ignored signal {signal} missing"
+            );
+        }
+        for signal in crate::signals::Signal::ALL {
+            assert!(
+                signal_is_set(mask, signal.number()),
+                "handled signal {signal:?} missing"
+            );
+        }
+        assert!(!signal_is_set(mask, libc::SIGKILL));
+        assert!(!signal_is_set(mask, libc::SIGSTOP));
     }
 }
