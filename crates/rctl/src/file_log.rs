@@ -42,56 +42,84 @@ fn log_paths(path: &Path) -> Vec<PathBuf> {
     paths
 }
 
+/// The paths in newest-first order: `path`, then `path.1` ... `path.N`.
+///
+/// `log_paths` remains the streaming order for a full read; a tail only needs
+/// the newer files until it has enough lines, so it walks this direction and
+/// stops early.
+fn log_paths_newest_first(path: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::with_capacity(MAX_LOG_KEEP + 1);
+    paths.push(path.to_path_buf());
+    for index in 1..=MAX_LOG_KEEP {
+        let mut rotated = path.as_os_str().to_os_string();
+        rotated.push(format!(".{index}"));
+        paths.push(PathBuf::from(rotated));
+    }
+    paths
+}
+
+/// Open one log path, skipping a missing rotated file.
+///
+/// A directory at `path.1` or `.2` is skipped (a failed rotation can leave
+/// one); the current path is an error because the user asked for a log, not a
+/// directory. A file that disappears between metadata and open is also normal
+/// during rotation.
+fn open_log(path: &Path, current: &Path) -> io::Result<Option<BufReader<std::fs::File>>> {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(io::Error::new(
+                error.kind(),
+                format!("cannot read {}: {error}", path.display()),
+            ));
+        }
+    };
+    if !metadata.is_file() {
+        if path == current {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("cannot read {}: not a regular file", path.display()),
+            ));
+        }
+        return Ok(None);
+    }
+    match std::fs::File::open(path) {
+        Ok(file) => Ok(Some(BufReader::new(file))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(io::Error::new(
+            error.kind(),
+            format!("cannot read {}: {error}", path.display()),
+        )),
+    }
+}
+
+fn no_log_file(log: &FileLog) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("cannot read {}: no such file", log.path.display()),
+    )
+}
+
 /// Write the selected lines, preserving the file's line endings.
 fn write_log<W: Write>(log: &FileLog, out: &mut W) -> io::Result<()> {
     let prefix = log.unit.as_ref().map(|unit| format!("{unit}: "));
-    let mut selected: Option<VecDeque<Vec<u8>>> = if log.tail == 0 {
-        None
+    if log.tail == 0 {
+        write_all(log, out, prefix.as_deref())
     } else {
-        // Do not trust the requested count as an allocation size: a CLI can
-        // ask for `u32::MAX` while the file is tiny.
-        Some(VecDeque::new())
-    };
+        write_tail(log, out, prefix.as_deref())
+    }
+}
+
+/// Stream every matching line, oldest file first.
+fn write_all<W: Write>(log: &FileLog, out: &mut W, prefix: Option<&str>) -> io::Result<()> {
     let mut found = false;
     let mut line = Vec::new();
-
     for path in log_paths(&log.path) {
-        let metadata = match std::fs::metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                return Err(io::Error::new(
-                    error.kind(),
-                    format!("cannot read {}: {error}", path.display()),
-                ));
-            }
-        };
-        if !metadata.is_file() {
-            // A failed rotation can leave a directory at `.1` or `.2`; that
-            // must not hide a perfectly good current file. The current path is
-            // still an error because the user asked for a log, not a directory.
-            if path == log.path {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("cannot read {}: not a regular file", path.display()),
-                ));
-            }
+        let Some(mut reader) = open_log(&path, &log.path)? else {
             continue;
-        }
-        let file = match std::fs::File::open(&path) {
-            Ok(file) => file,
-            // Rotation can remove this file between metadata() and open().
-            // That is normal, not a reason to fail the whole read.
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                return Err(io::Error::new(
-                    error.kind(),
-                    format!("cannot read {}: {error}", path.display()),
-                ));
-            }
         };
         found = true;
-        let mut reader = BufReader::new(file);
         loop {
             line.clear();
             if reader.read_until(b'\n', &mut line)? == 0 {
@@ -99,33 +127,70 @@ fn write_log<W: Write>(log: &FileLog, out: &mut W) -> io::Result<()> {
             }
             let content = line.strip_suffix(b"\n").unwrap_or(&line);
             let content = content.strip_suffix(b"\r").unwrap_or(content);
-            if let Some(prefix) = &prefix
+            if let Some(prefix) = prefix
                 && !content.starts_with(prefix.as_bytes())
             {
                 continue;
             }
-            if let Some(queue) = &mut selected {
-                queue.push_back(line.clone());
-                if queue.len() > log.tail as usize {
-                    queue.pop_front();
-                }
-            } else {
-                out.write_all(&line)?;
-            }
-        }
-    }
-
-    if !found {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("cannot read {}: no such file", log.path.display()),
-        ));
-    }
-
-    if let Some(queue) = selected {
-        for line in queue {
             out.write_all(&line)?;
         }
+    }
+    if !found {
+        return Err(no_log_file(log));
+    }
+    out.flush()
+}
+
+/// Keep the last `tail` matching lines while reading newest files first.
+///
+/// A rotated log can be tens of megabytes; if the current file already holds
+/// enough matching lines, none of the older files need to be read at all.
+fn write_tail<W: Write>(log: &FileLog, out: &mut W, prefix: Option<&str>) -> io::Result<()> {
+    let tail = log.tail as usize;
+    let mut selected: VecDeque<Vec<u8>> = VecDeque::new();
+    let mut found = false;
+    let mut line = Vec::new();
+    for path in log_paths_newest_first(&log.path) {
+        let Some(mut reader) = open_log(&path, &log.path)? else {
+            continue;
+        };
+        found = true;
+        let mut file_lines: VecDeque<Vec<u8>> = VecDeque::new();
+        loop {
+            line.clear();
+            if reader.read_until(b'\n', &mut line)? == 0 {
+                break;
+            }
+            let content = line.strip_suffix(b"\n").unwrap_or(&line);
+            let content = content.strip_suffix(b"\r").unwrap_or(content);
+            if let Some(prefix) = prefix
+                && !content.starts_with(prefix.as_bytes())
+            {
+                continue;
+            }
+            if file_lines.len() == tail {
+                file_lines.pop_front();
+            }
+            file_lines.push_back(std::mem::take(&mut line));
+        }
+        // Keep only the part of this older file that still belongs to the
+        // newest `tail` lines across all files.
+        let keep = tail.saturating_sub(selected.len());
+        while file_lines.len() > keep {
+            file_lines.pop_front();
+        }
+        while let Some(line) = file_lines.pop_back() {
+            selected.push_front(line);
+        }
+        if selected.len() >= tail {
+            break;
+        }
+    }
+    if !found {
+        return Err(no_log_file(log));
+    }
+    for line in selected {
+        out.write_all(&line)?;
     }
     out.flush()
 }

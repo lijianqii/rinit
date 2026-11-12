@@ -240,12 +240,20 @@ fn run(opts: &Options) -> io::Result<()> {
     let uptime = read_uptime(&opts.proc_root).unwrap_or(0.0);
     let users = load_users();
     let details = opts.long || opts.json;
-    let mut processes = read_processes(opts, &users, uptime, details)?;
+    let mut processes = read_processes(opts, &users, uptime)?;
     filter_processes(&mut processes, opts);
 
     sort_processes(&mut processes, opts);
     if let Some(limit) = opts.limit {
         processes.truncate(limit);
+    }
+    // `smaps_rollup` is only needed for the rows that are actually printed.
+    // Reading it here, after `--pid`/`--user` filtering, sorting and
+    // `--limit`, avoids one proc file per process for a short listing.
+    if details {
+        for process in &mut processes {
+            enrich_smaps(&opts.proc_root, process);
+        }
     }
 
     if opts.json {
@@ -365,7 +373,6 @@ fn read_processes(
     opts: &Options,
     users: &HashMap<u32, String>,
     uptime: f64,
-    details: bool,
 ) -> io::Result<Vec<Process>> {
     let mut processes = Vec::new();
     for entry in fs::read_dir(&opts.proc_root)? {
@@ -377,7 +384,14 @@ fn read_processes(
         let Some(pid) = name.to_str().and_then(|text| text.parse::<u32>().ok()) else {
             continue;
         };
-        if let Some(process) = read_process(&opts.proc_root, pid, users, uptime, details) {
+        // `--pid` is known before any proc file is opened; skipping here avoids
+        // stat/status/cmdline for every process the user did not ask about.
+        if let Some(pids) = &opts.pids
+            && !pids.contains(&pid)
+        {
+            continue;
+        }
+        if let Some(process) = read_process(&opts.proc_root, pid, users, uptime) {
             processes.push(process);
         }
     }
@@ -397,7 +411,6 @@ fn read_process(
     pid: u32,
     users: &HashMap<u32, String>,
     uptime: f64,
-    long: bool,
 ) -> Option<Process> {
     let dir = proc_root.join(pid.to_string());
     let stat_text = read_lossy(&dir.join("stat"))?;
@@ -405,13 +418,6 @@ fn read_process(
     let status = read_lossy(&dir.join("status"))
         .map(|text| parse_status(&text))
         .unwrap_or_default();
-    let smaps = if long {
-        read_lossy(&dir.join("smaps_rollup"))
-            .map(|text| parse_smaps(&text))
-            .unwrap_or_default()
-    } else {
-        Smaps::default()
-    };
     let command = fs::read(dir.join("cmdline"))
         .ok()
         .map(|bytes| parse_cmdline(&bytes))
@@ -441,14 +447,27 @@ fn read_process(
         state: stat.state,
         vsz: stat.vsize,
         rss: stat.rss_bytes,
-        pss: smaps.pss,
-        uss: smaps.uss,
+        pss: None,
+        uss: None,
         swap: status.vm_swap,
         cpu_usec,
         cpu_percent,
         threads: status.threads,
         command,
     })
+}
+
+/// Read the two `smaps_rollup`-only columns for one process.
+///
+/// Called after filtering, sorting and `--limit`, because no sort key depends
+/// on these fields.
+fn enrich_smaps(proc_root: &Path, process: &mut Process) {
+    let dir = proc_root.join(process.pid.to_string());
+    let smaps = read_lossy(&dir.join("smaps_rollup"))
+        .map(|text| parse_smaps(&text))
+        .unwrap_or_default();
+    process.pss = smaps.pss;
+    process.uss = smaps.uss;
 }
 
 fn parse_stat(text: &str) -> Option<Stat> {
@@ -545,12 +564,14 @@ fn parse_kib(value: &str) -> Option<u64> {
 }
 
 fn parse_cmdline(bytes: &[u8]) -> String {
-    bytes
-        .split(|byte| *byte == 0)
-        .filter(|arg| !arg.is_empty())
-        .map(|arg| String::from_utf8_lossy(arg).into_owned())
-        .collect::<Vec<_>>()
-        .join(" ")
+    let mut command = String::new();
+    for arg in bytes.split(|byte| *byte == 0).filter(|arg| !arg.is_empty()) {
+        if !command.is_empty() {
+            command.push(' ');
+        }
+        command.push_str(&String::from_utf8_lossy(arg));
+    }
+    command
 }
 
 fn read_uptime(proc_root: &Path) -> Option<f64> {

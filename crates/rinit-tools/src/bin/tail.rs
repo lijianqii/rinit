@@ -142,6 +142,53 @@ fn tail_bytes<R: Read + ?Sized, W: Write>(
     Ok(())
 }
 
+/// Write the last `count` lines of a regular file without reading the whole
+/// file. `len` is the file's size when it was opened.
+fn tail_lines_seekable<W: Write>(
+    file: &mut File,
+    writer: &mut W,
+    count: u64,
+    len: u64,
+) -> io::Result<()> {
+    if count == 0 || len == 0 {
+        return Ok(());
+    }
+
+    // A trailing newline terminates the last line; it does not start an empty
+    // one. Skip it when counting separators.
+    file.seek(SeekFrom::End(-1))?;
+    let mut last = [0_u8; 1];
+    file.read_exact(&mut last)?;
+    let mut scan_end = if last[0] == b'\n' { len - 1 } else { len };
+    let mut remaining = count;
+    let mut block = vec![0_u8; 64 * 1024];
+
+    while scan_end > 0 {
+        let block_start = scan_end.saturating_sub(block.len() as u64);
+        let block_len = usize::try_from(scan_end - block_start).unwrap_or(block.len());
+        file.seek(SeekFrom::Start(block_start))?;
+        file.read_exact(&mut block[..block_len])?;
+        for index in (0..block_len).rev() {
+            if block[index] != b'\n' {
+                continue;
+            }
+            remaining -= 1;
+            if remaining == 0 {
+                let start = block_start + index as u64 + 1;
+                file.seek(SeekFrom::Start(start))?;
+                io::copy(&mut file.take(len - start), writer)?;
+                return Ok(());
+            }
+        }
+        scan_end = block_start;
+    }
+
+    // Fewer than `count` separators: the whole file is the tail.
+    file.seek(SeekFrom::Start(0))?;
+    io::copy(&mut file.take(len), writer)?;
+    Ok(())
+}
+
 fn header_name(path: &Path) -> &[u8] {
     if path == Path::new("-") {
         b"standard input"
@@ -186,8 +233,9 @@ fn tail_path<W: Write>(
     }
 
     let mut file = File::open(path)?;
+    let metadata = file.metadata().ok();
     if options.unit == Unit::Bytes
-        && let Ok(metadata) = file.metadata()
+        && let Some(metadata) = &metadata
         && metadata.file_type().is_file()
     {
         let start = metadata.len().saturating_sub(options.count);
@@ -196,6 +244,14 @@ fn tail_path<W: Write>(
             io::copy(&mut file.take(options.count), writer)?;
             return Ok(());
         }
+    }
+    if options.unit == Unit::Lines
+        && let Some(metadata) = &metadata
+        && metadata.file_type().is_file()
+        && metadata.len() > 0
+    {
+        write_header(path, writer, show_headers, header_count)?;
+        return tail_lines_seekable(&mut file, writer, options.count, metadata.len());
     }
 
     let mut reader = BufReader::new(file);
@@ -408,6 +464,37 @@ mod tests {
         assert_eq!(bytes(b"abc", 9), b"abc");
         assert_eq!(bytes(b"abc", 0), b"");
         assert_eq!(bytes(b"0123456789", 3), b"789");
+    }
+
+    #[test]
+    fn seekable_line_tail_matches_the_streaming_definition() {
+        let root = std::env::temp_dir().join(format!("rinit-tail-seek-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("temp");
+        let cases: &[(&[u8], u64)] = &[
+            (b"a\nb\nc\n".as_slice(), 1),
+            (b"a\nb\nc\n".as_slice(), 2),
+            (b"a\nb\nc\n".as_slice(), 9),
+            (b"a\nb".as_slice(), 1),
+            (b"a\nb".as_slice(), 5),
+            (b"\n".as_slice(), 1),
+            (b"\n\n".as_slice(), 1),
+            (b"a\n\nb\n".as_slice(), 2),
+            (b"".as_slice(), 3),
+            (b"abc".as_slice(), 0),
+        ];
+        for (index, (content, count)) in cases.iter().enumerate() {
+            let path = root.join(format!("case-{index}"));
+            std::fs::write(&path, content).expect("write");
+            let mut file = File::open(&path).expect("open");
+            let mut actual = Vec::new();
+            tail_lines_seekable(&mut file, &mut actual, *count, content.len() as u64)
+                .expect("seek tail");
+            let mut expected = Vec::new();
+            tail_lines(&mut Cursor::new(*content), &mut expected, *count).expect("stream");
+            assert_eq!(actual, expected, "content={content:?} count={count}");
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
