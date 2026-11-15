@@ -259,9 +259,10 @@ crates/
     src/reload.rs     # §7.6：`rctl reload` 应用的差异，及其报告
     src/notify.rs, readiness.rs, deadline.rs, args.rs, manager.rs
     tests/m2_lifecycle.rs, tests/smoke.rs
+  rnet/               # rnetd + rncli：IPv4 链路、地址、路由、bridge、DHCPv4
   rctl/               # 控制 CLI（main.rs, parse.rs, client.rs）+ 测试
 units/                # 启动集：两个 target、getty.service（`make run` 启动的
-                      # 控制台登录）、network.service（DHCP）和替代品 shell.service
+                      # 控制台登录）、network.service（rnetd）和替代品 shell.service
 units/demo/           # §7.x 的验收单元；只打进 `make test-system` 启动的镜像，
                       # 并从控制台手动启动
 units/device/         # 可部署设备服务；只打进 `run-disk` 的 ext4 镜像
@@ -294,10 +295,10 @@ make test           # check + test-system
 make gates          # acceptance gates: binary size + coverage thresholds
 ```
 
-`cargo test --offline --workspace`（`make check` 最后一步跑的就是它）在 58 个
-cargo 测试目标里执行 **1123 个测试**。五种形态，以及为什么每种都不是多余的：
+`cargo test --offline --workspace`（`make check` 最后一步跑的就是它）在 62 个
+cargo 测试目标里执行 **1185 个测试**。五种形态，以及为什么每种都不是多余的：
 
-- **单元测试**紧挨着代码（core 341、rinit 242、rinit-runtime 140、rinit-tools 255、rctl 24、processes 10），
+- **单元测试**紧挨着代码（core 341、rinit 242、rinit-runtime 140、rinit-tools 255、rctl 24、processes 10、rnet 60），
   包括解析器上的 `proptest` 属性测试；
 - **集成测试**在 `crates/*/tests/`：系统调用层面对真实内核（`rinit-runtime` 26 个：
   以非特权身份运行，断言每次降权都*被拒绝*而不是被静默跳过——`setuid(0)`、
@@ -363,12 +364,13 @@ qemu 的 `i6300esb` 设备和带该驱动编译的内核是测试装置的一部
 | crate            | 行覆盖率      | 函数      |
 | ---------------- | ------------- | --------- |
 | `rinit-core`     | **97.91%**    | 591/601   |
-| `rinit-runtime`  | 84.68%        | 380/440   |
-| `rinit`          | 87.92%        | 846/948   |
-| `rinit-tools`    | 80.85%        | 720/930   |
-| `rctl`           | 93.27%        | 61/68     |
-| `processes`      | 87.86%        | 72/88     |
-| **总计**         | **86.80%**    | 2670/3075 |
+| `rinit-runtime`  | 84.18%        | 387/449   |
+| `rinit`          | 87.81%        | 846/948   |
+| `rinit-tools`    | 80.93%        | 722/932   |
+| `rctl`           | 93.30%        | 66/73     |
+| `processes`      | 88.03%        | 72/88     |
+| `rnet`           | 55.47%        | 270/524   |
+| **总计**         | **82.02%**    | 2954/3615 |
 
 计划清单要求总体 ≥80%、核心 ≥90%，所以回答它的是这些数字，而不是某种形状：
 
@@ -463,16 +465,21 @@ cargo llvm-cov --offline --workspace --html                  # target/llvm-cov/h
 
 | 计划 §6 | 现状 |
 | ------- | --------------- |
-| 在 qemu（256M）里作为 PID 1 启动，内核无 panic | `make test-system`：aarch64 与 armv7 各 106 条断言，包括 "no rinit panic" 和四条内核日志检查 |
+| 在 qemu（256M）里作为 PID 1 启动，内核无 panic | `make test-system`：aarch64 与 armv7 各 115 条断言，包括 "no rinit panic" 和四条内核日志检查 |
 | 20 个服务并行，明显快于串行 | **19.2x**：`make parallel`——20 个各睡 1 s 的 `oneshot` 服务，并行总耗时 1065 ms，串行 20 424 ms |
 | 崩溃重启、熔断、健康检查 | `make test-system`（"a crashed service is scheduled for restart"、"the breaker tripped on the failing unit"）和 `crates/rinit/tests/m2_lifecycle.rs` |
 | `rctl` 能启动、停止、查询、读日志 | `make test-system` 的 M3 段和 `crates/rctl/tests/control.rs` |
 | 优雅关闭、无僵尸、无 fd 泄漏 | `make soak` 在重启 churn 中采样描述符、线程和僵尸子进程，并断言各自回到基线 |
 | 72 小时 soak，RSS 稳定 | **宿主上已通过。** 第九段在 `8b373d8` 上完成 **4,320/4,320 个样本**和 **8,640/8,640 条 control 命令**。前半段与后半段的 RSS 峰值分别为 5,168 kB 和 4,300 kB，描述符最低值均为 11（峰值 22），最大 zombie 连续出现 1 个瞬时采样，最终静默扫描为 0。 |
-| 24 小时目标客户机 soak | **已通过。** `7a5df04`，aarch64 `run-disk`，guest 内采样：86,343 秒内完成 **1,440/1,440 个样本**和 **2,880/2,880 条 control 命令**。RSS 保持在 2,364–2,528 kB（前后半段峰值 2,520/2,528），描述符 19–20，全程未观察到 zombie，最终检查为 `quiescent=0 health_fail=0`。每个样本里 `eth0`、默认路由、`udhcpc`、dropbear、`network.service` 和 `sshd.service` 都正常；串口日志只有一次启动，无 panic/OOM。采样在 guest 内运行（`scripts/soak-qemu.sh` + `scripts/soak-guest.sh`），宿主 SSH 断开不会让测试静默失效。 |
+| 24 小时目标客户机 soak | **已通过。** `7a5df04`，aarch64 `run-disk`，guest 内采样：86,343 秒内完成 **1,440/1,440 个样本**和 **2,880/2,880 条 control 命令**。RSS 保持在 2,364–2,528 kB（前后半段峰值 2,520/2,528），描述符 19–20，全程未观察到 zombie，最终检查为 `quiescent=0 health_fail=0`。每个样本里 `eth0`、默认路由、`udhcpc`、dropbear、`network.service` 和 `sshd.service` 都正常（历史结果，早于 `rnet`）；串口日志只有一次启动，无 panic/OOM。采样在 guest 内运行（`scripts/soak-qemu.sh` + `scripts/soak-guest.sh`），宿主 SSH 断开不会让测试静默失效。 |
 | 二进制 ≤2 MB 动态 / ≤4 MB 静态 | [测量](#测量计划-01-校准点)：aarch64 动态 1.00 MiB、armv7 动态 1.07 MiB，由 `make size-check` 检查 |
-| 单元测试覆盖率总体 ≥80%、核心 ≥90% | **86.80%** 和 **97.91%**（`make coverage-check`，见[上文](#测试)） |
-| 文档：架构、单元格式、`rctl`、移植 | 本 README（架构、状态、测量）、[`docs/units.md`](docs/units.md)（每条指令、取值语法和默认值）、[`docs/porting.md`](docs/porting.md)（内核、用户空间、构建、与 systemd 的差异），以及 `rinit-开发计划.md` |
+| 单元测试覆盖率总体 ≥80%、核心 ≥90% | **82.02%** 和 **97.91%**（`make coverage-check`，见[上文](#测试)） |
+| 文档：架构、单元格式、`rctl`、移植 | 本 README（架构、状态、测量）、[`docs/units.md`](docs/units.md)（每条指令、取值语法和默认值）、[`docs/porting.md`](docs/porting.md)（内核、用户空间、构建、与 systemd 的差异）、[`docs/rnet-design.md`](docs/rnet-design.md)（网络管理器设计与任务拆分），以及 `rinit-开发计划.md` |
+
+发版专用门禁（宿主、双目标架构、tools、24h soak、reboot、打包）见
+[`docs/release.md`](docs/release.md)。跳过的门禁不算通过。
+
+上面的 24 小时行是 `rnet` 之前的历史结果；当前门禁用 `rnetd` 重跑。
 
 还有一个清单没要求、但计划 §0.1 的设计目标要求的数字：rinit 的 RSS，在*客户机里*从
 `/proc/1/status` 测得，而不是在宿主机上——空闲 **2 704 kB**，跑 20 个服务时
@@ -551,7 +558,7 @@ make KERNEL_VERSION=6.6.158 BUSYBOX_VERSION=1.36.1 ...   # pin versions
 密码是 `/etc/shadow` 里的默认值 `toor`。上面的记录就是那个提示符。登录后
 `/etc/motd` 会打印常用命令（`rctl list`、`rctl status getty.service`、
 `rctl log getty.service`、`poweroff -f`），`/etc/profile` 会设置 `PATH` 并应用
-`/etc/hostname`。`network.service` 运行 DHCP 客户端：qemu 的用户态网络给客户机分配
+`/etc/hostname`。`network.service` 运行 `rnetd`，由内置 DHCPv4 客户端应用租约：qemu 的用户态网络给客户机分配
 `10.0.2.15/24`、网关 `10.0.2.2` 和 DNS `10.0.2.3`，所以接口无需手工配置。
 
 这刻意不是一个安全边界：能碰到串口的人已经拥有这台机器。镜像里打包了
@@ -605,8 +612,8 @@ swap 文件时约 65 MiB），内容来自同一套 rootfs，加上 `units/devic
 
 `device.target` 会启动：
 
-- `hostname.service` 和 `network-online.service`（必需；后者等 DHCP 租约，而不是
-  只等 `udhcpc` 被 exec）；
+- `hostname.service` 和 `network-online.service`（必需；后者等 `rnetd` 报告在线地址，而不是
+  只等它被 exec）；
 - `syslog.service` / `klogd.service`（持久化 `/var/log/messages`）；
 - `seedrng.service`（持久化 `/var/lib/seedrng`）；
 - `time-sync.service`（busybox `ntpd`）；
@@ -682,7 +689,7 @@ scripts/device-smoke.sh --key ~/.ssh/id_ed25519
 
 `make run` 流水线覆盖 arm64 和 arm32。要在构建宿主机上不下载 ARM 内核就验证 rinit
 作为 PID 1 的行为，可以构建 musl 二进制并启动 Debian 宿主机内核。这个镜像没有
-NIC：`udhcpc` 以非 0 退出，状态机会把 `network.service` 留在 `failed`，但
+NIC：`rnetd` 保持 active 并等待热插拔，`network-online` 超时；但
 `multi-user.target` 只用 `Wants=` 拉入它，所以其余启动不受影响：
 
 ```bash

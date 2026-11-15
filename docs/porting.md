@@ -18,7 +18,8 @@ script puts in the image, so the kernel has to hand it a few things:
 | `CONFIG_PROC_FS`, `CONFIG_SYSFS` | `/proc` and `/sys`; `/proc` is what `rctl status` and reaping read | same |
 | a cgroup v2 hierarchy: `CGROUP_SCHED`, `CFS_BANDWIDTH`, `MEMCG`, `CGROUP_PIDS` | the `Cgroup*=` limits (plan §7.3); without one of them the kernel answers `ENOENT` for that attribute and rinit skips the limit with a warning | `make kernel-config-check` |
 | a watchdog driver (`WATCHDOG_CORE` + your hardware's) | plan §7.5; the Makefile builds `I6300ESB_WDT` because that is what qemu's `virt` machine can attach | `make kernel-config-check` |
-| a NIC driver (`VIRTIO_NET` + `VIRTIO_MMIO` on qemu's `virt`) | `units/network.service` runs `udhcpc` on `eth0`; without a NIC `udhcpc` fails and the unit is left failed, but `multi-user.target` only `Wants=` it | `make kernel-config-check` |
+| a NIC driver (`VIRTIO_NET` + `VIRTIO_MMIO` on qemu's `virt`) | `units/network.service` runs `rnetd`; the built-in DHCPv4 client configures `eth0`. Without a NIC `rnetd` stays active and waits for hotplug; `multi-user.target` only `Wants=` the network units | `make kernel-config-check` |
+| `CONFIG_BRIDGE`, `CONFIG_VETH`, `CONFIG_DUMMY` (and `CONFIG_IPV6=y` or `n`, because bridge is capped at `m` when IPv6 is modular) | bridge and hotplug tests in `make test-system` | `make kernel-config-check` |
 | `CONFIG_WATCHDOG_SYSFS` | only so the *test* can read back the timeout rinit set; rinit itself does not need it | same |
 | `CONFIG_TMPFS` | `/run` and `/tmp` | `mounts.rs` |
 | `CONFIG_SWAP` | `swap.service` activates the image's `/swapfile` | `units/device/swap.service` |
@@ -150,8 +151,8 @@ or the machine's own cgroup hierarchy. On a real device it should not appear.
 The boot target's *closure* is what starts. A unit that nothing references is
 loaded and listed by `rctl` but never started - that is where the demo units in
 `units/demo/` sit, and `rctl start <unit>` is how they come up. (`units/` itself
-is the boot set: the two targets, `getty.service`, `network.service` and
-`shell.service`. The deployable-device services live in `units/device/` and are
+is the boot set: the two targets, `getty.service`, `network.service` (rnetd)
+and `shell.service`. The deployable-device services live in `units/device/` and are
 packed only into the disk image.)
 
 ### Persistent disk image
@@ -173,7 +174,7 @@ auto-mount makes that first-wave mount fail with `EBUSY`.
 The image is populated with `mke2fs -d` from a tar whose entries are explicitly
 `root:root` (a directory populated as the build user would otherwise leave every
 file owned by that uid); `util-linux`'s `mkswap` creates the embedded swap file. `units/device/` provides `hostname`, `network-online`
-(DHCP lease, not just udhcpc exec), `syslog`/`klogd`, `seedrng`, `time-sync`,
+(an address from `rnetd`, not just an exec), `syslog`/`klogd`, `seedrng`, `time-sync`,
 `mdev` (busybox hotplug daemon), `swap` (runs `swapon -a` on the fstab entry)
 and `sshd`; `/etc/fstab` mounts `devpts` on `/dev/pts` and declares
 `/swapfile none swap sw` in the second wave, before

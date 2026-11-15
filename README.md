@@ -288,8 +288,9 @@ crates/
     src/notify.rs, readiness.rs, deadline.rs, args.rs, manager.rs
     tests/m2_lifecycle.rs, tests/smoke.rs
   rctl/               # control CLI (main.rs, parse.rs, client.rs) + tests
+  rnet/               # rnetd + rncli: IPv4 links, addresses, routes, bridges, DHCPv4
 units/                # the boot set: the two targets, getty.service (the console
-                      # login `make run` boots), network.service (DHCP) and
+                      # login `make run` boots), network.service (rnetd) and
                       # shell.service, its alternative
 units/demo/           # the §7.x acceptance units; packed only into the image
                       # `make test-system` boots, and started from the console
@@ -323,12 +324,12 @@ make test           # check + test-system
 make gates          # acceptance gates: binary size + coverage thresholds
 ```
 
-`cargo test --offline --workspace` (what `make check` runs last) executes **1123
-tests** across 58 cargo test targets. The five shapes, and why each is not
+`cargo test --offline --workspace` (what `make check` runs last) executes **1185
+tests** across 62 cargo test targets. The five shapes, and why each is not
 redundant:
 
 - **unit tests** next to the code (core 341, rinit 242, rinit-runtime 140,
-  rinit-tools 255, rctl 24, processes 10), including `proptest` properties over
+  rinit-tools 255, rctl 24, processes 10, rnet 60), including `proptest` properties over
   the parser;
 - **integration tests** in `crates/*/tests/`: the syscall layer against the real
   kernel (`rinit-runtime` 26: run unprivileged, they assert that each drop is
@@ -420,12 +421,13 @@ they are measured on the tree as it stands rather than copied from one run:
 | crate            | line coverage | functions |
 | ---------------- | ------------- | --------- |
 | `rinit-core`     | **97.91%**    | 591/601   |
-| `rinit-runtime`  | 84.68%        | 380/440   |
-| `rinit`          | 87.92%        | 846/948   |
-| `rinit-tools`    | 80.85%        | 720/930   |
-| `rctl`           | 93.27%        | 61/68     |
-| `processes`      | 87.86%        | 72/88     |
-| **total**        | **86.80%**    | 2670/3075 |
+| `rinit-runtime`  | 84.18%        | 387/449   |
+| `rinit`          | 87.81%        | 846/948   |
+| `rinit-tools`    | 80.93%        | 722/932   |
+| `rctl`           | 93.30%        | 66/73     |
+| `processes`      | 88.03%        | 72/88     |
+| `rnet`           | 55.47%        | 270/524   |
+| **total**        | **82.02%**    | 2954/3615 |
 
 The plan's checklist asks for ≥80% overall and ≥90% in the core, so these are the
 numbers that answer it rather than a shape:
@@ -555,16 +557,21 @@ repository or a measurement in this README:
 
 | plan §6 | where it stands |
 | ------- | --------------- |
-| boots as PID 1 in qemu (256M) with no kernel panic | `make test-system`: 106 assertions on aarch64 and armv7, including "no rinit panic" and four kernel-log checks |
+| boots as PID 1 in qemu (256M) with no kernel panic | `make test-system`: 115 assertions on aarch64 and armv7, including "no rinit panic" and four kernel-log checks |
 | 20 services in parallel, visibly faster than serial | **19.2x**: `make parallel` - 20 `oneshot` services that each sleep 1 s finish in 1065 ms together and 20 424 ms chained |
 | crash-restart, breaker, health checks | `make test-system` ("a crashed service is scheduled for restart", "the breaker tripped on the failing unit") and `crates/rinit/tests/m2_lifecycle.rs` |
 | `rctl` can start, stop, query and read logs | `make test-system`'s M3 block and `crates/rctl/tests/control.rs` |
 | graceful shutdown, no zombies, no fd leak | `make soak` samples descriptors, threads and zombie children through restart churn, and asserts each comes back to its baseline |
 | 72 h soak with stable RSS | **Passed on the host.** Segment 9 on `8b373d8` completed **4,320/4,320 samples** and **8,640/8,640 control commands**. RSS peak per half fell from 5,168 kB to 4,300 kB, descriptor minima were 11 and 11 (peak 22), the maximum zombie streak was 1 transient sample, and the final quiescent sweep found 0 zombies. |
-| 24 h soak in the target guest | **Passed.** `7a5df04`, aarch64 `run-disk`, guest-side sampler: **1,440/1,440 samples** and **2,880/2,880 control commands** over 86,343 s. RSS stayed within 2,364–2,528 kB (half peaks 2,520/2,528), descriptors within 19–20, no zombie was ever observed, and the final sweep returned `quiescent=0 health_fail=0`. `eth0`, the default route, `udhcpc`, dropbear, `network.service` and `sshd.service` were healthy in every sample; the serial log shows one boot and no panic/OOM. Sampling runs inside the guest (`scripts/soak-qemu.sh` + `scripts/soak-guest.sh`), so a host SSH outage cannot end the run silently. |
+| 24 h soak in the target guest | **Passed.** `7a5df04`, aarch64 `run-disk`, guest-side sampler: **1,440/1,440 samples** and **2,880/2,880 control commands** over 86,343 s. RSS stayed within 2,364–2,528 kB (half peaks 2,520/2,528), descriptors within 19–20, no zombie was ever observed, and the final sweep returned `quiescent=0 health_fail=0`. `eth0`, the default route, `udhcpc`, dropbear, `network.service` and `sshd.service` were healthy in every sample (historical run, before `rnet`); the serial log shows one boot and no panic/OOM. Sampling runs inside the guest (`scripts/soak-qemu.sh` + `scripts/soak-guest.sh`), so a host SSH outage cannot end the run silently. |
 | binaries ≤2 MB dynamic / ≤4 MB static | [Measurements](#measurements-plan-01-calibration-point): 1.00 MiB dynamic arm64 / 1.07 MiB armv7, checked by `make size-check` |
-| unit test coverage ≥80% overall, ≥90% in the core | **86.80%** and **97.91%** (`make coverage-check`, [above](#testing)) |
-| documentation: architecture, unit format, `rctl`, porting | this README (architecture, status, measurements), [`docs/units.md`](docs/units.md) (every directive, its value syntax and its default), [`docs/porting.md`](docs/porting.md) (kernel, userspace, build, differences from systemd), and `rinit-开发计划.md` |
+| unit test coverage ≥80% overall, ≥90% in the core | **82.02%** and **97.91%** (`make coverage-check`, [above](#testing)) |
+| documentation: architecture, unit format, `rctl`, porting | this README (architecture, status, measurements), [`docs/units.md`](docs/units.md) (every directive, its value syntax and its default), [`docs/porting.md`](docs/porting.md) (kernel, userspace, build, differences from systemd), [`docs/rnet-design.md`](docs/rnet-design.md) (network manager design and task breakdown), and `rinit-开发计划.md` |
+
+The release-specific gate - host, both target architectures, tools, 24 h soak,
+reboot and packaging checks - is [`docs/release.md`](docs/release.md). A skipped
+gate is not a pass. The 24 h row above was measured before `rnet`; the current
+gate reruns it with `rnetd`.
 
 One number the checklist does not ask for, but plan §0.1's design goals do: rinit's
 RSS, measured *in the guest* out of `/proc/1/status` rather than on the host -
@@ -658,10 +665,9 @@ that image and leaves the run image alone.
 console. Type `root`, then the default password `toor` from `/etc/shadow`. The
 transcript above is that prompt. After login `/etc/motd` prints the commands that matter (`rctl list`,
 `rctl status getty.service`, `rctl log getty.service`, `poweroff -f`), and
-`/etc/profile` sets `PATH` and applies `/etc/hostname`. `network.service` runs
-the DHCP client: qemu's user-mode network gives the guest `10.0.2.15/24`,
-gateway `10.0.2.2` and DNS `10.0.2.3`, so the interface is configured without a
-manual step.
+`/etc/profile` sets `PATH` and applies `/etc/hostname`. `network.service` runs `rnetd`, which applies the built-in DHCPv4 lease:
+qemu's user-mode network gives the guest `10.0.2.15/24`, gateway `10.0.2.2` and
+DNS `10.0.2.3`, so the interface is configured without a manual step.
 
 This is deliberately not a security boundary: anyone who can reach the serial
 port already has the machine. The image ships `/etc/shadow` with the default
@@ -723,7 +729,7 @@ performs the same rebuild and writes the populated rootfs to
 `device.target` starts:
 
 - `hostname.service` and `network-online.service` (required; the latter waits
-  for the DHCP lease, not just for `udhcpc` to be exec'd);
+  for `rnetd` to report an online address, not just for it to be exec'd);
 - `syslog.service`/`klogd.service` (persistent `/var/log/messages`);
 - `seedrng.service` (persistent `/var/lib/seedrng`);
 - `time-sync.service` (busybox `ntpd`);
@@ -807,9 +813,9 @@ rootfs). A firewall/nftables service is not included yet: the image has no
 
 The `make run` pipeline covers arm64 and arm32. To sanity-check rinit as PID 1
 on the build host without downloading an ARM kernel, build the musl binary and boot
-the Debian host kernel. This image has no NIC: `udhcpc` exits nonzero, the state
-machine leaves `network.service` `failed`, but `multi-user.target` only `Wants=`
-it, so the rest of the boot is unaffected.
+the Debian host kernel. This image has no NIC: `rnetd` stays active and waits for hotplug, while
+`network-online` times out; `multi-user.target` only `Wants=` the network units,
+so the rest of the boot is unaffected.
 
 ```bash
 cargo build --offline --release --target x86_64-unknown-linux-musl
