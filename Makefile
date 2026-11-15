@@ -89,7 +89,7 @@ DISK_EXTRA_MB    ?= 0
 # Everything the guest's acceptance tests need the kernel to provide.
 KERNEL_REQUIRED_OPTS := CGROUP_SCHED FAIR_GROUP_SCHED CFS_BANDWIDTH MEMCG \
                         CGROUP_PIDS I6300ESB_WDT WATCHDOG_SYSFS VIRTIO_NET \
-                        VIRTIO_MMIO EXT4_FS VIRTIO_BLK SWAP
+                        VIRTIO_MMIO EXT4_FS VIRTIO_BLK SWAP IPV6 BRIDGE VETH DUMMY
 ifeq ($(KERNEL_ARCH),arm)
 KERNEL_REQUIRED_OPTS += ARCH_VIRT PCI_HOST_GENERIC
 endif
@@ -139,10 +139,12 @@ help:
 RINIT_BIN        := target/$(TARGET)/release/rinit
 RCTL_BIN         := target/$(TARGET)/release/rctl
 PROCESSES_BIN    := target/$(TARGET)/release/processes
+RNETD_BIN        := target/$(TARGET)/release/rnetd
+RNCLI_BIN        := target/$(TARGET)/release/rncli
 RINIT_SRCS       := $(shell find crates \( -name '*.rs' -o -name 'Cargo.toml' \) 2>/dev/null) \
                     Cargo.toml Cargo.lock rust-toolchain.toml
 
-rinit: $(RINIT_BIN) $(RCTL_BIN) $(PROCESSES_BIN)
+rinit: $(RINIT_BIN) $(RCTL_BIN) $(PROCESSES_BIN) $(RNETD_BIN) $(RNCLI_BIN)
 processes: $(PROCESSES_BIN)
 
 # Independent tools (rinit-tools). `tools` builds every bin target for the
@@ -173,11 +175,13 @@ install-tools: tools
 
 # Grouped target: one cargo invocation builds all three binaries. Nothing
 # happens when they already exist and are newer than the sources.
-$(RINIT_BIN) $(RCTL_BIN) $(PROCESSES_BIN) &: $(RINIT_SRCS)
+$(RINIT_BIN) $(RCTL_BIN) $(PROCESSES_BIN) $(RNETD_BIN) $(RNCLI_BIN) &: $(RINIT_SRCS)
 	cargo build --release --target $(TARGET)
 	@test -x $(RINIT_BIN) || { echo "rinit build failed"; exit 1; }
 	@test -x $(RCTL_BIN) || { echo "rctl build failed"; exit 1; }
 	@test -x $(PROCESSES_BIN) || { echo "processes build failed"; exit 1; }
+	@test -x $(RNETD_BIN) || { echo "rnetd build failed"; exit 1; }
+	@test -x $(RNCLI_BIN) || { echo "rncli build failed"; exit 1; }
 
 # --- Linux kernel ---------------------------------------------------------
 $(KERNEL_TARBALL):
@@ -194,7 +198,7 @@ $(KERNEL_SRC)/.config: $(KERNEL_TARBALL)
 	# then let olddefconfig resolve dependencies. A symbol that still disappears
 	# is caught by kernel-config-check below.
 	@for opt in $(KERNEL_REQUIRED_OPTS); do \
-	    sed -i "s/^# CONFIG_$$opt is not set$$/CONFIG_$$opt=y/" $(KERNEL_SRC)/.config; \
+	    sed -i -e "s/^# CONFIG_$$opt is not set$$/CONFIG_$$opt=y/" -e "s/^CONFIG_$$opt=m$$/CONFIG_$$opt=y/" $(KERNEL_SRC)/.config; \
 	done
 	# On a real root filesystem the kernel's devtmpfs auto-mount would make
 	# rinit's first-wave /dev mount fail with EBUSY. rinit mounts /dev itself.
@@ -206,7 +210,7 @@ $(KERNEL_SRC)/.config: $(KERNEL_TARBALL)
 	# for CFS_BANDWIDTH on ARM) has been defaulted. Re-apply after the graph has
 	# settled, then resolve once more.
 	@for opt in $(KERNEL_REQUIRED_OPTS); do \
-	    sed -i "s/^# CONFIG_$$opt is not set$$/CONFIG_$$opt=y/" $(KERNEL_SRC)/.config; \
+	    sed -i -e "s/^# CONFIG_$$opt is not set$$/CONFIG_$$opt=y/" -e "s/^CONFIG_$$opt=m$$/CONFIG_$$opt=y/" $(KERNEL_SRC)/.config; \
 	done
 	$(MAKE_KERNEL) olddefconfig
 
@@ -410,7 +414,7 @@ soak:
 SIZE_BUDGET_STATIC := 4194304
 
 size-check: rinit
-	@fail=0; for b in $(RINIT_BIN) $(RCTL_BIN) $(PROCESSES_BIN); do \
+	@fail=0; for b in $(RINIT_BIN) $(RCTL_BIN) $(PROCESSES_BIN) $(RNETD_BIN) $(RNCLI_BIN); do \
 	    size=$$(stat -c%s "$$b"); \
 	    printf 'size-check: %-46s %8d bytes (budget %d)\n' "$$b" "$$size" $(SIZE_BUDGET_STATIC); \
 	    if [ "$$size" -gt $(SIZE_BUDGET_STATIC) ]; then \

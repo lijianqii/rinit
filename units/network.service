@@ -1,22 +1,19 @@
-# DHCP client for the development image's qemu NIC.
+# Network manager.
 #
-# This is a normal rinit service rather than an init script: `Type=simple`
-# because `udhcpc -f` stays in the foreground for the life of the lease, and
-# `Restart=on-failure` because a DHCP client that dies has to come back.
-# `multi-user.target` pulls it in with `Wants=` so a board without a NIC does
-# not fail the target.
-#
-# `ExecStart` is `udhcpc` itself, not a wrapper. `/etc/udhcpc/default.script`
-# is the client's lease event handler (`-s`), not a startup script. The x86_64
-# verification image has no eth0: `udhcpc` exits nonzero and the state machine
-# leaves the unit failed; the target is unaffected because it only wants it.
+# `rnetd` owns link/address/route/bridge state and the built-in DHCPv4 client.
+# It is Type=notify: READY means the initial configuration was applied and the
+# DHCP clients started. A missing NIC is not fatal; `network-online` is the
+# unit that waits for an address, and it has its own timeout.
 [Unit]
-Description=DHCP client on eth0
+Description=Network manager
 Requires=rinit-init.target
 After=rinit-init.target
 
 [Service]
-Type=simple
-ExecStart=/sbin/udhcpc -i eth0 -f -s /etc/udhcpc/default.script
+Type=notify
+ExecStart=/sbin/rnetd --config /etc/rnet/config
 Restart=on-failure
 RestartSec=2
+TimeoutStartSec=30
+NoNewPrivileges=true
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_CHOWN

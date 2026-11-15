@@ -164,6 +164,18 @@ await_log() {
     await_log 10 'inet 10\.0\.2\.15/24' || true
     await_log 10 'default via 10\.0\.2\.2' || true
     await_log 10 'nameserver 10\.0\.2\.3' || true
+    printf '[ "$(stat -c "%%a %%G" /run/rnet/control.sock)" = "660 rnet" ] && printf "rnet-%%s-ok\\n" socket\n' >&3
+    printf 'rncli config check >/dev/null && printf "rnet-%%s-ok\\n" config\n' >&3
+    printf 'rncli addr add eth0 10.99.0.1/24 && ip -4 addr show eth0 | grep -q "10.99.0.1/24" && printf "rnet-%%s-ok\\n" addr\n' >&3
+    printf 'rncli route add rtest 10.99.1.0/24 dev eth0 && ip route show | grep -q "10.99.1.0/24 dev eth0" && printf "rnet-%%s-ok\\n" route\n' >&3
+    printf 'rncli bridge create rbr0 && rncli bridge add-port rbr0 eth0 && rncli iface up rbr0 && ip link show eth0 | grep -q "master rbr0" && printf "rnet-%%s-ok\\n" bridge\n' >&3
+    printf 'rncli bridge del-port rbr0 eth0 && rncli bridge delete rbr0 && echo rnet-bridge-clean-ok\n' >&3
+    printf 'rncli route del rtest 10.99.1.0/24 dev eth0 && rncli addr del eth0 10.99.0.1/24 && rncli iface up eth0 && printf "rnet-%%s-ok\\n" clean\n' >&3
+    printf 'rncli --persist route add persist-route 10.99.2.0/24 dev eth0 && grep -q "10.99.2.0/24" /etc/rnet/config.d/90-rncli.conf && printf "rnet-%%s-ok\\n" persist\n' >&3
+    printf 'rncli --persist route del persist-route 10.99.2.0/24 dev eth0 && printf "rnet-%%s-%%s\\n" persist clean-ok\n' >&3
+    printf 'mkdir -p /etc/rnet/config.d; echo "[interface rtest0]" > /etc/rnet/config.d/90-hotplug.conf; echo "type = ethernet" >> /etc/rnet/config.d/90-hotplug.conf; echo "enabled = yes" >> /etc/rnet/config.d/90-hotplug.conf; echo "address = 10.99.3.1/24" >> /etc/rnet/config.d/90-hotplug.conf; rncli reload; ip link add rtest0 type dummy; sleep 2; ip -4 addr show rtest0 | grep -q "10.99.3.1/24" && printf "rnet-%%s-ok\\n" hotplug; rm /etc/rnet/config.d/90-hotplug.conf; rncli reload; ip link del rtest0\n' >&3
+    await_log 20 'rnet-hotplug-ok' || true
+    await_log 30 'rnet-persist-clean-ok' || true
 
     # Plan §7.2: the default target has no process, but reaching it must leave
     # it `active` in the control interface, not merely in the boot log.
@@ -624,6 +636,15 @@ expect "network.service is active" "net-state: active"
 expect "the guest got its address from DHCP" "inet 10.0.2.15/24"
 expect "the DHCP default route is installed" "default via 10.0.2.2"
 expect "the DHCP DNS server reached /etc/resolv.conf" "nameserver 10.0.2.3"
+expect "rnet control socket is root:rnet 0660" "rnet-socket-ok"
+expect "rnet config check passed" "rnet-config-ok"
+expect "rnet applied a runtime address" "rnet-addr-ok"
+expect "rnet applied a runtime route" "rnet-route-ok"
+expect "rnet created a bridge and enslaved a port" "rnet-bridge-ok"
+expect "rnet cleaned up runtime objects" "rnet-clean-ok"
+expect "rnet persisted a runtime change" "rnet-persist-ok"
+expect "rnet removed the persisted change" "rnet-persist-clean-ok"
+expect "rnet applied an address when a configured link appeared" "rnet-hotplug-ok"
 expect "the default target is active" "boot-target-state: active"
 
 # M3 acceptance (plan §3): the guest's own `rctl` drives the running system and

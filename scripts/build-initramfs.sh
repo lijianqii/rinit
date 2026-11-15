@@ -131,7 +131,7 @@ chmod 0755 "${work}"
 # skeleton a login expects to find: `/var/log` for the log mirror and wtmp,
 # `/mnt`, `/home`, `/opt`, `/srv` and `/usr/local` for an operator, and `/var/run`
 # pointing at the `/run` tmpfs rinit mounts over the image's own directory.
-install -d "${work}"/{sbin,bin,lib,etc/rinit/units,etc/udhcpc,proc,sys,dev,run,usr/bin,usr/local/bin,usr/local/sbin}
+install -d "${work}"/{sbin,bin,lib,etc/rinit/units,proc,sys,dev,run,usr/bin,usr/local/bin,usr/local/sbin}
 install -d "${work}"/{var/log/rinit,var/spool,var/lib/seedrng,mnt,media,home,opt,srv}
 
 # rinit, rctl and processes are dynamically linked. The loader and runtime
@@ -181,6 +181,10 @@ if [[ -x "${bin_dir}/processes" ]]; then
     # instead of leaving a second copy under /usr/bin.
     install -m 0755 "${bin_dir}/processes" "${work}/bin/processes"
 fi
+install -m 0755 "${bin_dir}/rnetd" "${work}/sbin/rnetd"
+install -m 0755 "${bin_dir}/rncli" "${work}/sbin/rncli"
+install -d "${work}/etc/rnet"
+install -m 0644 "${repo_root}/rnet.conf" "${work}/etc/rnet/config"
 
 # Plan §1.3(9)'s second wave: the mount table rinit reads after the first wave.
 # It ships in the image because the second wave runs at *boot* - a table written
@@ -240,44 +244,8 @@ Units live in /etc/rinit/units; this image carries the boot set only.
 The acceptance image (make test-system) adds units/demo/.
 EOF
 
-# The DHCP client is a real unit (`units/network.service`) whose `ExecStart` is
-# `udhcpc` directly. This is the client's *lease event* script (`-s`), not a
-# startup wrapper: it applies the address, route and resolver when a lease
-# arrives and clears the address when it is deconfigured.
-write_script "${work}/etc/udhcpc/default.script" <<'EOF'
-#!/bin/sh
-# udhcpc event script for the development image. busybox exports the prefix
-# length as $mask (and the dotted netmask as $subnet); $router and $dns are
-# space-separated lists. Absolute paths: rinit starts this without a login shell.
-case "$1" in
-deconfig)
-    /sbin/ip addr flush dev "$interface"
-    /sbin/ip link set dev "$interface" up
-    ;;
-bound|renew)
-    /sbin/ip addr flush dev "$interface"
-    if [ -n "${broadcast:-}" ]; then
-        /sbin/ip addr add "$ip/${mask:-24}" broadcast "$broadcast" dev "$interface"
-    else
-        /sbin/ip addr add "$ip/${mask:-24}" dev "$interface"
-    fi
-    /sbin/ip link set dev "$interface" up
-
-    if [ -n "${router:-}" ]; then
-        while /sbin/ip route del default dev "$interface" 2>/dev/null; do :; done
-        for r in ${router}; do
-            /sbin/ip route add default via "$r" dev "$interface" && break
-        done
-    fi
-
-    {
-        [ -n "${domain:-}" ] && echo "search $domain"
-        for d in ${dns:-}; do echo "nameserver $d"; done
-    } > /etc/resolv.conf
-    ;;
-esac
-exit 0
-EOF
+# Networking is owned by rnetd (units/network.service). BusyBox udhcpc is
+# still installed for manual diagnosis, but no lease script writes kernel state.
 
 # The unit directory, which is what the guest actually boots.
 #
@@ -365,7 +333,7 @@ if [[ -n "${busybox_src}" ]]; then
         echo "warning: device image uses the development root/toor password; set RINIT_ROOT_PASSWORD_HASH (use '!' to lock root) before deploying" >&2
     fi
     chmod 0600 "${work}/etc/shadow"
-    printf 'root:x:0:\nnogroup:x:65534:\n' >"${work}/etc/group"
+    printf 'root:x:0:\nnogroup:x:65534:\nrnet:x:1000:\n' >"${work}/etc/group"
 fi
 
 # Optional rinit-tools: install after busybox so every replacement path can be
