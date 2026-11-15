@@ -24,7 +24,7 @@ done
 
 mkdir -p /var/log/rinit
 : >"$out"
-printf 'elapsed,rss_kb,fds,threads,zombies,control_ok,control_fail,ip,route,udhcpc,dropbear,network,sshd,device_target,disk_free_kb,mem_available_kb,swap_used_kb,load1,feature_active\n' >"$out"
+printf 'elapsed,rss_kb,fds,threads,zombies,control_ok,control_fail,ip,route,rnetd,dropbear,network,sshd,device_target,disk_free_kb,mem_available_kb,swap_used_kb,load1,feature_active\n' >"$out"
 
 start=$(date +%s)
 count=$((seconds / interval))
@@ -59,7 +59,7 @@ while [ "$i" -le "$count" ]; do
 
     ip4=$(ip addr show dev eth0 2>/dev/null | awk '/inet /{print $2; exit}')
     route=$(ip route 2>/dev/null | awk '$1 == "default" { print $3; exit }')
-    udhcpc=$(ps 2>/dev/null | grep -c '[u]dhcpc')
+    rnetd=$(ps 2>/dev/null | grep -c '[r]netd')
     dropbear=$(ps 2>/dev/null | grep -c '[d]ropbear')
     network=$(rctl status --plain network.service 2>/dev/null | awk '/^state:/{print $2; exit}')
     sshd=$(rctl status --plain sshd.service 2>/dev/null | awk '/^state:/{print $2; exit}')
@@ -77,14 +77,14 @@ while [ "$i" -le "$count" ]; do
     [ "$device_target" = "active" ] || health_fail=$((health_fail + 1))
     [ -n "$ip4" ] || health_fail=$((health_fail + 1))
     [ -n "$route" ] || health_fail=$((health_fail + 1))
-    [ "$udhcpc" -gt 0 ] || health_fail=$((health_fail + 1))
+    [ "$rnetd" -gt 0 ] || health_fail=$((health_fail + 1))
     [ "$dropbear" -gt 0 ] || health_fail=$((health_fail + 1))
     [ -n "$disk_free_kb" ] && [ "$disk_free_kb" -ge 8192 ] || health_fail=$((health_fail + 1))
 
     elapsed=$(( $(date +%s) - start ))
     printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
         "$elapsed" "$rss" "$fds" "$threads" "$zombies" "$ctl_ok" "$ctl_fail" \
-        "$ip4" "$route" "$udhcpc" "$dropbear" "$network" "$sshd" \
+        "$ip4" "$route" "$rnetd" "$dropbear" "$network" "$sshd" \
         "$device_target" "${disk_free_kb:-}" "${mem_available_kb:-}" \
         "$swap_used_kb" "${load1:-}" "$feature_active" >>"$out"
     printf 'SOAK elapsed=%s rss=%s fds=%s threads=%s zombies=%s control=%s/%s network=%s sshd=%s disk_free=%s feature=%s\n' \

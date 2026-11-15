@@ -155,9 +155,15 @@ ssh_guest() {
         "$seconds" "$interval" "$checkpoint_interval"
 } >"$run_info"
 
+# A long soak must not be reset by the hardware watchdog when the *host* is
+# starved or suspended for more than the watchdog interval. The reboot test
+# exercises the watchdog; the soak needs one uninterrupted guest. Pointing
+# --watchdog at /dev/null leaves the device unarmed while keeping rinit's
+# command line in the same shape.
 timeout -k 5 $((seconds + 1800)) "$repo_root/scripts/run-qemu.sh" --arch "$arch" \
     --kernel "$kernel" --disk "$disk" --root /dev/vda --mem 128M \
-    --hostfwd "tcp:127.0.0.1:$port-:22" --kernel-args "-- --default device.target" \
+    --hostfwd "tcp:127.0.0.1:$port-:22" \
+    --kernel-args "-- --default device.target --watchdog /dev/null" \
     </dev/null >"$serial" 2>&1 &
 qemu_pid=$!
 
@@ -247,18 +253,47 @@ fi
 
 deadline=$((SECONDS + seconds + 1800))
 last_checkpoint=$SECONDS
+last_guest_elapsed=0
+guest_rebooted=0
 while ((SECONDS < deadline)); do
     if grep -q 'SOAK_DONE' "$serial"; then break; fi
     if ! kill -0 "$qemu_pid" 2>/dev/null; then break; fi
+    # A second kernel boot means the guest reset: the soak is no longer
+    # measuring one continuous uptime, so stop early instead of burning hours.
+    if [[ "$(grep -cF 'Booting Linux on physical CPU' "$serial")" -gt 1 ]]; then
+        printf 'FAIL %s guest rebooted during soak\n' "$(date '+%F %T %Z')" >>"$checkpoint_dir/log"
+        guest_rebooted=1
+        break
+    fi
     if ((checkpoint_interval > 0 && SECONDS - last_checkpoint >= checkpoint_interval)); then
         stamp="$(date +%Y%m%d%H%M%S)"
         tmp="$checkpoint_dir/.guest-$stamp.csv"
-        if ssh_guest 'cat /var/log/rinit/soak-guest.csv' >"$tmp" 2>/dev/null && [[ -s "$tmp" ]]; then
-            mv "$tmp" "$checkpoint_dir/guest-$stamp.csv"
-            printf 'ok   %s guest-%s.csv\n' "$(date '+%F %T %Z')" "$stamp" >>"$checkpoint_dir/log"
-        else
+        checkpoint_ok=0
+        for _attempt in 1 2 3; do
+            if ssh_guest 'cat /var/log/rinit/soak-guest.csv' >"$tmp" 2>/dev/null && [[ -s "$tmp" ]]; then
+                mv "$tmp" "$checkpoint_dir/guest-$stamp.csv"
+                printf 'ok   %s guest-%s.csv\n' "$(date '+%F %T %Z')" "$stamp" >>"$checkpoint_dir/log"
+                checkpoint_ok=1
+                break
+            fi
             rm -f "$tmp"
-            printf 'FAIL %s ssh/checkpoint unavailable\n' "$(date '+%F %T %Z')" >>"$checkpoint_dir/log"
+            sleep 3
+        done
+        if ((checkpoint_ok == 0)); then
+            printf 'FAIL %s ssh/checkpoint unavailable after retries\n' "$(date '+%F %T %Z')" >>"$checkpoint_dir/log"
+        else
+            # A stale CSV is worse than a missing one: after a guest reboot the
+            # sampler is gone, but its old file is still readable. Require the
+            # last elapsed value to move forward before calling this checkpoint
+            # healthy.
+            last_row="$(tail -1 "$checkpoint_dir/guest-$stamp.csv" 2>/dev/null || true)"
+            elapsed="${last_row%%,*}"
+            if [[ "$elapsed" =~ ^[0-9]+$ ]] && ((elapsed > last_guest_elapsed)); then
+                last_guest_elapsed=$elapsed
+            else
+                printf 'FAIL %s guest CSV did not advance (elapsed=%s)\n' \
+                    "$(date '+%F %T %Z')" "${elapsed:-missing}" >>"$checkpoint_dir/log"
+            fi
         fi
         last_checkpoint=$SECONDS
     fi
@@ -326,6 +361,10 @@ fi
 result=FAIL
 if [[ "$serial_status" == *'status=OK'* ]] && ((ssh_final)) && ((csv_ok)) && ((feature_ok)); then
     result=OK
+fi
+if ((guest_rebooted)); then
+    echo "SOAK FAIL tag=${tag} reason=guest-reboot samples=${guest_csv} serial=${serial}"
+    exit 1
 fi
 echo "SOAK ${result} tag=${tag} samples=${guest_csv} serial=${serial}"
 if [[ "$result" == OK ]]; then exit 0; fi

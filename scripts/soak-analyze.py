@@ -156,7 +156,7 @@ def main():
             bad_health += 1
         if not r.get("ip") or not r.get("route"):
             bad_health += 1
-        if r.get("udhcpc", "0").isdigit() and int(r["udhcpc"]) < 1:
+        if r.get("rnetd", r.get("udhcpc", "0")).isdigit() and int(r.get("rnetd", r.get("udhcpc", "0"))) < 1:
             bad_health += 1
         if r.get("dropbear", "0").isdigit() and int(r["dropbear"]) < 1:
             bad_health += 1
