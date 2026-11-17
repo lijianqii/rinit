@@ -157,7 +157,11 @@ TOOLS_PROFILE    ?= replace-system
 TOOLS_BIN_DIR    := target/$(TARGET)/release
 TOOLS_SRCS       := $(RINIT_SRCS) tools.list scripts/install-tools.sh
 TOOLS_STAMP      := $(TOOLS_BIN_DIR)/.rinit-tools-stamp
-TOOLS_PROFILE_STAMP := $(TOOLS_BIN_DIR)/.tools-profile
+# The value is part of the file name: an unchanged profile finds the existing
+# stamp, a changed one names a new prerequisite and rebuilds. A FORCE target
+# with `cmp` would look equivalent but makes every dependent rebuild, because
+# make marks a prerequisite as updated whenever its recipe runs.
+TOOLS_PROFILE_STAMP := $(TOOLS_BIN_DIR)/.tools-profile-$(TOOLS_PROFILE)
 
 tools:
 	cargo build --release --target $(TARGET) --bins
@@ -165,10 +169,9 @@ tools:
 # A stamp keeps `make run` incremental: the phony `tools` target is only run
 # when a tool source, the manifest, the installer or the selected profile
 # changed, not on every boot.
-$(TOOLS_PROFILE_STAMP): FORCE
+$(TOOLS_PROFILE_STAMP):
 	@mkdir -p $(TOOLS_BIN_DIR)
-	@printf '%s\n' "$(TOOLS_PROFILE)" > $@.tmp
-	@if ! cmp -s $@.tmp $@; then mv $@.tmp $@; else rm -f $@.tmp; fi
+	@touch $@
 
 $(TOOLS_STAMP): $(TOOLS_SRCS) $(TOOLS_PROFILE_STAMP)
 	$(MAKE) tools
@@ -348,23 +351,21 @@ disk-image: rinit tools $(BUSYBOX_BIN) $(DROPBEAR_BIN_DIR)/dropbear \
 	DISK_EXTRA_MB=$(DISK_EXTRA_MB) $(SCRIPTS)/mkdisk.sh $(ROOTFS_DIR) $(DISK_IMAGE)
 
 KEY_ID := $(if $(AUTHORIZED_KEY),$(shell sha256sum "$(AUTHORIZED_KEY)" 2>/dev/null | cut -d' ' -f1),none)
-KEY_STAMP := $(OUT_DIR)/.authorized-key
+KEY_STAMP := $(OUT_DIR)/.authorized-key-$(KEY_ID)
 
-$(KEY_STAMP): FORCE
+$(KEY_STAMP):
 	@mkdir -p $(OUT_DIR)
-	@printf '%s\n' "$(KEY_ID)" > $@.tmp
-	@if ! cmp -s $@.tmp $@; then mv $@.tmp $@; else rm -f $@.tmp; fi
-
-FORCE:
+	@touch $@
 
 # Values that change the image without changing any file: a different tools
 # profile, swap size or extra disk space must not reuse the previous ext4.
-DISK_CONFIG_STAMP := $(OUT_DIR)/.disk-config
+# Encoding them in the name is what makes the check incremental; see the
+# TOOLS_PROFILE_STAMP comment above.
+DISK_CONFIG_STAMP := $(OUT_DIR)/.disk-config-$(TOOLS_PROFILE)-$(SWAP_SIZE_MB)-$(DISK_EXTRA_MB)
 
-$(DISK_CONFIG_STAMP): FORCE
+$(DISK_CONFIG_STAMP):
 	@mkdir -p $(OUT_DIR)
-	@printf '%s %s %s\n' "$(TOOLS_PROFILE)" "$(SWAP_SIZE_MB)" "$(DISK_EXTRA_MB)" > $@.tmp
-	@if ! cmp -s $@.tmp $@; then mv $@.tmp $@; else rm -f $@.tmp; fi
+	@touch $@
 
 DISK_INPUTS := $(RINIT_BIN) $(RCTL_BIN) $(PROCESSES_BIN) $(RNETD_BIN) $(RNCLI_BIN) \
                $(TOOLS_STAMP) $(BUSYBOX_BIN) $(DROPBEAR_BIN_DIR)/dropbear \
