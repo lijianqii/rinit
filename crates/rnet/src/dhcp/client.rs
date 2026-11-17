@@ -292,7 +292,15 @@ impl Client {
                     Ipv4Addr::UNSPECIFIED,
                 ))])
             }
-            (State::Requesting { .. }, Some(MessageType::Ack)) => {
+            (State::Requesting { requested, server }, Some(MessageType::Ack)) => {
+                // An ACK is only this transaction's answer if it comes from
+                // the server we sent the REQUEST to and confirms the address
+                // we asked for. A late or spoofed ACK must not replace the
+                // lease, and a second DHCP server on the segment is exactly
+                // what the transaction id alone does not rule out.
+                if packet.options.server_id != Some(server) || packet.yiaddr != requested {
+                    return Ok(Vec::new());
+                }
                 let lease = Lease::from_ack(packet, self.fallback_lease)?;
                 let mut actions = vec![Action::Lease(lease.clone())];
                 let renew_at = now + Duration::from_secs(u64::from(lease.t1));
@@ -316,7 +324,14 @@ impl Client {
                 actions.extend(self.discover(now));
                 Ok(actions)
             }
-            (State::Renewing { .. } | State::Rebinding { .. }, Some(MessageType::Ack)) => {
+            (
+                State::Renewing { lease, .. } | State::Rebinding { lease, .. },
+                Some(MessageType::Ack),
+            ) => {
+                if packet.options.server_id != Some(lease.server) || packet.yiaddr != lease.address
+                {
+                    return Ok(Vec::new());
+                }
                 let lease = Lease::from_ack(packet, self.fallback_lease)?;
                 let renew_at = now + Duration::from_secs(u64::from(lease.t1));
                 let rebind_at = now + Duration::from_secs(u64::from(lease.t2));
@@ -467,6 +482,47 @@ mod tests {
         let actions = client.handle(&ack, now).expect("ack");
         assert!(matches!(actions[0], Action::Lease(_)));
         assert!(client.lease().is_some());
+    }
+
+    #[test]
+    fn an_ack_from_the_wrong_server_is_ignored() {
+        let now = Instant::now();
+        let mut client = Client::new("eth0", mac());
+        let actions = client.start(now);
+        let Action::Send(discover) = &actions[0] else {
+            panic!("expected discover");
+        };
+        let xid = discover.xid;
+        client
+            .handle(
+                &reply(xid, MessageType::Offer, Ipv4Addr::new(192, 168, 1, 50)),
+                now,
+            )
+            .expect("offer");
+        let mut ack = reply(xid, MessageType::Ack, Ipv4Addr::new(192, 168, 1, 50));
+        ack.options.server_id = Some(Ipv4Addr::new(192, 168, 1, 2));
+        assert!(client.handle(&ack, now).expect("ignore").is_empty());
+        assert!(client.lease().is_none());
+    }
+
+    #[test]
+    fn an_ack_for_a_different_address_is_ignored() {
+        let now = Instant::now();
+        let mut client = Client::new("eth0", mac());
+        let actions = client.start(now);
+        let Action::Send(discover) = &actions[0] else {
+            panic!("expected discover");
+        };
+        let xid = discover.xid;
+        client
+            .handle(
+                &reply(xid, MessageType::Offer, Ipv4Addr::new(192, 168, 1, 50)),
+                now,
+            )
+            .expect("offer");
+        let ack = reply(xid, MessageType::Ack, Ipv4Addr::new(192, 168, 1, 51));
+        assert!(client.handle(&ack, now).expect("ignore").is_empty());
+        assert!(client.lease().is_none());
     }
 
     #[test]

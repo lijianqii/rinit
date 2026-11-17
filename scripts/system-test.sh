@@ -51,7 +51,7 @@ service=""
 # Rinit's own default is what `make run` boots with.
 kernel_args="--watchdog-timeout 10"
 
-usage() { sed -n '2,27p' "$0"; }
+usage() { sed -n '2,/^set -euo pipefail$/p' "$0" | sed '$d'; }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -528,8 +528,13 @@ if [[ ${qemu_rc} -ne 124 && ${qemu_rc} -ne 137 && ${qemu_rc} -ne 0 ]]; then
 fi
 
 failures=0
-pass() { printf '  ok   %s\n' "$1"; }
+assertions=0
+pass() {
+    assertions=$((assertions + 1))
+    printf '  ok   %s\n' "$1"
+}
 fail() {
+    assertions=$((assertions + 1))
     printf '  FAIL %s\n' "$1" >&2
     failures=$((failures + 1))
 }
@@ -923,7 +928,7 @@ done
 
 echo
 if [[ ${failures} -eq 0 ]]; then
-    echo "PASS: all assertions held on ${arch}"
+    echo "PASS: all ${assertions} assertions held on ${arch}"
     if [[ ${keep_log} -eq 1 ]]; then
         echo "log: ${log_file}"
     else

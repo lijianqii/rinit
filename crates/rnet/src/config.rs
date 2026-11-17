@@ -128,7 +128,65 @@ pub fn load_effective(path: &Path) -> Result<Config, ConfigError> {
             }
         }
     }
+    validate_limits(&config)?;
     Ok(config)
+}
+
+/// Re-check the per-file limits after drop-ins have been merged.
+///
+/// `Parser::parse` enforces them while reading one file, but every drop-in is
+/// a separate file: 256 interfaces in the main file and 256 more in each of
+/// ten drop-ins would otherwise pass individually and produce a configuration
+/// with 2,816 interfaces.
+fn validate_limits(config: &Config) -> Result<(), ConfigError> {
+    if config.interfaces.len() > MAX_INTERFACES {
+        return Err(ConfigError::new(
+            0,
+            format!("more than {MAX_INTERFACES} interfaces after merging drop-ins"),
+        ));
+    }
+    if config.routes.len() > MAX_ROUTES {
+        return Err(ConfigError::new(
+            0,
+            format!("more than {MAX_ROUTES} routes after merging drop-ins"),
+        ));
+    }
+    if config.global.dns.len() > MAX_DNS {
+        return Err(ConfigError::new(
+            0,
+            format!("more than {MAX_DNS} DNS servers after merging drop-ins"),
+        ));
+    }
+    for iface in &config.interfaces {
+        if iface.addresses.len() > MAX_ADDRESSES {
+            return Err(ConfigError::new(
+                0,
+                format!(
+                    "{}: more than {MAX_ADDRESSES} addresses after merging drop-ins",
+                    iface.name
+                ),
+            ));
+        }
+        if iface.dns.len() > MAX_DNS {
+            return Err(ConfigError::new(
+                0,
+                format!(
+                    "{}: more than {MAX_DNS} DNS servers after merging drop-ins",
+                    iface.name
+                ),
+            ));
+        }
+        if iface.ports.len() > MAX_PORTS {
+            return Err(ConfigError::new(
+                0,
+                format!(
+                    "{}: more than {MAX_PORTS} bridge ports after merging drop-ins",
+                    iface.name
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn read_text(path: &Path) -> Result<String, ConfigError> {
@@ -990,6 +1048,31 @@ any
         );
         let rendered = render_sections(&config);
         assert!(rendered.contains("[interface eth0]"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn dropins_cannot_merge_past_the_interface_limit() {
+        let root =
+            std::env::temp_dir().join(format!("rnet-config-many-dropins-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("config.d")).expect("temp");
+        let main = root.join("config");
+        std::fs::write(&main, "[global]\nwait-online = any\n").expect("main");
+
+        for file in ["10-a.conf", "20-b.conf"] {
+            let mut text = String::new();
+            for index in 0..200 {
+                text.push_str(&format!("[interface e{file}_{index}]\ntype = ethernet\n"));
+            }
+            std::fs::write(root.join("config.d").join(file), text).expect("drop-in");
+        }
+
+        let error = load_effective(&main).expect_err("the merged limit must be enforced");
+        assert!(
+            error.message.contains("interfaces after merging drop-ins"),
+            "{error}"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

@@ -83,6 +83,12 @@ impl fmt::Display for UnitType {
 /// every name is validated is what keeps the wire honest.
 pub(crate) const MAX_UNIT_NAME_BYTES: usize = 255;
 
+/// The largest accepted `StartLimitBurst=`, and the breaker's own hard cap.
+///
+/// The parser and `BackoffState::new` both need it; one constant keeps a value
+/// the parser accepts from becoming a window the breaker silently clamps.
+pub(crate) const MAX_START_LIMIT_BURST: u32 = 1_000_000;
+
 /// A validated unit name with its resolved type.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct UnitName {

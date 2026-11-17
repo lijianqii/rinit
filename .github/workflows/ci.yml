@@ -18,6 +18,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # One place for the kernel version the step commands name; the Makefile still
+  # owns the default used by `make run`. Keep the two in step when bumping.
+  KERNEL_VERSION: "6.6.158"
   # Do not set RUSTFLAGS globally: it overrides per-target linker and feature
   # flags from `.cargo/config.toml`. Clippy below passes `-D warnings`
   # explicitly instead.
@@ -26,6 +29,7 @@ jobs:
   host:
     name: fmt + clippy + tests (host)
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -51,6 +55,9 @@ jobs:
       - name: Tests
         run: cargo test --offline --locked --workspace -- --nocapture
 
+      - name: Parallel startup measurement
+        run: make parallel
+
       - name: Docs build
         run: cargo doc --offline --locked --workspace --no-deps
 
@@ -66,6 +73,7 @@ jobs:
   aarch64:
     name: cross-compile (aarch64, dynamic)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -114,6 +122,7 @@ jobs:
   arm32:
     name: armv7 build and system test
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 
@@ -162,7 +171,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: build/dl
-          key: kernel-${{ runner.os }}-6.6.158-arm32
+          key: kernel-${{ runner.os }}-${{ env.KERNEL_VERSION }}-arm32
 
       - name: Build kernel and initramfs
         run: make ARCH=arm32 initramfs kernel
@@ -188,6 +197,7 @@ jobs:
   guest:
     name: qemu system test (aarch64)
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     needs: aarch64
     steps:
       - uses: actions/checkout@v4
@@ -211,7 +221,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: build/dl
-          key: kernel-${{ runner.os }}-6.6.158
+          key: kernel-${{ runner.os }}-${{ env.KERNEL_VERSION }}
 
       - name: Build rinit, kernel, busybox, initramfs
         run: make initramfs kernel busybox
@@ -229,7 +239,7 @@ jobs:
         run: >-
           scripts/device-smoke.sh
           --image build/out/rinit-aarch64-unknown-linux-gnu.ext4
-          --kernel build/src/linux-6.6.158/arch/arm64/boot/Image
+          --kernel build/src/linux-${KERNEL_VERSION}/arch/arm64/boot/Image
           --key "$RUNNER_TEMP/device-key"
           --tag ci-device
 
@@ -241,7 +251,7 @@ jobs:
           scripts/tools-test.sh
           --arch aarch64
           --image build/out/rinit-aarch64-unknown-linux-gnu.ext4
-          --kernel build/src/linux-6.6.158/arch/arm64/boot/Image
+          --kernel build/src/linux-${KERNEL_VERSION}/arch/arm64/boot/Image
           --key "$RUNNER_TEMP/device-key"
           --tag ci-tools
 
@@ -250,7 +260,7 @@ jobs:
           scripts/reboot-test.sh
           --arch aarch64
           --image build/out/rinit-aarch64-unknown-linux-gnu.ext4
-          --kernel build/src/linux-6.6.158/arch/arm64/boot/Image
+          --kernel build/src/linux-${KERNEL_VERSION}/arch/arm64/boot/Image
           --key "$RUNNER_TEMP/device-key"
           --tag ci-reboot
 

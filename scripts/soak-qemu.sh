@@ -13,6 +13,10 @@
 set -u
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+rinit_version="$(sed -n 's/^version = "\(.*\)"$/\1/p' "$repo_root/Cargo.toml" | head -1)"
+kernel_version="${KERNEL_VERSION:-$(sed -n 's/^KERNEL_VERSION[[:space:]]*?=[[:space:]]*//p' "$repo_root/Makefile" | head -1)}"
+[[ -n "$rinit_version" ]] || { echo "error: cannot read the rinit version from Cargo.toml" >&2; exit 2; }
+[[ -n "$kernel_version" ]] || { echo "error: cannot read KERNEL_VERSION from the Makefile" >&2; exit 2; }
 arch=aarch64
 kernel=""
 disk=""
@@ -57,12 +61,12 @@ done
 
 case "$arch" in
     aarch64)
-        : "${kernel:=$repo_root/build/src/linux-6.6.158/arch/arm64/boot/Image}"
+        : "${kernel:=$repo_root/build/src/linux-${kernel_version}/arch/arm64/boot/Image}"
         : "${disk:=$repo_root/build/out/rinit-aarch64-unknown-linux-gnu.ext4}"
         qemu_bin=qemu-system-aarch64
         ;;
     arm)
-        : "${kernel:=$repo_root/build/arm32/src/linux-6.6.158/arch/arm/boot/zImage}"
+        : "${kernel:=$repo_root/build/arm32/src/linux-${kernel_version}/arch/arm/boot/zImage}"
         : "${disk:=$repo_root/build/arm32/out/rinit-armv7-unknown-linux-gnueabihf.ext4}"
         qemu_bin=qemu-system-arm
         ;;
@@ -218,7 +222,7 @@ if [[ -n "$feature_suite" ]]; then
     ssh_guest 'reboot' >/dev/null 2>&1 || true
     boot_deadline=$((SECONDS + 180))
     while ((SECONDS < boot_deadline)); do
-        [[ "$(grep -cF 'rinit 0.1.0 starting (pid 1)' "$serial")" -ge 2 ]] && break
+        [[ "$(grep -cF "rinit ${rinit_version} starting (pid 1)" "$serial")" -ge 2 ]] && break
         sleep 1
     done
     for _ in $(seq 1 180); do

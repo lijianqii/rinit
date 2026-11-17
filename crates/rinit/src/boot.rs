@@ -345,6 +345,17 @@ fn sync_socket_activation(
     }
 }
 
+/// Hard upper bound on the boot schedule.
+///
+/// A unit may set `TimeoutStartSec=0` to mean "wait forever", and a `notify`
+/// service that never writes `READY=1` would then keep its level - and the
+/// boot - pending indefinitely. Boot and supervision share one loop, so that
+/// also means the control socket would answer `start`/`stop`/`reload` with
+/// "boot is still in progress" forever. This bound is the backstop: a boot
+/// that has made no progress for five minutes is ended, its pending units are
+/// failed, and the supervisor takes over.
+const BOOT_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// The boot schedule, advanced by the same loop that later supervises services.
 ///
 /// Boot used to be a separate synchronous walk: it could not answer signals,
@@ -370,6 +381,7 @@ struct Boot {
     first_service_uptime_ms: Option<u64>,
     started_at: Instant,
     complete: bool,
+    timed_out: bool,
 }
 
 impl Boot {
@@ -387,6 +399,7 @@ impl Boot {
             first_service_uptime_ms: None,
             started_at,
             complete: false,
+            timed_out: false,
         }
     }
 
@@ -420,6 +433,10 @@ impl Boot {
     ) -> bool {
         self.record_spawned(spawned);
         if self.complete {
+            return false;
+        }
+        if self.started_at.elapsed() >= BOOT_TIMEOUT {
+            self.time_out(manager, starts);
             return false;
         }
         let mut began = false;
@@ -560,13 +577,45 @@ impl Boot {
         }
     }
 
-    fn finish(&mut self, manager: &UnitManager) {
+    /// End a boot that has been pending for [`BOOT_TIMEOUT`] and fail the
+    /// units that were still starting. The supervisor then owns the system,
+    /// which is what re-opens the mutating half of the control protocol.
+    fn time_out(&mut self, manager: &mut UnitManager, starts: &mut StartCoordinator) {
+        self.timed_out = true;
+        let pending: Vec<UnitName> = self.pending.iter().cloned().collect();
         rlog!(
-            "boot complete: {} unit(s) started from '{}' ({} still running)",
-            self.started_units,
-            self.plan.default_target,
-            manager.running_count()
+            "error: boot exceeded {}s at level {}; failing {} pending unit(s)",
+            BOOT_TIMEOUT.as_secs(),
+            self.level,
+            pending.len()
         );
+        for unit in pending {
+            // A flow may still own an `ExecStartPre=`/`Post=` command or a
+            // spawn report; cancel it before failing the unit so neither
+            // outlives the boot that created it.
+            starts.cancel(manager, &unit);
+            fail_unit(manager, &unit);
+        }
+        self.finish(manager);
+    }
+
+    fn finish(&mut self, manager: &UnitManager) {
+        if self.timed_out {
+            rlog!(
+                "boot stopped after {}s: {} unit(s) started from '{}' ({} still running)",
+                BOOT_TIMEOUT.as_secs(),
+                self.started_units,
+                self.plan.default_target,
+                manager.running_count()
+            );
+        } else {
+            rlog!(
+                "boot complete: {} unit(s) started from '{}' ({} still running)",
+                self.started_units,
+                self.plan.default_target,
+                manager.running_count()
+            );
+        }
         let rinit_ms = self.started_at.elapsed().as_millis() as u64;
         match self.first_service_uptime_ms {
             Some(first) => rlog!(
@@ -831,7 +880,12 @@ async fn supervise(
                         starts.cancel(manager, unit);
                     }
                     let reloaded = matches!(&request, Request::Reload);
-                    match handle_control(
+                    // A reload's directory scan runs on the blocking pool, but
+                    // the loop still waits for it. Feed before and after so a
+                    // slow scan gets a full watchdog interval instead of
+                    // starting with whatever margin was left.
+                    watchdog.feed_if_due();
+                    let control_action = handle_control(
                         cfg,
                         manager,
                         supervised.logs,
@@ -840,8 +894,9 @@ async fn supervise(
                         &mut starts,
                         &request,
                     )
-                    .await
-                    {
+                    .await;
+                    watchdog.feed_if_due();
+                    match control_action {
                         ControlAction::Reply(status, text) => {
                             if reloaded {
                                 starts.after_reload(manager);
@@ -2290,45 +2345,48 @@ async fn handle_control(
             unit: Some(unit),
             tail,
             format,
-        } => match describe_unit_formatted(manager, unit, *format) {
-            Some(mut text) => {
-                if *tail > 0 {
-                    let logs_text = render_logs(logs, Some(unit), *tail);
-                    if !logs_text.is_empty() {
-                        if *format == StatusFormat::Json {
-                            // The JSON reply is one object; a textual log block
-                            // would make it invalid. Drop the object's closing
-                            // brace, add the field, and close it again. If the
-                            // escaped log would push the frame past the
-                            // protocol limit, omit it with an explicit marker:
-                            // a truncated object is not JSON at all.
-                            let escaped = json_string(&logs_text);
-                            if text.len().saturating_add(escaped.len()).saturating_add(32)
-                                > MAX_FRAME_BYTES
-                            {
-                                if text.ends_with('}') {
-                                    text.pop();
+        } => {
+            let usage = read_unit_usage(manager, unit).await;
+            match describe_unit_formatted(manager, unit, *format, usage) {
+                Some(mut text) => {
+                    if *tail > 0 {
+                        let logs_text = render_logs(logs, Some(unit), *tail);
+                        if !logs_text.is_empty() {
+                            if *format == StatusFormat::Json {
+                                // The JSON reply is one object; a textual log block
+                                // would make it invalid. Drop the object's closing
+                                // brace, add the field, and close it again. If the
+                                // escaped log would push the frame past the
+                                // protocol limit, omit it with an explicit marker:
+                                // a truncated object is not JSON at all.
+                                let escaped = json_string(&logs_text);
+                                if text.len().saturating_add(escaped.len()).saturating_add(32)
+                                    > MAX_FRAME_BYTES
+                                {
+                                    if text.ends_with('}') {
+                                        text.pop();
+                                    }
+                                    text.push_str(",\"log_omitted\":\"response size limit\"}");
+                                } else {
+                                    if text.ends_with('}') {
+                                        text.pop();
+                                    }
+                                    text.push_str(",\"log\":");
+                                    text.push_str(&escaped);
+                                    text.push('}');
                                 }
-                                text.push_str(",\"log_omitted\":\"response size limit\"}");
                             } else {
-                                if text.ends_with('}') {
-                                    text.pop();
-                                }
-                                text.push_str(",\"log\":");
-                                text.push_str(&escaped);
-                                text.push('}');
+                                text.push_str("log:\n");
+                                text.push_str(&logs_text);
+                                text.push('\n');
                             }
-                        } else {
-                            text.push_str("log:\n");
-                            text.push_str(&logs_text);
-                            text.push('\n');
                         }
                     }
+                    ControlAction::Reply(Status::Ok, text)
                 }
-                ControlAction::Reply(Status::Ok, text)
+                None => ControlAction::Reply(Status::NoSuchUnit, format!("no such unit: {unit}")),
             }
-            None => ControlAction::Reply(Status::NoSuchUnit, format!("no such unit: {unit}")),
-        },
+        }
         Request::StatusFormatted {
             unit: None, format, ..
         } => {
@@ -2718,11 +2776,33 @@ fn cpu_value(usec: Option<u64>) -> String {
     })
 }
 
+/// Read one unit's counters on the blocking pool.
+///
+/// `rctl list` already does this; `rctl status` used to read `/proc/<pid>` and
+/// the unit's cgroup files directly on the supervisor thread. A slow `/proc`
+/// read must not hold the loop that feeds the watchdog.
+async fn read_unit_usage(manager: &UnitManager, unit: &UnitName) -> ResourceUsage {
+    let Some(target) = manager
+        .usage_targets()
+        .into_iter()
+        .find(|target| &target.name == unit)
+    else {
+        return ResourceUsage::default();
+    };
+    tokio::task::spawn_blocking(move || UnitManager::collect_usage(vec![target]))
+        .await
+        .ok()
+        .and_then(|rows| rows.into_iter().next())
+        .map(|(_, usage)| usage)
+        .unwrap_or_default()
+}
+
 /// Render one unit in the format selected by `rctl status --format`.
 fn describe_unit_formatted(
     manager: &UnitManager,
     unit: &UnitName,
     format: StatusFormat,
+    usage: ResourceUsage,
 ) -> Option<String> {
     if !manager.exists(unit) {
         return None;
@@ -2733,7 +2813,6 @@ fn describe_unit_formatted(
         Some(JobTarget::Stopped) => "stopped",
         None => "none",
     };
-    let usage = manager.resource_usage(unit);
     Some(match format {
         StatusFormat::Plain => render_plain(rt, target, usage),
         StatusFormat::Systemd => render_systemd(rt, target, usage),
@@ -3353,18 +3432,21 @@ mod tests {
         let manager = manager_with("app.service");
         let app = unit("app.service");
 
+        let usage = manager.resource_usage(&app);
         let systemd =
-            describe_unit_formatted(&manager, &app, StatusFormat::Systemd).expect("systemd");
+            describe_unit_formatted(&manager, &app, StatusFormat::Systemd, usage).expect("systemd");
         assert!(systemd.contains("Memory:"), "{systemd}");
         assert!(systemd.contains("CPU:"), "{systemd}");
         assert!(systemd.contains("Restart:"), "{systemd}");
 
-        let plain = describe_unit_formatted(&manager, &app, StatusFormat::Plain).expect("plain");
+        let plain =
+            describe_unit_formatted(&manager, &app, StatusFormat::Plain, usage).expect("plain");
         assert!(plain.contains("memory:"), "{plain}");
         assert!(plain.contains("cpu:"), "{plain}");
         assert!(plain.contains("target: none"), "{plain}");
 
-        let json = describe_unit_formatted(&manager, &app, StatusFormat::Json).expect("json");
+        let json =
+            describe_unit_formatted(&manager, &app, StatusFormat::Json, usage).expect("json");
         for key in ["\"memory_bytes\"", "\"cpu_usec\"", "\"tasks\""] {
             assert!(json.contains(key), "{json}");
         }
@@ -3757,6 +3839,30 @@ mod tests {
         assert!(
             manager.get(&app).unwrap().pid.is_none(),
             "it must not start"
+        );
+    }
+
+    /// A boot whose schedule never settles must end rather than keep the
+    /// control socket closed forever.
+    #[test]
+    fn a_boot_that_exceeds_its_deadline_finishes_instead_of_hanging() {
+        let plan = manager::BootPlan {
+            configs: Vec::new(),
+            levels: Vec::new(),
+            default_target: UnitName::parse("multi-user.target").unwrap(),
+            warnings: Vec::new(),
+            templates: BTreeMap::new(),
+        };
+        let mut boot = Boot::new(plan, Instant::now() - BOOT_TIMEOUT - Duration::from_secs(1));
+        let mut manager = UnitManager::new();
+        let mut starts = StartCoordinator::default();
+
+        assert!(!boot.is_complete());
+        boot.advance(&mut manager, &mut starts, &[]);
+        assert!(boot.is_complete(), "the schedule must not wait forever");
+        assert!(
+            boot.timed_out,
+            "the completion must be reported as a timeout"
         );
     }
 }

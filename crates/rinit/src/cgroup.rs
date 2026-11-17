@@ -240,6 +240,10 @@ impl Cgroup {
     /// These are best-effort diagnostics: a missing file means the unit has no
     /// cgroup of its own, or the kernel does not provide that controller, and
     /// is represented as `None` rather than failing the status request.
+    ///
+    /// Production reads use [`dir_for`](Self::dir_for) and the blocking pool;
+    /// this synchronous form is what the rendering tests call.
+    #[cfg(test)]
     pub fn usage(&self, unit: &UnitName) -> CgroupUsage {
         let Some(dir) = self.dir(unit) else {
             return CgroupUsage::default();

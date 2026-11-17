@@ -25,6 +25,8 @@
 set -u -o pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+kernel_version="${KERNEL_VERSION:-$(sed -n 's/^KERNEL_VERSION[[:space:]]*?=[[:space:]]*//p' "$repo_root/Makefile" | head -1)}"
+[[ -n "$kernel_version" ]] || { echo "device-smoke: cannot read KERNEL_VERSION from the Makefile" >&2; exit 2; }
 arch=aarch64
 image=""
 kernel=""
@@ -59,12 +61,12 @@ done
 case "$arch" in
     aarch64)
         default_image="$repo_root/build/out/rinit-aarch64-unknown-linux-gnu.ext4"
-        default_kernel="$repo_root/build/src/linux-6.6.158/arch/arm64/boot/Image"
+        default_kernel="$repo_root/build/src/linux-${kernel_version}/arch/arm64/boot/Image"
         qemu_bin=qemu-system-aarch64
         ;;
     arm)
         default_image="$repo_root/build/arm32/out/rinit-armv7-unknown-linux-gnueabihf.ext4"
-        default_kernel="$repo_root/build/arm32/src/linux-6.6.158/arch/arm/boot/zImage"
+        default_kernel="$repo_root/build/arm32/src/linux-${kernel_version}/arch/arm/boot/zImage"
         qemu_bin=qemu-system-arm
         ;;
     *) die "--arch must be aarch64 or arm" ;;

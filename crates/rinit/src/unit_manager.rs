@@ -2045,8 +2045,12 @@ impl UnitManager {
             return;
         };
         // A second stop while the first one is still running would replace the
-        // tracked ExecStop pid and orphan the first command.
+        // tracked ExecStop pid and orphan the first command. It is still an
+        // explicit operator decision, though, so it cancels a restart that an
+        // earlier stop (or `rctl restart`) queued.
         if rt.state == UnitState::Deactivating {
+            rt.restart_after_stop = false;
+            rt.restart_at = None;
             return;
         }
         rt.restart_at = None;
@@ -2540,6 +2544,11 @@ impl UnitManager {
     /// falls back to the main process in `/proc`, which is the only thing rinit
     /// can attribute to the unit without a cgroup. Missing files are normal:
     /// a oneshot has no process, and dev mode has no hierarchy.
+    ///
+    /// Production reads snapshot [`usage_targets`](Self::usage_targets) and
+    /// call [`collect_usage`](Self::collect_usage) on the blocking pool; this
+    /// synchronous form is for tests and small callers.
+    #[cfg(test)]
     pub fn resource_usage(&self, unit: &UnitName) -> ResourceUsage {
         let cgroup = self.cgroup.usage(unit);
         let process = self
@@ -4676,6 +4685,40 @@ mod tests {
             rt.restart_after_stop,
             "the exit must re-enter the restart path"
         );
+
+        cleanup(&mut m, &unit);
+    }
+
+    /// An explicit stop overrides a restart that is already in flight: the
+    /// unit must come to rest instead of failing because its queued restart
+    /// was cancelled by the stop.
+    #[test]
+    fn a_stop_cancels_a_pending_restart_intent() {
+        let _guard = crate::test_support::children_lock();
+        let mut m = manager_with("a.service", RestartPolicy::Always);
+        let unit = UnitName::parse("a.service").unwrap();
+        m.request_start(&unit, RequestSource::Dependency);
+        spawn_pid(&mut m, &unit);
+        assert_eq!(m.restart_unit(&unit), RestartPlan::Stopping);
+        assert!(m.get(&unit).unwrap().restart_after_stop);
+
+        m.stop_unit(&unit);
+        let rt = m.get(&unit).unwrap();
+        assert_eq!(rt.state, UnitState::Deactivating);
+        assert!(
+            !rt.restart_after_stop,
+            "an explicit stop must cancel the queued restart"
+        );
+
+        let pid = rt.pid.expect("pid");
+        let outcome = m
+            .on_child_exit(pid, ExitOutcome::Signalled(libc::SIGTERM))
+            .expect("handled");
+        assert!(
+            matches!(outcome, Outcome::Exited { .. }),
+            "the cancelled restart must not schedule another one, got {outcome:?}"
+        );
+        assert_eq!(m.get(&unit).unwrap().state, UnitState::Inactive);
 
         cleanup(&mut m, &unit);
     }

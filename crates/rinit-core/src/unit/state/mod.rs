@@ -26,15 +26,15 @@ mod proptests {
 
     // Every state/event pair must produce *some* answer - a transition or an
     // explicit refusal - and must never panic or loop. The plan's §4.4
-    // property testing is aimed at exactly this: the table has 8 states and 8
+    // property testing is aimed at exactly this: the table has 8 states and 9
     // events, and a new one added later could easily be forgotten.
     proptest! {
         #[test]
         fn every_state_event_pair_is_decided(
             state_idx in 0usize..8,
-            event_idx in 0usize..8,
+            event_idx in 0usize..9,
             policy_idx in 0usize..5,
-            kind_idx in 0usize..3,
+            kind_idx in 0usize..4,
         ) {
             let states = [
                 UnitState::Inactive,
@@ -54,6 +54,8 @@ mod proptests {
                 Event::Exit(ExitOutcome::Failure(1)),
                 Event::Stop,
                 Event::StopComplete,
+                Event::BackoffElapsed,
+                Event::StartLimitTripped,
                 Event::ResetFailed,
             ];
             let policies = [
@@ -63,7 +65,12 @@ mod proptests {
                 RestartPolicy::OnFailure,
                 RestartPolicy::OnAbnormal,
             ];
-            let kinds = [ServiceKind::Simple, ServiceKind::Oneshot, ServiceKind::Notify];
+            let kinds = [
+                ServiceKind::Simple,
+                ServiceKind::Oneshot,
+                ServiceKind::Notify,
+                ServiceKind::Forking,
+            ];
 
             let event = events[event_idx];
             let state = states[state_idx];
@@ -79,7 +86,7 @@ mod proptests {
         #[test]
         fn a_transition_never_produces_an_impossible_state(
             state_idx in 0usize..8,
-            event_idx in 0usize..8,
+            event_idx in 0usize..9,
         ) {
             let states = [
                 UnitState::Inactive,
@@ -99,6 +106,8 @@ mod proptests {
                 Event::Exit(ExitOutcome::Failure(1)),
                 Event::Stop,
                 Event::StopComplete,
+                Event::BackoffElapsed,
+                Event::StartLimitTripped,
                 Event::ResetFailed,
             ];
             let state = states[state_idx];
@@ -124,7 +133,7 @@ mod proptests {
     proptest! {
         #[test]
         fn any_event_sequence_terminates(
-            events in prop::collection::vec(0usize..8, 0..24),
+            events in prop::collection::vec(0usize..9, 0..24),
         ) {
             let all = [
                 Event::Start,

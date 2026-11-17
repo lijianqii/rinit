@@ -616,8 +616,11 @@ impl<'a> Decoder<'a> {
     }
 
     fn unit(&mut self) -> Result<UnitName, ProtocolError> {
+        // A u8 length can never exceed MAX_UNIT_NAME_BYTES (255), so the only
+        // value this wire encoding needs to reject is zero. The canonical-name
+        // and length rules are `UnitName::parse`'s job.
         let len = self.u8()? as usize;
-        if len == 0 || len > MAX_UNIT_NAME_BYTES {
+        if len == 0 {
             return Err(ProtocolError::BadUnitName);
         }
         let bytes = self.take(len)?;

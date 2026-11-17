@@ -111,6 +111,8 @@ BUSYBOX_BIN      := $(BUSYBOX_SRC)/busybox
 # so a change to it has to repack the image just like a unit file does.
 FSTAB            := fstab
 MDEV_CONF        := mdev.conf
+# Installed as /etc/rnet/config; rnetd reads it, so it is an image input too.
+RNET_CONF        := rnet.conf
 INITRAMFS        := $(OUT_DIR)/initramfs-$(TARGET).cpio.gz
 # The acceptance image: the same root plus units/demo/. `make run` boots the
 # image above, `make test-system` this one - see the packing rules below.
@@ -155,13 +157,20 @@ TOOLS_PROFILE    ?= replace-system
 TOOLS_BIN_DIR    := target/$(TARGET)/release
 TOOLS_SRCS       := $(RINIT_SRCS) tools.list scripts/install-tools.sh
 TOOLS_STAMP      := $(TOOLS_BIN_DIR)/.rinit-tools-stamp
+TOOLS_PROFILE_STAMP := $(TOOLS_BIN_DIR)/.tools-profile
 
 tools:
 	cargo build --release --target $(TARGET) --bins
 
 # A stamp keeps `make run` incremental: the phony `tools` target is only run
-# when a tool source, the manifest or the installer changed, not on every boot.
-$(TOOLS_STAMP): $(TOOLS_SRCS)
+# when a tool source, the manifest, the installer or the selected profile
+# changed, not on every boot.
+$(TOOLS_PROFILE_STAMP): FORCE
+	@mkdir -p $(TOOLS_BIN_DIR)
+	@printf '%s\n' "$(TOOLS_PROFILE)" > $@.tmp
+	@if ! cmp -s $@.tmp $@; then mv $@.tmp $@; else rm -f $@.tmp; fi
+
+$(TOOLS_STAMP): $(TOOLS_SRCS) $(TOOLS_PROFILE_STAMP)
 	$(MAKE) tools
 	@touch $@
 
@@ -292,14 +301,15 @@ INITRAMFS_SCRIPTS := $(SCRIPTS)/build-initramfs.sh $(SCRIPTS)/mkinitramfs.sh
 # packed only into the one the system test boots. `make run` is the development
 # loop - boot, get a console, look at a service - and fourteen units that exist
 # to be started one at a time from the console are not part of that.
-$(INITRAMFS): $(RINIT_BIN) $(RCTL_BIN) $(PROCESSES_BIN) $(BUSYBOX_BIN) \
-              $(BOOT_UNIT_FILES) $(FSTAB) $(MDEV_CONF) $(INITRAMFS_SCRIPTS) \
-              $(TOOLS_STAMP)
+$(INITRAMFS): $(RINIT_BIN) $(RCTL_BIN) $(PROCESSES_BIN) $(RNETD_BIN) $(RNCLI_BIN) \
+              $(BUSYBOX_BIN) $(BOOT_UNIT_FILES) $(FSTAB) $(MDEV_CONF) $(RNET_CONF) \
+              $(INITRAMFS_SCRIPTS) $(TOOLS_STAMP)
 	$(SCRIPTS)/build-initramfs.sh $(TARGET) --busybox-src $(BUSYBOX_SRC) \
 	    --rinit-tools --tools-profile $(TOOLS_PROFILE) --out $@
 
-$(INITRAMFS_DEMO): $(RINIT_BIN) $(RCTL_BIN) $(PROCESSES_BIN) $(BUSYBOX_BIN) \
-                   $(BOOT_UNIT_FILES) $(DEMO_UNIT_FILES) $(FSTAB) $(MDEV_CONF) \
+$(INITRAMFS_DEMO): $(RINIT_BIN) $(RCTL_BIN) $(PROCESSES_BIN) $(RNETD_BIN) $(RNCLI_BIN) \
+                   $(BUSYBOX_BIN) $(BOOT_UNIT_FILES) $(DEMO_UNIT_FILES) \
+                   $(FSTAB) $(MDEV_CONF) $(RNET_CONF) \
                    $(INITRAMFS_SCRIPTS) $(TOOLS_STAMP)
 	$(SCRIPTS)/build-initramfs.sh $(TARGET) --busybox-src $(BUSYBOX_SRC) \
 	    --rinit-tools --tools-profile $(TOOLS_PROFILE) --demo-units --out $@
@@ -312,7 +322,7 @@ $(INITRAMFS_DEMO): $(RINIT_BIN) $(RCTL_BIN) $(PROCESSES_BIN) $(BUSYBOX_BIN) \
 QEMU_CMD = $(SCRIPTS)/run-qemu.sh --arch $(QEMU_ARCH) --kernel $(KERNEL_IMAGE) \
 	--initrd $(INITRAMFS) --mem $(QEMU_MEM)
 
-qemu run: $(KERNEL_IMAGE) $(INITRAMFS)
+qemu run: kernel-config-check $(KERNEL_IMAGE) $(INITRAMFS)
 	$(QEMU_CMD)
 
 # The persistent variant: an ext4 root filesystem instead of an initramfs.
@@ -322,7 +332,7 @@ qemu run: $(KERNEL_IMAGE) $(INITRAMFS)
 # is the explicit destructive rebuild. AUTHORIZED_KEY=<file.pub> installs a
 # client key for root; CI uses it to boot the image without a console login.
 disk-image: rinit tools $(BUSYBOX_BIN) $(DROPBEAR_BIN_DIR)/dropbear \
-            $(BOOT_UNIT_FILES) $(DEVICE_UNIT_FILES) $(FSTAB) $(MDEV_CONF) \
+            $(BOOT_UNIT_FILES) $(DEVICE_UNIT_FILES) $(FSTAB) $(MDEV_CONF) $(RNET_CONF) \
             $(INITRAMFS_SCRIPTS) $(SCRIPTS)/mkdisk.sh \
             $(SCRIPTS)/mkswapfile.sh $(SCRIPTS)/install-tools.sh tools.list
 	$(SCRIPTS)/build-initramfs.sh $(TARGET) --busybox-src $(BUSYBOX_SRC) \
@@ -347,12 +357,21 @@ $(KEY_STAMP): FORCE
 
 FORCE:
 
-DISK_INPUTS := $(RINIT_BIN) $(RCTL_BIN) $(PROCESSES_BIN) $(TOOLS_STAMP) \
-               $(BUSYBOX_BIN) $(DROPBEAR_BIN_DIR)/dropbear \
+# Values that change the image without changing any file: a different tools
+# profile, swap size or extra disk space must not reuse the previous ext4.
+DISK_CONFIG_STAMP := $(OUT_DIR)/.disk-config
+
+$(DISK_CONFIG_STAMP): FORCE
+	@mkdir -p $(OUT_DIR)
+	@printf '%s %s %s\n' "$(TOOLS_PROFILE)" "$(SWAP_SIZE_MB)" "$(DISK_EXTRA_MB)" > $@.tmp
+	@if ! cmp -s $@.tmp $@; then mv $@.tmp $@; else rm -f $@.tmp; fi
+
+DISK_INPUTS := $(RINIT_BIN) $(RCTL_BIN) $(PROCESSES_BIN) $(RNETD_BIN) $(RNCLI_BIN) \
+               $(TOOLS_STAMP) $(BUSYBOX_BIN) $(DROPBEAR_BIN_DIR)/dropbear \
                $(BOOT_UNIT_FILES) $(DEVICE_UNIT_FILES) $(FSTAB) $(MDEV_CONF) \
-               $(INITRAMFS_SCRIPTS) $(SCRIPTS)/mkdisk.sh \
+               $(RNET_CONF) $(INITRAMFS_SCRIPTS) $(SCRIPTS)/mkdisk.sh \
                $(SCRIPTS)/mkswapfile.sh $(SCRIPTS)/install-tools.sh tools.list \
-               $(KEY_STAMP)
+               $(KEY_STAMP) $(DISK_CONFIG_STAMP)
 
 $(DISK_IMAGE): $(DISK_INPUTS)
 	$(MAKE) disk-image
@@ -365,7 +384,7 @@ pack: disk-image
 	tar --owner=0:0 --group=0:0 -C $(ROOTFS_DIR) -czf $(PACK_ARCHIVE) .
 	@printf 'pack: wrote %s (%s)\n' "$(PACK_ARCHIVE)" "$$(du -h '$(PACK_ARCHIVE)' | cut -f1)"
 
-run-disk: $(KERNEL_IMAGE) $(DISK_IMAGE)
+run-disk: kernel-config-check $(KERNEL_IMAGE) $(DISK_IMAGE)
 	$(SCRIPTS)/run-qemu.sh --arch $(QEMU_ARCH) --kernel $(KERNEL_IMAGE) \
 	    --disk $(DISK_IMAGE) --root /dev/vda --mem $(QEMU_MEM) \
 	    --hostfwd "$(DISK_HOSTFWD)" \
@@ -388,7 +407,7 @@ test: check
 # `scripts/system-test.sh`) on the serial console. Logs land in build/logs/.
 # It boots the acceptance image: the §7.x units it drives from the console are
 # in `units/demo/`, which `make run`'s image does not carry.
-test-system: $(KERNEL_IMAGE) $(INITRAMFS_DEMO)
+test-system: kernel-config-check $(KERNEL_IMAGE) $(INITRAMFS_DEMO)
 	QEMU_MEM=$(QEMU_MEM) $(SCRIPTS)/system-test.sh --arch $(QEMU_ARCH) \
 	    --kernel $(KERNEL_IMAGE) --initrd $(INITRAMFS_DEMO)
 
@@ -409,15 +428,23 @@ soak:
 #
 # Plan §0.1's size budget: <=2 MB for a dynamic binary, <=4 MB for a static one.
 # The Rust tools packed by the initramfs are dynamic; the image also carries
-# their loader/libc. Keep a 4 MB guard here so the check catches a regression
-# without depending on which link mode a developer used.
+# their loader/libc. `tools.list` already carries a per-binary KiB budget for
+# the tools it installs, and that is the number `install-tools.sh` enforces -
+# use the same source here so the two gates cannot disagree. A binary with no
+# manifest entry (rnetd/rncli today) keeps the 4 MB guard.
 SIZE_BUDGET_STATIC := 4194304
 
 size-check: rinit
 	@fail=0; for b in $(RINIT_BIN) $(RCTL_BIN) $(PROCESSES_BIN) $(RNETD_BIN) $(RNCLI_BIN); do \
+	    name=$$(basename "$$b"); \
+	    kib=$$(awk -v name="$$name" '$$1 == name { print $$5; exit }' tools.list); \
+	    case "$$kib" in \
+	        ''|'-') budget=$(SIZE_BUDGET_STATIC) ;; \
+	        *) budget=$$((kib * 1024)) ;; \
+	    esac; \
 	    size=$$(stat -c%s "$$b"); \
-	    printf 'size-check: %-46s %8d bytes (budget %d)\n' "$$b" "$$size" $(SIZE_BUDGET_STATIC); \
-	    if [ "$$size" -gt $(SIZE_BUDGET_STATIC) ]; then \
+	    printf 'size-check: %-46s %8d bytes (budget %d)\n' "$$b" "$$size" "$$budget"; \
+	    if [ "$$size" -gt "$$budget" ]; then \
 	        echo "size-check: FAIL $$b is over the budget" >&2; fail=1; \
 	    fi; \
 	done; [ "$$fail" -eq 0 ] || exit 1; echo "size-check: OK"
@@ -442,8 +469,11 @@ parallel: $(HOST_RINIT)
 	$(SCRIPTS)/parallel-boot.sh --rinit $(HOST_RINIT) $(PARALLEL_ARGS)
 
 # --- housekeeping ---------------------------------------------------------
+# Keep the download cache: it is the expensive part of a rebuild and is the
+# reason a second `make run` does no network I/O. `distclean` removes it too.
 clean:
-	rm -rf $(BUILD_DIR) initramfs-*.cpio.gz
+	rm -rf build/out build/src build/arm32 build/logs build/soak-charts \
+	    initramfs-*.cpio.gz
 
 distclean: clean
-	rm -rf target
+	rm -rf build target

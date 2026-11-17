@@ -35,14 +35,20 @@ if [[ -s "${dest}" ]]; then
 fi
 
 mkdir -p "$(dirname "${dest}")"
-part="${dest}.part"
+# A PID suffix keeps two concurrent `make` invocations from writing the same
+# partial file; the trap removes it on every exit path.
+part="${dest}.part.$$"
+trap 'rm -f "${part}"' EXIT
 
 download() {
     local url="$1"
     if command -v curl >/dev/null 2>&1; then
-        curl -fL --retry 3 --connect-timeout 20 --progress-bar -o "${part}" "${url}"
+        # A stalled mirror must not hold the build until the job timeout. The
+        # 900 s ceiling is comfortably above a slow-but-progressing download.
+        curl -fL --retry 3 --retry-delay 2 --connect-timeout 20 --max-time 900 \
+            --progress-bar -o "${part}" "${url}"
     elif command -v wget >/dev/null 2>&1; then
-        wget -O "${part}" "${url}"
+        wget --timeout=60 --tries=3 -O "${part}" "${url}"
     else
         echo "fetch: need curl or wget" >&2
         exit 127
@@ -51,11 +57,15 @@ download() {
 
 for url in "$@"; do
     echo "fetch: trying ${url}"
+    rm -f "${part}"
     if download "${url}"; then
         mv "${part}" "${dest}"
         if ! verify; then
+            # A mirror can serve an error page with status 200. That is a bad
+            # source, not a reason to stop before trying upstream.
             rm -f "${dest}"
-            exit 1
+            echo "fetch: ${url} did not match the expected SHA-256; trying the next source" >&2
+            continue
         fi
         echo "fetch: saved ${dest} ($(du -h "${dest}" | cut -f1))"
         exit 0

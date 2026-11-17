@@ -21,6 +21,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
 use std::io::{self, Read};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use crate::error::SyscallError;
@@ -321,6 +322,7 @@ fn mount_with_mounted(
     // than for every boot that will never call it.
     let mut visible: Option<Vec<String>> = None;
     let mut mounted = Vec::new();
+    let mut seen_points = BTreeSet::new();
     for entry in entries {
         // Swap is not a mount. It is activated by `swapon -a`, which reads the
         // same /etc/fstab line; rinit must not try to mount it on `none`.
@@ -328,6 +330,16 @@ fn mount_with_mounted(
             continue;
         }
         let point = entry.mountpoint.to_string_lossy().into_owned();
+        // Two entries for one mountpoint would stack a second filesystem on the
+        // first. The mount table is captured once, so the "already mounted"
+        // check below cannot see the first mount of this same pass; the
+        // duplicate has to be skipped here.
+        if !seen_points.insert(point.clone()) {
+            warnings.push(format!(
+                "/etc/fstab: duplicate mountpoint '{point}', skipping"
+            ));
+            continue;
+        }
         let already_mounted = if let Some(ids) = &mount_ids
             && !ids.is_empty()
         {
@@ -391,8 +403,14 @@ pub fn run_with(ops: &mut impl MountOps, path: &Path) -> Result<FstabReport, Sys
     const MAX_FSTAB_BYTES: u64 = 1024 * 1024;
     // Open first and inspect the handle: a path metadata check followed by a
     // second open is a TOCTOU window, and a regular file can grow between the
-    // two. `take(MAX + 1)` bounds the read even if it does.
-    let file = match std::fs::File::open(path) {
+    // two. `take(MAX + 1)` bounds the read even if it does. `O_NONBLOCK` is
+    // what keeps a FIFO planted at /etc/fstab from blocking PID 1 in `open(2)`
+    // forever; the type check below then rejects it without reading.
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+    {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(FstabReport::default()),
         Err(e) => return Err(SyscallError::from_io("read(/etc/fstab)", &e)),
@@ -636,6 +654,27 @@ mod tests {
             ops.calls.len(),
             3,
             "and the third entry was still attempted"
+        );
+    }
+
+    /// Two entries for one mountpoint would stack a second filesystem on the
+    /// first; the second must be skipped with a warning.
+    #[test]
+    fn duplicate_mountpoints_are_mounted_once() {
+        let mut ops = Recorder::default();
+        let report = mount_with(
+            &mut ops,
+            "tmpfs /data tmpfs defaults 0 0\nproc /data proc defaults 0 0\n",
+        );
+        assert_eq!(report.mounted, ["/data"]);
+        assert_eq!(ops.calls.len(), 1, "{:?}", ops.calls);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("duplicate mountpoint")),
+            "{:?}",
+            report.warnings
         );
     }
 

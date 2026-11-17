@@ -416,12 +416,11 @@ impl Parser {
                 self.cfg.restart_sec = number(line, key, &tokens, Zero::Allowed)?;
             }
             (Section::Service, "StartLimitBurst") => {
-                const MAX_START_LIMIT_BURST: u32 = 1_000_000;
                 let value = number(line, key, &tokens, Zero::Rejected)?;
                 let value = u32::try_from(value).map_err(|_| {
                     invalid(line, key, &join_tokens(&tokens), "must fit in 32 bits")
                 })?;
-                if value > MAX_START_LIMIT_BURST {
+                if value > super::MAX_START_LIMIT_BURST {
                     return Err(invalid(
                         line,
                         key,
@@ -2221,18 +2220,25 @@ mod proptests {
 
     use super::*;
 
+    /// Arbitrary text, including newlines, so the line- and section-oriented
+    /// half of the parser is actually reached. A regex-based `".{0,n}"`
+    /// strategy never generates a newline.
+    fn multiline(max: usize) -> impl Strategy<Value = alloc::string::String> {
+        prop::collection::vec(any::<char>(), 0..max).prop_map(|chars| chars.into_iter().collect())
+    }
+
     // Any input at all must produce a result rather than a panic or a hang.
     proptest! {
         #[test]
-        fn parse_never_panics(raw in ".{0,300}") {
+        fn parse_never_panics(raw in multiline(300)) {
             let _ = parse(&UnitName::parse("app.service").unwrap(), &raw);
         }
     }
 
-    // Unicode and control characters must not break the lexer.
+    // Long Unicode and control-character inputs must not break the lexer.
     proptest! {
         #[test]
-        fn parse_never_panics_on_arbitrary_unicode(raw in ".{0,120}") {
+        fn parse_never_panics_on_long_arbitrary_input(raw in multiline(1024)) {
             let _ = parse(&UnitName::parse("app.service").unwrap(), &raw);
         }
     }
@@ -2254,7 +2260,7 @@ mod proptests {
     // need not. This pins the §1.1 invariant across random inputs.
     proptest! {
         #[test]
-        fn exec_start_invariant_holds_for_any_input(raw in ".{0,200}") {
+        fn exec_start_invariant_holds_for_any_input(raw in multiline(200)) {
             let name = UnitName::parse("app.service").unwrap();
             if let Ok(cfg) = parse(&name, &raw) {
                 prop_assert!(
@@ -2287,7 +2293,7 @@ mod proptests {
     // (UnitConfig's Eq ignores nothing, so this compares the whole struct.)
     proptest! {
         #[test]
-        fn parsing_is_deterministic(raw in ".{0,200}") {
+        fn parsing_is_deterministic(raw in multiline(200)) {
             let name = UnitName::parse("app.service").unwrap();
             let a = parse(&name, &raw);
             let b = parse(&name, &raw);

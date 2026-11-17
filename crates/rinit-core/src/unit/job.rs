@@ -81,13 +81,26 @@ impl Job {
     /// if the other request is newer. Only within one source does the newest
     /// request win.
     pub fn supersedes(&self, other: &Job) -> bool {
-        match self.source.cmp(&other.source) {
-            core::cmp::Ordering::Greater => true,
-            core::cmp::Ordering::Less => false,
-            // Same source: the later request wins, so an identical timestamp
-            // is a no-op rather than a coin flip.
-            core::cmp::Ordering::Equal => self.at > other.at,
-        }
+        supersedes(self.source, self.at, other.source, other.at)
+    }
+}
+
+/// The merge rule for one unit's target.
+///
+/// Source first, then timestamp. One function rather than a method plus a
+/// copy in `JobQueue::submit`: the two must not drift.
+fn supersedes(
+    source: RequestSource,
+    at: Millis,
+    other_source: RequestSource,
+    other_at: Millis,
+) -> bool {
+    match source.cmp(&other_source) {
+        core::cmp::Ordering::Greater => true,
+        core::cmp::Ordering::Less => false,
+        // Same source: the later request wins, so an identical timestamp
+        // is a no-op rather than a coin flip.
+        core::cmp::Ordering::Equal => at > other_at,
     }
 }
 
@@ -160,8 +173,8 @@ impl JobQueue {
         {
             Some((_, current)) => {
                 // The same ordering as `Job::supersedes`, without allocating a
-                // throwaway holder job: source first, then timestamp.
-                if source > current.source || (source == current.source && at > current.at) {
+                // throwaway holder job.
+                if supersedes(source, at, current.source, current.at) {
                     *current = MergedTarget { target, source, at };
                     true
                 } else {

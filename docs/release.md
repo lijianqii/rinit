@@ -106,7 +106,8 @@ Only after all boxes above are checked:
 ## 6. Local verification log
 
 These are development measurements, not a release candidate: the working tree
-is not committed and the 24 h soak is still running.
+was not committed when they were recorded, and the 24 h soak row below is an
+incomplete run rather than a pass.
 
 | gate | result |
 | --- | --- |

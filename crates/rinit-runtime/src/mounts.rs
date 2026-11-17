@@ -116,6 +116,14 @@ fn fatal(
             report.mounted.push(target);
             Ok(())
         }
+        // A mount that is already there is the end state this wave wanted.
+        // `EBUSY` is also what a second rinit boot on an already-populated
+        // namespace sees; treating it as fatal would reboot the board in a
+        // loop. Keep the warning so the boot log still says it happened.
+        Err(e) if e.errno() == libc::EBUSY => {
+            report.warnings.push(format!("{target} is already mounted"));
+            Ok(())
+        }
         Err(e) => Err(RuntimeError::Syscall(e)),
     }
 }
@@ -450,6 +458,28 @@ mod tests {
                 ops.calls
             );
         }
+    }
+
+    /// An already-mounted first-wave path is not a fatal error: the namespace
+    /// may have been populated by an initramfs or a previous rinit, and
+    /// rebooting in a loop over `EBUSY` helps nobody.
+    #[test]
+    fn an_already_mounted_fatal_path_is_not_fatal() {
+        let mut ops = FakeMounts::failing_at("mount_tmpfs", "/run");
+        ops.errno = libc::EBUSY;
+        let report = first_wave_mounts_with(&mut ops).expect("already mounted is survivable");
+
+        assert_eq!(
+            report.mounted,
+            ["/proc", "/sys", "/dev", "/tmp", "/sys/fs/cgroup"]
+        );
+        assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+        assert!(
+            report.warnings[0].contains("/run"),
+            "warning must name the mount: {:?}",
+            report.warnings
+        );
+        assert_eq!(ops.calls.len(), 6, "{:?}", ops.calls);
     }
 
     /// `/tmp` is the one degradable *early* mount: its failure warns, the

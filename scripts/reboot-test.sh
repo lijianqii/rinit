@@ -26,6 +26,12 @@
 set -u -o pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# The boot log's version comes from Cargo.toml, not from a copy that goes
+# stale the moment the workspace version changes.
+rinit_version="$(sed -n 's/^version = "\(.*\)"$/\1/p' "$repo_root/Cargo.toml" | head -1)"
+kernel_version="${KERNEL_VERSION:-$(sed -n 's/^KERNEL_VERSION[[:space:]]*?=[[:space:]]*//p' "$repo_root/Makefile" | head -1)}"
+[[ -n "$rinit_version" ]] || { echo "reboot-test: cannot read the rinit version from Cargo.toml" >&2; exit 2; }
+[[ -n "$kernel_version" ]] || { echo "reboot-test: cannot read KERNEL_VERSION from the Makefile" >&2; exit 2; }
 arch=aarch64
 image=""
 kernel=""
@@ -62,12 +68,12 @@ done
 case "$arch" in
     aarch64)
         default_image="$repo_root/build/out/rinit-aarch64-unknown-linux-gnu.ext4"
-        default_kernel="$repo_root/build/src/linux-6.6.158/arch/arm64/boot/Image"
+        default_kernel="$repo_root/build/src/linux-${kernel_version}/arch/arm64/boot/Image"
         qemu_bin=qemu-system-aarch64
         ;;
     arm)
         default_image="$repo_root/build/arm32/out/rinit-armv7-unknown-linux-gnueabihf.ext4"
-        default_kernel="$repo_root/build/arm32/src/linux-6.6.158/arch/arm/boot/zImage"
+        default_kernel="$repo_root/build/arm32/src/linux-${kernel_version}/arch/arm/boot/zImage"
         qemu_bin=qemu-system-arm
         ;;
     *) die "--arch must be aarch64 or arm" ;;
@@ -209,7 +215,7 @@ reboot_guest() {
         -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
         -o LogLevel=ERROR -o ConnectTimeout=5 \
         root@127.0.0.1 'kill -TERM 1' >/dev/null 2>&1 || true
-    if ! wait_log_count 'rinit 0.1.0 starting (pid 1)' "$want" 180; then
+    if ! wait_log_count "rinit ${rinit_version} starting (pid 1)" "$want" 180; then
         echo "reboot-test: boot $want did not start" >&2
         tail -40 "$log" >&2
         exit 3
@@ -285,7 +291,7 @@ if ! wait_port_free; then
     exit 3
 fi
 start_qemu || { echo "reboot-test: qemu did not restart after power loss" >&2; exit 3; }
-if ! wait_log_count 'rinit 0.1.0 starting (pid 1)' 3 180; then
+if ! wait_log_count "rinit ${rinit_version} starting (pid 1)" 3 180; then
     echo "reboot-test: guest did not boot after power loss" >&2
     tail -40 "$log" >&2
     exit 3

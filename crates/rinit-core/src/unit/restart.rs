@@ -105,7 +105,7 @@ impl BackoffState {
             // The parser rejects `StartLimitBurst=0` and values above its
             // one-million cap; a programmatic caller gets the same bounds
             // rather than an accidentally disabled or memory-unbounded breaker.
-            burst: burst.clamp(1, 1_000_000),
+            burst: burst.clamp(1, super::MAX_START_LIMIT_BURST),
             interval,
             became_active_at: None,
             jitter: Jitter::new(seed),
@@ -118,7 +118,7 @@ impl BackoffState {
     /// new base and interval.
     pub fn reconfigure(&mut self, base: Duration, burst: u32, interval: Duration) {
         self.base = base;
-        self.burst = burst.clamp(1, 1_000_000);
+        self.burst = burst.clamp(1, super::MAX_START_LIMIT_BURST);
         self.interval = interval;
         while self.window.len() > self.burst as usize {
             self.window.pop_front();
@@ -234,7 +234,9 @@ impl BackoffState {
     /// Whether the breaker is currently tripped.
     pub fn is_tripped(&self) -> bool {
         let width = as_millis(self.interval);
-        width != 0 && self.burst != 0 && self.window.len() as u32 >= self.burst
+        // `burst` is clamped to 1..=1_000_000 by the constructor, so it is
+        // never zero here.
+        width != 0 && self.window.len() as u32 >= self.burst
     }
 
     /// Forget everything; `rctl reset-failed` and a manual start both use this.

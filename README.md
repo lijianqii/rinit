@@ -20,8 +20,8 @@ commands, RSS 2,364–2,528 kB, descriptors 19–20, zero zombies and a clean fi
 sweep.
 
 What is in place, and what it is proven by. Every claim below is either a host
-test (`make check`) or a guest assertion (`make test-system`, 105 of them in
-`scripts/system-test.sh`); "proven on the host" always means the fake-runtime or
+test (`make check`) or a guest assertion (`make test-system`, whose PASS line
+reports the count it ran); "proven on the host" always means the fake-runtime or
 `--dev` form of the same code path, and the guest means the real one.
 
 | milestone | content | evidence |
@@ -375,7 +375,8 @@ redundant:
   tested;
 - **the guest system test** (`scripts/system-test.sh`, plan §4.3): boots the real
   initramfs on the selected ARCH in qemu, types at the console to prove a root shell is
-  reachable, drives `rctl` against the running system, and asserts 105 things -
+  reachable, drives `rctl` against the running system, and asserts the
+  acceptance list (its PASS line reports how many) -
   including that levels run in dependency order, that no target is ever exec'd,
   the §7.4 privilege-drop outcomes, the §7.3 limits read back out of the guest's
   own kernel, rinit's own RSS at boot and under 20 services read out of
@@ -557,14 +558,14 @@ repository or a measurement in this README:
 
 | plan §6 | where it stands |
 | ------- | --------------- |
-| boots as PID 1 in qemu (256M) with no kernel panic | `make test-system`: 115 assertions on aarch64 and armv7, including "no rinit panic" and four kernel-log checks |
+| boots as PID 1 in qemu (256M) with no kernel panic | `make test-system`: the PASS line reports the assertion count on aarch64 and armv7, including "no rinit panic" and four kernel-log checks |
 | 20 services in parallel, visibly faster than serial | **19.2x**: `make parallel` - 20 `oneshot` services that each sleep 1 s finish in 1065 ms together and 20 424 ms chained |
 | crash-restart, breaker, health checks | `make test-system` ("a crashed service is scheduled for restart", "the breaker tripped on the failing unit") and `crates/rinit/tests/m2_lifecycle.rs` |
 | `rctl` can start, stop, query and read logs | `make test-system`'s M3 block and `crates/rctl/tests/control.rs` |
 | graceful shutdown, no zombies, no fd leak | `make soak` samples descriptors, threads and zombie children through restart churn, and asserts each comes back to its baseline |
 | 72 h soak with stable RSS | **Passed on the host.** Segment 9 on `8b373d8` completed **4,320/4,320 samples** and **8,640/8,640 control commands**. RSS peak per half fell from 5,168 kB to 4,300 kB, descriptor minima were 11 and 11 (peak 22), the maximum zombie streak was 1 transient sample, and the final quiescent sweep found 0 zombies. |
 | 24 h soak in the target guest | **Passed.** `7a5df04`, aarch64 `run-disk`, guest-side sampler: **1,440/1,440 samples** and **2,880/2,880 control commands** over 86,343 s. RSS stayed within 2,364–2,528 kB (half peaks 2,520/2,528), descriptors within 19–20, no zombie was ever observed, and the final sweep returned `quiescent=0 health_fail=0`. `eth0`, the default route, `udhcpc`, dropbear, `network.service` and `sshd.service` were healthy in every sample (historical run, before `rnet`); the serial log shows one boot and no panic/OOM. Sampling runs inside the guest (`scripts/soak-qemu.sh` + `scripts/soak-guest.sh`), so a host SSH outage cannot end the run silently. |
-| binaries ≤2 MB dynamic / ≤4 MB static | [Measurements](#measurements-plan-01-calibration-point): 1.00 MiB dynamic arm64 / 1.07 MiB armv7, checked by `make size-check` |
+| binaries ≤2 MB dynamic / ≤4 MB static | [Measurements](#measurements-plan-01-calibration-point): 1.00 MiB dynamic arm64 / 1.07 MiB armv7; `make size-check` applies the per-binary budgets in `tools.list` (4 MiB otherwise) |
 | unit test coverage ≥80% overall, ≥90% in the core | **82.02%** and **97.91%** (`make coverage-check`, [above](#testing)) |
 | documentation: architecture, unit format, `rctl`, porting | this README (architecture, status, measurements), [`docs/units.md`](docs/units.md) (every directive, its value syntax and its default), [`docs/porting.md`](docs/porting.md) (kernel, userspace, build, differences from systemd), [`docs/rnet-design.md`](docs/rnet-design.md) (network manager design and task breakdown), and `rinit-开发计划.md` |
 
@@ -856,6 +857,13 @@ rinit [OPTIONS] [-- <SERVICE> [ARGS...]]
 With no `--test-service`, rinit boots the unit directory. `--test-service` (and
 the `RINIT_TEST_SERVICE` environment variable) is the bring-up escape hatch
 that bypasses it; the guest never sets it.
+
+Boot has a fixed **300 s backstop**. A unit may ask for `TimeoutStartSec=0` to
+wait forever, and a `notify` service that never sends `READY=1` would otherwise
+keep its level - and the boot - pending indefinitely. When the backstop fires,
+the pending units are failed, the boot ends, and the supervisor takes over, so
+the mutating half of `rctl` becomes available instead of answering "boot is
+still in progress" forever.
 
 `--cgroup-root` exists for a system that mounts the hierarchy somewhere else,
 and it is also the seam the host tests use: pointed at a directory of ordinary
@@ -1167,8 +1175,9 @@ byte counts as `ls -l` reports them:
 
 `rctl` is 332 576 B on aarch64 and 330 908 B on armv7; `processes` is 463 664 B
 and 461 988 B. All three are dynamic and are inside the initramfs; the loader, libc
-and libgcc are packaged alongside them. `make size-check` checks all three
-binaries of the selected ARCH with a 4 MiB guard. The musl figures are a manual build
+and libgcc are packaged alongside them. `make size-check` checks all five
+binaries of the selected ARCH: the per-binary budgets in `tools.list` where a
+row exists, and the 4 MiB guard otherwise. The musl figures are a manual build
 (`cargo build --release --target x86_64-unknown-linux-musl`), which is how that
 target came to be broken for a while without anyone noticing: `ioctl`'s request
 parameter is `unsigned long` in glibc and `int` in musl, so four call sites did
