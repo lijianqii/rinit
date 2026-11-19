@@ -1,6 +1,6 @@
 # rinit-tools: independent system tools
 
-Status: proposed, 2026-11-02.
+Status: implemented. This document remains the compatibility specification.
 
 This document defines the first expansion of rinit from a PID 1/service manager
 into a small set of **independent system tools**. It is not a BusyBox clone:
@@ -93,7 +93,7 @@ The first `replace-system` set is:
 | `umount` | `/bin/umount` | `umount.rs` | high |
 | `hostname` | `/bin/hostname` | `hostname.rs` | medium: must support `-F` |
 | `reboot` | `/sbin/reboot` | `reboot.rs` | medium: must go through PID 1 |
-| `poweroff` | `/sbin/poweroff` | `poweroff.rs` | high: rinit has no poweroff path yet |
+| `poweroff` | `/sbin/poweroff` | `poweroff.rs` | high: must go through PID 1's ordered shutdown path |
 | `sysctl` | `/sbin/sysctl` | `sysctl.rs` | medium |
 | `ps` | `/bin/ps` | `ps.rs` | medium |
 | `free` | `/usr/bin/free` | `free.rs` | low |
@@ -177,19 +177,21 @@ Still out of scope:
 Tools with no BusyBox conflict keep a `rinit-` prefix. `rinit-check` is the
 first of these; `rinit-logs`, `rinit-notify` and `rinit-watchdog` can follow.
 
-## 5. Prerequisite: a real poweroff path
+## 5. Poweroff path
 
-The current rinit shutdown path is:
+The implemented shutdown path is:
 
 ```text
 SIGTERM / SIGINT / SIGPWR -> shutdown services -> reboot()
+rctl reboot               -> shutdown services -> RB_AUTOBOOT
+rctl poweroff             -> shutdown services -> RB_POWER_OFF
 ```
 
-There is no poweroff action. `/sbin/poweroff` must not call `reboot(2)` behind
-rinit's back: that would skip service shutdown, log flushing, watchdog disarming
-and the rest of the ordered shutdown.
+`/sbin/poweroff` and `/sbin/reboot` request these operations through the control
+socket. They do not call `reboot(2)` directly, which would skip service shutdown,
+log flushing, watchdog handling and the rest of the ordered shutdown.
 
-Before implementing `/sbin/poweroff`, add a control command pair:
+The control protocol carries the command pair:
 
 ```text
 rctl reboot    -> stop services, then RB_AUTOBOOT
@@ -574,7 +576,7 @@ exclude real-board validation.
 | risk | mitigation |
 | --- | --- |
 | `mount` compatibility | A/B against BusyBox, explicit option subset, keep `busybox mount` fallback |
-| no poweroff path today | add `rctl poweroff` and protocol tests first |
+| poweroff bypasses PID 1 | `rctl poweroff` plus protocol and guest reboot tests |
 | `hostname -F` regression | first-version requirement, guest assertion |
 | removing BusyBox links breaks scripts | run the full 105 guest assertions; keep the `coexist` profile for rollback |
 | glibc/loader mismatch | same cross toolchain, readelf/ldd gate, image-only rootfs test |

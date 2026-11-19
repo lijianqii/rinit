@@ -32,6 +32,19 @@ i=1
 control_ok=0
 control_fail=0
 health_fail=0
+sample_fail=0
+
+# Count procfs descriptors with shell expansion. A directory lister can fail the
+# whole listing when one live entry disappears between readdir and stat; the
+# expansion records the names as the shell observes them and needs no second
+# lookup. The literal first argument means the glob matched nothing.
+fd_count() {
+    set -- /proc/1/fd/*
+    case "$1" in
+        '/proc/1/fd/*') printf '0\n' ;;
+        *) printf '%s\n' "$#" ;;
+    esac
+}
 
 sample_zombies() {
     z=0
@@ -44,7 +57,13 @@ sample_zombies() {
 
 while [ "$i" -le "$count" ]; do
     rss=$(awk '/VmRSS:/{print $2}' /proc/1/status 2>/dev/null)
-    fds=$(ls /proc/1/fd 2>/dev/null | wc -l | tr -d ' ')
+    fds=$(fd_count)
+    case "$fds" in
+        '' | *[!0-9]* | 0)
+            sample_fail=$((sample_fail + 1))
+            fds=""
+            ;;
+    esac
     threads=$(awk '/Threads:/{print $2}' /proc/1/status 2>/dev/null)
     zombies=$(sample_zombies)
 
@@ -88,8 +107,9 @@ while [ "$i" -le "$count" ]; do
         "$device_target" "${disk_free_kb:-}" "${mem_available_kb:-}" \
         "$swap_used_kb" "${load1:-}" "$feature_active" >>"$out"
     printf 'SOAK elapsed=%s rss=%s fds=%s threads=%s zombies=%s control=%s/%s network=%s sshd=%s disk_free=%s feature=%s\n' \
-        "$elapsed" "$rss" "$fds" "$threads" "$zombies" "$ctl_ok" "$((ctl_ok + ctl_fail))" \
-        "$network" "$sshd" "${disk_free_kb:-}" "$feature_active" >"$console"
+        "$elapsed" "$rss" "${fds:-ERR}" "$threads" "$zombies" \
+        "$ctl_ok" "$((ctl_ok + ctl_fail))" "$network" "$sshd" \
+        "${disk_free_kb:-}" "$feature_active" >"$console"
 
     i=$((i + 1))
     if [ "$i" -le "$count" ]; then
@@ -109,12 +129,13 @@ rctl status --plain sshd.service >/dev/null 2>&1 || health_fail=$((health_fail +
 rctl status --plain mdev.service >/dev/null 2>&1 || health_fail=$((health_fail + 1))
 
 sync
-if [ "$control_fail" -eq 0 ] && [ "$quiescent" -eq 0 ] && [ "$health_fail" -eq 0 ]; then
+if [ "$control_fail" -eq 0 ] && [ "$quiescent" -eq 0 ] &&
+    [ "$health_fail" -eq 0 ] && [ "$sample_fail" -eq 0 ]; then
     result=OK
 else
     result=FAIL
 fi
-summary="SOAK_DONE status=$result samples=$count control_ok=$control_ok control_fail=$control_fail quiescent=$quiescent health_fail=$health_fail"
+summary="SOAK_DONE status=$result samples=$count control_ok=$control_ok control_fail=$control_fail quiescent=$quiescent health_fail=$health_fail sample_fail=$sample_fail"
 printf '%s\n' "$summary" >"$status"
 printf '%s\n' "$summary" >"$console"
 [ "$result" = "OK" ] && exit 0

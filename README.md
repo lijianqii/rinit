@@ -574,6 +574,13 @@ reboot and packaging checks - is [`docs/release.md`](docs/release.md). A skipped
 gate is not a pass. The 24 h row above was measured before `rnet`; the current
 gate reruns it with `rnetd`.
 
+The completed `release-24h` run on `a62642a` produced 8,640 samples and passed
+the runtime health checks, but its post-run analysis found 21 invalid FD
+samples. Those came from the replacement `ls` failing when a procfs descriptor
+disappeared during directory listing. The tool and sampler are fixed, and the
+soak driver now runs the analyzer itself; a fresh 24 h run is still required
+before that gate can be checked.
+
 One number the checklist does not ask for, but plan §0.1's design goals do: rinit's
 RSS, measured *in the guest* out of `/proc/1/status` rather than on the host -
 **2 704 kB idle** and **3 216 kB with 20 services running**, with a 3 MB boot
@@ -1169,15 +1176,16 @@ byte counts as `ls -l` reports them:
 
 | target                               | binary              | size                    | in an image |
 | ------------------------------------ | ------------------- | ----------------------- | ----------- |
-| `aarch64-unknown-linux-gnu` (dynamic) | `rinit`             | 1.00 MiB (1 053 752 B) | yes        |
-| `armv7-unknown-linux-gnueabihf` (dynamic) | `rinit`         | 1.07 MiB (1 117 540 B) | yes        |
-| `x86_64-unknown-linux-musl` (static) | `rinit`             | 1.05 MiB (1 098 688 B)  | yes         |
+| `aarch64-unknown-linux-gnu` (dynamic) | `rinit`             | 1.07 MiB (1 119 304 B) | yes        |
+| `armv7-unknown-linux-gnueabihf` (dynamic) | `rinit`         | 1.13 MiB (1 183 092 B) | yes        |
+| `x86_64-unknown-linux-musl` (static) | `rinit`             | 1.05 MiB (1 098 688 B, last recorded) | yes |
 
-`rctl` is 332 576 B on aarch64 and 330 908 B on armv7; `processes` is 463 664 B
-and 461 988 B. All three are dynamic and are inside the initramfs; the loader, libc
+`rctl` is 332 584 B on aarch64 and 330 908 B on armv7; `processes` is 463 672 B
+and 461 988 B. `rnetd` is 529 216/593 056 B and `rncli` is 398 144/461 984 B on
+aarch64/armv7. All five are dynamic and are inside the initramfs; the loader, libc
 and libgcc are packaged alongside them. `make size-check` checks all five
 binaries of the selected ARCH: the per-binary budgets in `tools.list` where a
-row exists, and the 4 MiB guard otherwise. The musl figures are a manual build
+row exists, and the 2 MiB dynamic guard otherwise. The musl figures are a manual build
 (`cargo build --release --target x86_64-unknown-linux-musl`), which is how that
 target came to be broken for a while without anyone noticing: `ioctl`'s request
 parameter is `unsigned long` in glibc and `int` in musl, so four call sites did
@@ -1214,6 +1222,11 @@ Plan §0.1's memory column is measured in the guest, out of `/proc/1/status`, by
 reads higher - about 5 MB - because it is an unoptimised `--dev` build of the
 same code.
 
+## License
+
+Licensed under either of Apache License, Version 2.0 or MIT license, at your
+option. See [`LICENSE-APACHE`](LICENSE-APACHE) and [`LICENSE-MIT`](LICENSE-MIT).
+
 ## Next
 
 The plan's extension list is complete - §7.7's templates, §7.8's socket
@@ -1229,8 +1242,10 @@ was the plan's original boundary - both are in the extension list (§7.9, §7.7)
 and both are implemented. The table records where the project started, not where
 it ended; this README records the latter.
 
-What is left is not a feature: both the 72 h host soak and the 24 h target-guest
-soak are closed. CI covers the coverage/size gates, the 60 s host soak, the
+The earlier 72 h host and 24 h target-guest soaks passed, but they predate the
+current sampler, analyzer and tool fixes. A fresh 24 h guest run and a completed
+72 h host run are required for the next release candidate. CI covers the
+coverage/size gates, the 60 s host soak, the
 initramfs system test, the device-image boot and now the reboot/power-loss
 recovery test. The plan's §0.1 boot and idle-memory targets remain above the
 recorded measurements (`3 520 ms` to first service, `395 ms` of it rinit;

@@ -151,6 +151,7 @@ check 'swapoff and swapon handle one device' "ssh_guest 'swapoff /swapfile && ! 
 check 'swapoff -a and swapon -a round trip' "ssh_guest 'swapoff -a && ! grep -q /swapfile /proc/swaps && swapon -a && grep -q /swapfile /proc/swaps'"
 
 check 'ls lists a file' "ssh_guest 'ls /etc/hostname' | grep -q hostname"
+check 'ls survives a live fd directory' "ssh_guest 'sh -c \"while :; do exec 3</dev/null; exec 3<&-; done\" & p=\$!; i=0; fail=0; while [ \$i -lt 200 ]; do ls /proc/\$p/fd >/dev/null 2>&1 || fail=1; i=\$((i+1)); done; kill \$p 2>/dev/null; wait \$p 2>/dev/null; test \$fail -eq 0'"
 check 'cat reads a file' "ssh_guest 'cat /etc/hostname' | grep -q rinit"
 check 'cp copies a file' "ssh_guest 'cp /etc/hostname /tmp/tool-cp && cmp -s /etc/hostname /tmp/tool-cp'"
 check 'mv moves a file' "ssh_guest 'mv /tmp/tool-cp /tmp/tool-mv && test -f /tmp/tool-mv && ! test -e /tmp/tool-cp'"

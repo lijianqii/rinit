@@ -1054,4 +1054,34 @@ mod tests {
         assert_eq!(yes_no(true), "yes");
         assert_eq!(yes_no(false), "no");
     }
+
+    #[test]
+    fn a_failed_reload_keeps_the_previous_configuration() {
+        let root = std::env::temp_dir().join(format!("rnet-runtime-reload-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("temp");
+        let config_path = root.join("config");
+        std::fs::write(
+            &config_path,
+            "[global]\nmanage-loopback = no\n\n[interface eth0]\ntype = ethernet\naddress = 192.0.2.10/24\n",
+        )
+        .expect("initial config");
+        let initial = crate::config::load_effective(&config_path).expect("initial config");
+        let mut daemon = Daemon::new(
+            config_path.clone(),
+            root.join("control.sock"),
+            root.join("state"),
+            root.join("leases"),
+            root.join("resolv.conf"),
+            initial.clone(),
+        )
+        .expect("daemon");
+
+        std::fs::write(&config_path, "[interface eth0]\nunknown = value\n")
+            .expect("invalid config");
+        let response = daemon.reload();
+        assert!(!response.ok, "{response:?}");
+        assert_eq!(daemon.config, initial, "a rejected reload must be atomic");
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

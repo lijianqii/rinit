@@ -398,6 +398,7 @@ check:
 	cargo fmt --all --check
 	cargo clippy --offline --all-targets -- -D warnings
 	cargo test --offline --workspace
+	$(SCRIPTS)/soak-analyze-test.sh
 
 # `test` = `check` plus the qemu system test, which needs the target
 # artifacts.
@@ -431,16 +432,17 @@ soak:
 # The Rust tools packed by the initramfs are dynamic; the image also carries
 # their loader/libc. `tools.list` already carries a per-binary KiB budget for
 # the tools it installs, and that is the number `install-tools.sh` enforces -
-# use the same source here so the two gates cannot disagree. A binary with no
-# manifest entry (rnetd/rncli today) keeps the 4 MB guard.
-SIZE_BUDGET_STATIC := 4194304
+# use the same source here so the two gates cannot disagree. Every unchecked
+# binary on these targets is dynamic (rnetd/rncli today), so the fallback is the
+# plan's 2 MiB dynamic budget rather than the 4 MiB static allowance.
+SIZE_BUDGET_DYNAMIC := 2097152
 
 size-check: rinit
 	@fail=0; for b in $(RINIT_BIN) $(RCTL_BIN) $(PROCESSES_BIN) $(RNETD_BIN) $(RNCLI_BIN); do \
 	    name=$$(basename "$$b"); \
 	    kib=$$(awk -v name="$$name" '$$1 == name { print $$5; exit }' tools.list); \
 	    case "$$kib" in \
-	        ''|'-') budget=$(SIZE_BUDGET_STATIC) ;; \
+	        ''|'-') budget=$(SIZE_BUDGET_DYNAMIC) ;; \
 	        *) budget=$$((kib * 1024)) ;; \
 	    esac; \
 	    size=$$(stat -c%s "$$b"); \

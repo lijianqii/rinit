@@ -524,4 +524,44 @@ mod tests {
         packet[HEADER_LEN] = 0;
         assert!(Packet::decode(&packet).is_err());
     }
+
+    #[test]
+    fn malformed_known_options_are_rejected() {
+        fn with_options(options: &[u8]) -> Vec<u8> {
+            let mut packet = vec![0u8; HEADER_LEN];
+            packet[2] = 6;
+            packet.extend_from_slice(&MAGIC_COOKIE);
+            packet.extend_from_slice(options);
+            packet
+        }
+
+        let cases = [
+            (&[53u8][..], "option length is missing"),
+            (&[53, 1][..], "option value is truncated"),
+            (&[3, 5, 192, 0, 2, 1, 0][..], "list of IPv4 addresses"),
+            (&[26, 1, 0][..], "MTU option has the wrong length"),
+            (
+                &[121, 3, 24, 10, 0][..],
+                "classless route option is malformed",
+            ),
+        ];
+        for (options, expected) in cases {
+            let error = Packet::decode(&with_options(options)).expect_err("malformed option");
+            assert!(error.to_string().contains(expected), "{options:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn an_oversized_hardware_address_is_rejected() {
+        let mut packet = Packet::client(
+            MessageType::Discover,
+            1,
+            [2, 0, 0, 0, 0, 1],
+            Ipv4Addr::UNSPECIFIED,
+        )
+        .encode();
+        packet[2] = 17;
+        let error = Packet::decode(&packet).expect_err("hardware address length");
+        assert!(error.to_string().contains("exceeds 16"), "{error}");
+    }
 }

@@ -975,13 +975,15 @@ PID   PPID  USER  STAT  VSZ    RSS   %CPU  TIME+  COMMAND
 
 | 目标                                 | 二进制              | 大小                    | 在镜像里 |
 | ------------------------------------ | ------------------- | ----------------------- | ----------- |
-| `aarch64-unknown-linux-gnu`（动态）  | `rinit`             | 1.00 MiB (1 053 752 B) | 是        |
-| `armv7-unknown-linux-gnueabihf`（动态） | `rinit`          | 1.07 MiB (1 117 540 B) | 是        |
-| `x86_64-unknown-linux-musl`（静态）  | `rinit`             | 1.05 MiB (1 098 688 B)  | 是         |
+| `aarch64-unknown-linux-gnu`（动态）  | `rinit`             | 1.07 MiB (1 119 304 B) | 是        |
+| `armv7-unknown-linux-gnueabihf`（动态） | `rinit`          | 1.13 MiB (1 183 092 B) | 是        |
+| `x86_64-unknown-linux-musl`（静态）  | `rinit`             | 1.05 MiB (1 098 688 B，最后一次记录) | 是 |
 
-`rctl` 在 aarch64/armv7 上分别是 332 576/330 908 B，`processes` 分别是
-463 664/461 988 B；三者都是动态链接并随 initramfs 发布，loader、libc 和 libgcc
-一起打包。`make size-check` 用 4 MiB 上限检查所选 ARCH 的三个二进制。
+`rctl` 在 aarch64/armv7 上分别是 332 584/330 908 B，`processes` 分别是
+463 672/461 988 B；`rnetd` 是 529 216/593 056 B，`rncli` 是
+398 144/461 984 B。五者都是动态链接并随 initramfs 发布，loader、libc 和 libgcc
+一起打包。`make size-check` 检查所选 ARCH 的五个二进制，并应用 `tools.list`
+中的逐项预算；没有逐项预算的动态二进制使用 2 MiB 上限。
 musl 的数字来自手工构建（`cargo build --release --target
 x86_64-unknown-linux-musl`），这也解释了那个目标为什么坏了一段时间却没人发现：
 `ioctl` 的请求参数在 glibc 里是 `unsigned long`、在 musl 里是 `int`，所以四个调用点
@@ -1021,8 +1023,14 @@ busybox 自己的构建不是字节级可复现的，镜像会随之变动几个
 单元标为 ❌"不做"，那是计划最初的边界——两者都在扩展清单里（§7.9、§7.7）且都已
 实现。那张表记录的是项目从哪里出发，而不是到哪里结束；后者记录在本 README 里。
 
-剩下的不是功能：72 小时宿主 soak 与 24 小时目标客户机 soak 都已闭环。CI 已覆盖
-覆盖/体积门禁、60 秒宿主 soak、initramfs 系统测试、设备镜像启动，以及新增的重启/
+早期的 72 小时宿主 soak 与 24 小时目标客户机 soak 已通过，但它们早于当前这轮
+采样器、分析器和工具修复。下一个发布候选仍需要新的 24 小时客户机运行与完整的
+72 小时宿主运行。CI 已覆盖覆盖/体积门禁、60 秒宿主 soak、initramfs 系统测试、设备镜像启动，以及新增的重启/
 断电恢复测试。计划 §0.1 的启动和空闲内存目标仍高于实测值（首个服务 `3 520 ms`，
 其中 rinit 自身 `395 ms`；空闲 `2 704 kB`），但差距主要来自内核/运行时结构，没有
 找到安全的局部优化手段，因此按刻意偏离接受并记录。
+
+## 许可证
+
+本项目按 Apache License 2.0 或 MIT 许可证双许可发布，使用者可任选其一。
+完整文本见 [`LICENSE-APACHE`](LICENSE-APACHE) 和 [`LICENSE-MIT`](LICENSE-MIT)。

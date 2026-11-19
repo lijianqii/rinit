@@ -1,7 +1,9 @@
 # rnet: network manager and rncli
 
-Status: implemented through P4 (2026-11-12); P5 release gates are tracked in
-[`docs/release.md`](release.md). The 24 h soak was stopped at 34,834 s (`rnet-24h-d`) before the 86,400 s gate; it has not completed.
+Status: implemented through P4; P5 release gates are tracked in
+[`docs/release.md`](release.md). The `a62642a` 24 h runner completed, but its
+post-run analyzer rejected invalid FD samples produced by the old sampler. The
+sampler and tool are fixed and a fresh 24 h gate run is required.
 
 This document is the design and task breakdown for `rnet`, a network manager
 for rinit systems, and `rncli`, its control CLI. It records the decisions
@@ -102,9 +104,11 @@ crates/rnet/
 ```
 
 `rnet` depends on `libc` only. It does not depend on `tokio`, `serde`, `toml`,
-`rtnetlink` or `rinit-core`. The `unsafe` code is confined to `src/netlink/` and
-the DHCP socket setup, and is audited like
-the `rinit-runtime` syscall layer.
+`rtnetlink` or `rinit-core`. Most `unsafe` code is in `src/netlink/` and the
+DHCP socket setup; small process-level boundaries in `src/lib.rs` and
+`src/runtime.rs` restore SIGPIPE, poll descriptors, create signalfd and change
+the control-socket owner. All of these boundaries are documented and audited
+like the `rinit-runtime` syscall layer.
 
 ## 4. Configuration
 
@@ -718,6 +722,7 @@ A release candidate is ready only when:
 - **P4:** runtime `iface`/`addr`/`route`/`bridge`/`dhcp` commands and
   `rncli --persist` drop-ins are implemented.
 - **P5:** `make check` and both architecture system tests pass, including the
-  rnet runtime, bridge and persistence assertions. The 24 h soak was stopped at 34,834 s; `tools-test`, `install-tools-test`,
-  coverage and the other release measurements have passed locally. See
+  rnet runtime, bridge and persistence assertions. The `a62642a` 24 h runner
+  completed, but the post-run analyzer rejected invalid FD samples from the old
+  sampler. The sampler and tool are fixed; a fresh 24 h run is required. See
   `docs/release.md`.

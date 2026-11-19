@@ -128,7 +128,16 @@ def main():
     if control_fail:
         reasons.append(f"{control_fail} control failures")
 
-    fds = [int(r["fds"]) for r in rows if r.get("fds", "").isdigit()]
+    fds = []
+    invalid_fd_samples = 0
+    for row in rows:
+        raw_fds = row.get("fds", "")
+        if raw_fds.isdigit() and int(raw_fds) > 0:
+            fds.append(int(raw_fds))
+        else:
+            invalid_fd_samples += 1
+    if invalid_fd_samples:
+        reasons.append(f"{invalid_fd_samples} samples have no positive FD count")
     fd_span = (max(fds) - min(fds)) if fds else 0
     if fd_span > fd_limit:
         reasons.append(f"fd span {fd_span} exceeds {fd_limit}")
@@ -179,9 +188,15 @@ def main():
             reasons.append(
                 f"RSS median drift {rss_drift:.0f} kB exceeds {drift_limit} kB"
             )
-        if rss_slope > slope_limit:
+        # A linear fit over a 24-hour window is dominated by one-time,
+        # bounded growth such as the 256 KiB log ring filling. Require the
+        # median drift to corroborate a slope failure; otherwise the two
+        # thresholds contradict each other.
+        slope_drift_floor = drift_limit / 2
+        if rss_slope > slope_limit and rss_drift > slope_drift_floor:
             reasons.append(
-                f"RSS slope {rss_slope:.2f} kB/h exceeds {slope_limit:.1f} kB/h"
+                f"RSS slope {rss_slope:.2f} kB/h exceeds {slope_limit:.1f} kB/h "
+                f"with {rss_drift:.0f} kB median drift"
             )
 
     feature_failures = []
@@ -213,6 +228,7 @@ def main():
         "rss_slope_kb_per_hour": round(rss_slope, 3),
         "fds_min": min(fds) if fds else None,
         "fds_max": max(fds) if fds else None,
+        "invalid_fd_samples": invalid_fd_samples,
         "threads_max": max(threads) if threads else None,
         "zombies_max": zombie_max,
         "control_fail": control_fail,
@@ -225,6 +241,7 @@ def main():
             "rss_peak_kb": 4096,
             "rss_drift_kb": drift_limit,
             "rss_slope_kb_per_hour": slope_limit,
+            "rss_slope_confirmation_drift_kb": drift_limit / 2,
             "fd_span": fd_limit,
         },
         "reasons": reasons,

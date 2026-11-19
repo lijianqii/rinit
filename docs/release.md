@@ -24,6 +24,7 @@ make ARCH=arm32 size-check
 Required:
 
 - [ ] `make check` reports `0 failed`.
+- [ ] `scripts/soak-analyze-test.sh` reports `OK` as part of `make check`.
 - [ ] Overall coverage is at least 80% and `rinit-core` at least 90%.
 - [ ] Both `size-check` runs report `OK`, including `rnetd` and `rncli`.
 
@@ -73,6 +74,8 @@ scripts/reboot-test.sh --arch aarch64 \
 Required:
 
 - [ ] The 24 h soak prints `SOAK OK`.
+- [ ] `soak-qemu.sh` reports `Analyzer: OK`; its JSON is saved as
+  `build/soak-charts/soak-qemu-<tag>-analysis.json`.
 - [ ] The final guest CSV has at least `seconds / interval` data rows.
 - [ ] The serial log contains exactly one `Booting Linux` line; the harness
   fails early with `reason=guest-reboot` if the guest resets.
@@ -112,16 +115,18 @@ incomplete run rather than a pass.
 | gate | result |
 | --- | --- |
 | `make check` | pass (0 failed) |
-| `make coverage-check` | pass: overall **82.02%**, `rinit-core` **97.91%** |
-| `make ARCH=arm64 size-check` | pass: `rnetd` 529,208 B, `rncli` 398,136 B |
+| `make coverage-check` | not rerun in this working tree; `cargo-llvm-cov` is not installed. Previous recorded result: overall **82.02%**, `rinit-core` **97.91%** |
+| `make ARCH=arm64 size-check` | pass: `rnetd` 529,216 B, `rncli` 398,144 B |
 | `make ARCH=arm32 size-check` | pass: `rnetd` 593,056 B, `rncli` 461,984 B |
 | aarch64 `test-system` | pass: 115 assertions, including rnet socket ownership, config, runtime address/route, bridge, persistence and hotplug |
 | armv7 `test-system` | pass: 115 assertions, same rnet checks |
-| aarch64 `tools-test` | `TOOLS OK`, 101 checks |
-| armv7 `tools-test` | `TOOLS OK`, 101 checks |
+| aarch64 `tools-test` | `TOOLS OK`, 102 checks, including live-FD `ls` regression |
+| armv7 `tools-test` | `TOOLS OK`, 102 checks, including live-FD `ls` regression |
 | `install-tools-test` | 17 passed, 0 failed |
-| aarch64 `device-smoke` | `DEVICE SMOKE OK`, 24 checks |
-| armv7 `device-smoke` | `DEVICE SMOKE OK`, 24 checks |
-| `reboot-test` | `REBOOT OK`, 24 checks |
-| 120 s soak | `SOAK OK`, 12 samples, health_fail=0 |
-| 24 h soak (`rnet-24h-d`) | **stopped at 34,834 s / 3,484 samples**; 9/9 hourly checkpoints `ok`; RSS 2,672–2,896 kB, fds ≤22, zombies 0; one boot; no final `SOAK OK` and no 8,640-row CSV, so not a pass |
+| aarch64 `device-smoke` | not rerun in this working tree; historical pass |
+| armv7 `device-smoke` | not rerun in this working tree; historical pass |
+| `reboot-test` | not rerun in this working tree; historical pass |
+| 60 s host soak | `SOAK OK`, 60 samples, 469 churns, 120/120 control commands |
+| 120 s guest soak | `SOAK OK` and `Analyzer: OK`, 12 samples, FD 20 throughout, `sample_fail=0` |
+| 24 h soak (`release-24h`, `a62642a`) | Runner reported `SOAK OK`: 8,640 samples, 17,280/17,280 control commands, 24 hourly checkpoints `ok`, RSS 2,736–3,028 kB, zero zombies. The original analyzer rejected 21 zero-FD samples caused by the replacement `ls`; the tool and sampler are now fixed, but a fresh 24 h run is required before this gate can pass |
+| 72 h host soak | in progress during this working-tree verification |

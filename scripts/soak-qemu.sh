@@ -148,6 +148,8 @@ ssh_guest() {
 {
     printf 'started  %s\n' "$(date '+%F %T %Z')"
     printf 'commit   %s\n' "$(git -C "$repo_root" rev-parse HEAD)"
+    dirty="$(git -C "$repo_root" status --porcelain 2>/dev/null | head -5 | tr '\n' ';' || true)"
+    printf 'dirty    %s\n' "${dirty:-clean}"
     printf 'arch     %s\n' "$arch"
     printf 'image    %s\n' "$(sha256sum "$disk" | cut -d' ' -f1)"
     printf 'kernel   %s\n' "$(sha256sum "$kernel" | cut -d' ' -f1)"
@@ -362,8 +364,29 @@ else
     echo 'CSV final: incomplete or unavailable'
 fi
 
+analysis_ok=0
+analysis_json="$log_dir/soak-qemu-${tag}-analysis.json"
+rm -f "$analysis_json"
+analyzer=(python3 "$repo_root/scripts/soak-analyze.py" \
+    --dir "$log_dir" --tag "$tag")
+if [[ -n "$feature_suite" ]]; then
+    analyzer+=(--require-feature)
+fi
+if ! command -v python3 >/dev/null 2>&1; then
+    echo 'Analyzer: unavailable (python3 not found)' >&2
+elif "${analyzer[@]}" >"$analysis_json"; then
+    analysis_ok=1
+    echo 'Analyzer: OK'
+else
+    echo 'Analyzer: FAIL' >&2
+fi
+if [[ -s "$analysis_json" ]]; then
+    cat "$analysis_json"
+fi
+
 result=FAIL
-if [[ "$serial_status" == *'status=OK'* ]] && ((ssh_final)) && ((csv_ok)) && ((feature_ok)); then
+if [[ "$serial_status" == *'status=OK'* ]] && ((ssh_final)) && ((csv_ok)) &&
+    ((feature_ok)) && ((analysis_ok)); then
     result=OK
 fi
 if ((guest_rebooted)); then

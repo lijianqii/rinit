@@ -130,25 +130,49 @@ fn format_entry(path: &Path, name: &OsStr, meta: &fs::Metadata, options: Options
     line
 }
 
-fn format_dir(path: &Path, options: Options) -> io::Result<Vec<u8>> {
+fn collect_entries<F>(
+    path: &Path,
+    options: Options,
+    mut metadata: F,
+) -> io::Result<Vec<(OsString, fs::Metadata)>>
+where
+    F: for<'a> FnMut(&'a Path) -> io::Result<fs::Metadata>,
+{
     let mut entries: Vec<(OsString, fs::Metadata)> = Vec::new();
     if options.all {
-        entries.push((".".into(), fs::symlink_metadata(path)?));
+        entries.push((".".into(), metadata(path)?));
         // `Path::parent(".")` and `parent("foo")` are both `Some("")`; joining
         // `..` works for both and avoids statting the empty path.
-        entries.push(("..".into(), fs::symlink_metadata(path.join(".."))?));
+        entries.push(("..".into(), metadata(&path.join(".."))?));
     }
     for entry in fs::read_dir(path)? {
-        let entry = entry?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
         let name = entry.file_name();
         let hidden = name.as_bytes().first() == Some(&b'.');
         if hidden && !options.all && !options.almost_all {
             continue;
         }
-        let meta = fs::symlink_metadata(entry.path())?;
+        // procfs and other live directories can lose an entry between readdir
+        // and stat. The entry is already gone, so skip it and keep the rest of
+        // the listing instead of turning a successful directory read into an
+        // empty failed command.
+        let meta = match metadata(&entry.path()) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
         entries.push((name, meta));
     }
     entries.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(entries)
+}
+
+fn format_dir(path: &Path, options: Options) -> io::Result<Vec<u8>> {
+    let entries = collect_entries(path, options, |entry| fs::symlink_metadata(entry))?;
     let mut out = Vec::new();
     for (name, meta) in entries {
         out.extend(format_entry(&path.join(&name), &name, &meta, options));
@@ -376,6 +400,38 @@ mod tests {
         );
         assert!(all.contains(".hidden"));
         assert!(all.contains("..\n"));
+    }
+
+    #[test]
+    fn entries_that_vanish_during_a_directory_read_are_skipped() {
+        let root = temp_root("vanish");
+        fs::write(root.join("stable"), b"x").expect("stable");
+        fs::write(root.join("vanish"), b"x").expect("vanish");
+
+        let entries = collect_entries(&root, Options::default(), |path| {
+            if path.file_name() == Some(OsStr::new("vanish")) {
+                Err(io::Error::from(io::ErrorKind::NotFound))
+            } else {
+                fs::symlink_metadata(path)
+            }
+        })
+        .expect("a vanished entry must not fail the directory");
+
+        let names: Vec<_> = entries.iter().map(|(name, _)| name.as_os_str()).collect();
+        assert_eq!(names, [OsStr::new("stable")]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn non_vanishing_metadata_errors_still_fail_the_directory() {
+        let root = temp_root("metadata-error");
+        fs::write(root.join("file"), b"x").expect("file");
+        let error = collect_entries(&root, Options::default(), |_| {
+            Err(io::Error::from(io::ErrorKind::PermissionDenied))
+        })
+        .expect_err("a permission error must remain visible");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        let _ = fs::remove_dir_all(root);
     }
 
     /// `ls -a` without a path uses `"."`, whose `Path::parent()` is the empty
