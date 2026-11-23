@@ -9,8 +9,14 @@
   - `scripts/soak-analyze.py --tag release-24h` 判 **FAIL**，理由两条：`fd span 22 exceeds 2`、`RSS slope 3.32 kB/h exceeds 1.0 kB/h`。
   - 【事实】`fd span` 这条是采集工具缺陷：`scripts/soak-guest.sh` 用 `ls /proc/1/fd | wc -l` 统计 fd，而镜像里 `/bin/ls` 是 rinit-tools 实现（`tools.list` profile=replace-system）。`crates/rinit-tools/src/bin/ls.rs` 的 `format_dir` 用 `fs::read_dir(path)?` / `entry?` / `fs::symlink_metadata(entry.path())?`，目录项在读取过程中消失时整个命令以 1 退出且不打印任何行。实测 400 次对不断增删的目录执行：rinit-tools ls 有 248 次输出 0 行，coreutils ls 0 次。24h CSV 中 21 个 `fds=0` 样本（0.24%）即由此产生，剔除后 fd 跨度为 2（20..22），与线程、控制面计数一致（这些样本的 threads/control 均正常，说明 rinit 本身健康）。
   - 24h guest 的 `disk_free` 单调下降约 -708 kB / 22 h，属日志持久化文件的正常增长（`DEFAULT_LOG_FILE_MAX_BYTES` = 1 MiB，truncate 策略），未触及下限 8192 kB（最低 17944 kB）。
-  - 72h host soak 仍在运行（PID 349721/349728/349765，进程自 11-17 19:30 起未重启）。截至 2026-11-19 20:57 已运行约 49.5 h、178030 个样本；RSS 4244 kB、fds 11、threads 1、zombies 0 的最新样本正常。
   - 72h 通过标准以 `scripts/soak.sh` 内断言为准（半窗 RSS 峰值差 ≤ 1024 kB、半窗 fd 谷值差 ≤ 2、quiescent zombie = 0、样本数 ≥ 95%、control 无失败、churn restarts ≥ 10、SIGTERM 退出码 0）。
+  - 72h host soak 已结束（2026-11-17 19:30 起，72 h，259,200 样本）：采样完整，但判决步骤崩溃——`make: *** [Makefile:421: soak] Error 141`，无 `SOAK OK`/`SOAK FAILED` 输出。
+  - 【事实】Error 141 = SIGPIPE：`scripts/soak.sh` 用 `steady="$(awk ...)"` 取 3.1 MB 稳态窗口后，以 `first_half="$(echo "$steady" | head -n "$half")"` 切半。`echo` 写入整个窗口、`head` 取到行数即退出，`echo` 收到 SIGPIPE；`set -o pipefail` 把 141 变成脚本退出码。复现：20,000 行即触发（exit=141），1,000/5,000 行不触发（管道缓冲约 12 KB）。该写法自 `248c20f` 起存在，短程 soak 从未暴露。
+  - 【事实】用保存的 `/tmp/rinit-soak-H8J7Jq/curve.txt` 手工复算 72h 全部判据，全部通过：RSS 半窗峰值 5816 → 4252 kB（delta −1564，限 +1024）、fd 半窗谷值 11 → 11（限 +2，峰值 13）、zombie 峰值 1 / 最长连续 1（quiescent 扫描为权威，未能执行）、churn restarts 2,022,317（限 ≥10）、`control-errors.log` 0 字节（0 失败）、样本 259,195/259,200（≥95%）。threads 只出现 1 和 2。rinit 进程全程未重启（`ps lstart` 11-17 19:30，运行 1 天 13 小时）。
+  - 【事实】已修复并提交 `21225e2`：`peak`/`trough` 改为直接对 `$curve` 文件做 awk 行区间选择，不再用 `echo | head`；奇数行数时中间样本不计入任何一半。对真实 72h 曲线结果与旧实现逐项一致（5816/4252、11/11、13、1）。
+  - 【事实】新增 `scripts/soak-verdict-test.sh` 并接入 `make check`：从 `soak.sh` 原样抽取判决代码块，喂 259,200 行曲线、两个半窗各置一个尖峰、中间行尖峰、空曲线四种输入。对旧实现失败、对新实现通过。
+  - 【事实】24h 数据用当前 HEAD 的 analyzer 复算仍判 FAIL，唯一理由是 `21 samples have no positive FD count`。这 21 个样本是旧版 `soak-guest.sh` 用 `ls /proc/1/fd` 统计 fd 时 ls 崩溃产生的伪影；`4208c69` 已改用 shell glob 并把失败采样计入 `sample_fail`。把 CSV 中这 21 个 0 按前后样本补成 20 后，analyzer 判 **OK**（drift 28 kB、slope 3.32 kB/h 因 drift 未超过 64 kB 门槛而不单独触发、fds 20–22）。
+  - 【事实】`4208c69` 未改动 `crates/rinit`、`crates/rinit-core`、`crates/rinit-runtime` 任何源码，因此这两个长测的运行时结论对当前 HEAD 仍成立；变化的只有采集与判定工具。
   - `rinit-tools ls` 已修复：目录项在 `readdir` 后消失时只跳过该条目，其他元数据错误仍失败；新增确定性命中消失和权限错误测试。
   - 修复后对持续开关 FD 的进程复现 2000 次：失败/空输出从 429 次降为 0；系统 `/bin/ls` 对照为 0。
   - `soak-guest.sh` 不再调用 `ls` 统计 FD，改用 shell glob；空或非正 FD 采样计入 `sample_fail` 并令结果失败。
