@@ -399,6 +399,7 @@ check:
 	cargo clippy --offline --all-targets -- -D warnings
 	cargo test --offline --workspace
 	$(SCRIPTS)/soak-analyze-test.sh
+	$(SCRIPTS)/soak-verdict-test.sh
 
 # `test` = `check` plus the qemu system test, which needs the target
 # artifacts.

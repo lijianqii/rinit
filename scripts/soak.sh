@@ -462,8 +462,14 @@ done
 
 # Steady state is everything after the warmup: boot, the first allocations and
 # the allocator's own arena growth all belong to the samples before it.
-steady="$(awk -v w="$warmup" 'NR > w' "$curve")"
-if [[ -z "$steady" ]] || (($(echo "$steady" | wc -l) < 2)); then
+#
+# A 72-hour run at one sample a second is ~3 MB of text, and it is read four
+# times here. It must be read from the *file*, never piped through `echo`:
+# `echo "$steady" | head -n N` closes the pipe early, `echo` dies of SIGPIPE,
+# and `set -o pipefail` turns that into exit 141 - which is exactly how a
+# complete 259,200-sample run was thrown away after the sampling had finished.
+steady_rows=$(($(wc -l <"$curve") - warmup))
+if ((steady_rows < 2)); then
     echo "soak too short to reach steady state (warmup $warmup of $sample samples)" >&2
     exit 2
 fi
@@ -473,23 +479,43 @@ fi
 # buffer filling, a table sized lazily - passes, while anything that keeps
 # climbing, which is what a leak is, does not. Taking a per-half maximum also
 # absorbs the descriptors that come and go with every restart.
-half=$(($(echo "$steady" | wc -l) / 2))
-first_half="$(echo "$steady" | head -n "$half")"
-second_half="$(echo "$steady" | tail -n "$half")"
-peak() { echo "$1" | awk -v column="$2" '{ if ($column > m) m = $column } END { print m + 0 }'; }
+half=$((steady_rows / 2))
+peak() {
+    awk -v column="$1" -v skip="$warmup" -v first="$2" -v last="$3" '
+        NR <= skip { next }
+        {
+            row = NR - skip
+            if (row >= first && row <= last && $column > m) m = $column
+        }
+        END        { print m + 0 }
+    ' "$curve"
+}
 # The lowest value in a half: what the descriptor check is actually about. The
 # count moves with the churn - a log pipe, an accepted connection, a spawned
 # child - so a *peak* per half is a coin flip over 72 hours (one sample catching
 # the wrong instant fails the run), while the trough is the state everything is
 # supposed to come back to. A leak raises the trough; a spike leaves it alone.
-trough() { echo "$1" | awk -v column="$2" 'NR == 1 { m = $column } { if ($column < m) m = $column } END { print m + 0 }'; }
+trough() {
+    awk -v column="$1" -v skip="$warmup" -v first="$2" -v last="$3" '
+        NR <= skip { next }
+        {
+            row = NR - skip
+            if (row < first || row > last) next
+            if (!seen++) { m = $column } else if ($column < m) m = $column
+        }
+        END        { print m + 0 }
+    ' "$curve"
+}
 
-first_rss="$(peak "$first_half" 1)"
-last_rss="$(peak "$second_half" 1)"
-first_fds="$(trough "$first_half" 2)"
-last_fds="$(trough "$second_half" 2)"
-fds_peak="$(peak "$steady" 2)"
-max_zombies="$(peak "$steady" 4)"
+# `first`/`last` are 1-based row numbers inside the steady window; the second
+# half starts where the first one ends, so an odd row count drops the middle
+# sample from both halves rather than counting it twice.
+first_rss="$(peak 1 1 "$half")"
+last_rss="$(peak 1 $((half + 1)) "$steady_rows")"
+first_fds="$(trough 2 1 "$half")"
+last_fds="$(trough 2 $((half + 1)) "$steady_rows")"
+fds_peak="$(peak 2 1 "$steady_rows")"
+max_zombies="$(peak 4 1 "$steady_rows")"
 
 fail=0
 
