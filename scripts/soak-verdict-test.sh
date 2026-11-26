@@ -112,4 +112,40 @@ if bash -c '
     exit 1
 fi
 
+# The guest-reboot check in soak-qemu.sh counts kernel boots in the serial
+# log. It used to compare against zero, so the deliberate reboot that binds
+# the feature units' sockets made every feature-enabled run fail within
+# seconds. Baseline the count where the sampler starts and only a boot beyond
+# it is a reset.
+boot_line='Booting Linux on physical CPU'
+baseline_of() {
+    grep -cF "$boot_line" "$1" || true
+}
+
+printf '%s\n' "$boot_line" "$boot_line" >"$work/serial-prepared"
+baseline="$(baseline_of "$work/serial-prepared")"
+[[ "$baseline" == "2" ]] || {
+    echo "reboot test: baseline should be 2, got ${baseline}" >&2
+    exit 1
+}
+if [[ "$(baseline_of "$work/serial-prepared")" -gt "$baseline" ]]; then
+    echo "reboot test: the prepared boots must not count as a reset" >&2
+    exit 1
+fi
+
+printf '%s\n' "$boot_line" >>"$work/serial-prepared"
+if ! [[ "$(baseline_of "$work/serial-prepared")" -gt "$baseline" ]]; then
+    echo "reboot test: a boot after sampling started must be detected" >&2
+    exit 1
+fi
+
+# No boots yet (an unusual but possible serial) must baseline at 0, not abort
+# under `set -u` or be mistaken for a reset.
+: >"$work/serial-empty"
+empty_baseline="$(baseline_of "$work/serial-empty")"
+[[ "$empty_baseline" == "0" ]] || {
+    echo "reboot test: an empty serial should baseline at 0, got ${empty_baseline}" >&2
+    exit 1
+}
+
 echo 'soak-verdict-test: OK'

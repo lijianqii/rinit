@@ -246,6 +246,13 @@ ssh_guest "rctl start steady.service; rctl start driven.service; rctl start chur
     echo "FAIL: could not start soak units" >&2
     exit 3
 }
+# Every boot before the sampler starts is deliberate: the one the image was
+# launched with, plus the single reboot above when the feature units need
+# their `SocketActivate=` sockets bound. Counting from zero made every
+# feature-enabled run report "guest rebooted during soak" a few seconds in;
+# the soak is about resets *after* sampling begins.
+boot_baseline="$(grep -cF 'Booting Linux on physical CPU' "$serial" || true)"
+
 ssh_guest "nohup sh /root/soak-guest.sh --seconds $seconds --interval $interval >/var/log/rinit/soak-guest.log 2>&1 &" || {
     echo "FAIL: could not start guest sampler" >&2
     exit 3
@@ -264,9 +271,9 @@ guest_rebooted=0
 while ((SECONDS < deadline)); do
     if grep -q 'SOAK_DONE' "$serial"; then break; fi
     if ! kill -0 "$qemu_pid" 2>/dev/null; then break; fi
-    # A second kernel boot means the guest reset: the soak is no longer
+    # A boot beyond the baseline means the guest reset: the soak is no longer
     # measuring one continuous uptime, so stop early instead of burning hours.
-    if [[ "$(grep -cF 'Booting Linux on physical CPU' "$serial")" -gt 1 ]]; then
+    if [[ "$(grep -cF 'Booting Linux on physical CPU' "$serial")" -gt "$boot_baseline" ]]; then
         printf 'FAIL %s guest rebooted during soak\n' "$(date '+%F %T %Z')" >>"$checkpoint_dir/log"
         guest_rebooted=1
         break
