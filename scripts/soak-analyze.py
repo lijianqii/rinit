@@ -128,21 +128,26 @@ def main():
     if control_fail:
         reasons.append(f"{control_fail} control failures")
 
-    fds = []
+    # Descriptors and threads are counted over the steady window, like RSS. A
+    # boot legitimately has more of both: the blocking pool starts a worker for
+    # the unit-directory scan, the log file and the first mounts, and those
+    # workers exit again. Judging the peak over the whole run made a healthy
+    # 24-hour soak fail on the `threads=3` sample taken three seconds after
+    # boot on arm32. A leak still shows up: it has to persist to be seen here.
     invalid_fd_samples = 0
     for row in rows:
         raw_fds = row.get("fds", "")
-        if raw_fds.isdigit() and int(raw_fds) > 0:
-            fds.append(int(raw_fds))
-        else:
+        if not (raw_fds.isdigit() and int(raw_fds) > 0):
             invalid_fd_samples += 1
     if invalid_fd_samples:
         reasons.append(f"{invalid_fd_samples} samples have no positive FD count")
+
+    fds = [int(r["fds"]) for r in stable if r.get("fds", "").isdigit()]
     fd_span = (max(fds) - min(fds)) if fds else 0
     if fd_span > fd_limit:
         reasons.append(f"fd span {fd_span} exceeds {fd_limit}")
 
-    threads = [int(r["threads"]) for r in rows if r.get("threads", "").isdigit()]
+    threads = [int(r["threads"]) for r in stable if r.get("threads", "").isdigit()]
     if threads and max(threads) > 2:
         reasons.append(f"threads peak {max(threads)} exceeds 2")
 
