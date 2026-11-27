@@ -421,14 +421,14 @@ they are measured on the tree as it stands rather than copied from one run:
 
 | crate            | line coverage | functions |
 | ---------------- | ------------- | --------- |
-| `rinit-core`     | **97.91%**    | 591/601   |
-| `rinit-runtime`  | 84.18%        | 387/449   |
-| `rinit`          | 87.81%        | 846/948   |
-| `rinit-tools`    | 80.93%        | 722/932   |
-| `rctl`           | 93.30%        | 66/73     |
-| `processes`      | 88.03%        | 72/88     |
-| `rnet`           | 55.47%        | 270/524   |
-| **total**        | **82.02%**    | 2954/3615 |
+| `rinit-core`     | **98.13%**    | 603/613   |
+| `rinit-runtime`  | 84.35%        | 390/452   |
+| `rinit`          | 87.71%        | 876/978   |
+| `rinit-tools`    | 80.52%        | 729/940   |
+| `rctl`           | 93.32%        | 66/73     |
+| `processes`      | 85.84%        | 74/90     |
+| `rnet`           | 55.95%        | 284/537   |
+| **total**        | **81.97%**    | 3022/3683 |
 
 The plan's checklist asks for ≥80% overall and ≥90% in the core, so these are the
 numbers that answer it rather than a shape:
@@ -563,10 +563,10 @@ repository or a measurement in this README:
 | crash-restart, breaker, health checks | `make test-system` ("a crashed service is scheduled for restart", "the breaker tripped on the failing unit") and `crates/rinit/tests/m2_lifecycle.rs` |
 | `rctl` can start, stop, query and read logs | `make test-system`'s M3 block and `crates/rctl/tests/control.rs` |
 | graceful shutdown, no zombies, no fd leak | `make soak` samples descriptors, threads and zombie children through restart churn, and asserts each comes back to its baseline |
-| 72 h soak with stable RSS | **Passed on the host.** Segment 9 on `8b373d8` completed **4,320/4,320 samples** and **8,640/8,640 control commands**. RSS peak per half fell from 5,168 kB to 4,300 kB, descriptor minima were 11 and 11 (peak 22), the maximum zombie streak was 1 transient sample, and the final quiescent sweep found 0 zombies. |
-| 24 h soak in the target guest | **Passed.** `7a5df04`, aarch64 `run-disk`, guest-side sampler: **1,440/1,440 samples** and **2,880/2,880 control commands** over 86,343 s. RSS stayed within 2,364–2,528 kB (half peaks 2,520/2,528), descriptors within 19–20, no zombie was ever observed, and the final sweep returned `quiescent=0 health_fail=0`. `eth0`, the default route, `udhcpc`, dropbear, `network.service` and `sshd.service` were healthy in every sample (historical run, before `rnet`); the serial log shows one boot and no panic/OOM. Sampling runs inside the guest (`scripts/soak-qemu.sh` + `scripts/soak-guest.sh`), so a host SSH outage cannot end the run silently. |
+| 72 h soak with stable RSS | **Passed on the host.** Segment 9 on `8b373d8` completed **4,320/4,320 samples** and **8,640/8,640 control commands**. RSS peak per half fell from 5,168 kB to 4,300 kB, descriptor minima were 11 and 11 (peak 22), the maximum zombie streak was 1 transient sample, and the final quiescent sweep found 0 zombies. Repeated on `21367ed`: **259,200/259,200 samples**, **2,022,664 churn restarts**, **518,400/518,400 control commands**, RSS peak per half 5,856 kB → 4,220 kB, descriptors 11 → 11 at their lowest (peak 13), quiescent 0. |
+| 24 h soak in the target guest | **Passed.** `7a5df04`, aarch64 `run-disk`, guest-side sampler: **1,440/1,440 samples** and **2,880/2,880 control commands** over 86,343 s. RSS stayed within 2,364–2,528 kB (half peaks 2,520/2,528), descriptors within 19–20, no zombie was ever observed, and the final sweep returned `quiescent=0 health_fail=0`. `eth0`, the default route, `udhcpc`, dropbear, `network.service` and `sshd.service` were healthy in every sample (historical run, before `rnet`); the serial log shows one boot and no panic/OOM. Sampling runs inside the guest (`scripts/soak-qemu.sh` + `scripts/soak-guest.sh`), so a host SSH outage cannot end the run silently. Repeated on `21367ed` with `rnet`: `SOAK OK` and `Analyzer: OK` over **8,640/8,640 samples**, RSS drift 56 kB, FD 20–22 with zero invalid samples. |
 | binaries ≤2 MB dynamic / ≤4 MB static | [Measurements](#measurements-plan-01-calibration-point): 1.00 MiB dynamic arm64 / 1.07 MiB armv7; `make size-check` applies the per-binary budgets in `tools.list` (4 MiB otherwise) |
-| unit test coverage ≥80% overall, ≥90% in the core | **82.02%** and **97.91%** (`make coverage-check`, [above](#testing)) |
+| unit test coverage ≥80% overall, ≥90% in the core | **81.97%** and **98.13%** (`make coverage-check`, [above](#testing)) |
 | documentation: architecture, unit format, `rctl`, porting | this README (architecture, status, measurements), [`docs/units.md`](docs/units.md) (every directive, its value syntax and its default), [`docs/porting.md`](docs/porting.md) (kernel, userspace, build, differences from systemd), [`docs/rnet-design.md`](docs/rnet-design.md) (network manager design and task breakdown), and `rinit-开发计划.md` |
 
 The release-specific gate - host, both target architectures, tools, 24 h soak,
@@ -577,9 +577,14 @@ gate reruns it with `rnetd`.
 The completed `release-24h` run on `a62642a` produced 8,640 samples and passed
 the runtime health checks, but its post-run analysis found 21 invalid FD
 samples. Those came from the replacement `ls` failing when a procfs descriptor
-disappeared during directory listing. The tool and sampler are fixed, and the
-soak driver now runs the analyzer itself; a fresh 24 h run is still required
-before that gate can be checked.
+disappeared during directory listing. Both were fixed, and three runs on the
+fixed harness have since passed: a 24 h guest soak on `21367ed` (`SOAK OK` and
+`Analyzer: OK`, 8,640/8,640 samples, zero invalid FD samples), a 72 h host soak
+on `21367ed` (`SOAK OK`, 259,200/259,200 samples, 2,022,664 churn restarts,
+518,400/518,400 control commands, quiescent zombie sweep clean), and a 24 h
+two-architecture matrix on `8304374` with the feature suite enabled
+(`soak-matrix: OK`, 1,440/1,440 samples and 119/119 feature probes on both
+aarch64 and armv7).
 
 One number the checklist does not ask for, but plan §0.1's design goals do: rinit's
 RSS, measured *in the guest* out of `/proc/1/status` rather than on the host -

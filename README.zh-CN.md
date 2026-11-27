@@ -363,14 +363,14 @@ qemu 的 `i6300esb` 设备和带该驱动编译的内核是测试装置的一部
 
 | crate            | 行覆盖率      | 函数      |
 | ---------------- | ------------- | --------- |
-| `rinit-core`     | **97.91%**    | 591/601   |
-| `rinit-runtime`  | 84.18%        | 387/449   |
-| `rinit`          | 87.81%        | 846/948   |
-| `rinit-tools`    | 80.93%        | 722/932   |
-| `rctl`           | 93.30%        | 66/73     |
-| `processes`      | 88.03%        | 72/88     |
-| `rnet`           | 55.47%        | 270/524   |
-| **总计**         | **82.02%**    | 2954/3615 |
+| `rinit-core`     | **98.13%**    | 603/613   |
+| `rinit-runtime`  | 84.35%        | 390/452   |
+| `rinit`          | 87.71%        | 876/978   |
+| `rinit-tools`    | 80.52%        | 729/940   |
+| `rctl`           | 93.32%        | 66/73     |
+| `processes`      | 85.84%        | 74/90     |
+| `rnet`           | 55.95%        | 284/537   |
+| **总计**         | **81.97%**    | 3022/3683 |
 
 计划清单要求总体 ≥80%、核心 ≥90%，所以回答它的是这些数字，而不是某种形状：
 
@@ -473,7 +473,7 @@ cargo llvm-cov --offline --workspace --html                  # target/llvm-cov/h
 | 72 小时 soak，RSS 稳定 | **宿主上已通过。** 第九段在 `8b373d8` 上完成 **4,320/4,320 个样本**和 **8,640/8,640 条 control 命令**。前半段与后半段的 RSS 峰值分别为 5,168 kB 和 4,300 kB，描述符最低值均为 11（峰值 22），最大 zombie 连续出现 1 个瞬时采样，最终静默扫描为 0。 |
 | 24 小时目标客户机 soak | **已通过。** `7a5df04`，aarch64 `run-disk`，guest 内采样：86,343 秒内完成 **1,440/1,440 个样本**和 **2,880/2,880 条 control 命令**。RSS 保持在 2,364–2,528 kB（前后半段峰值 2,520/2,528），描述符 19–20，全程未观察到 zombie，最终检查为 `quiescent=0 health_fail=0`。每个样本里 `eth0`、默认路由、`udhcpc`、dropbear、`network.service` 和 `sshd.service` 都正常（历史结果，早于 `rnet`）；串口日志只有一次启动，无 panic/OOM。采样在 guest 内运行（`scripts/soak-qemu.sh` + `scripts/soak-guest.sh`），宿主 SSH 断开不会让测试静默失效。 |
 | 二进制 ≤2 MB 动态 / ≤4 MB 静态 | [测量](#测量计划-01-校准点)：aarch64 动态 1.00 MiB、armv7 动态 1.07 MiB，由 `make size-check` 检查 |
-| 单元测试覆盖率总体 ≥80%、核心 ≥90% | **82.02%** 和 **97.91%**（`make coverage-check`，见[上文](#测试)） |
+| 单元测试覆盖率总体 ≥80%、核心 ≥90% | **81.97%** 和 **98.13%**（`make coverage-check`，见[上文](#测试)） |
 | 文档：架构、单元格式、`rctl`、移植 | 本 README（架构、状态、测量）、[`docs/units.md`](docs/units.md)（每条指令、取值语法和默认值）、[`docs/porting.md`](docs/porting.md)（内核、用户空间、构建、与 systemd 的差异）、[`docs/rnet-design.md`](docs/rnet-design.md)（网络管理器设计与任务拆分），以及 `rinit-开发计划.md` |
 
 发版专用门禁（宿主、双目标架构、tools、24h soak、reboot、打包）见
